@@ -36,6 +36,83 @@ struct SlotReconcileEnv<'a> {
     owns_rebalance: bool,
 }
 
+/// Immutable inputs shared by the repair and healthy reconciliation paths for one slot.
+struct SlotReconcileContext<'a> {
+    spec: &'a ServiceSpecValue,
+    slot: &'a ReplicaSlot,
+    assigned_task_id: Uuid,
+    key: &'a SlotKey,
+    desired_node: Uuid,
+    preferred_node: Option<Uuid>,
+    health_snapshot: &'a HashMap<Uuid, HealthStatus>,
+    service_degraded: bool,
+    owns_missing_repair: bool,
+    owns_rebalance: bool,
+}
+
+/// Observed task details that require the assigned slot to be repaired or replaced.
+#[derive(Clone, Copy)]
+struct SlotRepairObservation<'a> {
+    task: Option<&'a WorkloadSpec>,
+    task_on_draining_node: bool,
+    task_owner_unavailable: bool,
+}
+
+/// Classifies the assigned task before reconciliation performs any slot mutations.
+enum SlotTaskDisposition<'a> {
+    /// The assigned task cannot access a volume that exists only on its current node.
+    ///
+    /// Moving the task cannot repair this state because no other node can mount the volume.
+    /// Reconciliation therefore marks the service as `VolumeUnavailable` and leaves the assigned
+    /// task in place. The same task can return to `Running` if the volume becomes available again.
+    PinnedVolumeUnavailable,
+
+    /// The assigned task is missing or cannot continue serving this replica slot.
+    ///
+    /// This includes a task row that is not visible locally, a task in an unhealthy state, a task
+    /// on a draining node, or a task whose owner has left or is down. The repair path first adopts
+    /// any replacement that was already started for this slot. If none exists, the elected slot
+    /// owner starts a replacement after the delay selected by `SlotRepairDelay`.
+    RepairRequired(SlotRepairObservation<'a>),
+
+    /// The assigned task is visible, healthy, and hosted by an available non-draining node.
+    ///
+    /// No failure repair is needed. Reconciliation makes sure the task is published for service
+    /// traffic, stops replacement tasks that are no longer valid, and lets the generation owner
+    /// move the task if the current placement no longer matches the computed slot target.
+    Healthy(&'a WorkloadSpec),
+}
+
+/// Delay policy that must elapse before a slot repair may create a replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotRepairDelay {
+    /// Start a replacement during this reconciliation pass without waiting for another scan.
+    ///
+    /// This is used only when the controller has direct evidence that waiting cannot make the
+    /// current assignment usable: its node is draining, its owner has left or is down, its
+    /// deployment target is down, its deployment task is terminal, or a steady-state cluster split
+    /// deliberately removed its workload row.
+    Immediate,
+
+    /// Wait for a newly assigned deployment task to appear in the local workload inventory.
+    ///
+    /// The service assignment and the workload inventory are replicated separately. A slot owner
+    /// can therefore receive a service row containing the assigned task ID before it receives the
+    /// workload row for that task. The task may already be starting or running on its target node,
+    /// only its workload row is missing from this node's snapshot. Starting a replacement at this
+    /// point would create two tasks for one replica slot. We thus wait for a delay until we receive
+    /// the workload row.
+    DeploymentVisibilityGrace,
+
+    /// Wait for a temporarily missing or unhealthy task to become visible and healthy again.
+    ///
+    /// This is the default when the controller has no direct evidence that the assignment is
+    /// permanently lost. The first observation records a `SERVICE_SLOT_MISSING_GRACE_SECS`
+    /// deadline. Later reconciliation passes replace the task only if the slot is still unhealthy
+    /// after that deadline, observing a healthy task before then clears the deadline.
+    MissingGrace,
+}
+
 /// Task and target identities involved in a start-first slot replacement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SlotReplacement {
@@ -114,6 +191,39 @@ fn preferred_slot_node(
         None
     } else {
         Some(desired_node)
+    }
+}
+
+/// Chooses the delay policy for one repair-required slot observation.
+///
+/// Deployment visibility takes precedence over split-prune hints because an assigned workload row
+/// can still be in flight while its target remains healthy. Concrete placement failure, terminal
+/// deployment state, and steady-state split pruning may bypass the normal missing-slot grace.
+fn slot_repair_delay(
+    status: ServiceStatus,
+    task: Option<&WorkloadSpec>,
+    desired_node: Uuid,
+    health_snapshot: &HashMap<Uuid, HealthStatus>,
+    split_pruned: bool,
+    task_on_draining_node: bool,
+    task_owner_unavailable: bool,
+) -> SlotRepairDelay {
+    if deploying_missing_slot_is_unknown(status, task, desired_node, health_snapshot) {
+        return SlotRepairDelay::DeploymentVisibilityGrace;
+    }
+
+    let deploying_absent_target_down = status == ServiceStatus::Deploying
+        && task.is_none()
+        && node_is_down(desired_node, health_snapshot);
+    if task_on_draining_node
+        || task_owner_unavailable
+        || split_pruned
+        || deploying_absent_target_down
+        || should_restart_missing_slot_immediately(status, task)
+    {
+        SlotRepairDelay::Immediate
+    } else {
+        SlotRepairDelay::MissingGrace
     }
 }
 
@@ -296,6 +406,7 @@ impl ServiceController {
         health_snapshot: &HashMap<Uuid, HealthStatus>,
     ) {
         let mut remote_cleanup_owners = BTreeSet::new();
+
         for task in service_tasks.observed_tasks() {
             if service_tasks.is_desired(task.id) {
                 continue;
@@ -396,51 +507,42 @@ impl ServiceController {
         let Some(desired_node) = env.slot_targets.get(key).copied() else {
             return Ok(());
         };
+
         let preferred_node = preferred_slot_node(
             desired_node,
             env.health_snapshot,
             self.cluster_registry.peer_schedulable(desired_node),
         );
+
         let requires_pinned_target = mounted_local_volumes_require_pinned_target(
             &self.volume_registry,
             &slot.template.volumes,
         )?;
 
         let task = env.inventory.by_id.get(&task_id);
-        if matches!(
-            task.map(|task| &task.state),
-            Some(WorkloadPhase::VolumeUnavailable)
-        ) && requires_pinned_target
-        {
-            // Imported and other pinned local volumes recover in place once the node-local
-            // path returns. Promote the service immediately instead of waiting for a restart
-            // attempt to rediscover the same local volume error.
-            self.mark_service_volume_unavailable(spec).await?;
-            return Ok(());
-        }
-        let task_on_draining_node = task
-            .map(|task| self.node_drain_requested(task.node_id))
-            .unwrap_or(false);
-        let task_owner_unavailable = task
-            .map(|task| {
-                // Health Down and explicit Left both mean a remote stop RPC cannot make progress.
-                // Unknown topology is intentionally not terminal so sync lag does not retire work.
-                let owner_active_cluster_member = self
-                    .cluster_registry
-                    .peer_active_in_local_view(task.node_id);
-                service_task_owner_unavailable_for_cleanup(
-                    task.node_id,
-                    self.local_node_id,
-                    env.health_snapshot,
-                    owner_active_cluster_member,
-                )
-            })
-            .unwrap_or(false);
-        let missing = match task {
-            None => true,
-            Some(task) => {
-                task_on_draining_node || task_owner_unavailable || !task_state_healthy(&task.state)
-            }
+        let disposition =
+            match self.classify_slot_task(task, requires_pinned_target, env.health_snapshot) {
+                SlotTaskDisposition::PinnedVolumeUnavailable => {
+                    // Imported and other pinned local volumes recover in place once the node-local
+                    // path returns. Promote the service immediately instead of waiting for a restart
+                    // attempt to rediscover the same local volume error.
+                    self.mark_service_volume_unavailable(spec).await?;
+                    return Ok(());
+                }
+                disposition => disposition,
+            };
+
+        let context = SlotReconcileContext {
+            spec,
+            slot,
+            assigned_task_id: task_id,
+            key,
+            desired_node,
+            preferred_node,
+            health_snapshot: env.health_snapshot,
+            service_degraded: env.service_degraded,
+            owns_missing_repair: env.owns_missing_repair,
+            owns_rebalance: env.owns_rebalance,
         };
         let handoff_candidates = self
             .collect_slot_handoff_candidates(
@@ -452,159 +554,256 @@ impl ServiceController {
             )
             .await;
 
-        if missing {
-            self.clear_rebalance_plan(key).await;
-            if let Some(candidate) =
-                select_slot_handoff_candidate(&handoff_candidates, preferred_node)
-            {
-                if !env.owns_rebalance {
-                    return Ok(());
-                }
-                self.resume_slot_handoff(
-                    spec,
-                    slot,
-                    SlotReplacement {
-                        previous_task_id: task_id,
-                        replacement_task_id: candidate.task_id,
-                        replacement_node_id: candidate.node_id,
-                    },
-                    &handoff_candidates,
-                    env.health_snapshot,
-                    key,
-                )
-                .await?;
-                return Ok(());
-            }
-            if !env.owns_missing_repair {
-                return Ok(());
-            }
-            if task_on_draining_node {
-                tracing::debug!(
-                    target: "services",
-                    service = %spec.service_name,
-                    template = %slot.template.name,
-                    replica = slot.replica,
-                    task = %task_id,
-                    "slot task is assigned to a draining node; forcing evacuation"
-                );
-            }
-            if task_owner_unavailable {
-                tracing::debug!(
-                    target: "services",
-                    service = %spec.service_name,
-                    template = %slot.template.name,
-                    replica = slot.replica,
-                    task = %task_id,
-                    "slot task owner is unavailable; forcing replacement"
-                );
-            }
-            let deployment_visibility_elapsed = if deploying_missing_slot_is_unknown(
-                spec.status(),
-                task,
-                desired_node,
-                env.health_snapshot,
-            ) {
-                if !self
-                    .slot_missing_elapsed_after(
-                        key,
-                        Duration::from_secs(SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS),
-                    )
+        match disposition {
+            SlotTaskDisposition::RepairRequired(observation) => {
+                self.reconcile_repair_required_slot(&context, observation, &handoff_candidates)
                     .await
-                {
-                    tracing::debug!(
-                        target: "services",
-                        service = %spec.service_name,
-                        template = %slot.template.name,
-                        replica = slot.replica,
-                        task = %task_id,
-                        target = %desired_node,
-                        visibility_grace_secs = SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS,
-                        "slot task row is not locally visible during deployment; waiting for direct assignment delivery or workload MST sync"
-                    );
-                    return Ok(());
-                }
+            }
+            SlotTaskDisposition::Healthy(task) => {
+                self.reconcile_healthy_slot(&context, task, handoff_candidates)
+                    .await
+            }
+            SlotTaskDisposition::PinnedVolumeUnavailable => Ok(()),
+        }
+    }
 
-                tracing::debug!(
-                    target: "services",
-                    service = %spec.service_name,
-                    template = %slot.template.name,
-                    replica = slot.replica,
-                    task = %task_id,
-                    target = %desired_node,
-                    visibility_grace_secs = SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS,
-                    "deployment visibility grace elapsed for absent slot task; allowing replacement"
-                );
-                true
-            } else {
-                false
-            };
-            let deploying_absent_target_down = spec.status() == ServiceStatus::Deploying
-                && task.is_none()
-                && node_is_down(desired_node, env.health_snapshot);
-            if deploying_absent_target_down {
-                tracing::debug!(
-                    target: "services",
-                    service = %spec.service_name,
-                    template = %slot.template.name,
-                    replica = slot.replica,
-                    task = %task_id,
-                    target = %desired_node,
-                    "deployment slot task is absent and its assigned target is down; allowing replacement without visibility grace"
-                );
-            }
-            let split_pruned =
-                task.is_none() && self.reconcile_trigger.workload_was_split_pruned(task_id);
-            let placement_requires_restart = task_on_draining_node || task_owner_unavailable;
-            let missing_task_can_restart =
-                split_pruned || deploying_absent_target_down || deployment_visibility_elapsed;
-            let task_state_requires_restart =
-                should_restart_missing_slot_immediately(spec.status(), task);
-            let restart_immediately = placement_requires_restart
-                || missing_task_can_restart
-                || task_state_requires_restart;
-            if restart_immediately || self.slot_missing_elapsed(key).await {
-                self.start_slot_task(
-                    spec,
-                    slot,
-                    task_id,
-                    preferred_node,
-                    env.health_snapshot,
-                    key,
+    /// Classifies the assigned task into the next slot reconciliation path.
+    fn classify_slot_task<'a>(
+        &self,
+        task: Option<&'a WorkloadSpec>,
+        requires_pinned_target: bool,
+        health_snapshot: &HashMap<Uuid, HealthStatus>,
+    ) -> SlotTaskDisposition<'a> {
+        if matches!(
+            task.map(|task| &task.state),
+            Some(WorkloadPhase::VolumeUnavailable)
+        ) && requires_pinned_target
+        {
+            return SlotTaskDisposition::PinnedVolumeUnavailable;
+        }
+
+        let task_on_draining_node = task
+            .map(|task| self.node_drain_requested(task.node_id))
+            .unwrap_or(false);
+
+        let task_owner_unavailable = task
+            .map(|task| {
+                // Health Down and explicit Left both mean a remote stop RPC cannot make progress.
+                // Unknown topology is intentionally not terminal so sync lag does not retire work.
+                let owner_active_cluster_member = self
+                    .cluster_registry
+                    .peer_active_in_local_view(task.node_id);
+                service_task_owner_unavailable_for_cleanup(
+                    task.node_id,
+                    self.local_node_id,
+                    health_snapshot,
+                    owner_active_cluster_member,
                 )
-                .await?;
+            })
+            .unwrap_or(false);
+
+        let observation = SlotRepairObservation {
+            task,
+            task_on_draining_node,
+            task_owner_unavailable,
+        };
+
+        match task {
+            Some(task)
+                if !task_on_draining_node
+                    && !task_owner_unavailable
+                    && task_state_healthy(&task.state) =>
+            {
+                SlotTaskDisposition::Healthy(task)
             }
+            _ => SlotTaskDisposition::RepairRequired(observation),
+        }
+    }
+
+    /// Repairs an absent, unhealthy, draining, or unavailable slot assignment.
+    async fn reconcile_repair_required_slot(
+        &self,
+        context: &SlotReconcileContext<'_>,
+        observation: SlotRepairObservation<'_>,
+        handoff_candidates: &[SlotHandoffCandidate],
+    ) -> anyhow::Result<()> {
+        self.clear_rebalance_plan(context.key).await;
+
+        if let Some(candidate) =
+            select_slot_handoff_candidate(handoff_candidates, context.preferred_node)
+        {
+            if !context.owns_rebalance {
+                return Ok(());
+            }
+            self.resume_slot_handoff(
+                context.spec,
+                context.slot,
+                SlotReplacement {
+                    previous_task_id: context.assigned_task_id,
+                    replacement_task_id: candidate.task_id,
+                    replacement_node_id: candidate.node_id,
+                },
+                handoff_candidates,
+                context.health_snapshot,
+                context.key,
+            )
+            .await?;
+            return Ok(());
+        }
+        if !context.owns_missing_repair {
             return Ok(());
         }
 
-        self.clear_slot_missing(key).await;
+        if observation.task_on_draining_node {
+            tracing::debug!(
+                target: "services",
+                service = %context.spec.service_name,
+                template = %context.slot.template.name,
+                replica = context.slot.replica,
+                task = %context.assigned_task_id,
+                "slot task is assigned to a draining node; forcing evacuation"
+            );
+        }
 
-        let Some(task) = task else {
-            return Ok(());
-        };
+        if observation.task_owner_unavailable {
+            tracing::debug!(
+                target: "services",
+                service = %context.spec.service_name,
+                template = %context.slot.template.name,
+                replica = context.slot.replica,
+                task = %context.assigned_task_id,
+                "slot task owner is unavailable; forcing replacement"
+            );
+        }
 
-        if spec.status() == ServiceStatus::Running
-            && task_state_healthy(&task.state)
-            && !node_is_down(task.node_id, env.health_snapshot)
+        let split_pruned = observation.task.is_none()
+            && self
+                .reconcile_trigger
+                .workload_was_split_pruned(context.assigned_task_id);
+
+        let delay = slot_repair_delay(
+            context.spec.status(),
+            observation.task,
+            context.desired_node,
+            context.health_snapshot,
+            split_pruned,
+            observation.task_on_draining_node,
+            observation.task_owner_unavailable,
+        );
+
+        if !self
+            .slot_repair_delay_elapsed(context, observation.task, delay)
+            .await
         {
-            self.publish_running_task_traffic_best_effort(&spec.service_name, task.id)
+            return Ok(());
+        }
+
+        self.start_slot_task(
+            context.spec,
+            context.slot,
+            context.assigned_task_id,
+            context.preferred_node,
+            context.health_snapshot,
+            context.key,
+        )
+        .await
+    }
+
+    /// Returns true once the selected repair delay has elapsed, logging exceptional bypasses.
+    async fn slot_repair_delay_elapsed(
+        &self,
+        context: &SlotReconcileContext<'_>,
+        task: Option<&WorkloadSpec>,
+        delay: SlotRepairDelay,
+    ) -> bool {
+        match delay {
+            SlotRepairDelay::Immediate => {
+                if context.spec.status() == ServiceStatus::Deploying
+                    && task.is_none()
+                    && node_is_down(context.desired_node, context.health_snapshot)
+                {
+                    tracing::debug!(
+                        target: "services",
+                        service = %context.spec.service_name,
+                        template = %context.slot.template.name,
+                        replica = context.slot.replica,
+                        task = %context.assigned_task_id,
+                        target = %context.desired_node,
+                        "deployment slot task is absent and its assigned target is down; allowing replacement without visibility grace"
+                    );
+                }
+                true
+            }
+            SlotRepairDelay::DeploymentVisibilityGrace => {
+                let elapsed = self
+                    .slot_missing_elapsed_after(
+                        context.key,
+                        Duration::from_secs(SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS),
+                    )
+                    .await;
+
+                if elapsed {
+                    tracing::debug!(
+                        target: "services",
+                        service = %context.spec.service_name,
+                        template = %context.slot.template.name,
+                        replica = context.slot.replica,
+                        task = %context.assigned_task_id,
+                        target = %context.desired_node,
+                        visibility_grace_secs = SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS,
+                        "deployment visibility grace elapsed for absent slot task; allowing replacement"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "services",
+                        service = %context.spec.service_name,
+                        template = %context.slot.template.name,
+                        replica = context.slot.replica,
+                        task = %context.assigned_task_id,
+                        target = %context.desired_node,
+                        visibility_grace_secs = SERVICE_DEPLOYING_SLOT_VISIBILITY_GRACE_SECS,
+                        "slot task row is not locally visible during deployment; waiting for direct assignment delivery or workload MST sync"
+                    );
+                }
+                elapsed
+            }
+            SlotRepairDelay::MissingGrace => self.slot_missing_elapsed(context.key).await,
+        }
+    }
+
+    /// Reconciles traffic, handoffs, and placement for one healthy assigned task.
+    async fn reconcile_healthy_slot(
+        &self,
+        context: &SlotReconcileContext<'_>,
+        task: &WorkloadSpec,
+        handoff_candidates: Vec<SlotHandoffCandidate>,
+    ) -> anyhow::Result<()> {
+        self.clear_slot_missing(context.key).await;
+
+        if context.spec.status() == ServiceStatus::Running
+            && task_state_healthy(&task.state)
+            && !node_is_down(task.node_id, context.health_snapshot)
+        {
+            self.publish_running_task_traffic_best_effort(&context.spec.service_name, task.id)
                 .await;
         }
 
         let (target_candidates, misplaced_candidates): (Vec<_>, Vec<_>) = handoff_candidates
             .into_iter()
-            .partition(|candidate| candidate.node_id == desired_node);
+            .partition(|candidate| candidate.node_id == context.desired_node);
+
         self.abort_slot_handoff_candidates(
-            &spec.service_name,
+            &context.spec.service_name,
             &misplaced_candidates,
             None,
             "handoff no longer matches the converged slot target",
         )
         .await;
 
-        if desired_node == task.node_id {
-            self.clear_rebalance_plan(key).await;
+        if context.desired_node == task.node_id {
+            self.clear_rebalance_plan(context.key).await;
             self.abort_slot_handoff_candidates(
-                &spec.service_name,
+                &context.spec.service_name,
                 &target_candidates,
                 None,
                 "replacement no longer needed for current service slot",
@@ -616,56 +815,68 @@ impl ServiceController {
         // A visible candidate already records a valid handoff from this slot to the converged
         // target. Resume it independently of local creation gates such as age and cooldown.
         if let Some(candidate) =
-            select_slot_handoff_candidate(&target_candidates, Some(desired_node))
+            select_slot_handoff_candidate(&target_candidates, Some(context.desired_node))
         {
-            self.clear_rebalance_plan(key).await;
-            if !env.owns_rebalance {
+            self.clear_rebalance_plan(context.key).await;
+            if !context.owns_rebalance {
                 return Ok(());
             }
             self.resume_slot_handoff(
-                spec,
-                slot,
+                context.spec,
+                context.slot,
                 SlotReplacement {
-                    previous_task_id: task_id,
+                    previous_task_id: context.assigned_task_id,
                     replacement_task_id: candidate.task_id,
                     replacement_node_id: candidate.node_id,
                 },
                 &target_candidates,
-                env.health_snapshot,
-                key,
+                context.health_snapshot,
+                context.key,
             )
             .await?;
-            self.set_rebalance_cooldown(key).await;
+            self.set_rebalance_cooldown(context.key).await;
             return Ok(());
         }
 
         // Missing slots are healed by their slot owners above. Healthy slots are moved only by the
         // generation owner because each cutover rewrites the shared service assignment row.
-        let service_can_rebalance = spec.status() == ServiceStatus::Running
-            && env.owns_rebalance
-            && slot.template.replicas > 1
-            && !env.service_degraded;
+        let service_can_rebalance = context.spec.status() == ServiceStatus::Running
+            && context.owns_rebalance
+            && context.slot.template.replicas > 1
+            && !context.service_degraded;
+
         let task_can_rebalance = task_state_rebalanceable(&task.state)
             && task_age_allows_rebalance(task, self.timing.rebalance_min_age);
+
         if !service_can_rebalance || !task_can_rebalance {
-            self.clear_rebalance_plan(key).await;
+            self.clear_rebalance_plan(context.key).await;
             return Ok(());
         }
 
-        let cooldown_elapsed = self.rebalance_allowed(key).await;
-        let target_is_available = !node_is_down(desired_node, env.health_snapshot);
+        let cooldown_elapsed = self.rebalance_allowed(context.key).await;
+        let target_is_available = !node_is_down(context.desired_node, context.health_snapshot);
+
         if !cooldown_elapsed || !target_is_available {
-            self.clear_rebalance_plan(key).await;
-            return Ok(());
-        }
-        if !self.rebalance_plan_is_stable(key, task, desired_node).await {
+            self.clear_rebalance_plan(context.key).await;
             return Ok(());
         }
 
-        self.move_slot_task(spec, slot, task, desired_node, env.health_snapshot, key)
-            .await?;
+        if !self
+            .rebalance_plan_is_stable(context.key, task, context.desired_node)
+            .await
+        {
+            return Ok(());
+        }
 
-        Ok(())
+        self.move_slot_task(
+            context.spec,
+            context.slot,
+            task,
+            context.desired_node,
+            context.health_snapshot,
+            context.key,
+        )
+        .await
     }
 
     /// Collects applicable handoffs and retires rows superseded by the current service slot.
@@ -1489,6 +1700,90 @@ mod tests {
         let health = HashMap::from([(node, HealthStatus::Down)]);
 
         assert_eq!(preferred_slot_node(node, &health, true), None);
+    }
+
+    /// Absent deployment rows keep the long visibility grace even after split pruning.
+    #[test]
+    fn deployment_visibility_grace_precedes_split_pruning() {
+        let node = Uuid::from_bytes([4u8; 16]);
+        let health = HashMap::from([(node, HealthStatus::Alive)]);
+
+        assert_eq!(
+            slot_repair_delay(
+                ServiceStatus::Deploying,
+                None,
+                node,
+                &health,
+                false,
+                false,
+                false,
+            ),
+            SlotRepairDelay::DeploymentVisibilityGrace
+        );
+        assert_eq!(
+            slot_repair_delay(
+                ServiceStatus::Deploying,
+                None,
+                node,
+                &health,
+                true,
+                false,
+                false,
+            ),
+            SlotRepairDelay::DeploymentVisibilityGrace
+        );
+    }
+
+    /// A down deployment target proves that an absent assignment cannot still make progress.
+    #[test]
+    fn deployment_down_target_bypasses_visibility_grace() {
+        let node = Uuid::from_bytes([5u8; 16]);
+        let health = HashMap::from([(node, HealthStatus::Down)]);
+
+        assert_eq!(
+            slot_repair_delay(
+                ServiceStatus::Deploying,
+                None,
+                node,
+                &health,
+                false,
+                false,
+                false,
+            ),
+            SlotRepairDelay::Immediate
+        );
+    }
+
+    /// Steady-state absence keeps normal grace unless split evidence confirms local pruning.
+    #[test]
+    fn steady_state_split_pruning_bypasses_missing_grace() {
+        let node = Uuid::from_bytes([6u8; 16]);
+        let health = HashMap::new();
+
+        assert_eq!(
+            slot_repair_delay(
+                ServiceStatus::Running,
+                None,
+                node,
+                &health,
+                false,
+                false,
+                false,
+            ),
+            SlotRepairDelay::MissingGrace
+        );
+        assert_eq!(
+            slot_repair_delay(
+                ServiceStatus::Running,
+                None,
+                node,
+                &health,
+                true,
+                false,
+                false,
+            ),
+            SlotRepairDelay::Immediate
+        );
     }
 
     /// Current-generation handoffs remain owned by slot reconciliation instead of generic cleanup.
