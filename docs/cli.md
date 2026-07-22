@@ -20,7 +20,7 @@ Common commands:
 - `mantissa nodes resume <node-id>` - clear a maintenance fence
 - `mantissa clusters list` - list known clusters and node counts
 - `mantissa clusters name <cluster-id> <name>` - assign a friendly lineage name
-- `mantissa clusters merge <source-cluster-id> <destination-cluster-id>` - merge one cluster lineage into another
+- `mantissa clusters merge <source-cluster-id> <destination-cluster-id> [--depends-on <operation-id>]...` - merge one cluster lineage into another, optionally after earlier operations finish
 - `mantissa clusters split --cluster <cluster-id> --by gpu-vendor --values NVIDIA,AMD` - split a cluster with simple filter values
 - `mantissa clusters split --filter-per-gpu NVIDIA,AMD` - shortcut split by GPU vendor on the local active cluster
 - `mantissa clusters split --interactive --left-name blue --right-name green` - interactive left/right node picker with hover details

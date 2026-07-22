@@ -1722,6 +1722,16 @@ pub struct MergeArgs {
     #[arg(long = "services", value_enum, default_value = "rebalance")]
     pub services: MergeServicePolicyOpt,
 
+    /// Earlier cluster operation that must finalize before this merge can start.
+    /// If that operation aborts, this merge also aborts. Repeat the flag when
+    /// operations on both the source and destination must finish first.
+    #[arg(
+        long = "depends-on",
+        value_name = "OPERATION_ID",
+        action = ArgAction::Append
+    )]
+    pub dependency_operation_ids: Vec<Uuid>,
+
     /// Wait until the local daemon reports the operation finalized or aborted.
     #[arg(long = "wait", action = ArgAction::SetTrue)]
     pub wait: bool,
@@ -2038,12 +2048,23 @@ mod tests {
             "--wait",
         ])
         .unwrap();
-        assert!(matches!(
-            merge.cmd,
+        match merge.cmd {
             Command::Clusters {
-                cmd: ClustersCommand::Merge(MergeArgs { wait: true, .. })
+                cmd:
+                    ClustersCommand::Merge(MergeArgs {
+                        wait,
+                        dependency_operation_ids,
+                        ..
+                    }),
+            } => {
+                assert!(wait);
+                assert!(
+                    dependency_operation_ids.is_empty(),
+                    "merge dependencies must remain optional"
+                );
             }
-        ));
+            other => panic!("unexpected command: {other:?}"),
+        }
 
         let split = MantissaCli::try_parse_from([
             "mantissa",
@@ -2059,6 +2080,38 @@ mod tests {
                 cmd: ClustersCommand::Split(SplitArgs { wait: true, .. })
             }
         ));
+    }
+
+    #[test]
+    fn cluster_merge_dependencies_parse() {
+        let first_dependency = Uuid::from_u128(1);
+        let second_dependency = Uuid::from_u128(2);
+        let merge = MantissaCli::try_parse_from([
+            "mantissa",
+            "clusters",
+            "merge",
+            "10000000-0000-0000-0000-000000000001",
+            "20000000-0000-0000-0000-000000000002",
+            "--depends-on",
+            &first_dependency.to_string(),
+            "--depends-on",
+            &second_dependency.to_string(),
+        ])
+        .unwrap();
+
+        match merge.cmd {
+            Command::Clusters {
+                cmd:
+                    ClustersCommand::Merge(MergeArgs {
+                        dependency_operation_ids,
+                        ..
+                    }),
+            } => assert_eq!(
+                dependency_operation_ids,
+                vec![first_dependency, second_dependency]
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

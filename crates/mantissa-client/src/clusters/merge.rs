@@ -26,13 +26,18 @@ impl MergeServicePolicy {
     }
 }
 
-/// Submits a merge request using cluster lineage identifiers instead of raw view ids.
+/// Submits a merge using cluster lineage ids and an optional list of required operations.
+///
+/// Pass an empty dependency slice for an independent merge. When this merge consumes clusters
+/// that earlier operations are still changing, pass those operation ids so every node applies
+/// the earlier changes before this merge.
 pub async fn merge_by_cluster_id(
     cfg: &ClientConfig,
     source_cluster_id: &str,
     destination_cluster_id: &str,
     dry_run: bool,
     service_policy: MergeServicePolicy,
+    dependency_operation_ids: &[Uuid],
 ) -> Result<ClusterOperationSummary> {
     let source_cluster = parse_cluster_id(source_cluster_id, "source cluster id")?;
     let destination_cluster = parse_cluster_id(destination_cluster_id, "destination cluster id")?;
@@ -45,23 +50,37 @@ pub async fn merge_by_cluster_id(
     let summaries = list_cluster_views(cfg).await?;
     let source_view = resolve_view_from_summaries(&summaries, source_cluster)?;
     let destination_view = resolve_view_from_summaries(&summaries, destination_cluster)?;
-    submit_merge_request(cfg, source_view, destination_view, dry_run, service_policy).await
+    submit_merge_request(
+        cfg,
+        source_view,
+        destination_view,
+        dry_run,
+        service_policy,
+        dependency_operation_ids,
+    )
+    .await
 }
 
-/// Sends a merge request to topology using resolved source and destination views.
+/// Sends a merge request with the earlier operations that must finish before it can start.
 async fn submit_merge_request(
     cfg: &ClientConfig,
     source_view: ClusterViewSpec,
     destination_view: ClusterViewSpec,
     dry_run: bool,
     service_policy: MergeServicePolicy,
+    dependency_operation_ids: &[Uuid],
 ) -> Result<ClusterOperationSummary> {
     let topology = topology_capability(cfg).await?;
     let mut request = topology.merge_clusters_request();
     {
         let mut req = request.get().init_req();
         req.set_operation_id(Uuid::new_v4().as_bytes());
-        req.reborrow().init_dependency_operation_ids(0);
+        let mut dependencies = req
+            .reborrow()
+            .init_dependency_operation_ids(dependency_operation_ids.len() as u32);
+        for (index, operation_id) in dependency_operation_ids.iter().enumerate() {
+            dependencies.set(index as u32, operation_id.as_bytes());
+        }
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(dry_run);

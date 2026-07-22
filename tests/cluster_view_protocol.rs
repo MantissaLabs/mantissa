@@ -179,30 +179,37 @@ async fn cluster_operation_stage(
         .expect("operation stage")
 }
 
-/// Submits a live merge request and returns the accepted operation id bytes.
+/// Submits a merge and records which earlier operations must finish before it can start.
 async fn request_merge_operation(
     topology: &mantissa::topology_capnp::topology::Client,
     source_view: ClusterViewId,
     destination_view: ClusterViewId,
-) -> Vec<u8> {
+    dependency_operation_ids: &[Uuid],
+) -> Uuid {
     let mut merge_req = topology.merge_clusters_request();
     {
         let mut req = merge_req.get().init_req();
         req.set_operation_id(Uuid::new_v4().as_bytes());
-        req.reborrow().init_dependency_operation_ids(0);
+        let mut dependencies = req
+            .reborrow()
+            .init_dependency_operation_ids(dependency_operation_ids.len() as u32);
+        for (index, operation_id) in dependency_operation_ids.iter().enumerate() {
+            dependencies.set(index as u32, operation_id.as_bytes());
+        }
         source_view.write_capnp(req.reborrow().init_source_view());
         destination_view.write_capnp(req.reborrow().init_destination_view());
         req.set_dry_run(false);
     }
     let merge_resp = merge_req.send().promise.await.expect("mergeClusters send");
-    merge_resp
+    let operation_id = merge_resp
         .get()
         .expect("mergeClusters get")
         .get_op()
         .expect("merge operation")
         .get_id()
         .expect("merge operation id")
-        .to_vec()
+        .to_vec();
+    Uuid::from_slice(&operation_id).expect("merge operation UUID")
 }
 
 async fn cluster_name_for_lineage(
@@ -4227,28 +4234,42 @@ local_test!(
         let merge_ca_client = cluster[0].topology();
         let merge_db_client = cluster[1].topology();
         let (merge_ca_id, merge_db_id) = tokio::join!(
-            request_merge_operation(&merge_ca_client, view_c, view_a),
-            request_merge_operation(&merge_db_client, view_d, view_b)
+            request_merge_operation(&merge_ca_client, view_c, view_a, &[]),
+            request_merge_operation(&merge_db_client, view_d, view_b, &[])
         );
-        let merge_ba_id = request_merge_operation(&cluster[0].topology(), view_b, view_a).await;
+        let mut merge_ba_dependencies = vec![merge_ca_id, merge_db_id];
+        merge_ba_dependencies.sort_unstable();
+        let merge_ba_id = request_merge_operation(
+            &cluster[0].topology(),
+            view_b,
+            view_a,
+            &merge_ba_dependencies,
+        )
+        .await;
+
+        assert_eq!(
+            cluster_operation_dependency_ids(&cluster[0].topology(), merge_ba_id).await,
+            merge_ba_dependencies,
+            "the chained merge must retain both operations that build its source and destination"
+        );
 
         wait_for_operation_stage(
             &cluster[0].topology(),
-            &merge_ca_id,
+            merge_ca_id.as_bytes(),
             ClusterOperationStage::Finalized,
             Duration::from_secs(10),
         )
         .await;
         wait_for_operation_stage(
             &cluster[1].topology(),
-            &merge_db_id,
+            merge_db_id.as_bytes(),
             ClusterOperationStage::Finalized,
             Duration::from_secs(10),
         )
         .await;
         wait_for_operation_stage(
             &cluster[0].topology(),
-            &merge_ba_id,
+            merge_ba_id.as_bytes(),
             ClusterOperationStage::Finalized,
             Duration::from_secs(10),
         )

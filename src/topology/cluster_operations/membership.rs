@@ -258,4 +258,74 @@ mod tests {
             ]))
         );
     }
+
+    /// Ensures explicit dependencies override timestamp ties that put a chained merge first.
+    #[test]
+    fn chained_merge_dependencies_override_equal_timestamp_order() {
+        let view = |id| ClusterViewId::new(ClusterId::from_uuid(Uuid::from_u128(id)), 1);
+        let root = ClusterViewId::legacy_default();
+        let [a, b, c, d] = [1, 2, 3, 4].map(view);
+        let split_id = 400;
+        let merge_ca_id = 300;
+        let merge_db_id = 200;
+        let merge_ba_id = 100;
+        let operations = vec![
+            finalized_operation(
+                split_id,
+                vec![],
+                ClusterOperationKind::Split,
+                root,
+                vec![a, b, c, d],
+                vec![(1, 0), (2, 1), (3, 2), (4, 3)],
+            ),
+            finalized_operation(
+                merge_ca_id,
+                vec![split_id],
+                ClusterOperationKind::Merge,
+                c,
+                vec![a],
+                vec![],
+            ),
+            finalized_operation(
+                merge_db_id,
+                vec![split_id],
+                ClusterOperationKind::Merge,
+                d,
+                vec![b],
+                vec![],
+            ),
+            finalized_operation(
+                merge_ba_id,
+                vec![merge_ca_id, merge_db_id],
+                ClusterOperationKind::Merge,
+                b,
+                vec![a],
+                vec![],
+            ),
+        ];
+
+        let mut timestamp_order = operations.iter().collect::<Vec<_>>();
+        timestamp_order.sort_by_key(|operation| operation.lineage_order_key());
+        assert_eq!(
+            timestamp_order
+                .iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            [merge_ba_id, merge_db_id, merge_ca_id, split_id]
+                .map(Uuid::from_u128)
+                .to_vec(),
+            "the fixture must put the chained merge before both operations it depends on"
+        );
+
+        assert_eq!(
+            projected_view_members(&operations, a, None),
+            Some(HashSet::from([
+                Uuid::from_u128(1),
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+                Uuid::from_u128(4),
+            ])),
+            "dependency replay must retain every node when timestamp ordering is causally wrong"
+        );
+    }
 }

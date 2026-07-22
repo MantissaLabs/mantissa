@@ -44,7 +44,7 @@ Current cluster commands are:
 
 - `mantissa clusters list`
 - `mantissa clusters name <cluster-id> <name>`
-- `mantissa clusters merge <source-cluster-id> <destination-cluster-id> [--dry-run] [--services rebalance|preserve]`
+- `mantissa clusters merge <source-cluster-id> <destination-cluster-id> [--dry-run] [--services rebalance|preserve] [--depends-on <operation-id>]...`
 - `mantissa clusters split --cluster <cluster-id> --by gpu-vendor --values NVIDIA,AMD`
 - `mantissa clusters split --interactive --left-name blue --right-name green`
 
@@ -63,6 +63,21 @@ Merge and split both persist a `ClusterOperationRecord` containing:
 - policy choices,
 - human-readable details,
 - split assignments when applicable.
+
+A merge has no dependencies unless `--depends-on` is supplied. Use the flag
+once for every unfinished operation that changes the merge's source or
+destination cluster. The new merge waits for all listed operations to finalize.
+If one of them aborts, the new merge also aborts. This gives every node the same
+order when several merges are submitted at nearly the same time.
+
+For example, if operations `OP_A` and `OP_B` build the two clusters consumed by
+the next merge:
+
+```sh
+mantissa clusters merge <source-cluster-id> <destination-cluster-id> \
+  --depends-on OP_A \
+  --depends-on OP_B
+```
 
 Operation records live in:
 

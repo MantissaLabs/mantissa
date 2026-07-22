@@ -248,6 +248,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                         &m.destination_cluster_id,
                         m.dry_run,
                         service_policy,
+                        &m.dependency_operation_ids,
                         wait,
                     ))
                     .await?;
