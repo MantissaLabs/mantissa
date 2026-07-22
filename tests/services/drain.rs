@@ -275,7 +275,12 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         .expect("service should exist before node failure");
     let baseline_ids: BTreeSet<Uuid> = baseline_spec.assigned_replica_ids().into_iter().collect();
 
-    cluster[2].stop().await.expect("stop failed node");
+    let failed_node = cluster.remove(2);
+    let failed_node = *failed_node.node;
+    failed_node
+        .shutdown()
+        .await
+        .expect("shut down failed node runtime");
 
     cluster[0]
         .wait_status_of(

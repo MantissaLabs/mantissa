@@ -788,34 +788,13 @@ impl ServiceController {
                 .await;
         }
 
-        let (target_candidates, misplaced_candidates): (Vec<_>, Vec<_>) = handoff_candidates
-            .into_iter()
-            .partition(|candidate| candidate.node_id == context.desired_node);
-
-        self.abort_slot_handoff_candidates(
-            &context.spec.service_name,
-            &misplaced_candidates,
-            None,
-            "handoff no longer matches the converged slot target",
-        )
-        .await;
-
-        if context.desired_node == task.node_id {
-            self.clear_rebalance_plan(context.key).await;
-            self.abort_slot_handoff_candidates(
-                &context.spec.service_name,
-                &target_candidates,
-                None,
-                "replacement no longer needed for current service slot",
-            )
-            .await;
-            return Ok(());
-        }
-
-        // A visible candidate already records a valid handoff from this slot to the converged
-        // target. Resume it independently of local creation gates such as age and cooldown.
+        // A visible candidate proves that a controller already started replacing this slot. Nodes
+        // can temporarily calculate different targets from independent health snapshots, so a
+        // target mismatch is not evidence that the candidate is stale. Complete one candidate
+        // deterministically, preferring this observer's target. The guarded slot update chooses one
+        // winner, and that assignment change gives every observer causal proof to stop the losers.
         if let Some(candidate) =
-            select_slot_handoff_candidate(&target_candidates, Some(context.desired_node))
+            select_slot_handoff_candidate(&handoff_candidates, Some(context.desired_node))
         {
             self.clear_rebalance_plan(context.key).await;
             if !context.owns_rebalance {
@@ -829,12 +808,17 @@ impl ServiceController {
                     replacement_task_id: candidate.task_id,
                     replacement_node_id: candidate.node_id,
                 },
-                &target_candidates,
+                &handoff_candidates,
                 context.health_snapshot,
                 context.key,
             )
             .await?;
             self.set_rebalance_cooldown(context.key).await;
+            return Ok(());
+        }
+
+        if context.desired_node == task.node_id {
+            self.clear_rebalance_plan(context.key).await;
             return Ok(());
         }
 
@@ -879,7 +863,7 @@ impl ServiceController {
         .await
     }
 
-    /// Collects applicable handoffs and retires rows superseded by the current service slot.
+    /// Collects valid handoffs and retires only candidates proven obsolete by replicated state.
     async fn collect_slot_handoff_candidates(
         &self,
         spec: &ServiceSpecValue,
@@ -1862,6 +1846,21 @@ mod tests {
         assert_eq!(
             select_slot_handoff_candidate(&[larger, smaller], Some(node_id)),
             Some(smaller)
+        );
+    }
+
+    /// A different local placement result still resumes a valid handoff on its healthy target.
+    #[test]
+    fn healthy_handoff_target_disagreement_is_non_destructive() {
+        let candidate = SlotHandoffCandidate {
+            task_id: Uuid::from_bytes([1u8; 16]),
+            node_id: Uuid::from_bytes([2u8; 16]),
+        };
+        let observer_target = Uuid::from_bytes([3u8; 16]);
+
+        assert_eq!(
+            select_slot_handoff_candidate(&[candidate], Some(observer_target)),
+            Some(candidate)
         );
     }
 
