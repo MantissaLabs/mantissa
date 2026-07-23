@@ -113,7 +113,7 @@ libc = "0.2"
 
 # Storage, replication, and deterministic hashing
 # redb is used as our storage engine for the cluster state.
-redb = "3.1.1"
+redb = "4.1.0"
 
 # crdt based structures useful for state replication and conflict resolution.
 merkle-search-tree = "0.8.0"
