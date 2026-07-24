@@ -9,7 +9,7 @@ CPUS=10
 MEM="24GiB"
 DISK="100GiB"
 SSH_BASE=7200
-IMAGE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2"
+IMAGE_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2"
 CREATED_COUNT=0
 SKIPPED_COUNT=0
 LIMA_ENABLE_VZNAT="${LIMA_ENABLE_VZNAT:-0}"
@@ -22,6 +22,7 @@ Defaults: COUNT=2, REPO=\$HOME/dev/mantissa, SSH_BASE=7200, CPUS=10, MEM=24GiB, 
 Notes:
   - Prefers VZ + virtiofs on supported macOS hosts and falls back to QEMU + 9p otherwise.
   - Enables Lima nested virtualization automatically on supported M3+ macOS 15+ hosts.
+  - Uses Debian 13's Linux 6.12 kernel and enables the ublk kernel module.
   - Mounts only the repo at /mantissa inside each VM.
   - Use "limactl shell --workdir /mantissa mantissa-N" to enter a VM.
   - Enables shared VM <-> VM network (user-v2) so VMs can ping each other.
@@ -240,8 +241,38 @@ provision:
       set -euxo pipefail
       sudo apt-get update && sudo apt-get upgrade -y
 
-      # Install docker
-      sudo apt-get install -y ca-certificates curl build-essential git capnproto libcapnp-dev libssl-dev pkg-config iputils-ping linux-perf bpftool wireguard ripgrep htop
+      # Install development tools and the kernel package used by Mantissa.
+      sudo apt-get install -y \
+        bpftool \
+        build-essential \
+        ca-certificates \
+        capnproto \
+        curl \
+        e2fsprogs \
+        git \
+        htop \
+        iputils-ping \
+        kmod \
+        libcapnp-dev \
+        libssl-dev \
+        linux-image-cloud-arm64 \
+        linux-perf \
+        pkg-config \
+        ripgrep \
+        util-linux \
+        wireguard \
+        gpg
+
+      # Keep ublk available after reboot and fail provisioning if the image ever
+      # loses the module required by Mantissa's userspace block driver.
+      printf '%s\n' ublk_drv | sudo tee /etc/modules-load.d/mantissa-ublk.conf > /dev/null
+      sudo modprobe ublk_drv
+      sudo udevadm settle
+      if [ ! -c /dev/ublk-control ]; then
+        echo "ublk_drv loaded but /dev/ublk-control was not created." >&2
+        exit 1
+      fi
+
       sudo install -m 0755 -d /etc/apt/keyrings
       if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
