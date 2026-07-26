@@ -9,7 +9,8 @@ mod linux {
     use aya::maps::MapData;
     use aya::pin::PinError;
     use aya::programs::tc::{
-        SchedClassifierLinkId, TcAttachType, qdisc_add_clsact, qdisc_detach_program,
+        NlOptions, SchedClassifierLinkId, TcAttachOptions, TcAttachType, qdisc_add_clsact,
+        qdisc_detach_program,
     };
     use aya::programs::xdp::XdpLinkId;
     use aya::programs::{SchedClassifier, Xdp, XdpFlags};
@@ -1796,13 +1797,21 @@ mod linux {
                         format!("load tc classifier program '{}'", program_name)
                     })?;
 
-                    let link_id = classifier.attach(interface, attach_type).with_context(|| {
-                        format!(
-                            "attach tc program '{}' to {} ({:?})",
-                            program_name, interface, attach_type
+                    // Mantissa replaces classifiers by their stable netlink names during restart
+                    // and reconciliation. Aya defaults to TCX on newer kernels, whose links are
+                    // not visible to that cleanup path and would accumulate stale classifiers.
+                    let link_id = classifier
+                        .attach_with_options(
+                            interface,
+                            attach_type,
+                            TcAttachOptions::Netlink(NlOptions::default()),
                         )
-                    })?;
-
+                        .with_context(|| {
+                            format!(
+                                "attach tc program '{}' to {} ({:?})",
+                                program_name, interface, attach_type
+                            )
+                        })?;
                     Ok(Box::new(TcHandle {
                         bpf,
                         program_name,

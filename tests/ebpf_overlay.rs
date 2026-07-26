@@ -77,9 +77,12 @@ fn privileged_ebpf_artifact_dir() -> Option<PrivilegedBpfArtifacts> {
 /// Assert that one tc hook carries a BPF classifier on the requested interface.
 fn assert_tc_attachment(interface: &str, hook: &str, context: &str) {
     let filters = command_stdout("tc", &["filter", "show", "dev", interface, hook]);
+    let bpf_links = command_stdout("bpftool", &["net", "show", "dev", interface]);
+    let tcx_hook = format!("tcx/{hook}");
     assert!(
-        filters.contains("bpf"),
-        "{context}: expected a tc BPF program on {interface} {hook}, got: {filters}"
+        filters.contains("bpf")
+            || (bpf_links.contains(&tcx_hook) && bpf_links.contains("bridge_tc_")),
+        "{context}: expected a legacy tc or TCX BPF program on {interface} {hook}; tc: {filters}; bpftool: {bpf_links}"
     );
 }
 

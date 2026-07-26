@@ -16,7 +16,10 @@ use anyhow::{Context, Result, anyhow};
 use aya::Pod;
 use aya::maps::{Map, MapData, PerCpuArray};
 use aya::programs::ProgramError;
-use aya::programs::tc::{SchedClassifier, TcAttachType, qdisc_add_clsact, qdisc_detach_program};
+use aya::programs::tc::{
+    NlOptions, SchedClassifier, TcAttachOptions, TcAttachType, qdisc_add_clsact,
+    qdisc_detach_program,
+};
 use aya::{Ebpf, EbpfLoader};
 use futures::TryStreamExt;
 use libc::if_nametoindex;
@@ -2109,7 +2112,14 @@ fn attach_tc(
         Err(ProgramError::AlreadyLoaded) => {}
         Err(err) => return Err(err.into()),
     }
-    match tc.attach(iface, attach_type) {
+    // NodePort replaces classifiers by their stable netlink names. Explicitly retain netlink
+    // attachment on kernels where Aya otherwise selects TCX, which cannot be removed by the
+    // named cleanup path and would stack stale programs with obsolete map references.
+    match tc.attach_with_options(
+        iface,
+        attach_type,
+        TcAttachOptions::Netlink(NlOptions::default()),
+    ) {
         Ok(_) => {}
         Err(ProgramError::AlreadyAttached) => {}
         Err(err) => return Err(err.into()),
