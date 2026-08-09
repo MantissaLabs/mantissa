@@ -1,5 +1,8 @@
 use crate::output;
-use crate::volumes::{format_bytes, inspect::format_task_ids};
+use crate::volumes::{
+    format_bytes,
+    inspect::{format_task_ids, render_replication},
+};
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use mantissa_client::volumes::VolumeInspect;
@@ -18,7 +21,12 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
     writeln!(&mut rendered, "Volume Status:")?;
     writeln!(&mut rendered, "  Volume: {}", volume.spec.name)?;
     writeln!(&mut rendered, "  ID: {}", volume.spec.id)?;
-    writeln!(&mut rendered, "  Status: {}", volume.spec.status)?;
+    writeln!(&mut rendered, "  State: {}", volume.state)?;
+    writeln!(
+        &mut rendered,
+        "  Desired disposition: {}",
+        volume.spec.desired_disposition
+    )?;
     writeln!(
         &mut rendered,
         "  Bound node: {}",
@@ -31,13 +39,8 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
     )?;
     writeln!(
         &mut rendered,
-        "  Reason: {}",
-        volume.spec.reason.as_deref().unwrap_or("-")
-    )?;
-    writeln!(
-        &mut rendered,
         "  Message: {}",
-        volume.spec.message.as_deref().unwrap_or("-")
+        volume.state_message.as_deref().unwrap_or("-")
     )?;
     writeln!(&mut rendered, "  Node states:")?;
     if volume.node_states.is_empty() {
@@ -49,7 +52,8 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
                 "    Node: {} ({})",
                 state.node_name, state.node_id
             )?;
-            writeln!(&mut rendered, "      State: {}", state.state)?;
+            writeln!(&mut rendered, "      Replica state: {}", state.state)?;
+            writeln!(&mut rendered, "      Node health: {}", state.health)?;
             writeln!(
                 &mut rendered,
                 "      Local path: {}",
@@ -78,5 +82,6 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
             writeln!(&mut rendered, "      Updated: {}", state.updated_at)?;
         }
     }
+    render_replication(&mut rendered, volume)?;
     Ok(rendered)
 }

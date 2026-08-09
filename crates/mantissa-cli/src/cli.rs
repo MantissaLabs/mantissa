@@ -1424,6 +1424,12 @@ pub enum VolumeBindingOpt {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum VolumeDriverOpt {
+    Local,
+    Replicated,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum VolumeReclaimOpt {
     Retain,
     Delete,
@@ -1472,7 +1478,7 @@ pub enum IngressCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum VolumesCommand {
-    /// Create a managed local volume
+    /// Create a Mantissa-managed volume
     Create(VolumesCreateArgs),
 
     /// Import an existing host path as a local volume
@@ -1488,7 +1494,10 @@ pub enum VolumesCommand {
     /// Show node-local realization state for one volume
     Status(VolumesStatusArgs),
 
-    /// Delete a volume object
+    /// Restore a retained replicated volume
+    Restore(VolumesRestoreArgs),
+
+    /// Retain a volume or permanently delete its data
     Delete(VolumesDeleteArgs),
 }
 
@@ -1612,6 +1621,10 @@ pub struct VolumesCreateArgs {
     #[arg(long = "name", value_name = "NAME")]
     pub name: String,
 
+    /// Storage driver to use
+    #[arg(long = "driver", value_enum, default_value = "local")]
+    pub driver: VolumeDriverOpt,
+
     /// Explicit uid ownership for managed volumes; requires --gid
     #[arg(long = "uid", value_name = "UID")]
     pub uid: Option<u32>,
@@ -1687,10 +1700,21 @@ pub struct VolumesStatusArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct VolumesRestoreArgs {
+    /// Retained volume UUID or name to restore
+    #[arg(index = 1, value_name = "ID-OR-NAME")]
+    pub selector: String,
+}
+
+#[derive(Args, Debug)]
 pub struct VolumesDeleteArgs {
     /// Volume UUID or name to delete
     #[arg(index = 1, value_name = "ID-OR-NAME")]
     pub selector: String,
+
+    /// Permanently remove managed backing data, including retained replicas
+    #[arg(long = "delete-data", action = ArgAction::SetTrue)]
+    pub delete_data: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2177,6 +2201,75 @@ mod tests {
         ));
 
         assert!(MantissaCli::try_parse_from(["mantissa", "ingress", "pools", "list"]).is_err());
+    }
+
+    #[test]
+    fn volume_create_driver_defaults_to_local_and_accepts_replicated() {
+        let local =
+            MantissaCli::try_parse_from(["mantissa", "volumes", "create", "--name", "data"])
+                .unwrap();
+        assert!(matches!(
+            local.cmd,
+            Command::Volumes {
+                cmd: VolumesCommand::Create(VolumesCreateArgs {
+                    driver: VolumeDriverOpt::Local,
+                    ..
+                })
+            }
+        ));
+
+        let replicated = MantissaCli::try_parse_from([
+            "mantissa",
+            "volumes",
+            "create",
+            "--name",
+            "data",
+            "--driver",
+            "replicated",
+            "--capacity-mb",
+            "64",
+        ])
+        .unwrap();
+        assert!(matches!(
+            replicated.cmd,
+            Command::Volumes {
+                cmd: VolumesCommand::Create(VolumesCreateArgs {
+                    driver: VolumeDriverOpt::Replicated,
+                    capacity_mb: Some(64),
+                    ..
+                })
+            }
+        ));
+    }
+
+    #[test]
+    fn volume_restore_and_permanent_delete_parse() {
+        let restore =
+            MantissaCli::try_parse_from(["mantissa", "volumes", "restore", "database"]).unwrap();
+        assert!(matches!(
+            restore.cmd,
+            Command::Volumes {
+                cmd: VolumesCommand::Restore(VolumesRestoreArgs { selector })
+            } if selector == "database"
+        ));
+
+        let delete = MantissaCli::try_parse_from([
+            "mantissa",
+            "volumes",
+            "delete",
+            "database",
+            "--delete-data",
+        ])
+        .unwrap();
+        assert!(matches!(
+            delete.cmd,
+            Command::Volumes {
+                cmd: VolumesCommand::Delete(VolumesDeleteArgs {
+                    selector,
+                    delete_data: true,
+                })
+            } if selector == "database"
+        ));
     }
 
     #[test]

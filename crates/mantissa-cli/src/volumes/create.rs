@@ -4,7 +4,7 @@ use mantissa_client::config::ClientConfig;
 
 pub use mantissa_client::volumes::VolumeCreateRequest;
 
-/// Creates one managed local volume and renders the result.
+/// Creates one Mantissa-managed volume and renders the result.
 pub async fn create(
     cfg: &ClientConfig,
     request: VolumeCreateRequest,

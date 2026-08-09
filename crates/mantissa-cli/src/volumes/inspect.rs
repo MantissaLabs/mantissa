@@ -25,7 +25,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         "  Ownership: {}",
         volume
             .spec
-            .local_ownership
+            .filesystem_ownership
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_else(|| "-".to_string())
@@ -33,7 +33,12 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
     writeln!(&mut rendered, "  Access: {}", volume.spec.access_mode)?;
     writeln!(&mut rendered, "  Binding: {}", volume.spec.binding_mode)?;
     writeln!(&mut rendered, "  Reclaim: {}", volume.spec.reclaim_policy)?;
-    writeln!(&mut rendered, "  Status: {}", volume.spec.status)?;
+    writeln!(&mut rendered, "  State: {}", volume.state)?;
+    writeln!(
+        &mut rendered,
+        "  Desired disposition: {}",
+        volume.spec.desired_disposition
+    )?;
     writeln!(
         &mut rendered,
         "  Bound node: {}",
@@ -48,13 +53,8 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
     writeln!(&mut rendered, "  Updated: {}", volume.spec.updated_at)?;
     writeln!(
         &mut rendered,
-        "  Reason: {}",
-        volume.spec.reason.as_deref().unwrap_or("-")
-    )?;
-    writeln!(
-        &mut rendered,
         "  Message: {}",
-        volume.spec.message.as_deref().unwrap_or("-")
+        volume.state_message.as_deref().unwrap_or("-")
     )?;
     writeln!(&mut rendered, "  Labels:")?;
     if volume.spec.labels.is_empty() {
@@ -71,7 +71,8 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
             "    Node: {} ({})",
             state.node_name, state.node_id
         )?;
-        writeln!(&mut rendered, "      State: {}", state.state)?;
+        writeln!(&mut rendered, "      Replica state: {}", state.state)?;
+        writeln!(&mut rendered, "      Node health: {}", state.health)?;
         writeln!(
             &mut rendered,
             "      Local path: {}",
@@ -89,7 +90,80 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         )?;
         writeln!(&mut rendered, "      Updated: {}", state.updated_at)?;
     }
+    render_replication(&mut rendered, volume)?;
     Ok(rendered)
+}
+
+/// Adds immutable replica placement and observed Raft status to inspect output.
+pub(super) fn render_replication(rendered: &mut String, volume: &VolumeInspect) -> Result<()> {
+    let Some(plan) = &volume.plan else {
+        if matches!(
+            volume.spec.driver,
+            mantissa_client::volumes::VolumeDriver::Replicated
+        ) {
+            writeln!(rendered, "  Replica plan: waiting for a consumer")?;
+        }
+        return Ok(());
+    };
+
+    writeln!(rendered, "  Replica plan:")?;
+    writeln!(rendered, "    Bootstrap ID: {}", plan.bootstrap_id)?;
+    writeln!(rendered, "    Storage generation: {}", plan.generation)?;
+    writeln!(rendered, "    Planned nodes:")?;
+    for node_id in plan.replica_node_ids {
+        if let Some(node) = volume
+            .node_states
+            .iter()
+            .find(|state| state.node_id == node_id)
+        {
+            writeln!(rendered, "      {} ({})", node.node_name, node.node_id)?;
+        } else {
+            writeln!(rendered, "      {node_id}")?;
+        }
+    }
+    if let Some(group) = &volume.group_status {
+        writeln!(rendered, "    Raft status: {}", group.status)?;
+        writeln!(
+            rendered,
+            "    Active copies: {}",
+            format_node_ids(&group.copy_node_ids)
+        )?;
+        writeln!(
+            rendered,
+            "    Raft voters: {}",
+            format_node_ids(&group.voter_node_ids)
+        )?;
+        writeln!(
+            rendered,
+            "    Leader node: {}",
+            group
+                .leader_node_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string())
+        )?;
+        writeln!(
+            rendered,
+            "    Attached node: {}",
+            group
+                .attached_node_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string())
+        )?;
+        writeln!(
+            rendered,
+            "    Replacement: {}",
+            group
+                .replacement_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string())
+        )?;
+        writeln!(rendered, "    Control state degraded: {}", group.degraded)?;
+        writeln!(
+            rendered,
+            "    Message: {}",
+            group.message.as_deref().unwrap_or("-")
+        )?;
+    } else {
+        writeln!(rendered, "    Raft status: not started")?;
+    }
+    Ok(())
 }
 
 /// Formats one task-id collection for volume inspect/status output.
@@ -98,6 +172,19 @@ pub(super) fn format_task_ids(task_ids: &[Uuid]) -> String {
         "-".to_string()
     } else {
         task_ids
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// Formats one node-id collection for replicated-volume control state output.
+fn format_node_ids(node_ids: &[Uuid]) -> String {
+    if node_ids.is_empty() {
+        "-".to_string()
+    } else {
+        node_ids
             .iter()
             .map(Uuid::to_string)
             .collect::<Vec<_>>()

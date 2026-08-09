@@ -29,7 +29,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             volume.access_mode,
             volume.binding_mode,
             volume.bound_node_name.unwrap_or_else(|| "-".to_string()),
-            volume.status,
+            volume.state,
             format_bytes(volume.requested_bytes),
             if volume.in_use { "yes" } else { "no" },
             volume.reclaim_policy,

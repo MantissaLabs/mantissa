@@ -25,22 +25,22 @@ pub async fn run_cli() -> Result<()> {
 }
 
 /// Resolves one CLI volume ownership flag set into the client-facing ownership contract.
-fn resolve_local_volume_ownership(
+fn resolve_filesystem_ownership(
     uid: Option<u32>,
     gid: Option<u32>,
     fs_group: Option<u32>,
-) -> Result<mantissa_client::volumes::LocalVolumeOwnership> {
+) -> Result<mantissa_client::volumes::FilesystemOwnership> {
     if let Some(fs_group) = fs_group {
         if uid.is_some() || gid.is_some() {
             return Err(anyhow!("--fs-group cannot be combined with --uid or --gid"));
         }
-        return Ok(mantissa_client::volumes::LocalVolumeOwnership::FsGroup { gid: fs_group });
+        return Ok(mantissa_client::volumes::FilesystemOwnership::FsGroup { gid: fs_group });
     }
 
     match (uid, gid) {
-        (None, None) => Ok(mantissa_client::volumes::LocalVolumeOwnership::Daemon),
+        (None, None) => Ok(mantissa_client::volumes::FilesystemOwnership::Daemon),
         (Some(uid), Some(gid)) => {
-            Ok(mantissa_client::volumes::LocalVolumeOwnership::User { uid, gid })
+            Ok(mantissa_client::volumes::FilesystemOwnership::User { uid, gid })
         }
         (Some(_), None) => Err(anyhow!("--uid requires --gid")),
         (None, Some(_)) => Err(anyhow!("--gid requires --uid")),
@@ -743,7 +743,13 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
 
         Command::Volumes { cmd } => match cmd {
             VolumesCommand::Create(args) => {
-                let ownership = resolve_local_volume_ownership(args.uid, args.gid, args.fs_group)?;
+                let ownership = resolve_filesystem_ownership(args.uid, args.gid, args.fs_group)?;
+                let driver = match args.driver {
+                    VolumeDriverOpt::Local => mantissa_client::volumes::VolumeCreateDriver::Local,
+                    VolumeDriverOpt::Replicated => {
+                        mantissa_client::volumes::VolumeCreateDriver::Replicated
+                    }
+                };
                 let binding = match args.binding {
                     VolumeBindingOpt::Immediate => {
                         mantissa_client::volumes::VolumeBindingMode::Immediate
@@ -765,12 +771,14 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                         &cfg,
                         crate::volumes::VolumeCreateRequest {
                             name: args.name,
+                            driver,
                             ownership,
                             binding_mode: binding,
                             reclaim_policy: reclaim,
                             requested_bytes: args
                                 .capacity_mb
-                                .map(|value| value.saturating_mul(1_048_576)),
+                                .map(mantissa_client::volumes::capacity_mb_to_bytes)
+                                .transpose()?,
                             labels: Vec::new(),
                             node_selector: args.node,
                         },
@@ -803,9 +811,18 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .run_until(crate::volumes::status(&cfg, &args.selector))
                     .await?;
             }
+            VolumesCommand::Restore(args) => {
+                local
+                    .run_until(crate::volumes::restore(&cfg, &args.selector))
+                    .await?;
+            }
             VolumesCommand::Delete(args) => {
                 local
-                    .run_until(crate::volumes::delete(&cfg, &args.selector))
+                    .run_until(crate::volumes::delete(
+                        &cfg,
+                        &args.selector,
+                        args.delete_data,
+                    ))
                     .await?;
             }
         },
