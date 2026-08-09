@@ -2,7 +2,7 @@ use super::deployment::{ServiceSlotCutover, task_cutover_was_cancelled};
 use super::inventory::{ServiceReplicaSnapshot, TaskInventory};
 use super::placement::{
     SlotTargetContext, build_placement_preference_inventory, compute_effective_slot_targets,
-    is_local_volume_unavailable_error, mounted_local_volumes_require_pinned_target,
+    is_volume_unavailable_error, mounted_volumes_require_pinned_target,
 };
 use super::state::{
     deploying_assignment_incomplete, deploying_missing_slot_is_unknown, expected_task_id_count,
@@ -412,6 +412,16 @@ impl ServiceController {
                 continue;
             }
             if !task_state_healthy(&task.state) {
+                if matches!(task.state, WorkloadPhase::VolumeUnavailable)
+                    && task_age_allows_cleanup(task, self.timing.cleanup_min_age)
+                {
+                    self.abort_replacement_task_best_effort(
+                        &spec.service_name,
+                        task.id,
+                        "volume-blocked task no longer owns the service slot",
+                    )
+                    .await;
+                }
                 continue;
             }
             if !task_age_allows_cleanup(task, self.timing.cleanup_min_age) {
@@ -514,10 +524,8 @@ impl ServiceController {
             self.cluster_registry.peer_schedulable(desired_node),
         );
 
-        let requires_pinned_target = mounted_local_volumes_require_pinned_target(
-            &self.volume_registry,
-            &slot.template.volumes,
-        )?;
+        let requires_pinned_target =
+            mounted_volumes_require_pinned_target(&self.volume_registry, &slot.template.volumes)?;
 
         let task = env.inventory.by_id.get(&task_id);
         let disposition =
@@ -577,7 +585,8 @@ impl ServiceController {
         if matches!(
             task.map(|task| &task.state),
             Some(WorkloadPhase::VolumeUnavailable)
-        ) && requires_pinned_target
+        ) && task.is_some_and(|task| !task.slot_ids.is_empty() || task.slot_id.is_some())
+            && requires_pinned_target
         {
             return SlotTaskDisposition::PinnedVolumeUnavailable;
         }
@@ -1004,10 +1013,8 @@ impl ServiceController {
         health_snapshot: &HashMap<Uuid, HealthStatus>,
         key: &SlotKey,
     ) -> anyhow::Result<()> {
-        let requires_pinned_target = mounted_local_volumes_require_pinned_target(
-            &self.volume_registry,
-            &slot.template.volumes,
-        )?;
+        let requires_pinned_target =
+            mounted_volumes_require_pinned_target(&self.volume_registry, &slot.template.volumes)?;
         if preferred_node.is_none() && requires_pinned_target {
             self.mark_service_volume_unavailable(spec).await?;
             return Ok(());
@@ -1078,7 +1085,21 @@ impl ServiceController {
                 }
                 Err(err) => {
                     if requires_pinned_target {
-                        if is_local_volume_unavailable_error(&err) {
+                        if is_volume_unavailable_error(&err) {
+                            let _ = self
+                                .settle_slot_replacement(
+                                    spec,
+                                    slot,
+                                    SlotReplacement {
+                                        previous_task_id: task_id,
+                                        replacement_task_id,
+                                        replacement_node_id: preferred_node,
+                                    },
+                                    health_snapshot,
+                                    key,
+                                    "volume-blocked replacement could not claim service slot",
+                                )
+                                .await?;
                             self.mark_service_volume_unavailable(spec).await?;
                             return Ok(());
                         }

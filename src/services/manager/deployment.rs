@@ -9,7 +9,7 @@ use super::admission_group::{
 use super::placement::{
     SlotTargetContext, allow_untargeted_fallback, build_missing_template_requests,
     build_placement_preference_inventory, build_start_requests, compute_effective_slot_targets,
-    is_local_volume_unavailable_error, requests_require_pinned_targets,
+    is_volume_unavailable_error, requests_require_pinned_targets,
 };
 use super::sharding::{
     deployment_launch_error_requires_service_requeue, service_launch_target_peer_count,
@@ -1704,11 +1704,20 @@ impl ServiceController {
         desired_task_ids: &[Uuid],
         err: &anyhow::Error,
     ) {
-        tracing::warn!(
-            target: "services",
-            "initial task launch for service '{}' failed: {err:#}",
-            deployment.service_name
-        );
+        let retry_after_convergence = deployment_launch_error_requires_service_requeue(err);
+        if retry_after_convergence {
+            tracing::info!(
+                target: "services",
+                "initial task launch for service '{}' is waiting for cluster prerequisites: {err:#}",
+                deployment.service_name
+            );
+        } else {
+            tracing::warn!(
+                target: "services",
+                "initial task launch for service '{}' failed: {err:#}",
+                deployment.service_name
+            );
+        }
 
         let service_id = compute_service_id(deployment.service_name);
         self.set_generation_retry_cooldown(ServiceGenerationExecutionKey {
@@ -1718,7 +1727,7 @@ impl ServiceController {
         })
         .await;
 
-        if deployment_launch_error_requires_service_requeue(err) {
+        if retry_after_convergence {
             self.persist_retryable_deployment_launch_error(
                 service_id,
                 deployment.service_name,
@@ -1736,7 +1745,7 @@ impl ServiceController {
         let detail = service_error_detail(err);
         let terminal_launch_error = deployment_launch_error_should_fail_generation(err);
         match self.registry.get(service_id) {
-            Ok(Some(mut persisted_spec)) if is_local_volume_unavailable_error(err) => {
+            Ok(Some(mut persisted_spec)) if is_volume_unavailable_error(err) => {
                 persisted_spec.service_epoch = deployment.service_epoch;
                 persisted_spec.set_replica_ids_compact_when_derived(desired_task_ids.to_vec());
                 persisted_spec.previous_generation = None;
@@ -1781,7 +1790,7 @@ impl ServiceController {
                     self.clone().await_service_readiness(persisted_spec).await;
                 }
             }
-            Ok(None) if is_local_volume_unavailable_error(err) => {
+            Ok(None) if is_volume_unavailable_error(err) => {
                 let mut blocked_spec = ServiceSpecValue::new(
                     deployment.manifest_id,
                     deployment.manifest_name.to_string(),
@@ -1997,6 +2006,26 @@ impl ServiceController {
                     "pinned placement failed for {context}; local resources require preserving target nodes: {err:#}"
                 );
                 Err(err)
+            }
+            Err(err)
+                if has_targets
+                    && allow_untargeted_fallback
+                    && is_volume_unavailable_error(&err) =>
+            {
+                tracing::debug!(
+                    target: "services",
+                    "preferred placement could not serve replicated storage for {context}; retrying through volume-aware scheduling: {err:#}"
+                );
+                for request in &mut requests {
+                    request.target_node = None;
+                }
+                self.workload_manager
+                    .start_workloads_batch_with_scheduling_retry_limit(
+                        requests,
+                        Some(SERVICE_FALLBACK_SCHEDULING_RETRY_MAX_ATTEMPTS),
+                    )
+                    .await
+                    .map_err(|err| err.context("volume-aware fallback placement failed"))
             }
             Err(err) if has_targets && deployment_launch_error_requires_service_requeue(&err) => {
                 tracing::warn!(
@@ -2376,7 +2405,7 @@ fn service_error_detail(err: &anyhow::Error) -> String {
 /// service loop.
 fn deployment_launch_error_should_fail_generation(err: &anyhow::Error) -> bool {
     !deployment_launch_error_requires_service_requeue(err)
-        && !is_local_volume_unavailable_error(err)
+        && !is_volume_unavailable_error(err)
         && !workload_start_error_consumes_service_failure_budget(err)
         && (deployment_launch_error_exceeded_healthy_deadline(err)
             || workload_start_error_is_terminal_service_launch(err))

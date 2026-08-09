@@ -1792,7 +1792,7 @@ mod tests {
                         version_id: Some(secret_version),
                     },
                     mode: Some(0o440),
-                    ownership: crate::volumes::types::LocalVolumeOwnership::Daemon,
+                    ownership: crate::volumes::types::FilesystemOwnership::Daemon,
                     path_env_name: None,
                 }],
                 volumes: vec![TaskVolumeMount {

@@ -17,7 +17,7 @@ use crate::services::types::{
 };
 use crate::task::types::TaskStateFilter;
 use crate::volumes::types::VolumeDriver;
-use crate::volumes::{LocalVolumeAccessError, VolumeRegistry};
+use crate::volumes::{VolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{
     WorkloadStartRequest, workload_start_error_consumes_service_failure_budget,

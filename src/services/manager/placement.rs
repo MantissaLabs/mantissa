@@ -133,7 +133,7 @@ fn dependency_requirements_for_template(
     requirements
 }
 
-/// Computes effective slot targets after applying any hard local-volume locality overrides.
+/// Computes effective slot targets after applying hard node-local volume overrides.
 pub(super) fn compute_effective_slot_targets(
     context: &SlotTargetContext<'_>,
 ) -> anyhow::Result<HashMap<SlotKey, Uuid>> {
@@ -332,8 +332,11 @@ pub(super) async fn build_placement_preference_inventory(
     Ok(inventory)
 }
 
-/// Resolves one hard target node for a template when all mounted local volumes are already bound.
-fn resolve_template_volume_target(
+/// Resolves one hard target node when a template mounts bound node-local volumes.
+///
+/// Replicated bindings are deliberately excluded. Their writer can move between active copies,
+/// and the workload scheduler owns that active-copy constraint and the corresponding CRDT rebind.
+pub(super) fn resolve_template_volume_target(
     volume_registry: &VolumeRegistry,
     mounts: &[WorkloadVolumeMount],
 ) -> anyhow::Result<Option<Uuid>> {
@@ -346,6 +349,9 @@ fn resolve_template_volume_target(
                 mount.volume_id
             )
         })?;
+        if !matches!(spec.driver, VolumeDriver::Local(_)) {
+            continue;
+        }
         let Some(node_id) = spec.bound_node_id else {
             continue;
         };
@@ -362,8 +368,8 @@ fn resolve_template_volume_target(
     Ok(bound_node)
 }
 
-/// Returns true when the mount list includes a bound node-local volume that cannot safely fall back.
-pub(super) fn mounted_local_volumes_require_pinned_target(
+/// Returns true when a bound node-local volume prevents movement to another node.
+pub(super) fn mounted_volumes_require_pinned_target(
     volume_registry: &VolumeRegistry,
     mounts: &[WorkloadVolumeMount],
 ) -> anyhow::Result<bool> {
@@ -389,7 +395,7 @@ pub(super) fn requests_require_pinned_targets(
     requests: &[WorkloadStartRequest],
 ) -> anyhow::Result<bool> {
     for request in requests {
-        if mounted_local_volumes_require_pinned_target(volume_registry, &request.volumes)? {
+        if mounted_volumes_require_pinned_target(volume_registry, &request.volumes)? {
             return Ok(true);
         }
         if request.target_node.is_some()
@@ -412,10 +418,9 @@ fn network_is_node_local(network_registry: &NetworkRegistry, network_id: Uuid) -
     )
 }
 
-/// Returns true when the error chain represents a recoverable node-local volume availability issue.
-pub(super) fn is_local_volume_unavailable_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.is::<LocalVolumeAccessError>())
+/// Returns true when the error chain represents a recoverable volume availability issue.
+pub(super) fn is_volume_unavailable_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<VolumeAccessError>())
 }
 
 /// Collects the sorted set of nodes that remain eligible for service placement.

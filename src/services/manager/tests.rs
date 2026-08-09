@@ -13,10 +13,13 @@ use crate::services::types::TaskTemplateNetworkRequirement;
 use crate::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
-use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
+use crate::store::replicated::volumes::{
+    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
+    open_volume_node_store, open_volume_spec_store,
+};
 use crate::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-    VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    FilesystemOwnership, LocalVolumeSpec, ReplicatedVolumeSpec, VolumeAccessMode,
+    VolumeBindingMode, VolumeDriver, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
 };
 use crate::workload::model::{
     ExecutionPlatform, WorkloadAdmissionState, WorkloadOwner, WorkloadServiceMetadata,
@@ -173,13 +176,25 @@ async fn make_test_volume_registry() -> TestVolumeRegistry {
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume spec store");
-    let node_store = open_volume_node_store(db, actor).expect("open volume node store");
+    let node_store = open_volume_node_store(db.clone(), actor).expect("open volume node store");
     node_store
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume node store");
+    let plan_store =
+        open_replicated_volume_plan_store(db.clone(), actor).expect("open volume plan store");
+    plan_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume plan store");
+    let status_store = open_replicated_volume_group_status_store(db, actor)
+        .expect("open volume group status store");
+    status_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume group status store");
     TestVolumeRegistry {
-        registry: VolumeRegistry::new(spec_store, node_store),
+        registry: VolumeRegistry::new(spec_store, node_store, plan_store, status_store),
         _dir: dir,
     }
 }
@@ -345,7 +360,7 @@ fn service_reserves_public_ports_until_stop_finishes() {
 fn make_local_volume_spec(name: &str, bound_node_id: Option<Uuid>) -> VolumeSpecValue {
     VolumeSpecValue::new(VolumeSpecDraft {
         name: name.to_string(),
-        driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
+        driver: VolumeDriver::Local(LocalVolumeSpec::managed(FilesystemOwnership::Daemon)),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: if bound_node_id.is_some() {
             VolumeBindingMode::Immediate
@@ -358,6 +373,25 @@ fn make_local_volume_spec(name: &str, bound_node_id: Option<Uuid>) -> VolumeSpec
         bound_node_id,
         bound_node_name: bound_node_id.map(|_| "node-a".to_string()),
     })
+}
+
+/// Builds one bound replicated volume for placement fallback tests.
+fn make_replicated_volume_spec(name: &str, bound_node_id: Uuid) -> VolumeSpecValue {
+    let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
+        name: name.to_string(),
+        driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
+            ownership: FilesystemOwnership::Daemon,
+        }),
+        access_mode: VolumeAccessMode::ReadWriteOnce,
+        binding_mode: VolumeBindingMode::WaitForFirstConsumer,
+        reclaim_policy: VolumeReclaimPolicy::Retain,
+        requested_bytes: Some(64 * 1_024 * 1_024),
+        labels: Vec::new(),
+        bound_node_id: Some(bound_node_id),
+        bound_node_name: Some("node-a".to_string()),
+    });
+    spec.plan_coordinator_node_id = Some(bound_node_id);
+    spec
 }
 
 /// Builds one node-local bridge network spec for placement and fallback tests.
@@ -1730,6 +1764,77 @@ async fn bound_local_volume_requests_disable_target_fallback() {
     .expect("evaluate fallback policy");
 
     assert!(requires_pinned);
+}
+
+/// A replicated binding can move to another active copy through workload scheduling.
+#[tokio::test(flavor = "current_thread")]
+async fn bound_replicated_volume_requests_allow_target_fallback() {
+    let test_registry = make_test_volume_registry().await;
+    let network_registry = make_test_network_registry().await;
+    let bound_node_id = Uuid::new_v4();
+    let volume = make_replicated_volume_spec("replicated-data", bound_node_id);
+    test_registry
+        .registry
+        .upsert_spec(volume.clone())
+        .await
+        .expect("persist replicated volume spec");
+
+    let request = make_volume_request(volume.id, &volume.name, Some(bound_node_id));
+    let requires_pinned = requests_require_pinned_targets(
+        &test_registry.registry,
+        &network_registry.registry,
+        &[request],
+    )
+    .expect("evaluate fallback policy");
+
+    assert!(!requires_pinned);
+}
+
+/// Replicated bindings remain movable while a bound local volume remains a hard target.
+#[tokio::test(flavor = "current_thread")]
+async fn only_bound_local_volumes_override_service_slot_targets() {
+    let test_registry = make_test_volume_registry().await;
+    let old_writer = Uuid::new_v4();
+    let local_node = Uuid::new_v4();
+    let replicated = make_replicated_volume_spec("replicated-data", old_writer);
+    let local = make_local_volume_spec("local-data", Some(local_node));
+    test_registry
+        .registry
+        .upsert_spec(replicated.clone())
+        .await
+        .expect("persist replicated volume spec");
+    test_registry
+        .registry
+        .upsert_spec(local.clone())
+        .await
+        .expect("persist local volume spec");
+
+    let replicated_mount = WorkloadVolumeMount {
+        volume_id: replicated.id,
+        volume_name: replicated.name.clone(),
+        target: "/replicated".to_string(),
+        read_only: false,
+    };
+    assert_eq!(
+        resolve_template_volume_target(
+            &test_registry.registry,
+            std::slice::from_ref(&replicated_mount)
+        )
+        .expect("resolve replicated placement"),
+        None
+    );
+
+    let local_mount = WorkloadVolumeMount {
+        volume_id: local.id,
+        volume_name: local.name.clone(),
+        target: "/local".to_string(),
+        read_only: false,
+    };
+    assert_eq!(
+        resolve_template_volume_target(&test_registry.registry, &[replicated_mount, local_mount],)
+            .expect("resolve mixed placement"),
+        Some(local_node)
+    );
 }
 
 /// Unbound local volumes may still use the generic target-clearing fallback path.
