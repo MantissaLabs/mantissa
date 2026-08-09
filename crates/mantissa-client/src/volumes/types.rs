@@ -1,9 +1,12 @@
 use anyhow::{Result, anyhow};
+use mantissa_protocol::health::NodeStatus as ProtoNodeHealth;
 use mantissa_protocol::volumes::{
     VolumeAccessMode as ProtoVolumeAccessMode, VolumeBindingMode as ProtoVolumeBindingMode,
+    VolumeDeleteDisposition as ProtoVolumeDeleteDisposition,
     VolumeNodeState as ProtoVolumeNodeState, VolumeReclaimPolicy as ProtoVolumeReclaimPolicy,
-    VolumeStatus as ProtoVolumeStatus, local_volume_ownership, local_volume_spec,
-    volume_driver_spec, volume_inspect, volume_node_status, volume_spec, volume_summary,
+    VolumeState as ProtoVolumeState, VolumeStatus as ProtoVolumeStatus, filesystem_ownership,
+    local_volume_spec, replicated_volume_group_status, replicated_volume_plan, volume_driver_spec,
+    volume_inspect, volume_node_status, volume_spec, volume_summary,
 };
 use serde::Deserialize;
 use std::fmt;
@@ -16,11 +19,11 @@ pub struct VolumeLabel {
     pub value: String,
 }
 
-/// Client-side ownership policy for one Mantissa-managed local volume.
+/// Client-side ownership policy for one Mantissa-managed filesystem.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum LocalVolumeOwnership {
+pub enum FilesystemOwnership {
     #[default]
     Daemon,
     User {
@@ -32,7 +35,7 @@ pub enum LocalVolumeOwnership {
     },
 }
 
-impl fmt::Display for LocalVolumeOwnership {
+impl fmt::Display for FilesystemOwnership {
     /// Renders the ownership policy in one compact operator-facing form.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -49,6 +52,7 @@ pub enum VolumeDriver {
     LocalManaged,
     LocalImportedPath(String),
     External { driver_name: String, handle: String },
+    Replicated,
 }
 
 impl fmt::Display for VolumeDriver {
@@ -58,6 +62,7 @@ impl fmt::Display for VolumeDriver {
             Self::LocalManaged => f.write_str("local(managed)"),
             Self::LocalImportedPath(path) => write!(f, "local(imported:{path})"),
             Self::External { driver_name, .. } => write!(f, "external({driver_name})"),
+            Self::Replicated => f.write_str("replicated"),
         }
     }
 }
@@ -147,9 +152,68 @@ pub enum VolumeStatus {
     Bound,
     Ready,
     InUse,
-    Deleting,
+    Retaining,
+    Retained,
+    Restoring,
     Failed,
     Deleted,
+}
+
+/// Clear public state shown by list, inspect, status, and REST responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeState {
+    Pending,
+    WaitingForConsumer,
+    CreatingReplicas,
+    Ready,
+    Attached,
+    Degraded,
+    Failed,
+    Retaining,
+    Retained,
+    Restoring,
+    Deleted,
+    Unavailable,
+}
+
+impl VolumeState {
+    /// Decodes the public state calculated by the server.
+    fn from_proto(state: ProtoVolumeState) -> Self {
+        match state {
+            ProtoVolumeState::Pending => Self::Pending,
+            ProtoVolumeState::WaitingForConsumer => Self::WaitingForConsumer,
+            ProtoVolumeState::CreatingReplicas => Self::CreatingReplicas,
+            ProtoVolumeState::Ready => Self::Ready,
+            ProtoVolumeState::Attached => Self::Attached,
+            ProtoVolumeState::Degraded => Self::Degraded,
+            ProtoVolumeState::Failed => Self::Failed,
+            ProtoVolumeState::Retaining => Self::Retaining,
+            ProtoVolumeState::Retained => Self::Retained,
+            ProtoVolumeState::Restoring => Self::Restoring,
+            ProtoVolumeState::Deleted => Self::Deleted,
+            ProtoVolumeState::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
+impl fmt::Display for VolumeState {
+    /// Renders the public state in the CLI and REST form.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => f.write_str("pending"),
+            Self::WaitingForConsumer => f.write_str("waiting_for_consumer"),
+            Self::CreatingReplicas => f.write_str("creating_replicas"),
+            Self::Ready => f.write_str("ready"),
+            Self::Attached => f.write_str("attached"),
+            Self::Degraded => f.write_str("degraded"),
+            Self::Failed => f.write_str("failed"),
+            Self::Retaining => f.write_str("retaining"),
+            Self::Retained => f.write_str("retained"),
+            Self::Restoring => f.write_str("restoring"),
+            Self::Deleted => f.write_str("deleted"),
+            Self::Unavailable => f.write_str("unavailable"),
+        }
+    }
 }
 
 impl VolumeStatus {
@@ -160,7 +224,9 @@ impl VolumeStatus {
             ProtoVolumeStatus::Bound => Self::Bound,
             ProtoVolumeStatus::Ready => Self::Ready,
             ProtoVolumeStatus::InUse => Self::InUse,
-            ProtoVolumeStatus::Deleting => Self::Deleting,
+            ProtoVolumeStatus::Retaining => Self::Retaining,
+            ProtoVolumeStatus::Retained => Self::Retained,
+            ProtoVolumeStatus::Restoring => Self::Restoring,
             ProtoVolumeStatus::Failed => Self::Failed,
             ProtoVolumeStatus::Deleted => Self::Deleted,
         }
@@ -175,7 +241,9 @@ impl fmt::Display for VolumeStatus {
             Self::Bound => f.write_str("bound"),
             Self::Ready => f.write_str("ready"),
             Self::InUse => f.write_str("in_use"),
-            Self::Deleting => f.write_str("deleting"),
+            Self::Retaining => f.write_str("retaining"),
+            Self::Retained => f.write_str("retained"),
+            Self::Restoring => f.write_str("restoring"),
             Self::Failed => f.write_str("failed"),
             Self::Deleted => f.write_str("deleted"),
         }
@@ -189,8 +257,45 @@ pub enum VolumeNodeState {
     Provisioning,
     Ready,
     Published,
+    Retained,
     Deleting,
     Error,
+}
+
+/// Current health of a node that stores one volume copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeHealth {
+    Unknown,
+    Alive,
+    Suspect,
+    Down,
+    Degraded,
+}
+
+impl NodeHealth {
+    /// Decodes the node health observed by the daemon serving the response.
+    fn from_proto(health: ProtoNodeHealth) -> Self {
+        match health {
+            ProtoNodeHealth::Unknown => Self::Unknown,
+            ProtoNodeHealth::Alive => Self::Alive,
+            ProtoNodeHealth::Suspect => Self::Suspect,
+            ProtoNodeHealth::Down => Self::Down,
+            ProtoNodeHealth::Degraded => Self::Degraded,
+        }
+    }
+}
+
+impl fmt::Display for NodeHealth {
+    /// Renders node health in CLI and REST responses.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("unknown"),
+            Self::Alive => f.write_str("alive"),
+            Self::Suspect => f.write_str("suspect"),
+            Self::Down => f.write_str("down"),
+            Self::Degraded => f.write_str("degraded"),
+        }
+    }
 }
 
 impl VolumeNodeState {
@@ -201,6 +306,7 @@ impl VolumeNodeState {
             ProtoVolumeNodeState::Provisioning => Self::Provisioning,
             ProtoVolumeNodeState::Ready => Self::Ready,
             ProtoVolumeNodeState::Published => Self::Published,
+            ProtoVolumeNodeState::Retained => Self::Retained,
             ProtoVolumeNodeState::Deleting => Self::Deleting,
             ProtoVolumeNodeState::Error => Self::Error,
         }
@@ -215,6 +321,7 @@ impl fmt::Display for VolumeNodeState {
             Self::Provisioning => f.write_str("provisioning"),
             Self::Ready => f.write_str("ready"),
             Self::Published => f.write_str("published"),
+            Self::Retained => f.write_str("retained"),
             Self::Deleting => f.write_str("deleting"),
             Self::Error => f.write_str("error"),
         }
@@ -227,11 +334,12 @@ pub struct VolumeSummary {
     pub id: Uuid,
     pub name: String,
     pub driver: VolumeDriver,
-    pub local_ownership: Option<LocalVolumeOwnership>,
+    pub filesystem_ownership: Option<FilesystemOwnership>,
     pub access_mode: VolumeAccessMode,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: VolumeReclaimPolicy,
     pub status: VolumeStatus,
+    pub state: VolumeState,
     pub bound_node_id: Option<Uuid>,
     pub bound_node_name: Option<String>,
     pub requested_bytes: Option<u64>,
@@ -246,21 +354,40 @@ pub struct VolumeSpec {
     pub id: Uuid,
     pub name: String,
     pub driver: VolumeDriver,
-    pub local_ownership: Option<LocalVolumeOwnership>,
+    pub filesystem_ownership: Option<FilesystemOwnership>,
     pub access_mode: VolumeAccessMode,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: VolumeReclaimPolicy,
     pub requested_bytes: Option<u64>,
     pub labels: Vec<VolumeLabel>,
-    pub status: VolumeStatus,
     pub bound_node_id: Option<Uuid>,
     pub bound_node_name: Option<String>,
     pub volume_epoch: u64,
-    pub phase_version: u64,
+    pub lifecycle_revision: u64,
+    pub lifecycle_request_id: Uuid,
+    pub desired_disposition: DesiredVolumeDisposition,
+    pub remove_data: bool,
     pub created_at: String,
     pub updated_at: String,
-    pub reason: Option<String>,
-    pub message: Option<String>,
+}
+
+/// Client representation of the requested lifecycle outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesiredVolumeDisposition {
+    Live,
+    Retained,
+    Deleted,
+}
+
+impl fmt::Display for DesiredVolumeDisposition {
+    /// Renders desired state in CLI and REST output.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Live => f.write_str("live"),
+            Self::Retained => f.write_str("retained"),
+            Self::Deleted => f.write_str("deleted"),
+        }
+    }
 }
 
 /// Client-side representation of one node-local volume status row.
@@ -272,41 +399,106 @@ pub struct VolumeNodeStatus {
     pub node_name: String,
     pub local_path: Option<String>,
     pub state: VolumeNodeState,
+    pub health: NodeHealth,
     pub capacity_bytes: Option<u64>,
     pub used_bytes: Option<u64>,
     pub published_task_ids: Vec<Uuid>,
     pub updated_at: String,
     pub last_error: Option<String>,
     pub volume_epoch: u64,
+    pub group_id: Option<Uuid>,
+}
+
+/// Immutable genesis input shared by the three replica nodes.
+#[derive(Debug, Clone)]
+pub struct ReplicatedVolumePlan {
+    pub id: Uuid,
+    pub volume_id: Uuid,
+    pub volume_epoch: u64,
+    pub bootstrap_id: Uuid,
+    pub workload_node_id: Uuid,
+    pub replica_node_ids: [Uuid; 3],
+    pub generation: u64,
+    pub capacity_bytes: u64,
+    pub logical_sector_bytes: u32,
+    pub physical_block_bytes: u32,
+    pub minimum_io_bytes: u32,
+    pub data_block_bytes: u32,
+}
+
+/// Latest public status copied from the replicated volume's Raft state.
+#[derive(Debug, Clone)]
+pub struct ReplicatedVolumeGroupStatus {
+    pub id: Uuid,
+    pub volume_id: Uuid,
+    pub volume_epoch: u64,
+    pub group_id: Uuid,
+    pub reporter_node_id: Uuid,
+    pub status: VolumeStatus,
+    pub committed_index: u64,
+    pub leader_node_id: Option<Uuid>,
+    pub attached_node_id: Option<Uuid>,
+    pub updated_at: String,
+    pub message: Option<String>,
+    pub control_revision: u64,
+    pub fence: Option<u64>,
+    pub copy_node_ids: Vec<Uuid>,
+    pub voter_node_ids: Vec<Uuid>,
+    pub replacement_id: Option<Uuid>,
+    pub replacement_old_node_id: Option<Uuid>,
+    pub replacement_new_node_id: Option<Uuid>,
+    pub degraded: bool,
 }
 
 /// Client-side inspect payload returned by `get` and `getStatus`.
 #[derive(Debug, Clone)]
 pub struct VolumeInspect {
+    pub state: VolumeState,
+    pub state_message: Option<String>,
     pub spec: VolumeSpec,
     pub node_states: Vec<VolumeNodeStatus>,
+    pub plan: Option<ReplicatedVolumePlan>,
+    pub group_status: Option<ReplicatedVolumeGroupStatus>,
 }
 
 /// Client-side delete result payload.
 #[derive(Debug, Clone)]
 pub struct VolumeDeleteResult {
     pub preserved_path: Option<String>,
-    pub deleted_data: bool,
+    pub disposition: VolumeDeleteDisposition,
+}
+
+/// Logical outcome accepted by one volume delete request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeDeleteDisposition {
+    Deleted,
+    Retained,
+}
+
+impl VolumeDeleteDisposition {
+    /// Decodes the protocol outcome without inferring physical cleanup progress.
+    pub fn from_proto(disposition: ProtoVolumeDeleteDisposition) -> Self {
+        match disposition {
+            ProtoVolumeDeleteDisposition::Deleted => Self::Deleted,
+            ProtoVolumeDeleteDisposition::Retained => Self::Retained,
+        }
+    }
 }
 
 impl VolumeSummary {
     /// Decodes one list summary row from the protocol payload.
     pub fn from_reader(reader: volume_summary::Reader<'_>) -> Result<Self> {
-        let (driver, local_ownership) = parse_driver(reader.get_driver()?)?;
+        let (driver, filesystem_ownership) = parse_driver(reader.get_driver()?)?;
         Ok(Self {
             id: read_uuid(reader.get_id()?, "volume id")?,
             name: reader.get_name()?.to_str()?.to_string(),
             driver,
-            local_ownership,
+            filesystem_ownership,
             access_mode: VolumeAccessMode::from_proto(reader.get_access_mode()?),
             binding_mode: VolumeBindingMode::from_proto(reader.get_binding_mode()?),
             reclaim_policy: VolumeReclaimPolicy::from_proto(reader.get_reclaim_policy()?),
             status: VolumeStatus::from_proto(reader.get_status()?),
+            state: VolumeState::from_proto(reader.get_state()?),
             bound_node_id: read_optional_uuid(reader.get_bound_node_id()?, "bound node id")?,
             bound_node_name: empty_text(reader.get_bound_node_name()?.to_str()?),
             requested_bytes: zero_means_none(reader.get_requested_bytes()),
@@ -320,7 +512,7 @@ impl VolumeSummary {
 impl VolumeSpec {
     /// Decodes one canonical volume spec from the protocol payload.
     pub fn from_reader(reader: volume_spec::Reader<'_>) -> Result<Self> {
-        let (driver, local_ownership) = parse_driver(reader.get_driver()?)?;
+        let (driver, filesystem_ownership) = parse_driver(reader.get_driver()?)?;
         let mut labels = Vec::new();
         for entry in reader.get_labels()?.iter() {
             labels.push(VolumeLabel {
@@ -334,21 +526,34 @@ impl VolumeSpec {
             id: read_uuid(reader.get_id()?, "volume id")?,
             name: reader.get_name()?.to_str()?.to_string(),
             driver,
-            local_ownership,
+            filesystem_ownership,
             access_mode: VolumeAccessMode::from_proto(reader.get_access_mode()?),
             binding_mode: VolumeBindingMode::from_proto(reader.get_binding_mode()?),
             reclaim_policy: VolumeReclaimPolicy::from_proto(reader.get_reclaim_policy()?),
             requested_bytes: zero_means_none(reader.get_requested_bytes()),
             labels,
-            status: VolumeStatus::from_proto(reader.get_status()?),
             bound_node_id: read_optional_uuid(reader.get_bound_node_id()?, "bound node id")?,
             bound_node_name: empty_text(reader.get_bound_node_name()?.to_str()?),
             volume_epoch: reader.get_volume_epoch(),
-            phase_version: reader.get_phase_version(),
+            lifecycle_revision: reader.get_lifecycle()?.get_revision(),
+            lifecycle_request_id: read_uuid(
+                reader.get_lifecycle()?.get_request_id()?,
+                "lifecycle request id",
+            )?,
+            desired_disposition: match reader.get_lifecycle()?.get_disposition()? {
+                mantissa_protocol::volumes::DesiredVolumeDisposition::Live => {
+                    DesiredVolumeDisposition::Live
+                }
+                mantissa_protocol::volumes::DesiredVolumeDisposition::Retained => {
+                    DesiredVolumeDisposition::Retained
+                }
+                mantissa_protocol::volumes::DesiredVolumeDisposition::Deleted => {
+                    DesiredVolumeDisposition::Deleted
+                }
+            },
+            remove_data: reader.get_lifecycle()?.get_remove_data(),
             created_at: reader.get_created_at()?.to_str()?.to_string(),
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
-            reason: empty_text(reader.get_reason()?.to_str()?),
-            message: empty_text(reader.get_message()?.to_str()?),
         })
     }
 }
@@ -368,12 +573,90 @@ impl VolumeNodeStatus {
             node_name: reader.get_node_name()?.to_str()?.to_string(),
             local_path: empty_text(reader.get_local_path()?.to_str()?),
             state: VolumeNodeState::from_proto(reader.get_state()?),
+            health: NodeHealth::from_proto(reader.get_health()?),
             capacity_bytes: zero_means_none(reader.get_capacity_bytes()),
             used_bytes: zero_means_none(reader.get_used_bytes()),
             published_task_ids,
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
             last_error: empty_text(reader.get_last_error()?.to_str()?),
             volume_epoch: reader.get_volume_epoch(),
+            group_id: read_optional_uuid(reader.get_group_id()?, "volume group id")?,
+        })
+    }
+}
+
+impl ReplicatedVolumePlan {
+    /// Decodes immutable replica genesis input from the protocol response.
+    fn from_reader(reader: replicated_volume_plan::Reader<'_>) -> Result<Self> {
+        let replicas = reader.get_replica_node_ids()?;
+        if replicas.len() != 3 {
+            return Err(anyhow!(
+                "replicated volume plan requires exactly three replica nodes"
+            ));
+        }
+        let descriptor = reader.get_descriptor()?;
+        let block_sizes = descriptor.get_block_sizes()?;
+        Ok(Self {
+            id: read_uuid(reader.get_id()?, "replicated volume plan id")?,
+            volume_id: read_uuid(reader.get_volume_id()?, "volume id")?,
+            volume_epoch: reader.get_volume_epoch(),
+            bootstrap_id: read_uuid(reader.get_bootstrap_id()?, "bootstrap id")?,
+            workload_node_id: read_uuid(reader.get_workload_node_id()?, "workload node id")?,
+            replica_node_ids: [
+                read_uuid(replicas.get(0)?, "first replica node id")?,
+                read_uuid(replicas.get(1)?, "second replica node id")?,
+                read_uuid(replicas.get(2)?, "third replica node id")?,
+            ],
+            generation: descriptor.get_generation(),
+            capacity_bytes: descriptor.get_capacity_bytes(),
+            logical_sector_bytes: block_sizes.get_logical_sector_bytes(),
+            physical_block_bytes: block_sizes.get_physical_block_bytes(),
+            minimum_io_bytes: block_sizes.get_minimum_io_bytes(),
+            data_block_bytes: block_sizes.get_data_block_bytes(),
+        })
+    }
+}
+
+impl ReplicatedVolumeGroupStatus {
+    /// Decodes one status copied from committed Raft state.
+    fn from_reader(reader: replicated_volume_group_status::Reader<'_>) -> Result<Self> {
+        let mut copy_node_ids = Vec::new();
+        for value in reader.get_copy_node_ids()?.iter() {
+            copy_node_ids.push(read_uuid(value?, "active copy node id")?);
+        }
+        let mut voter_node_ids = Vec::new();
+        for value in reader.get_voter_node_ids()?.iter() {
+            voter_node_ids.push(read_uuid(value?, "volume voter node id")?);
+        }
+        Ok(Self {
+            id: read_uuid(reader.get_id()?, "replicated volume group status id")?,
+            volume_id: read_uuid(reader.get_volume_id()?, "volume id")?,
+            volume_epoch: reader.get_volume_epoch(),
+            group_id: read_uuid(reader.get_group_id()?, "volume group id")?,
+            reporter_node_id: read_uuid(reader.get_reporter_node_id()?, "reporter node id")?,
+            status: VolumeStatus::from_proto(reader.get_status()?),
+            committed_index: reader.get_committed_index(),
+            leader_node_id: read_optional_uuid(reader.get_leader_node_id()?, "leader node id")?,
+            attached_node_id: read_optional_uuid(
+                reader.get_attached_node_id()?,
+                "attached node id",
+            )?,
+            updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+            message: empty_text(reader.get_message()?.to_str()?),
+            control_revision: reader.get_control_revision(),
+            fence: zero_means_none(reader.get_fence()),
+            copy_node_ids,
+            voter_node_ids,
+            replacement_id: read_optional_uuid(reader.get_replacement_id()?, "replacement id")?,
+            replacement_old_node_id: read_optional_uuid(
+                reader.get_replacement_old_node_id()?,
+                "replacement old node id",
+            )?,
+            replacement_new_node_id: read_optional_uuid(
+                reader.get_replacement_new_node_id()?,
+                "replacement new node id",
+            )?,
+            degraded: reader.get_degraded(),
         })
     }
 }
@@ -391,7 +674,26 @@ impl VolumeInspect {
                 .cmp(&b.node_name)
                 .then(a.node_id.cmp(&b.node_id))
         });
-        Ok(Self { spec, node_states })
+        let plan = reader
+            .has_plan()
+            .then(|| reader.get_plan())
+            .transpose()?
+            .map(ReplicatedVolumePlan::from_reader)
+            .transpose()?;
+        let group_status = reader
+            .has_group_status()
+            .then(|| reader.get_group_status())
+            .transpose()?
+            .map(ReplicatedVolumeGroupStatus::from_reader)
+            .transpose()?;
+        Ok(Self {
+            state: VolumeState::from_proto(reader.get_state()?),
+            state_message: empty_text(reader.get_state_message()?.to_str()?),
+            spec,
+            node_states,
+            plan,
+            group_status,
+        })
     }
 }
 
@@ -434,14 +736,12 @@ fn empty_text(value: &str) -> Option<String> {
 /// Decodes one volume driver payload from the protocol response.
 fn parse_driver(
     reader: volume_driver_spec::Reader<'_>,
-) -> Result<(VolumeDriver, Option<LocalVolumeOwnership>)> {
+) -> Result<(VolumeDriver, Option<FilesystemOwnership>)> {
     match reader.which()? {
         volume_driver_spec::Which::Local(Ok(local_reader)) => match local_reader.which()? {
             local_volume_spec::Which::Managed(Ok(managed_reader)) => Ok((
                 VolumeDriver::LocalManaged,
-                Some(parse_local_volume_ownership(
-                    managed_reader.get_ownership()?,
-                )?),
+                Some(parse_filesystem_ownership(managed_reader.get_ownership()?)?),
             )),
             local_volume_spec::Which::Managed(Err(err)) => Err(anyhow!(err.to_string())),
             local_volume_spec::Which::ImportedPath(Ok(path)) => Ok((
@@ -459,23 +759,30 @@ fn parse_driver(
             None,
         )),
         volume_driver_spec::Which::External(Err(err)) => Err(anyhow!(err.to_string())),
+        volume_driver_spec::Which::Replicated(Ok(replicated_reader)) => Ok((
+            VolumeDriver::Replicated,
+            Some(parse_filesystem_ownership(
+                replicated_reader.get_ownership()?,
+            )?),
+        )),
+        volume_driver_spec::Which::Replicated(Err(err)) => Err(anyhow!(err.to_string())),
     }
 }
 
 /// Decodes one managed-volume ownership payload from the protocol response.
-fn parse_local_volume_ownership(
-    reader: local_volume_ownership::Reader<'_>,
-) -> Result<LocalVolumeOwnership> {
+fn parse_filesystem_ownership(
+    reader: filesystem_ownership::Reader<'_>,
+) -> Result<FilesystemOwnership> {
     match reader.which()? {
-        local_volume_ownership::Which::Daemon(()) => Ok(LocalVolumeOwnership::Daemon),
-        local_volume_ownership::Which::User(Ok(user)) => Ok(LocalVolumeOwnership::User {
+        filesystem_ownership::Which::Daemon(()) => Ok(FilesystemOwnership::Daemon),
+        filesystem_ownership::Which::User(Ok(user)) => Ok(FilesystemOwnership::User {
             uid: user.get_uid(),
             gid: user.get_gid(),
         }),
-        local_volume_ownership::Which::User(Err(err)) => Err(anyhow!(err.to_string())),
-        local_volume_ownership::Which::FsGroup(Ok(fs_group)) => Ok(LocalVolumeOwnership::FsGroup {
+        filesystem_ownership::Which::User(Err(err)) => Err(anyhow!(err.to_string())),
+        filesystem_ownership::Which::FsGroup(Ok(fs_group)) => Ok(FilesystemOwnership::FsGroup {
             gid: fs_group.get_gid(),
         }),
-        local_volume_ownership::Which::FsGroup(Err(err)) => Err(anyhow!(err.to_string())),
+        filesystem_ownership::Which::FsGroup(Err(err)) => Err(anyhow!(err.to_string())),
     }
 }

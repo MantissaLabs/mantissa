@@ -3,13 +3,18 @@ use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::{Context, Result};
 
-/// Deletes one volume object by UUID or name and returns the delete result.
-pub async fn delete(cfg: &ClientConfig, selector: &str) -> Result<VolumeDeleteResult> {
+/// Retains or permanently deletes one volume selected by UUID or name.
+pub async fn delete(
+    cfg: &ClientConfig,
+    selector: &str,
+    delete_data: bool,
+) -> Result<VolumeDeleteResult> {
     let session = connection::get_local_session(cfg).await?;
     let request = session.get_volumes_request();
     let volumes = request.send().pipeline.get_volumes();
     let mut delete = volumes.delete_request();
     delete.get().set_selector(selector);
+    delete.get().set_delete_data(delete_data);
     let response = delete
         .send()
         .promise
@@ -21,6 +26,6 @@ pub async fn delete(cfg: &ClientConfig, selector: &str) -> Result<VolumeDeleteRe
             let path = reader.get_preserved_path()?.to_str()?.trim().to_string();
             if path.is_empty() { None } else { Some(path) }
         },
-        deleted_data: reader.get_deleted_data(),
+        disposition: super::types::VolumeDeleteDisposition::from_proto(reader.get_disposition()?),
     })
 }

@@ -59,7 +59,7 @@ pub async fn import(
         name: name.to_string(),
         node_selector: node_selector.to_string(),
         path: path.to_string(),
-        requested_bytes: capacity_mb.map(|value| value.saturating_mul(1_048_576)),
+        requested_bytes: capacity_mb.map(super::capacity_mb_to_bytes).transpose()?,
         labels: parse_volume_labels(labels)?,
     };
     import_with_request(cfg, &request).await

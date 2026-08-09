@@ -3,6 +3,7 @@ mod delete;
 mod import;
 mod inspect;
 mod list;
+mod restore;
 mod status;
 mod types;
 
@@ -12,17 +13,26 @@ use anyhow::{Result, anyhow};
 use mantissa_protocol::topology::node_info;
 use uuid::Uuid;
 
-pub use create::{VolumeCreateRequest, create, create_with_request};
+pub use create::{VolumeCreateDriver, VolumeCreateRequest, create, create_with_request};
 pub use delete::delete;
 pub use import::{VolumeImportRequest, import, import_with_request};
 pub use inspect::inspect;
 pub use list::list;
+pub use restore::restore;
 pub use status::status;
 pub use types::{
-    LocalVolumeOwnership, VolumeAccessMode, VolumeBindingMode, VolumeDeleteResult, VolumeDriver,
-    VolumeInspect, VolumeLabel, VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec,
-    VolumeStatus, VolumeSummary,
+    DesiredVolumeDisposition, FilesystemOwnership, ReplicatedVolumeGroupStatus,
+    ReplicatedVolumePlan, VolumeAccessMode, VolumeBindingMode, VolumeDeleteDisposition,
+    VolumeDeleteResult, VolumeDriver, VolumeInspect, VolumeLabel, VolumeNodeState,
+    VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec, VolumeState, VolumeStatus, VolumeSummary,
 };
+
+/// Converts MiB to bytes and rejects values that are too large for `u64`.
+pub fn capacity_mb_to_bytes(value: u64) -> Result<u64> {
+    value
+        .checked_mul(1_048_576)
+        .ok_or_else(|| anyhow!("volume capacity is too large"))
+}
 
 /// Resolved form of one CLI volume mount after selector lookup and normalization.
 #[derive(Clone, Debug)]
