@@ -64,6 +64,8 @@ pub(super) enum SchedulingError {
     NetworksBlocked { networks: Vec<Uuid> },
     #[error("local node lacks required network specs for task '{task}'")]
     LocalNetworksBlocked { task: String },
+    #[error("replicated volume storage is unavailable for task '{task}'")]
+    VolumeStorageBlocked { task: String },
     #[error(
         "scheduler reservation failed: placement constraints unsatisfied for task '{task}' ({constraints})"
     )]
@@ -192,6 +194,7 @@ pub(super) struct StartIntent {
     pub(super) owner: Option<WorkloadOwner>,
     pub(super) dependency_requirements: Vec<NetworkServiceDependencyRequirement>,
     pub(super) target_node: Option<Uuid>,
+    pub(super) allowed_volume_nodes: Option<HashSet<Uuid>>,
 }
 
 impl StartIntent {
@@ -221,6 +224,20 @@ impl StartIntent {
         SchedulingError::PlacementConstraintsBlocked {
             task: self.name.clone(),
             constraints: self.placement.rendered_constraints().join(", "),
+        }
+    }
+
+    /// Returns whether this task may use its volumes on the selected node.
+    fn can_use_volumes_on(&self, node_id: Uuid) -> bool {
+        self.allowed_volume_nodes
+            .as_ref()
+            .is_none_or(|nodes| nodes.contains(&node_id))
+    }
+
+    /// Builds the scheduler error used when no allowed volume node can host the task.
+    fn volume_storage_error(&self) -> SchedulingError {
+        SchedulingError::VolumeStorageBlocked {
+            task: self.name.clone(),
         }
     }
 }
@@ -1090,6 +1107,7 @@ fn candidate_preference_counts(
 
 /// Returns true when the digest can plausibly host the intent without fetching slot details.
 fn digest_can_host_intent(
+    node_id: Uuid,
     digest: &SchedulerDigestValue,
     placement: &PlacementNode,
     schedulable_networks: &HashSet<Uuid>,
@@ -1097,6 +1115,7 @@ fn digest_can_host_intent(
     intent: &StartIntent,
 ) -> bool {
     digest.free_slot_count > 0
+        && intent.can_use_volumes_on(node_id)
         && intent.placement.matches(placement)
         && digest.free_cpu_millis >= intent.cpu_millis
         && digest.free_memory_bytes >= intent.memory_bytes
@@ -1349,6 +1368,7 @@ impl WorkloadManager {
                 owner,
                 dependency_requirements,
                 target_node,
+                allowed_volume_nodes: None,
             });
         }
 
@@ -1505,6 +1525,9 @@ impl WorkloadManager {
 
             if !intent.runtime_requirements_met(prereqs.runtime_support) {
                 return Err(intent.runtime_requirements_error().into());
+            }
+            if !intent.can_use_volumes_on(self.local_node_id) {
+                return Err(intent.volume_storage_error().into());
             }
 
             let requires_gpu = intent.gpu_count > 0 || !intent.gpu_device_ids.is_empty();
@@ -1767,6 +1790,7 @@ impl WorkloadManager {
                 .iter()
                 .filter(|intent| {
                     digest_can_host_intent(
+                        peer_id,
                         &digest,
                         &placement,
                         schedulable_networks,
@@ -1976,6 +2000,9 @@ impl WorkloadManager {
             }
             .into());
         }
+        if !intent.can_use_volumes_on(target_node) {
+            return Err(intent.volume_storage_error().into());
+        }
 
         let candidate_count = candidates.len();
         if candidate_count == 0 {
@@ -2080,10 +2107,15 @@ impl WorkloadManager {
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
         let mut skipped_for_ports = false;
+        let mut found_allowed_volume_node = false;
 
         for (idx, candidate) in candidates.iter().enumerate() {
             let node_id = candidate.node_id(self.local_node_id);
 
+            if !intent.can_use_volumes_on(node_id) {
+                continue;
+            }
+            found_allowed_volume_node = true;
             if !candidate.matches_placement(intent) {
                 skipped_for_constraints = true;
                 continue;
@@ -2153,7 +2185,9 @@ impl WorkloadManager {
         }
 
         let Some(best_index) = best_index else {
-            if skipped_for_constraints {
+            if !found_allowed_volume_node {
+                return Err(intent.volume_storage_error().into());
+            } else if skipped_for_constraints {
                 return Err(intent.placement_error().into());
             } else if skipped_for_runtime {
                 return Err(intent.runtime_requirements_error().into());
@@ -2205,8 +2239,14 @@ impl WorkloadManager {
         let mut skipped_for_networks = false;
         let mut skipped_for_runtime = false;
         let mut skipped_for_ports = false;
+        let mut found_allowed_volume_node = false;
 
         for (idx, candidate) in candidates.iter().enumerate() {
+            let node_id = candidate.node_id(self.local_node_id);
+            if !intent.can_use_volumes_on(node_id) {
+                continue;
+            }
+            found_allowed_volume_node = true;
             if !candidate.matches_placement(intent) {
                 skipped_for_constraints = true;
                 continue;
@@ -2230,7 +2270,6 @@ impl WorkloadManager {
             let Some(score) = candidate.binpack_score(intent) else {
                 continue;
             };
-            let node_id = candidate.node_id(self.local_node_id);
             let preference_counts =
                 candidate_preference_counts(preference_inventory, node_id, preference_context);
             let ready_network_count = candidate.ready_network_count(&intent.networks);
@@ -2264,7 +2303,9 @@ impl WorkloadManager {
         }
 
         let Some((best_index, _, _, _, _)) = best else {
-            if skipped_for_constraints {
+            if !found_allowed_volume_node {
+                return Err(intent.volume_storage_error().into());
+            } else if skipped_for_constraints {
                 return Err(intent.placement_error().into());
             } else if skipped_for_runtime {
                 return Err(intent.runtime_requirements_error().into());
@@ -2471,6 +2512,7 @@ mod tests {
             dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: None,
+            allowed_volume_nodes: None,
         };
         let digest = SchedulerDigestValue {
             node_id: Uuid::new_v4(),
@@ -2486,6 +2528,7 @@ mod tests {
         };
 
         assert!(!digest_can_host_intent(
+            digest.node_id,
             &digest,
             &Default::default(),
             &Default::default(),
@@ -2497,6 +2540,7 @@ mod tests {
         schedulable_networks.insert(required_network);
 
         assert!(!digest_can_host_intent(
+            digest.node_id,
             &digest,
             &Default::default(),
             &schedulable_networks,
@@ -2507,11 +2551,32 @@ mod tests {
         let mut gpu_ready_digest = digest.clone();
         gpu_ready_digest.gpu_runtime_ready = true;
         assert!(digest_can_host_intent(
+            gpu_ready_digest.node_id,
             &gpu_ready_digest,
             &Default::default(),
             &schedulable_networks,
             &RuntimeSupportProfile::default(),
             &intent
+        ));
+
+        let mut volume_intent = intent.clone();
+        volume_intent.allowed_volume_nodes = Some(HashSet::from([Uuid::new_v4()]));
+        assert!(!digest_can_host_intent(
+            gpu_ready_digest.node_id,
+            &gpu_ready_digest,
+            &Default::default(),
+            &schedulable_networks,
+            &RuntimeSupportProfile::default(),
+            &volume_intent
+        ));
+        volume_intent.allowed_volume_nodes = Some(HashSet::from([gpu_ready_digest.node_id]));
+        assert!(digest_can_host_intent(
+            gpu_ready_digest.node_id,
+            &gpu_ready_digest,
+            &Default::default(),
+            &schedulable_networks,
+            &RuntimeSupportProfile::default(),
+            &volume_intent
         ));
     }
 
@@ -2548,6 +2613,7 @@ mod tests {
             dependency_requirements: Vec::new(),
             service_placement_preferences: Vec::new(),
             target_node: None,
+            allowed_volume_nodes: None,
         };
         let digest = SchedulerDigestValue {
             node_id: Uuid::new_v4(),
@@ -2575,6 +2641,7 @@ mod tests {
         );
 
         assert!(!digest_can_host_intent(
+            digest.node_id,
             &digest,
             &Default::default(),
             &HashSet::new(),
@@ -2582,6 +2649,7 @@ mod tests {
             &intent
         ));
         assert!(digest_can_host_intent(
+            digest.node_id,
             &digest,
             &Default::default(),
             &HashSet::new(),
