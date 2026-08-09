@@ -1452,7 +1452,7 @@ fn read_assignment_batch_request(
 mod tests {
     use super::*;
     use crate::store::replicated::workloads::open_workload_store;
-    use crate::volumes::types::LocalVolumeOwnership;
+    use crate::volumes::types::FilesystemOwnership;
     use crate::workload::model::{
         WorkloadEnvironmentVariable, WorkloadJobMetadata, WorkloadOwner, WorkloadSecretFile,
         WorkloadSecretReference, WorkloadValueDraft, WorkloadVolumeMount, merge_status_into_value,
@@ -1526,7 +1526,7 @@ mod tests {
                     version_id: Some(Uuid::new_v4()),
                 },
                 mode: Some(0o400),
-                ownership: LocalVolumeOwnership::User {
+                ownership: FilesystemOwnership::User {
                     uid: 1_000,
                     gid: 1_000,
                 },

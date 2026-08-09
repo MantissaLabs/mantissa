@@ -1,7 +1,7 @@
 use super::{WorkloadManager, WorkloadStartRequest};
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::types::SecretValue;
-use crate::volumes::types::LocalVolumeOwnership;
+use crate::volumes::types::FilesystemOwnership;
 use crate::workload::model::{
     WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
 };
@@ -469,10 +469,10 @@ fn normalize_staged_secret_file_permissions(
 }
 
 /// Returns the default POSIX mode Mantissa should use for one staged secret file.
-fn default_secret_file_mode(ownership: LocalVolumeOwnership) -> u32 {
+fn default_secret_file_mode(ownership: FilesystemOwnership) -> u32 {
     match ownership {
-        LocalVolumeOwnership::Daemon | LocalVolumeOwnership::User { .. } => 0o400,
-        LocalVolumeOwnership::FsGroup { .. } => 0o440,
+        FilesystemOwnership::Daemon | FilesystemOwnership::User { .. } => 0o400,
+        FilesystemOwnership::FsGroup { .. } => 0o440,
     }
 }
 

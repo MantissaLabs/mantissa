@@ -2,7 +2,7 @@ use crate::scheduler::placement::{
     PlacementConstraint, PlacementConstraintOperator, PlacementConstraintSelector, PlacementPolicy,
     PlacementStrategy,
 };
-use crate::volumes::types::LocalVolumeOwnership;
+use crate::volumes::types::FilesystemOwnership;
 use crate::workload::model::{
     WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
 };
@@ -13,7 +13,7 @@ use crate::workload::types::{
     WorkloadRestartPolicy, WorkloadRestartPolicyKind,
 };
 use capnp::{Error, struct_list};
-use mantissa_protocol::volumes::local_volume_ownership;
+use mantissa_protocol::volumes::filesystem_ownership;
 use mantissa_protocol::workload::{
     admission_policy, deployment_policy, environment_var, network_requirement,
     placement_constraint, placement_constraint_selector, placement_policy, port_binding,
@@ -367,7 +367,7 @@ pub fn encode_secret_files(
         let secret_builder = entry.reborrow().init_secret();
         encode_secret_ref(secret_builder, &file.secret);
         entry.set_mode(file.mode.unwrap_or(0));
-        write_local_volume_ownership(entry.reborrow().init_ownership(), file.ownership);
+        write_filesystem_ownership(entry.reborrow().init_ownership(), file.ownership);
         entry.set_path_env_name(file.path_env_name.as_deref().unwrap_or(""));
     }
 }
@@ -385,9 +385,9 @@ pub fn decode_secret_files(
             value => Some(value),
         };
         let ownership = if entry.has_ownership() {
-            read_local_volume_ownership(entry.get_ownership()?)?
+            read_filesystem_ownership(entry.get_ownership()?)?
         } else {
-            LocalVolumeOwnership::Daemon
+            FilesystemOwnership::Daemon
         };
         let path_env_name = if entry.has_path_env_name() {
             let name = entry.get_path_env_name()?.to_str()?.trim().to_string();
@@ -407,20 +407,20 @@ pub fn decode_secret_files(
 }
 
 /// Encodes one uid/gid ownership policy into the shared workload wire contract.
-fn write_local_volume_ownership(
-    mut builder: local_volume_ownership::Builder<'_>,
-    ownership: LocalVolumeOwnership,
+fn write_filesystem_ownership(
+    mut builder: filesystem_ownership::Builder<'_>,
+    ownership: FilesystemOwnership,
 ) {
     match ownership {
-        LocalVolumeOwnership::Daemon => {
+        FilesystemOwnership::Daemon => {
             builder.set_daemon(());
         }
-        LocalVolumeOwnership::User { uid, gid } => {
+        FilesystemOwnership::User { uid, gid } => {
             let mut user = builder.reborrow().init_user();
             user.set_uid(uid);
             user.set_gid(gid);
         }
-        LocalVolumeOwnership::FsGroup { gid } => {
+        FilesystemOwnership::FsGroup { gid } => {
             let mut fs_group = builder.reborrow().init_fs_group();
             fs_group.set_gid(gid);
         }
@@ -428,20 +428,20 @@ fn write_local_volume_ownership(
 }
 
 /// Decodes one uid/gid ownership policy from the shared workload wire contract.
-fn read_local_volume_ownership(
-    reader: local_volume_ownership::Reader<'_>,
-) -> Result<LocalVolumeOwnership, Error> {
+fn read_filesystem_ownership(
+    reader: filesystem_ownership::Reader<'_>,
+) -> Result<FilesystemOwnership, Error> {
     match reader.which()? {
-        local_volume_ownership::Which::Daemon(()) => Ok(LocalVolumeOwnership::Daemon),
-        local_volume_ownership::Which::User(Ok(user)) => Ok(LocalVolumeOwnership::User {
+        filesystem_ownership::Which::Daemon(()) => Ok(FilesystemOwnership::Daemon),
+        filesystem_ownership::Which::User(Ok(user)) => Ok(FilesystemOwnership::User {
             uid: user.get_uid(),
             gid: user.get_gid(),
         }),
-        local_volume_ownership::Which::User(Err(err)) => Err(err),
-        local_volume_ownership::Which::FsGroup(Ok(fs_group)) => Ok(LocalVolumeOwnership::FsGroup {
+        filesystem_ownership::Which::User(Err(err)) => Err(err),
+        filesystem_ownership::Which::FsGroup(Ok(fs_group)) => Ok(FilesystemOwnership::FsGroup {
             gid: fs_group.get_gid(),
         }),
-        local_volume_ownership::Which::FsGroup(Err(err)) => Err(err),
+        filesystem_ownership::Which::FsGroup(Err(err)) => Err(err),
     }
 }
 
