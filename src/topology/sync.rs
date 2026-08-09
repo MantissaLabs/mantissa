@@ -1166,6 +1166,7 @@ mod tests {
                 signing_pub: [idx as u8; 32],
                 identity_sig: Vec::new(),
                 wireguard: None,
+                replicated_volumes: Default::default(),
                 runtime_support: RuntimeSupportProfile::default(),
                 scheduling: PeerSchedulingState::schedulable_default(peer_id),
                 readiness: Default::default(),

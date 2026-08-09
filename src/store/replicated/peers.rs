@@ -139,6 +139,7 @@ mod tests {
                 port: 51820,
                 enabled: true,
             }),
+            replicated_volumes: Default::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([byte; 16])),
             readiness: Default::default(),
             labels: PeerLabelState::default(),

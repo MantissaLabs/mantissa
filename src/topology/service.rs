@@ -116,6 +116,7 @@ fn peer_value_from_join_payload(payload: &JoinPayload) -> PeerValue {
         readiness: payload.readiness.clone(),
         labels: payload.labels.clone(),
         runtime_support: payload.runtime_support.clone(),
+        replicated_volumes: payload.replicated_volumes.clone(),
         root_schema: payload.root_schema,
         membership: PeerMembership::active(payload.incarnation),
     }
@@ -260,6 +261,7 @@ impl Topology {
             readiness: self.current_readiness_state(),
             labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
+            replicated_volumes: self.local.replicated_volume_support.clone(),
             root_schema: self.root_schema_info(),
         })
     }
@@ -1678,6 +1680,7 @@ pub fn read_topology_event(reader: topology_event::Reader) -> Result<TopologyEve
                 readiness: Box::new(peer.readiness),
                 labels: Box::new(peer.labels),
                 runtime_support: Box::new(peer.runtime_support),
+                replicated_volumes: Box::new(peer.replicated_volumes),
                 root_schema: peer.root_schema,
             }
         }
@@ -1812,6 +1815,7 @@ mod tests {
                 port: 7777,
                 enabled: false,
             }),
+            replicated_volumes: Default::default(),
             runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState {
                 schedulable: true,
@@ -1936,6 +1940,7 @@ mod tests {
             signing_pub: [7u8; 32],
             identity_sig: vec![6u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState {
                 schedulable: false,

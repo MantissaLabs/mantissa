@@ -6,6 +6,7 @@ use crate::topology::peers::{
     NodeReadiness, PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue,
     WireGuardPeerValue, write_peer,
 };
+use crate::volumes::replicated::ReplicatedVolumeSupport;
 use mantissa_protocol::gossip::gossip_message;
 use mantissa_protocol::server;
 use mantissa_protocol::topology::{
@@ -34,6 +35,7 @@ pub(super) struct JoinPayload {
     pub(super) readiness: NodeReadiness,
     pub(super) labels: PeerLabelState,
     pub(super) runtime_support: RuntimeSupportProfile,
+    pub(super) replicated_volumes: ReplicatedVolumeSupport,
     pub(super) root_schema: RootSchemaInfo,
 }
 
@@ -173,6 +175,7 @@ fn join_payload_peer_value(payload: &JoinPayload) -> PeerValue {
         readiness: payload.readiness.clone(),
         labels: payload.labels.clone(),
         runtime_support: payload.runtime_support.clone(),
+        replicated_volumes: payload.replicated_volumes.clone(),
         root_schema: payload.root_schema,
         membership: PeerMembership::active(payload.incarnation),
     }
@@ -307,6 +310,7 @@ fn write_join_event(
         readiness,
         labels,
         runtime_support,
+        replicated_volumes,
         root_schema,
     } = event
     else {
@@ -328,6 +332,7 @@ fn write_join_event(
         readiness: readiness.as_ref().clone(),
         labels: labels.as_ref().clone(),
         runtime_support: runtime_support.as_ref().clone(),
+        replicated_volumes: replicated_volumes.as_ref().clone(),
         root_schema: *root_schema,
         membership: PeerMembership::active(*incarnation),
     };

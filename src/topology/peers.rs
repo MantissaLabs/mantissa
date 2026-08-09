@@ -1,6 +1,7 @@
 use crate::cluster::RootSchemaInfo;
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::{PeerHandle, Topology, peer_provider::PeerProvider};
+use crate::volumes::replicated::ReplicatedVolumeSupport;
 use async_trait::async_trait;
 use capnp::Error as CapnpError;
 use capnp::text_list;
@@ -559,6 +560,10 @@ pub struct PeerValue {
     #[serde(default)]
     pub runtime_support: RuntimeSupportProfile,
 
+    /// Replicated-volume listener and checked pool space on this node.
+    #[serde(default)]
+    pub replicated_volumes: ReplicatedVolumeSupport,
+
     /// Root-schema support metadata used to negotiate sync projections per peer.
     #[serde(default)]
     pub root_schema: RootSchemaInfo,
@@ -660,6 +665,15 @@ pub(crate) fn write_peer(mut builder: peer_capnp::Builder<'_>, value: &PeerValue
     builder.set_supported_root_schema_version(value.root_schema.supported_version);
     builder.set_root_schema_updated_at_unix_ms(value.root_schema.updated_at_unix_ms);
     builder.set_root_schema_publication_generation(value.root_schema.publication_generation);
+    let mut volume_storage = builder.reborrow().init_replicated_volume_storage();
+    volume_storage.set_address(&value.replicated_volumes.address);
+    volume_storage.set_format_version(value.replicated_volumes.format_version);
+    volume_storage.set_ublk(value.replicated_volumes.ublk);
+    volume_storage.set_accepts_replicas(value.replicated_volumes.accepts_replicas);
+    volume_storage.set_available_bytes(value.replicated_volumes.available_bytes);
+    volume_storage.set_managed_bytes(value.replicated_volumes.managed_bytes);
+    volume_storage.set_updated_at_unix_ms(value.replicated_volumes.updated_at_unix_ms);
+    volume_storage.set_publication_generation(value.replicated_volumes.publication_generation);
     builder.set_membership_incarnation(value.membership.incarnation);
     builder.set_membership_state(match value.membership.state {
         PeerMembershipState::Active => CapnpPeerMembershipState::Active,
@@ -746,6 +760,17 @@ pub(crate) fn read_peer(reader: peer_capnp::Reader<'_>) -> Result<PeerValue, Cap
         reader.get_root_schema_publication_generation(),
     )
     .map_err(CapnpError::failed)?;
+    let volume_storage = reader.get_replicated_volume_storage()?;
+    let replicated_volumes = ReplicatedVolumeSupport {
+        address: volume_storage.get_address()?.to_str()?.to_owned(),
+        format_version: volume_storage.get_format_version(),
+        ublk: volume_storage.get_ublk(),
+        accepts_replicas: volume_storage.get_accepts_replicas(),
+        available_bytes: volume_storage.get_available_bytes(),
+        managed_bytes: volume_storage.get_managed_bytes(),
+        updated_at_unix_ms: volume_storage.get_updated_at_unix_ms(),
+        publication_generation: volume_storage.get_publication_generation(),
+    };
 
     let membership_state = match reader.get_membership_state()? {
         CapnpPeerMembershipState::Active => PeerMembershipState::Active,
@@ -765,6 +790,7 @@ pub(crate) fn read_peer(reader: peer_capnp::Reader<'_>) -> Result<PeerValue, Cap
         readiness,
         labels,
         runtime_support,
+        replicated_volumes,
         root_schema,
         membership: PeerMembership {
             incarnation: reader.get_membership_incarnation(),
@@ -826,6 +852,7 @@ pub struct PeerRootSnapshot {
     pub readiness: NodeReadiness,
     pub labels: PeerLabelState,
     pub runtime_support: RuntimeSupportProfile,
+    pub replicated_volumes: ReplicatedVolumeSupport,
     pub root_schema: RootSchemaInfo,
     pub membership: PeerMembership,
 }
@@ -854,6 +881,7 @@ impl PeerRootSnapshot {
             readiness: value.readiness.clone(),
             labels: value.labels.clone(),
             runtime_support,
+            replicated_volumes: value.replicated_volumes.clone(),
             root_schema: value.root_schema,
             membership: value.membership,
         }
@@ -960,6 +988,7 @@ impl PeerValue {
         let mut readiness: Option<NodeReadiness> = None;
         let mut labels: Option<PeerLabelState> = None;
         let mut runtime_support: Option<RuntimeSupportProfile> = None;
+        let mut replicated_volumes: Option<ReplicatedVolumeSupport> = None;
         let mut root_schema: Option<RootSchemaInfo> = None;
 
         for value in values {
@@ -1033,6 +1062,10 @@ impl PeerValue {
                 runtime_support.as_ref(),
                 Some(&value.runtime_support),
             );
+            replicated_volumes = ReplicatedVolumeSupport::preferred(
+                replicated_volumes.as_ref(),
+                Some(&value.replicated_volumes),
+            );
             root_schema = Some(match root_schema {
                 Some(current) => RootSchemaInfo::merge(current, value.root_schema),
                 None => value.root_schema,
@@ -1052,6 +1085,7 @@ impl PeerValue {
             readiness: readiness.unwrap_or_default(),
             labels: labels.unwrap_or_default(),
             runtime_support: runtime_support.unwrap_or_default(),
+            replicated_volumes: replicated_volumes.unwrap_or_default(),
             root_schema: root_schema.unwrap_or_default(),
             membership: winning_membership,
         })
@@ -1154,6 +1188,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState {
                 schedulable: true,
@@ -1201,6 +1236,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: Default::default(),
@@ -1245,6 +1281,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::syncing(node_id, 10),
@@ -1275,6 +1312,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::ready(node_id, 10),
@@ -1303,6 +1341,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::ready(node_id, 10),
@@ -1331,6 +1370,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::ready(node_id, 10),
@@ -1362,6 +1402,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::ready(node_id, 10),
@@ -1391,6 +1432,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::ready(node_id, 10),
@@ -1420,6 +1462,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::ready(node_id, 10),
@@ -1450,6 +1493,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: NodeReadiness::ready(node_id, 10),
@@ -1504,6 +1548,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: Default::default(),
@@ -1535,6 +1580,7 @@ mod tests {
                 port: 51820,
                 enabled: true,
             }),
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([6u8; 16])),
             readiness: Default::default(),
@@ -1564,6 +1610,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: crate::runtime::types::RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::from_bytes([6u8; 16])),
             readiness: Default::default(),
@@ -1593,6 +1640,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             runtime_support: RuntimeSupportProfile::new(
                 [crate::workload::model::ExecutionPlatform::Oci],
                 [crate::workload::model::IsolationMode::Sandboxed],
@@ -1631,6 +1679,16 @@ mod tests {
                 port: 51820,
                 enabled: true,
             }),
+            replicated_volumes: crate::volumes::replicated::ReplicatedVolumeSupport {
+                address: "10.0.0.8:7578".to_string(),
+                format_version: 1,
+                ublk: true,
+                accepts_replicas: true,
+                available_bytes: 8 << 30,
+                managed_bytes: 2 << 30,
+                updated_at_unix_ms: 1234,
+                publication_generation: 4,
+            },
             scheduling: PeerSchedulingState {
                 schedulable: false,
                 drain_requested: true,

@@ -263,6 +263,7 @@ impl Topology {
             },
             labels: crate::topology::peers::PeerLabelState::default(),
             runtime_support: RuntimeSupportProfile::default(),
+            replicated_volumes: Default::default(),
             root_schema: crate::cluster::RootSchemaInfo::default(),
             membership: PeerMembership::left(incarnation),
         });

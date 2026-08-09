@@ -180,6 +180,7 @@ impl Topology {
             readiness: self.current_readiness_state(),
             labels: self.current_label_state(),
             runtime_support: self.local.runtime_support.clone(),
+            replicated_volumes: self.local.replicated_volume_support.clone(),
             root_schema: self.root_schema_info(),
             membership: PeerMembership::active(self.swim_local_incarnation()),
         })
@@ -350,6 +351,7 @@ impl Topology {
             readiness,
             labels,
             runtime_support: self.local.runtime_support.clone(),
+            replicated_volumes: self.local.replicated_volume_support.clone(),
             root_schema,
             membership: PeerMembership::active(self.swim_local_incarnation()),
         };

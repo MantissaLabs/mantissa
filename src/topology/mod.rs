@@ -23,6 +23,7 @@ use crate::sync::{SyncRunner, SyncTraceContext};
 use crate::token::TokenStore;
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use crate::volumes::VolumeRegistry;
+use crate::volumes::replicated::ReplicatedVolumeSupport;
 use crate::workload::WorkloadRegistry;
 use ::mantissa_health::HealthMonitor;
 use async_channel::{Receiver, Sender};
@@ -155,6 +156,7 @@ pub struct TopologyConfig {
     pub crypto: Keys,
     pub deps: TopologyDependencies,
     pub runtime_support: RuntimeSupportProfile,
+    pub replicated_volume_support: ReplicatedVolumeSupport,
 }
 
 /// Bundles the store handles required to construct and operate a `Topology`.
@@ -202,6 +204,7 @@ impl Topology {
             crypto,
             deps,
             runtime_support,
+            replicated_volume_support,
         } = config;
         let Keys {
             noise_public_key,
@@ -218,6 +221,7 @@ impl Topology {
                 public_key: noise_public_key,
                 signing_key,
                 runtime_support,
+                replicated_volume_support,
             },
             stores,
             runtime: TopologyRuntime {

@@ -75,6 +75,7 @@ impl Topology {
                             ref readiness,
                             ref labels,
                             ref runtime_support,
+                            ref replicated_volumes,
                             root_schema,
                         } => {
                             info!(target: "topology", "Node joined: {id} at {address}");
@@ -105,6 +106,7 @@ impl Topology {
                                 readiness: readiness.as_ref().clone(),
                                 labels: labels.as_ref().clone(),
                                 runtime_support: runtime_support.as_ref().clone(),
+                                replicated_volumes: replicated_volumes.as_ref().clone(),
                                 root_schema,
                                 membership: PeerMembership::active(incarnation),
                             };
@@ -260,6 +262,7 @@ impl Topology {
                             readiness,
                             labels,
                             runtime_support,
+                            replicated_volumes,
                             root_schema,
                         } => {
                             let client = if id == self.local.node.id {
@@ -284,6 +287,7 @@ impl Topology {
                                 readiness,
                                 labels,
                                 runtime_support,
+                                replicated_volumes,
                                 root_schema,
                             }
                         }

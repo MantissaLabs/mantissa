@@ -10,6 +10,7 @@ use x25519_dalek::PublicKey;
 use crate::cluster::{ClusterViewState, RootSchemaState};
 use crate::node::Node;
 use crate::runtime::types::RuntimeSupportProfile;
+use crate::volumes::replicated::ReplicatedVolumeSupport;
 
 #[derive(Clone)]
 pub(super) struct AdvertiseState {
@@ -85,4 +86,7 @@ pub(super) struct LocalNodeState {
 
     /// Cluster-visible runtime support metadata published for this node.
     pub(super) runtime_support: RuntimeSupportProfile,
+
+    /// Replicated-volume listener and pool status published for this node.
+    pub(super) replicated_volume_support: ReplicatedVolumeSupport,
 }

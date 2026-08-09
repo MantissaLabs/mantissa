@@ -8,6 +8,7 @@ use crate::runtime::types::RuntimeSupportProfile;
 use crate::topology::peers::{
     NodeReadiness, PeerLabelState, PeerSchedulingState, WireGuardPeerValue,
 };
+use crate::volumes::replicated::ReplicatedVolumeSupport;
 
 /// Actions to apply to the memberlist.
 ///
@@ -39,6 +40,7 @@ pub enum TopologyEvent {
         readiness: Box<NodeReadiness>,
         labels: Box<PeerLabelState>,
         runtime_support: Box<RuntimeSupportProfile>,
+        replicated_volumes: Box<ReplicatedVolumeSupport>,
         root_schema: RootSchemaInfo,
     },
     Leave {
