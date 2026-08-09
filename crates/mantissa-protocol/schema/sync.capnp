@@ -75,6 +75,12 @@ enum Domain {
 
   clusterOperations @15;
   # Global split/merge operation ledger used to order cluster-view transitions.
+
+  volumePlans @16;
+  # Immutable bootstrap plans for replicated volumes.
+
+  volumeGroupStatuses @17;
+  # Latest reports copied from replicated-volume Raft groups.
 }
 
 struct PageRange {

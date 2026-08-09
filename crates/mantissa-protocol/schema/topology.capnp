@@ -5,6 +5,7 @@ using import "server.capnp".Server;
 using import "info.capnp".Info;
 using import "sync.capnp".Sync;
 using import "health.capnp".NodeStatus;
+using import "volumes.capnp".ReplicatedVolumeStorageStatus;
 
 interface Topology {
   # Topology defines operations to join or leave a
@@ -348,6 +349,9 @@ struct Peer {
 
   readinessActorNodeId @31 :Data;
   # Actor node id used to resolve readiness-state conflicts deterministically.
+
+  replicatedVolumeStorage @32 :ReplicatedVolumeStorageStatus;
+  # Replicated-volume storage currently offered by this node.
 }
 
 struct NodeList {

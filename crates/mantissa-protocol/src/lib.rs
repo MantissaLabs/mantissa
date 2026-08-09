@@ -17,6 +17,7 @@ capnp::generated_code!(pub mod secrets_capnp);
 capnp::generated_code!(pub mod network_capnp);
 capnp::generated_code!(pub mod ingress_capnp);
 capnp::generated_code!(pub mod volumes_capnp);
+capnp::generated_code!(pub mod raft_capnp);
 capnp::generated_code!(pub mod rest_capnp);
 
 // Flatten inner interface modules (e.g., mantissa_protocol::gossip::Client),
@@ -127,6 +128,10 @@ pub mod volumes {
     pub use super::volumes_capnp::volumes;
     pub use super::volumes_capnp::*;
     pub type VolumesClient = super::volumes_capnp::volumes::Client;
+}
+
+pub mod raft {
+    pub use super::raft_capnp::*;
 }
 
 pub mod rest {

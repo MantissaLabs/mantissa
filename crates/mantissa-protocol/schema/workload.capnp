@@ -53,7 +53,7 @@ struct SecretFile {
   mode @2 :UInt32;
   # POSIX file mode, 0 = policy default (0o400, or 0o440 for fsGroup).
 
-  ownership @3 :VolumeSchema.LocalVolumeOwnership;
+  ownership @3 :VolumeSchema.FilesystemOwnership;
   # Ownership policy applied to the staged secret file on the target node.
 
   pathEnvName @4 :Text;
