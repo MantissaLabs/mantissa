@@ -22,13 +22,11 @@ fn local_timer() -> OffsetTime<&'static [FormatItem<'static>]> {
     OffsetTime::new(offset, fmt)
 }
 
-/// Adds the default bollard directive when the user did not configure it.
+/// Adds one built-in dependency directive without making logging initialization fatal.
 ///
-/// The directive string is static, so parse failure would indicate a coding
-/// error. Falling back to the original filter keeps logger initialization
-/// non-fatal.
-fn add_default_bollard_directive(filter: EnvFilter) -> EnvFilter {
-    match "bollard::docker=warn".parse() {
+/// Built-in directives are static, so parse failure would indicate a coding error.
+fn add_default_directive(filter: EnvFilter, directive: &'static str) -> EnvFilter {
+    match directive.parse() {
         Ok(directive) => filter.add_directive(directive),
         Err(_) => filter,
     }
@@ -46,7 +44,13 @@ pub fn init() -> io::Result<()> {
 
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if !rust_log_mentions("bollard") {
-        filter = add_default_bollard_directive(filter);
+        filter = add_default_directive(filter, "bollard::docker=warn");
+    }
+    if !rust_log_mentions("openraft") {
+        // OpenRaft logs its internal retries, including expected peer removal,
+        // as warnings and errors. Mantissa reports actionable failures from
+        // the level reconciler: opt in to OpenRaft internals with RUST_LOG.
+        filter = add_default_directive(filter, "openraft=off");
     }
     let ansi = std::io::stderr().is_terminal();
     let timer = local_timer();
@@ -92,7 +96,10 @@ pub fn init_for_tests() {
     // Default to debug in tests unless overridden.
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     if !rust_log_mentions("bollard") {
-        filter = add_default_bollard_directive(filter);
+        filter = add_default_directive(filter, "bollard::docker=warn");
+    }
+    if !rust_log_mentions("openraft") {
+        filter = add_default_directive(filter, "openraft=off");
     }
 
     let timer = local_timer();
