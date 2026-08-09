@@ -31,7 +31,7 @@ const NODEPORT_FLOW_EVENT_COUNT: u32 = 5;
 const FLOW_EVENT_CREATE: u32 = 0;
 const FLOW_EVENT_CLEAR: u32 = 1;
 const FLOW_EVENT_INVALID_TRANSITION: u32 = 3;
-const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC as u32;
+const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
 #[repr(u32)]
 #[derive(Clone, Copy)]

@@ -41,7 +41,7 @@ const ARP_OPER_REQUEST: u16 = 1;
 const ARP_OPER_REPLY: u16 = 2;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
-const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC as u32;
+const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
 #[map(name = "BRIDGE_TC_INGRESS_STATS")]
 static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
@@ -289,7 +289,7 @@ fn handle_arp(
 /// Select one IPv4 backend for the provided VIP in O(1) by hashing into a precomputed ring.
 fn select_backend_v4(flow: &Flow4, vip: u32) -> Option<NatEntry> {
     let vip_key = VipKey { vip };
-    let config = unsafe { LB_VIPS.get(&vip_key)?.clone() };
+    let config = unsafe { *LB_VIPS.get(&vip_key)? };
     let count = config.backend_count as usize;
     if count == 0 || count > MAX_BACKENDS_PER_VIP {
         return None;
@@ -300,7 +300,7 @@ fn select_backend_v4(flow: &Flow4, vip: u32) -> Option<NatEntry> {
         vip,
         slot: ring_slot,
     };
-    let backend = unsafe { LB_BACKENDS.get(&key)?.clone() };
+    let backend = unsafe { *LB_BACKENDS.get(&key)? };
 
     Some(NatEntry {
         vip,

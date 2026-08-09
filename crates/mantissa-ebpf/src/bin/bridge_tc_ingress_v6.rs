@@ -46,7 +46,7 @@ const ETH_DST_OFFSET: usize = 0;
 const ETH_SRC_OFFSET: usize = 6;
 const IPV6_SRC_OFFSET: usize = net::ETH_HDR_LEN + 8;
 const IPV6_DST_OFFSET: usize = net::ETH_HDR_LEN + 24;
-const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC as u32;
+const SPARSE_MAP_FLAGS: u32 = BPF_F_NO_PREALLOC;
 
 #[map(name = "BRIDGE_TC_INGRESS_STATS")]
 static mut BRIDGE_TC_INGRESS_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries(1, 0);
@@ -275,7 +275,7 @@ fn load_neighbor_target(ctx: &TcContext, l4_offset: usize) -> Result<[u8; 16], (
 /// Select one IPv6 backend for the provided VIP in O(1) by hashing into a precomputed ring.
 fn select_backend_v6(flow: &Flow6, vip: [u8; 16]) -> Option<NatEntry6> {
     let vip_key = VipKey6 { vip };
-    let config = unsafe { LB_VIPS_V6.get(&vip_key)?.clone() };
+    let config = unsafe { *LB_VIPS_V6.get(&vip_key)? };
     let count = config.backend_count as usize;
     if count == 0 || count > MAX_BACKENDS_PER_VIP {
         return None;
@@ -287,7 +287,7 @@ fn select_backend_v6(flow: &Flow6, vip: [u8; 16]) -> Option<NatEntry6> {
         slot: ring_slot,
         _pad: [0u8; 4],
     };
-    let backend = unsafe { LB_BACKENDS_V6.get(&key)?.clone() };
+    let backend = unsafe { *LB_BACKENDS_V6.get(&key)? };
 
     Some(NatEntry6 {
         vip,

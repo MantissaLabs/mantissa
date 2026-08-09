@@ -24,7 +24,7 @@ static mut BRIDGE_XDP_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_en
 #[xdp]
 pub fn bridge_xdp(ctx: XdpContext) -> u32 {
     let frame_len = net::frame_len(ctx.data(), ctx.data_end());
-    let action = match validate_bridge_frame(&ctx) {
+    match validate_bridge_frame(&ctx) {
         Ok(()) => unsafe {
             stats::record_pass(ptr::addr_of_mut!(BRIDGE_XDP_STATS), frame_len);
             xdp_action::XDP_PASS
@@ -33,8 +33,7 @@ pub fn bridge_xdp(ctx: XdpContext) -> u32 {
             stats::record_drop(ptr::addr_of_mut!(BRIDGE_XDP_STATS), frame_len);
             xdp_action::XDP_DROP
         },
-    };
-    action
+    }
 }
 
 fn validate_bridge_frame(ctx: &XdpContext) -> Result<(), ()> {

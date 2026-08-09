@@ -24,7 +24,7 @@ static mut VXLAN_STATS: PerCpuArray<PacketStats> = PerCpuArray::with_max_entries
 #[xdp]
 pub fn vxlan_xdp(ctx: XdpContext) -> u32 {
     let frame_len = net::frame_len(ctx.data(), ctx.data_end());
-    let action = match validate_vxlan(&ctx) {
+    match validate_vxlan(&ctx) {
         Ok(()) => unsafe {
             stats::record_pass(ptr::addr_of_mut!(VXLAN_STATS), frame_len);
             xdp_action::XDP_PASS
@@ -33,8 +33,7 @@ pub fn vxlan_xdp(ctx: XdpContext) -> u32 {
             stats::record_drop(ptr::addr_of_mut!(VXLAN_STATS), frame_len);
             xdp_action::XDP_DROP
         },
-    };
-    action
+    }
 }
 
 fn validate_vxlan(ctx: &XdpContext) -> Result<(), ()> {
