@@ -3,6 +3,7 @@ use crate::scheduler::summary::{SchedulerGpuState, SchedulerSlotState, Scheduler
 use crate::services::types::{ServiceSpecValue, ServiceStatus};
 use crate::topology::Topology;
 use crate::topology::builders::{DrainStatusState, NodeDrainStatusSnapshot};
+use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::types::VolumeDriver;
 use crate::workload::model::{WorkloadPhase, WorkloadValue};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,42 @@ struct LocalVolumeDrainBlocker {
 struct DrainCapacityCandidate {
     slots: Vec<SlotCapacity>,
     free_gpus: u32,
+}
+
+/// Active work that still belongs to a node being drained.
+struct RemainingDrainWork {
+    service_tasks: Vec<WorkloadValue>,
+    standalone_task_count: u32,
+    local_volume_blockers: Vec<LocalVolumeDrainBlocker>,
+    replicated_volume_copies: u32,
+}
+
+impl RemainingDrainWork {
+    /// Returns the number of service tasks that have not moved yet.
+    fn service_task_count(&self) -> u32 {
+        self.service_tasks.len() as u32
+    }
+}
+
+/// Scheduler reservations that have not been released on a draining node.
+struct DrainReservations {
+    known: bool,
+    slots: u32,
+    gpus: u32,
+}
+
+/// Cluster conditions that currently prevent service tasks from moving.
+struct DrainBlockers {
+    rollout: Option<String>,
+    replacement: Option<String>,
+    capacity: Option<String>,
+}
+
+impl DrainBlockers {
+    /// Returns true when service reconciliation cannot move the remaining tasks.
+    fn has_any(&self) -> bool {
+        self.rollout.is_some() || self.replacement.is_some() || self.capacity.is_some()
+    }
 }
 
 impl DrainCapacityCandidate {
@@ -96,6 +133,30 @@ impl DrainCapacityCandidate {
 }
 
 impl Topology {
+    /// Counts ready replicated-volume copies that must move before one node is drained.
+    fn replicated_volume_copies_on_node(&self, node_id: Uuid) -> Result<u32, capnp::Error> {
+        let specs = self
+            .deps
+            .volume_registry
+            .list_specs()
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        let mut count = 0_u32;
+        for spec in specs.into_iter().filter(|spec| spec.driver.is_replicated()) {
+            let Some(plan) = self
+                .deps
+                .volume_registry
+                .get_plan(spec.id)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?
+            else {
+                continue;
+            };
+            if plan.replica_node_ids.contains(&node_id) {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
     /// Collects non-terminal task rows currently assigned to the provided node id.
     ///
     /// Drain validation uses the replicated workload store directly so blockers are determined from
@@ -202,6 +263,20 @@ impl Topology {
             .any(|peer_id| self.deps.registry.peer_schedulable(peer_id))
     }
 
+    /// Indexes current service definitions by name for drain checks.
+    fn service_specs_by_name(&self) -> Result<HashMap<String, ServiceSpecValue>, capnp::Error> {
+        self.deps
+            .service_registry
+            .list()
+            .map_err(|error| capnp::Error::failed(error.to_string()))
+            .map(|services| {
+                services
+                    .into_iter()
+                    .map(|spec| (spec.service_name.clone(), spec))
+                    .collect()
+            })
+    }
+
     /// Rejects drain requests that the current service/task control plane cannot evacuate safely.
     ///
     /// Milestone 2 supports service-managed evacuation only. Standalone tasks, orphaned service
@@ -237,15 +312,7 @@ impl Topology {
             )));
         }
 
-        let services = self
-            .deps
-            .service_registry
-            .list()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let service_by_name: HashMap<_, _> = services
-            .into_iter()
-            .map(|spec| (spec.service_name.clone(), spec))
-            .collect();
+        let service_by_name = self.service_specs_by_name()?;
 
         let mut affected_services = HashSet::new();
         for task in &active_tasks {
@@ -416,6 +483,109 @@ impl Topology {
         None
     }
 
+    /// Collects the tasks, local-volume blockers, and replica copies left on one node.
+    fn remaining_drain_work(&self, node_id: Uuid) -> Result<RemainingDrainWork, capnp::Error> {
+        let active_tasks = self.active_task_values_on_node(node_id)?;
+        let local_volume_blockers = self.local_volume_drain_blockers(node_id, &active_tasks)?;
+        let replicated_volume_copies = self.replicated_volume_copies_on_node(node_id)?;
+        let (service_tasks, standalone_tasks): (Vec<_>, Vec<_>) = active_tasks
+            .into_iter()
+            .partition(|task| task.service_owner().is_some());
+
+        Ok(RemainingDrainWork {
+            service_tasks,
+            standalone_task_count: standalone_tasks.len() as u32,
+            local_volume_blockers,
+            replicated_volume_copies,
+        })
+    }
+
+    /// Finds conditions that prevent service tasks from moving off one draining node.
+    async fn drain_blockers(
+        &self,
+        node_id: Uuid,
+        work: &RemainingDrainWork,
+    ) -> Result<DrainBlockers, capnp::Error> {
+        let service_by_name = self.service_specs_by_name()?;
+        let rollout = self.drain_rollout_blocker(&work.service_tasks, &service_by_name);
+        let replacement =
+            if work.service_tasks.is_empty() || self.has_schedulable_replacement_node(node_id) {
+                None
+            } else {
+                Some(format!(
+                    "node {node_id} has active service tasks but no schedulable replacement node"
+                ))
+            };
+        let capacity =
+            if work.service_tasks.is_empty() || rollout.is_some() || replacement.is_some() {
+                None
+            } else {
+                self.drain_capacity_blocker(node_id, &work.service_tasks)
+                    .await
+            };
+
+        Ok(DrainBlockers {
+            rollout,
+            replacement,
+            capacity,
+        })
+    }
+
+    /// Reads the scheduler reservations still held by one draining node.
+    async fn drain_reservations(&self, node_id: Uuid) -> DrainReservations {
+        match self.scheduler_summary_for_node(node_id, true).await {
+            Ok(summary) => DrainReservations {
+                known: true,
+                slots: summary.reserved_slots,
+                gpus: summary.gpu_reserved,
+            },
+            Err(error) => {
+                warn!(
+                    target: "topology",
+                    node_id = %node_id,
+                    "failed to fetch scheduler summary for drain status: {error}"
+                );
+                DrainReservations {
+                    known: false,
+                    slots: 0,
+                    gpus: 0,
+                }
+            }
+        }
+    }
+
+    /// Chooses the first useful operator message for the current drain state.
+    fn drain_status_message(
+        node_id: Uuid,
+        state: DrainStatusState,
+        work: &RemainingDrainWork,
+        blockers: &DrainBlockers,
+        reservations: &DrainReservations,
+    ) -> String {
+        if !work.local_volume_blockers.is_empty() {
+            return Self::local_volume_drain_message(node_id, &work.local_volume_blockers);
+        }
+        if work.standalone_task_count > 0 {
+            return format!(
+                "drain blocked by {} active standalone task(s)",
+                work.standalone_task_count
+            );
+        }
+        if let Some(message) = blockers
+            .rollout
+            .as_ref()
+            .or(blockers.replacement.as_ref())
+            .or(blockers.capacity.as_ref())
+        {
+            return message.clone();
+        }
+        if state == DrainStatusState::Drained {
+            return "node drained".to_string();
+        }
+
+        drain_waiting_message(work, reservations)
+    }
+
     /// Derives the operator-facing drain progress snapshot for one node from converged cluster state.
     pub(super) async fn build_node_drain_status(
         &self,
@@ -428,140 +598,14 @@ impl Topology {
             .ok_or_else(|| capnp::Error::failed(format!("unknown node {node_id}")))?;
         let scheduling = peer.scheduling;
         if !scheduling.drain_requested {
-            let state = if scheduling.schedulable {
-                DrainStatusState::Open
-            } else {
-                DrainStatusState::Fenced
-            };
-            let message = if scheduling.schedulable {
-                "node is schedulable".to_string()
-            } else {
-                "node is unschedulable without an active drain request".to_string()
-            };
-
-            return Ok(NodeDrainStatusSnapshot {
-                node_id,
-                schedulable: scheduling.schedulable,
-                drain_requested: scheduling.drain_requested,
-                task_stop_timeout_secs: scheduling.drain_task_stop_timeout_secs,
-                state,
-                remaining_service_tasks: 0,
-                blocking_standalone_tasks: 0,
-                remaining_reserved_slots: 0,
-                remaining_reserved_gpus: 0,
-                scheduler_summary_known: true,
-                reason: scheduling.reason,
-                message,
-                last_scheduling_error: None,
-            });
+            return Ok(drain_status_without_request(node_id, scheduling));
         }
 
-        let active_tasks = self.active_task_values_on_node(node_id)?;
-        let local_volume_blockers = self.local_volume_drain_blockers(node_id, &active_tasks)?;
-        let blocking_standalone_tasks = active_tasks
-            .iter()
-            .filter(|task| task.service_owner().is_none())
-            .count() as u32;
-        let service_tasks: Vec<WorkloadValue> = active_tasks
-            .iter()
-            .filter(|task| task.service_owner().is_some())
-            .cloned()
-            .collect();
-        let remaining_service_tasks = service_tasks.len() as u32;
-
-        let services = self
-            .deps
-            .service_registry
-            .list()
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let service_by_name: HashMap<_, _> = services
-            .into_iter()
-            .map(|spec| (spec.service_name.clone(), spec))
-            .collect();
-
-        let rollout_blocker = self.drain_rollout_blocker(&service_tasks, &service_by_name);
-        let replacement_blocker =
-            if remaining_service_tasks > 0 && !self.has_schedulable_replacement_node(node_id) {
-                Some(format!(
-                    "node {node_id} has active service tasks but no schedulable replacement node"
-                ))
-            } else {
-                None
-            };
-        let capacity_blocker = if scheduling.drain_requested
-            && remaining_service_tasks > 0
-            && rollout_blocker.is_none()
-            && replacement_blocker.is_none()
-        {
-            self.drain_capacity_blocker(node_id, &service_tasks).await
-        } else {
-            None
-        };
-
-        let (scheduler_summary_known, remaining_reserved_slots, remaining_reserved_gpus) =
-            match self.scheduler_summary_for_node(node_id, true).await {
-                Ok(summary) => (true, summary.reserved_slots, summary.gpu_reserved),
-                Err(err) => {
-                    warn!(
-                        target: "topology",
-                        node_id = %node_id,
-                        "failed to fetch scheduler summary for drain status: {err}"
-                    );
-                    (false, 0, 0)
-                }
-            };
-
-        let state = if !local_volume_blockers.is_empty()
-            || blocking_standalone_tasks > 0
-            || rollout_blocker.is_some()
-            || replacement_blocker.is_some()
-            || capacity_blocker.is_some()
-        {
-            DrainStatusState::Blocked
-        } else if scheduler_summary_known
-            && remaining_service_tasks == 0
-            && remaining_reserved_slots == 0
-            && remaining_reserved_gpus == 0
-        {
-            DrainStatusState::Drained
-        } else {
-            DrainStatusState::Draining
-        };
-
-        let message = if !local_volume_blockers.is_empty() {
-            Self::local_volume_drain_message(node_id, &local_volume_blockers)
-        } else if blocking_standalone_tasks > 0 {
-            format!("drain blocked by {blocking_standalone_tasks} active standalone task(s)")
-        } else if let Some(message) = rollout_blocker.as_ref() {
-            message.clone()
-        } else if let Some(message) = replacement_blocker.as_ref() {
-            message.clone()
-        } else if let Some(message) = capacity_blocker.as_ref() {
-            message.clone()
-        } else if state == DrainStatusState::Drained {
-            "node drained".to_string()
-        } else {
-            let mut parts = Vec::new();
-            if remaining_service_tasks > 0 {
-                parts.push(format!("{remaining_service_tasks} service task(s)"));
-            }
-            if scheduler_summary_known {
-                if remaining_reserved_slots > 0 {
-                    parts.push(format!("{remaining_reserved_slots} slot reservation(s)"));
-                }
-                if remaining_reserved_gpus > 0 {
-                    parts.push(format!("{remaining_reserved_gpus} gpu reservation(s)"));
-                }
-            } else {
-                parts.push("scheduler reservations unavailable".to_string());
-            }
-
-            if parts.is_empty() {
-                "drain requested; waiting for cluster convergence".to_string()
-            } else {
-                format!("waiting for {} to clear", join_human_list(&parts))
-            }
-        };
+        let work = self.remaining_drain_work(node_id)?;
+        let blockers = self.drain_blockers(node_id, &work).await?;
+        let reservations = self.drain_reservations(node_id).await;
+        let state = drain_status_state(&work, &blockers, &reservations);
+        let message = Self::drain_status_message(node_id, state, &work, &blockers, &reservations);
 
         Ok(NodeDrainStatusSnapshot {
             node_id,
@@ -569,15 +613,101 @@ impl Topology {
             drain_requested: scheduling.drain_requested,
             task_stop_timeout_secs: scheduling.drain_task_stop_timeout_secs,
             state,
-            remaining_service_tasks,
-            blocking_standalone_tasks,
-            remaining_reserved_slots,
-            remaining_reserved_gpus,
-            scheduler_summary_known,
+            remaining_service_tasks: work.service_task_count(),
+            blocking_standalone_tasks: work.standalone_task_count,
+            remaining_reserved_slots: reservations.slots,
+            remaining_reserved_gpus: reservations.gpus,
+            scheduler_summary_known: reservations.known,
             reason: scheduling.reason,
             message,
-            last_scheduling_error: capacity_blocker,
+            last_scheduling_error: blockers.capacity,
         })
+    }
+}
+
+/// Builds the complete status for a node that has no active drain request.
+fn drain_status_without_request(
+    node_id: Uuid,
+    scheduling: PeerSchedulingState,
+) -> NodeDrainStatusSnapshot {
+    let (state, message) = if scheduling.schedulable {
+        (DrainStatusState::Open, "node is schedulable".to_string())
+    } else {
+        (
+            DrainStatusState::Fenced,
+            "node is unschedulable without an active drain request".to_string(),
+        )
+    };
+
+    NodeDrainStatusSnapshot {
+        node_id,
+        schedulable: scheduling.schedulable,
+        drain_requested: scheduling.drain_requested,
+        task_stop_timeout_secs: scheduling.drain_task_stop_timeout_secs,
+        state,
+        remaining_service_tasks: 0,
+        blocking_standalone_tasks: 0,
+        remaining_reserved_slots: 0,
+        remaining_reserved_gpus: 0,
+        scheduler_summary_known: true,
+        reason: scheduling.reason,
+        message,
+        last_scheduling_error: None,
+    }
+}
+
+/// Derives the drain state from the work, blockers, and reservations still present.
+fn drain_status_state(
+    work: &RemainingDrainWork,
+    blockers: &DrainBlockers,
+    reservations: &DrainReservations,
+) -> DrainStatusState {
+    if !work.local_volume_blockers.is_empty()
+        || work.standalone_task_count > 0
+        || blockers.has_any()
+    {
+        DrainStatusState::Blocked
+    } else if reservations.known
+        && work.service_tasks.is_empty()
+        && reservations.slots == 0
+        && reservations.gpus == 0
+        && work.replicated_volume_copies == 0
+    {
+        DrainStatusState::Drained
+    } else {
+        DrainStatusState::Draining
+    }
+}
+
+/// Explains which remaining work must clear before a node is fully drained.
+fn drain_waiting_message(work: &RemainingDrainWork, reservations: &DrainReservations) -> String {
+    let mut parts = Vec::new();
+    if work.service_task_count() > 0 {
+        parts.push(format!("{} service task(s)", work.service_task_count()));
+    }
+    if work.replicated_volume_copies > 0 {
+        let name = if work.replicated_volume_copies == 1 {
+            "replicated volume copy"
+        } else {
+            "replicated volume copies"
+        };
+        parts.push(format!("{} {name}", work.replicated_volume_copies));
+    }
+    if reservations.known {
+        if reservations.slots > 0 {
+            parts.push(format!("{} slot reservation(s)", reservations.slots));
+        }
+        if reservations.gpus > 0 {
+            parts.push(format!("{} gpu reservation(s)", reservations.gpus));
+        }
+    } else {
+        parts.push("scheduler reservations unavailable".to_string());
+    }
+
+    if parts.is_empty() {
+        "drain requested; waiting for cluster convergence".to_string()
+    } else {
+        format!("waiting for {} to clear", join_human_list(&parts))
     }
 }
 
