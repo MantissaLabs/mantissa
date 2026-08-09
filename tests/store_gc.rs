@@ -35,9 +35,8 @@ use mantissa::store::replicated::workloads::{
     WorkloadRegAdapter, WorkloadStore, open_workload_store,
 };
 use mantissa::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    FilesystemOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
     VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
-    VolumeStatus,
 };
 use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadStoreValue, WorkloadValue,
@@ -370,11 +369,11 @@ fn secret_master_key_current_value(key_id: Uuid, generation: u64) -> SecretMaste
     })
 }
 
-/// Builds one volume spec value whose phase ordering advances with `version`.
-fn volume_spec_value(name: &str, version: u64, status: VolumeStatus) -> VolumeSpecValue {
+/// Builds one volume spec value whose generation ordering advances with `version`.
+fn volume_spec_value(name: &str, version: u64) -> VolumeSpecValue {
     let mut value = VolumeSpecValue::new(VolumeSpecDraft {
         name: name.to_string(),
-        driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
+        driver: VolumeDriver::Local(LocalVolumeSpec::managed(FilesystemOwnership::Daemon)),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
         reclaim_policy: VolumeReclaimPolicy::Retain,
@@ -384,8 +383,6 @@ fn volume_spec_value(name: &str, version: u64, status: VolumeStatus) -> VolumeSp
         bound_node_name: Some(format!("node-{version}")),
     });
     value.volume_epoch = version;
-    value.phase_version = version;
-    value.status = status;
     value.updated_at = format!("2026-04-27T00:09:{:02}Z", version % 60);
     value
 }
@@ -802,12 +799,10 @@ local_test!(store_compaction_rankers_cover_all_replicated_domains, {
 
     assert_compacts_to_one_value!(
         VolumeSpecRegAdapter,
-        volume_spec_value("gc-volume", 1, VolumeStatus::Pending),
-        volume_spec_value("gc-volume", 2, VolumeStatus::Ready),
+        volume_spec_value("gc-volume", 1),
+        volume_spec_value("gc-volume", 2),
         |retained: VolumeSpecValue| {
-            assert_eq!(retained.phase_version, 2);
             assert_eq!(retained.volume_epoch, 2);
-            assert_eq!(retained.status, VolumeStatus::Ready);
         }
     );
 

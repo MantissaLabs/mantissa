@@ -65,7 +65,7 @@ local_test!(services_gossip_propagates_across_peers, {
                         path: "/run/secrets/demo-service-secret".into(),
                         secret: secret_ref.clone(),
                         mode: Some(0o440),
-                        ownership: mantissa::volumes::types::LocalVolumeOwnership::Daemon,
+                        ownership: mantissa::volumes::types::FilesystemOwnership::Daemon,
                         path_env_name: None,
                     }],
                     ..empty_service_execution("ghcr.io/mantissa/demo:web")
@@ -164,7 +164,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
                 path: "/run/secrets/ack-demo-secret".into(),
                 secret: secret_ref,
                 mode: Some(0o440),
-                ownership: mantissa::volumes::types::LocalVolumeOwnership::Daemon,
+                ownership: mantissa::volumes::types::FilesystemOwnership::Daemon,
                 path_env_name: None,
             }],
             ..empty_service_execution("ghcr.io/mantissa/demo:web")
@@ -430,7 +430,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                         path: "/run/secrets/capacity-secret".into(),
                         secret: secret_ref,
                         mode: Some(0o440),
-                        ownership: mantissa::volumes::types::LocalVolumeOwnership::Daemon,
+                        ownership: mantissa::volumes::types::FilesystemOwnership::Daemon,
                         path_env_name: None,
                     }],
                     ..empty_service_execution("ghcr.io/mantissa/demo:web")

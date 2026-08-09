@@ -36,11 +36,14 @@ use mantissa::store::replicated::secret_key_sync::{
 };
 use mantissa::store::replicated::secrets::open_secret_store;
 use mantissa::store::replicated::services::open_service_store;
-use mantissa::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
+use mantissa::store::replicated::volumes::{
+    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
+    open_volume_node_store, open_volume_spec_store,
+};
 use mantissa::store::replicated::workloads::open_workload_store;
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
 use mantissa::volumes::VolumeRegistry;
-use mantissa::volumes::types::LocalVolumeOwnership;
+use mantissa::volumes::types::FilesystemOwnership;
 use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
 use mantissa::workload::types::ResolvedExecutionSpec;
@@ -360,7 +363,25 @@ async fn setup_workload_manager() -> TestHarness {
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume node store");
-    let volume_registry = VolumeRegistry::new(volume_spec_store, volume_node_store);
+    let volume_plan_store = open_replicated_volume_plan_store(volume_db.clone(), actor)
+        .expect("open volume plan store");
+    volume_plan_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume plan store");
+    let volume_group_status_store =
+        open_replicated_volume_group_status_store(volume_db.clone(), actor)
+            .expect("open volume group status store");
+    volume_group_status_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume group status store");
+    let volume_registry = VolumeRegistry::new(
+        volume_spec_store,
+        volume_node_store,
+        volume_plan_store,
+        volume_group_status_store,
+    );
 
     let master_dir = tempdir().expect("master tempdir");
     let master_path = master_dir
@@ -413,6 +434,7 @@ async fn setup_workload_manager() -> TestHarness {
         ),
         network_controller: None,
         volume_registry,
+        replicated_volume_runtime: None,
         secret_registry: secret_registry.clone(),
         secret_keyring: secret_keyring_arc.clone(),
         forwarding_events: None,
@@ -515,11 +537,11 @@ local_test!(workload_manager_stages_secret_env_and_files, {
                     #[cfg(unix)]
                     {
                         let (uid, gid) = current_process_ids();
-                        LocalVolumeOwnership::User { uid, gid }
+                        FilesystemOwnership::User { uid, gid }
                     }
                     #[cfg(not(unix))]
                     {
-                        LocalVolumeOwnership::Daemon
+                        FilesystemOwnership::Daemon
                     }
                 },
                 path_env_name: Some("DB_PASSWORD_FILE".into()),

@@ -1327,6 +1327,7 @@ pub(crate) async fn create_restartable_service_node(
             store_gc_config: None,
             service_timing: None,
             runtime_health: None,
+            replicated_volumes: None,
         },
     )
     .await
@@ -2141,18 +2142,18 @@ pub(crate) fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<Task
                             },
                             mode: file.mode,
                             ownership: match &file.ownership {
-                                mantissa_client::volumes::LocalVolumeOwnership::Daemon => {
-                                    mantissa::volumes::types::LocalVolumeOwnership::Daemon
+                                mantissa_client::volumes::FilesystemOwnership::Daemon => {
+                                    mantissa::volumes::types::FilesystemOwnership::Daemon
                                 }
-                                mantissa_client::volumes::LocalVolumeOwnership::User {
+                                mantissa_client::volumes::FilesystemOwnership::User {
                                     uid,
                                     gid,
-                                } => mantissa::volumes::types::LocalVolumeOwnership::User {
+                                } => mantissa::volumes::types::FilesystemOwnership::User {
                                     uid: *uid,
                                     gid: *gid,
                                 },
-                                mantissa_client::volumes::LocalVolumeOwnership::FsGroup { gid } => {
-                                    mantissa::volumes::types::LocalVolumeOwnership::FsGroup {
+                                mantissa_client::volumes::FilesystemOwnership::FsGroup { gid } => {
+                                    mantissa::volumes::types::FilesystemOwnership::FsGroup {
                                         gid: *gid,
                                     }
                                 }
