@@ -22,7 +22,10 @@ use mantissa::store::replicated::scheduler_digests::open_scheduler_digest_store;
 use mantissa::store::replicated::secret_key_sync::open_secret_master_key_store;
 use mantissa::store::replicated::secrets::open_secret_store;
 use mantissa::store::replicated::services::open_service_store;
-use mantissa::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
+use mantissa::store::replicated::volumes::{
+    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
+    open_volume_node_store, open_volume_spec_store,
+};
 use mantissa::store::replicated::workloads::open_workload_store;
 use mantissa_protocol::sync::Domain;
 use tempfile::TempDir;
@@ -191,6 +194,10 @@ async fn open_registry(actor: Uuid) -> (TempDir, ReplicatedStoreRegistry) {
             .expect("open cluster operation store"),
         volumes: open_volume_spec_store(db.clone(), actor).expect("open volume specs store"),
         volume_nodes: open_volume_node_store(db.clone(), actor).expect("open volume nodes store"),
+        volume_plans: open_replicated_volume_plan_store(db.clone(), actor)
+            .expect("open volume plans store"),
+        volume_group_statuses: open_replicated_volume_group_status_store(db.clone(), actor)
+            .expect("open volume group statuses store"),
         ingress_pools: open_ingress_pool_store(db.clone(), actor).expect("open ingress pool store"),
         scheduler_digests: open_scheduler_digest_store(db, actor)
             .expect("open scheduler digest store"),

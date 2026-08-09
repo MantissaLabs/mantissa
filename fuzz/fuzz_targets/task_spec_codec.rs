@@ -6,7 +6,7 @@ use capnp::message::ReaderOptions;
 use libfuzzer_sys::fuzz_target;
 use mantissa::task::service::{read_spec, write_spec};
 use mantissa::task::types::TaskSpec;
-use mantissa::volumes::types::LocalVolumeOwnership;
+use mantissa::volumes::types::FilesystemOwnership;
 use mantissa::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable, WorkloadPhase,
     WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
@@ -271,14 +271,14 @@ impl TaskSpecInput {
     }
 
     /// Builds an ownership policy for secret file permissions.
-    fn ownership(&self, idx: usize) -> LocalVolumeOwnership {
+    fn ownership(&self, idx: usize) -> FilesystemOwnership {
         match self.numbers[idx % self.numbers.len()] % 3 {
-            0 => LocalVolumeOwnership::Daemon,
-            1 => LocalVolumeOwnership::User {
+            0 => FilesystemOwnership::Daemon,
+            1 => FilesystemOwnership::User {
                 uid: bounded_u32(self.numbers[4], u32::MAX),
                 gid: bounded_u32(self.numbers[5], u32::MAX),
             },
-            _ => LocalVolumeOwnership::FsGroup {
+            _ => FilesystemOwnership::FsGroup {
                 gid: bounded_u32(self.numbers[6], u32::MAX),
             },
         }

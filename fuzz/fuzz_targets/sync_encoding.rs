@@ -459,7 +459,7 @@ fn assert_frontiers_equal(
 
 /// Maps arbitrary domain tags onto known sync domains.
 fn domain(tag: u8) -> sync_capnp::Domain {
-    match tag % 14 {
+    match tag % 18 {
         0 => sync_capnp::Domain::Peers,
         1 => sync_capnp::Domain::Workloads,
         2 => sync_capnp::Domain::Services,
@@ -473,7 +473,11 @@ fn domain(tag: u8) -> sync_capnp::Domain {
         10 => sync_capnp::Domain::SchedulerDigests,
         11 => sync_capnp::Domain::Jobs,
         12 => sync_capnp::Domain::Agents,
-        _ => sync_capnp::Domain::SecretMasterKeys,
+        13 => sync_capnp::Domain::SecretMasterKeys,
+        14 => sync_capnp::Domain::IngressPools,
+        15 => sync_capnp::Domain::ClusterOperations,
+        16 => sync_capnp::Domain::VolumePlans,
+        _ => sync_capnp::Domain::VolumeGroupStatuses,
     }
 }
 

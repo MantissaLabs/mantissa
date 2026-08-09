@@ -14,9 +14,9 @@ use mantissa::store::replicated::cluster_views::{
     ClusterNameRecord, ClusterNodeCountRecord, ClusterViewMetadataRecord,
 };
 use mantissa::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-    VolumeLabel, VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft,
-    VolumeSpecValue,
+    DesiredVolumeDisposition, FilesystemOwnership, LocalVolumeSpec, VolumeAccessMode,
+    VolumeBindingMode, VolumeDriver, VolumeLabel, VolumeNodeState, VolumeNodeStateValue,
+    VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::BTreeMap;
@@ -168,11 +168,11 @@ fn assert_volume_values_roundtrip(input: &InfraInput) {
     let local_spec = if flag(input.flags, 12) {
         LocalVolumeSpec::imported_path(format!("/var/lib/mantissa/{}", token("vol", &input.text)))
     } else if flag(input.flags, 13) {
-        LocalVolumeSpec::managed(LocalVolumeOwnership::FsGroup {
+        LocalVolumeSpec::managed(FilesystemOwnership::FsGroup {
             gid: input.numbers[0] as u32,
         })
     } else {
-        LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)
+        LocalVolumeSpec::managed(FilesystemOwnership::Daemon)
     };
 
     let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
@@ -197,13 +197,13 @@ fn assert_volume_values_roundtrip(input: &InfraInput) {
         bound_node_id: flag(input.flags, 0).then_some(uuid(input.seed, 20)),
         bound_node_name: optional_text(input.flags, 1, "node", &input.other_text),
     });
-    spec.status = volume_status(input.flags);
     spec.volume_epoch = input.numbers[2];
-    spec.phase_version = input.numbers[3];
+    spec.lifecycle.revision = input.numbers[3];
+    spec.lifecycle.disposition = volume_disposition(input.flags);
+    spec.lifecycle.remove_data = spec.lifecycle.disposition == DesiredVolumeDisposition::Deleted
+        && flag(input.flags, 2);
     spec.created_at = timestamp(input.numbers[4]);
     spec.updated_at = timestamp(input.numbers[5]);
-    spec.reason = optional_text(input.flags, 2, "reason", &input.text);
-    spec.message = optional_text(input.flags, 3, "message", &input.other_text);
 
     let mut state = VolumeNodeStateValue::new(
         spec.id,
@@ -369,15 +369,12 @@ fn bpf_attach_point(flags: u16) -> BpfAttachPoint {
     }
 }
 
-/// Maps generated flags to one volume status.
-fn volume_status(flags: u16) -> mantissa::volumes::types::VolumeStatus {
-    match (flags >> 9) % 6 {
-        0 => mantissa::volumes::types::VolumeStatus::Pending,
-        1 => mantissa::volumes::types::VolumeStatus::Bound,
-        2 => mantissa::volumes::types::VolumeStatus::Ready,
-        3 => mantissa::volumes::types::VolumeStatus::InUse,
-        4 => mantissa::volumes::types::VolumeStatus::Deleting,
-        _ => mantissa::volumes::types::VolumeStatus::Failed,
+/// Maps generated flags to one desired volume disposition.
+fn volume_disposition(flags: u16) -> DesiredVolumeDisposition {
+    match (flags >> 9) % 3 {
+        0 => DesiredVolumeDisposition::Live,
+        1 => DesiredVolumeDisposition::Retained,
+        _ => DesiredVolumeDisposition::Deleted,
     }
 }
 
