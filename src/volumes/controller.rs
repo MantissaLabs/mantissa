@@ -13,7 +13,7 @@ use crate::gossip::Message;
 use super::local::ensure_local_volume_path;
 use super::registry::VolumeRegistry;
 use super::types::{
-    VolumeDriver, VolumeEvent, VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue, VolumeStatus,
+    VolumeDriver, VolumeEvent, VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue,
 };
 use async_channel::Sender;
 
@@ -63,7 +63,7 @@ impl VolumeController {
 
     /// Ensures every local-driver volume bound to this node has a realized node-state row.
     pub async fn reconcile_local_volumes(&self) -> Result<()> {
-        let specs = self.registry.list_specs()?;
+        let specs = self.registry.list_reconcilable_specs()?;
         for spec in specs {
             if spec.bound_node_id != Some(self.local_node_id) {
                 continue;
@@ -77,7 +77,7 @@ impl VolumeController {
     }
 
     /// Materializes one local-driver volume and reports readiness or error through the node-state row.
-    async fn reconcile_one_local_volume(&self, mut spec: VolumeSpecValue) -> Result<()> {
+    async fn reconcile_one_local_volume(&self, spec: VolumeSpecValue) -> Result<()> {
         let Some(current_spec) = self.registry.get_spec_including_deleting(spec.id)? else {
             return Ok(());
         };
@@ -87,7 +87,7 @@ impl VolumeController {
         {
             return Ok(());
         }
-        spec = current_spec;
+        let spec = current_spec;
 
         let current = self
             .registry
@@ -130,17 +130,6 @@ impl VolumeController {
                     self.upsert_node_state_if_changed(&desired, &current)
                         .await?;
 
-                    if spec.status != VolumeStatus::Failed
-                        || spec.reason.as_deref() != Some("capacity_exceeded")
-                        || spec.message.as_deref() != Some(message.as_str())
-                    {
-                        spec.status = VolumeStatus::Failed;
-                        spec.phase_version = spec.phase_version.saturating_add(1);
-                        spec.reason = Some("capacity_exceeded".to_string());
-                        spec.message = Some(message);
-                        spec.updated_at = Utc::now().to_rfc3339();
-                        self.upsert_spec(spec).await?;
-                    }
                     return Ok(());
                 }
 
@@ -153,18 +142,6 @@ impl VolumeController {
                 desired.updated_at = Utc::now().to_rfc3339();
                 self.upsert_node_state_if_changed(&desired, &current)
                     .await?;
-
-                if matches!(
-                    spec.status,
-                    VolumeStatus::Pending | VolumeStatus::Bound | VolumeStatus::Failed
-                ) {
-                    spec.status = VolumeStatus::Ready;
-                    spec.phase_version = spec.phase_version.saturating_add(1);
-                    spec.reason = None;
-                    spec.message = Some("local volume realized".to_string());
-                    spec.updated_at = Utc::now().to_rfc3339();
-                    self.upsert_spec(spec).await?;
-                }
             }
             Err(err) => {
                 let mut desired = current;
@@ -172,33 +149,9 @@ impl VolumeController {
                 desired.last_error = Some(err.to_string());
                 desired.updated_at = Utc::now().to_rfc3339();
                 self.upsert_node_state(desired).await?;
-
-                if spec.status != VolumeStatus::Failed
-                    || spec.reason.as_deref() != Some("local_realization_failed")
-                {
-                    spec.status = VolumeStatus::Failed;
-                    spec.phase_version = spec.phase_version.saturating_add(1);
-                    spec.reason = Some("local_realization_failed".to_string());
-                    spec.message = Some(err.to_string());
-                    spec.updated_at = Utc::now().to_rfc3339();
-                    self.upsert_spec(spec).await?;
-                }
             }
         }
 
-        Ok(())
-    }
-
-    /// Stores and broadcasts one canonical volume spec update.
-    async fn upsert_spec(&self, spec: VolumeSpecValue) -> Result<()> {
-        self.registry.upsert_spec(spec.clone()).await?;
-        self.gossip_tx
-            .send(Message::Volume {
-                id: Uuid::new_v4(),
-                event: VolumeEvent::Upsert(Box::new(spec)),
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to enqueue volume spec gossip: {err}"))?;
         Ok(())
     }
 
@@ -264,10 +217,13 @@ fn capacity_exceeded_message(volume_name: &str, used_bytes: u64, capacity_bytes:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
+    use crate::store::replicated::volumes::{
+        open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
+        open_volume_node_store, open_volume_spec_store,
+    };
     use crate::volumes::types::{
-        LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-        VolumeReclaimPolicy, VolumeSpecDraft, VolumeStatus,
+        FilesystemOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+        VolumeReclaimPolicy, VolumeSpecDraft,
     };
     use async_channel::bounded;
     use std::sync::Arc;
@@ -288,13 +244,25 @@ mod tests {
             .rebuild_mst_from_disk()
             .await
             .expect("rebuild volume spec store");
-        let node_store = open_volume_node_store(db, actor).expect("open volume node store");
+        let node_store = open_volume_node_store(db.clone(), actor).expect("open volume node store");
         node_store
             .rebuild_mst_from_disk()
             .await
             .expect("rebuild volume node store");
+        let plan_store =
+            open_replicated_volume_plan_store(db.clone(), actor).expect("open volume plan store");
+        plan_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume plan store");
+        let status_store = open_replicated_volume_group_status_store(db, actor)
+            .expect("open volume group status store");
+        status_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume group status store");
         TestRegistry {
-            registry: VolumeRegistry::new(spec_store, node_store),
+            registry: VolumeRegistry::new(spec_store, node_store, plan_store, status_store),
             _dir: dir,
         }
     }
@@ -308,7 +276,7 @@ mod tests {
     ) -> VolumeSpecValue {
         let spec = VolumeSpecValue::new(VolumeSpecDraft {
             name: name.to_string(),
-            driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
+            driver: VolumeDriver::Local(LocalVolumeSpec::managed(FilesystemOwnership::Daemon)),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::Immediate,
             reclaim_policy: VolumeReclaimPolicy::Retain,
@@ -399,12 +367,12 @@ mod tests {
                 .is_some_and(|value| value.contains("exceeded requested capacity"))
         );
 
-        let refreshed = test_registry
-            .registry
-            .get_spec(spec.id)
-            .expect("load volume spec")
-            .expect("volume spec present");
-        assert_eq!(refreshed.status, VolumeStatus::Failed);
-        assert_eq!(refreshed.reason.as_deref(), Some("capacity_exceeded"));
+        assert_eq!(
+            test_registry
+                .registry
+                .get_spec(spec.id)
+                .expect("load volume spec"),
+            Some(spec)
+        );
     }
 }
