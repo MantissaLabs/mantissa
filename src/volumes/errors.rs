@@ -1,13 +1,13 @@
 use thiserror::Error;
 
-/// Structured local-volume access failures that block task launch or recovery.
+/// Recoverable volume access failure that blocks task launch or recovery.
 #[derive(Debug, Error)]
-pub enum LocalVolumeAccessError {
+pub enum VolumeAccessError {
     #[error("{message}")]
     Unavailable { message: String },
 }
 
-impl LocalVolumeAccessError {
+impl VolumeAccessError {
     /// Builds one recoverable volume-unavailable error from an operator-facing message.
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::Unavailable {

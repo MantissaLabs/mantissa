@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
-use crate::volumes::types::{LocalVolumeOwnership, LocalVolumeSpec, VolumeDriver, VolumeSpecValue};
+use crate::volumes::permissions::{apply_filesystem_ownership, resolve_filesystem_ownership};
+use crate::volumes::types::{FilesystemOwnership, LocalVolumeSpec, VolumeDriver, VolumeSpecValue};
 
 #[cfg(unix)]
 const ROOT_VOLUME_WRAPPER_DIR_MODE: u32 = 0o710;
@@ -34,6 +35,10 @@ pub fn resolve_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<
         VolumeDriver::Local(LocalVolumeSpec::ImportedPath { path }) => Ok(PathBuf::from(path)),
         VolumeDriver::External(_) => Err(anyhow!(
             "volume '{}' uses an external driver, which is not implemented yet",
+            spec.name
+        )),
+        VolumeDriver::Replicated(_) => Err(anyhow!(
+            "volume '{}' uses replicated storage and has no local-driver path",
             spec.name
         )),
     }
@@ -92,6 +97,7 @@ pub fn ensure_local_volume_path(root: &Path, spec: &VolumeSpecValue) -> Result<P
             }
         }
         VolumeDriver::External(_) => {}
+        VolumeDriver::Replicated(_) => {}
     }
 
     Ok(path)
@@ -143,103 +149,47 @@ fn normalize_volume_wrapper_permissions(_path: &Path) -> Result<()> {
 
 /// Applies Mantissa's managed-volume ownership policy to one realized data directory.
 #[cfg(unix)]
-fn normalize_managed_volume_permissions(
-    path: &Path,
-    ownership: LocalVolumeOwnership,
-) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let metadata = fs::metadata(path).with_context(|| {
-        format!(
-            "failed to read managed local volume metadata for {}",
-            path.display()
-        )
-    })?;
-    let (daemon_uid, daemon_gid) = current_process_ids();
-    let (desired_uid, desired_gid) = ownership.resolve_ids(daemon_uid, daemon_gid);
-    if metadata.uid() != desired_uid || metadata.gid() != desired_gid {
-        chown_path(path, desired_uid, desired_gid).with_context(|| {
-            format!(
-                "failed to set managed local volume owner {desired_uid}:{desired_gid} on {}",
-                path.display()
-            )
-        })?;
-    }
-
-    let desired_mode = ownership.directory_mode();
-    let current_mode = metadata.permissions().mode() & 0o7777;
-    if current_mode != desired_mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(desired_mode)).with_context(|| {
-            format!(
-                "failed to set managed local volume mode {:o} on {}",
-                desired_mode,
-                path.display()
-            )
-        })?;
-    }
-    Ok(())
+fn normalize_managed_volume_permissions(path: &Path, ownership: FilesystemOwnership) -> Result<()> {
+    let (owner_uid, owner_gid, mode) = resolve_filesystem_ownership(ownership);
+    apply_filesystem_ownership(path, owner_uid, owner_gid, mode)
 }
 
 /// Leaves managed-volume ownership normalization as a no-op on non-Unix targets.
 #[cfg(not(unix))]
 fn normalize_managed_volume_permissions(
     _path: &Path,
-    _ownership: LocalVolumeOwnership,
+    _ownership: FilesystemOwnership,
 ) -> Result<()> {
     Ok(())
-}
-
-/// Returns the uid and gid of the running Mantissa daemon process.
-#[cfg(unix)]
-fn current_process_ids() -> (u32, u32) {
-    // The managed-volume `daemon` ownership policy must map directly to the process credentials
-    // that are actually creating and reconciling the local directory.
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
-    (uid, gid)
-}
-
-/// Changes the uid and gid of one managed local volume directory in place.
-#[cfg(unix)]
-fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| {
-        format!(
-            "failed to chown managed local volume path {}",
-            path.display()
-        )
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::volumes::permissions::current_process_ids;
     use crate::volumes::types::{
-        LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-        VolumeReclaimPolicy, VolumeSpecValue, VolumeStatus,
+        FilesystemOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+        VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
     };
     use tempfile::tempdir;
 
     /// Builds one managed local volume spec for local path realization tests.
     fn managed_volume_spec() -> VolumeSpecValue {
-        VolumeSpecValue {
-            id: Uuid::new_v4(),
+        let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
             name: "workspace".to_string(),
-            driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
+            driver: VolumeDriver::Local(LocalVolumeSpec::managed(FilesystemOwnership::Daemon)),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
             requested_bytes: None,
+            labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,
-            volume_epoch: 0,
-            phase_version: 0,
-            status: VolumeStatus::Pending,
-            reason: None,
-            message: None,
-            labels: Vec::new(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        }
+        });
+        spec.id = Uuid::new_v4();
+        spec.created_at = "2026-01-01T00:00:00Z".to_string();
+        spec.updated_at = spec.created_at.clone();
+        spec
     }
 
     /// Ensures Mantissa-managed local volumes default to daemon-owned, non-world-writable roots.
@@ -271,7 +221,7 @@ mod tests {
         assert_eq!(path, managed_volume_data_path(root.path(), spec.id));
         assert_eq!(root_mode, expected_wrapper_mode);
         assert_eq!(wrapper_mode, expected_wrapper_mode);
-        assert_eq!(mode, LocalVolumeOwnership::Daemon.directory_mode());
+        assert_eq!(mode, FilesystemOwnership::Daemon.directory_mode());
         assert_eq!(metadata.uid(), uid);
         assert_eq!(metadata.gid(), gid);
     }
@@ -311,7 +261,7 @@ mod tests {
         let root = tempdir().expect("create temp volume root");
         let (uid, gid) = current_process_ids();
         let mut spec = managed_volume_spec();
-        spec.driver = VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::User {
+        spec.driver = VolumeDriver::Local(LocalVolumeSpec::managed(FilesystemOwnership::User {
             uid,
             gid,
         }));
@@ -324,7 +274,7 @@ mod tests {
         assert_eq!(metadata.gid(), gid);
         assert_eq!(
             mode,
-            LocalVolumeOwnership::User { uid, gid }.directory_mode()
+            FilesystemOwnership::User { uid, gid }.directory_mode()
         );
     }
 }
