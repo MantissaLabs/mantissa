@@ -53,9 +53,17 @@ impl VolumeReplicator {
     /// Applies one inbound volume event to the local registry.
     async fn apply_event(&self, event: VolumeEvent) -> Result<()> {
         match event {
-            VolumeEvent::Upsert(value) => self.registry.upsert_spec(*value).await?,
+            VolumeEvent::Upsert(value) => {
+                self.registry.upsert_spec(*value).await?;
+            }
             VolumeEvent::NodeUpsert(value) => self.registry.upsert_node_state(*value).await?,
             VolumeEvent::NodeRemove(id) => self.registry.remove_node_state(id).await?,
+            VolumeEvent::PlanUpsert(value) => self.registry.upsert_plan(*value).await?,
+            VolumeEvent::PlanRemove(id) => self.registry.remove_plan(id).await?,
+            VolumeEvent::GroupStatusUpsert(value) => {
+                self.registry.upsert_group_status(*value).await?
+            }
+            VolumeEvent::GroupStatusRemove(id) => self.registry.remove_group_status(id).await?,
         }
         Ok(())
     }
