@@ -19,6 +19,7 @@ pub use context::GossipContext;
 pub(crate) use dedupe::DedupeStateHandle;
 pub use message::Message;
 pub use outbound::DEFAULT_FANOUT;
+pub(crate) use outbound::OutboundControl;
 pub use outbound::fanout_sample;
 pub(crate) use outbound::start;
 pub use service::Channels;

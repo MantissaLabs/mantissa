@@ -764,6 +764,9 @@ struct WorkloadEvent {
   serviceProgress @5 :ServiceGenerationProgressRecord;
   # Compact per-node progress aggregate for one service generation.
 
+  removedTaskEpoch @6 :UInt64;
+  # Highest task assignment epoch removed by a remove event.
+
   enum EventType {
     upsertSpec @0;
     # Workload created or updated with the full workload definition.

@@ -14,9 +14,9 @@ use crate::workload::model::{
     ExecutionPlatform, IsolationMode, ServiceGenerationProgressCounts,
     ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
     WorkloadAdmissionState, WorkloadAgentRunMetadata, WorkloadEvent, WorkloadJobMetadata,
-    WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata, WorkloadSpec, WorkloadStateFilter,
-    WorkloadStateKind, WorkloadStatus, WorkloadStoreValue, WorkloadValue, merge_status_into_value,
-    spec_to_status, spec_to_value, value_to_spec,
+    WorkloadOwner, WorkloadPhase, WorkloadRemoval, WorkloadServiceMetadata, WorkloadSpec,
+    WorkloadStateFilter, WorkloadStateKind, WorkloadStatus, WorkloadStoreValue, WorkloadValue,
+    merge_status_into_value, spec_to_status, spec_to_value, value_to_spec,
 };
 use crate::workload::types::ResolvedExecutionSpec;
 use capnp::Error;
@@ -196,9 +196,10 @@ pub fn add_event(
             workload.set_event(workload_event::EventType::UpsertStatus);
             write_status(workload.reborrow().init_status(), status.as_ref());
         }
-        WorkloadEvent::Remove { id } => {
+        WorkloadEvent::Remove { id, task_epoch } => {
             workload.set_event(workload_event::EventType::Remove);
             workload.set_id(id.as_bytes());
+            workload.set_removed_task_epoch(*task_epoch);
         }
         WorkloadEvent::UpsertAdmissionGroup(record) => {
             workload.set_event(workload_event::EventType::UpsertAdmissionGroup);
@@ -227,7 +228,10 @@ pub fn read_event(reader: workload_event::Reader<'_>) -> Result<WorkloadEvent, E
         }
         workload_event::EventType::Remove => {
             let id = read_id_from_data(reader.get_id()?)?;
-            Ok(WorkloadEvent::Remove { id })
+            Ok(WorkloadEvent::Remove {
+                id,
+                task_epoch: reader.get_removed_task_epoch(),
+            })
         }
         workload_event::EventType::UpsertAdmissionGroup => {
             let record = read_admission_group(reader.get_admission_group()?)?;
@@ -258,6 +262,11 @@ impl StoreValueCodec for WorkloadStoreValue {
                     write_status(event.reborrow().init_status(), &status);
                 }
             }
+            WorkloadStoreValue::Removal(removal) => {
+                event.set_event(workload_event::EventType::Remove);
+                event.set_id(removal.id.as_bytes());
+                event.set_removed_task_epoch(removal.task_epoch);
+            }
             WorkloadStoreValue::AdmissionGroup(record) => {
                 event.set_event(workload_event::EventType::UpsertAdmissionGroup);
                 write_admission_group(event.reborrow().init_admission_group(), record.as_ref());
@@ -284,9 +293,9 @@ impl StoreValueCodec for WorkloadStoreValue {
             }
             WorkloadEvent::UpsertAdmissionGroup(record) => Ok((*record).into()),
             WorkloadEvent::UpsertServiceProgress(record) => Ok((*record).into()),
-            WorkloadEvent::Remove { id } => Err(Box::new(mantissa_store::error::Error::Other(
-                format!("workload store value cannot decode remove event for {id}"),
-            ))),
+            WorkloadEvent::Remove { id, task_epoch } => {
+                Ok(WorkloadRemoval { id, task_epoch }.into())
+            }
         }
     }
 }
@@ -330,7 +339,7 @@ impl StoreValueCodec for WorkloadValue {
                     record.id
                 ))))
             }
-            WorkloadEvent::Remove { id } => Err(Box::new(mantissa_store::error::Error::Other(
+            WorkloadEvent::Remove { id, .. } => Err(Box::new(mantissa_store::error::Error::Other(
                 format!("workload store value cannot decode remove event for {id}"),
             ))),
         }
@@ -1717,6 +1726,22 @@ mod tests {
         assert_eq!(decoded, WorkloadStoreValue::from(record));
     }
 
+    /// Task removals must keep their epoch when persisted or sent to another node.
+    #[test]
+    fn task_removal_store_codec_roundtrips_capnp() {
+        let removal = WorkloadRemoval {
+            id: Uuid::new_v4(),
+            task_epoch: 17,
+        };
+        let encoded = WorkloadStoreValue::from(removal.clone())
+            .encode_store_value()
+            .expect("encode task removal store value");
+        let decoded = WorkloadStoreValue::decode_store_value(&encoded)
+            .expect("decode task removal store value");
+
+        assert_eq!(decoded, WorkloadStoreValue::from(removal));
+    }
+
     /// Reopening the workload store should decode Cap'n Proto MVReg rows from Redb.
     #[tokio::test]
     async fn workload_store_reopens_capnp_rows() {
@@ -1730,6 +1755,11 @@ mod tests {
         let status_only = sample_status_only_workload_value();
         let complete_key = UuidKey::from(complete.id);
         let status_only_key = UuidKey::from(status_only.id);
+        let removal = WorkloadRemoval {
+            id: Uuid::new_v4(),
+            task_epoch: 9,
+        };
+        let removal_key = UuidKey::from(removal.id);
 
         {
             let store = open_workload_store(db.clone(), actor).expect("open workload store");
@@ -1741,6 +1771,10 @@ mod tests {
                 .upsert(&status_only_key, status_only.clone().into())
                 .await
                 .expect("upsert status-only workload");
+            store
+                .upsert(&removal_key, removal.clone().into())
+                .await
+                .expect("upsert task removal");
         }
 
         let store = open_workload_store(db, actor).expect("reopen workload store");
@@ -1757,6 +1791,10 @@ mod tests {
             .get_snapshot(&status_only_key)
             .expect("lookup status-only workload")
             .expect("status-only workload present");
+        let removal_snapshot = store
+            .get_snapshot(&removal_key)
+            .expect("lookup task removal")
+            .expect("task removal present");
 
         assert_eq!(
             select_best_workload_value(complete_snapshot.as_slice()),
@@ -1765,6 +1803,19 @@ mod tests {
         assert_eq!(
             select_best_workload_value(status_only_snapshot.as_slice()),
             Some(status_only)
+        );
+        assert_eq!(
+            removal_snapshot
+                .as_slice()
+                .iter()
+                .filter_map(WorkloadStoreValue::removal)
+                .map(|stored| stored.task_epoch)
+                .max(),
+            Some(removal.task_epoch)
+        );
+        assert_eq!(
+            select_best_workload_value(removal_snapshot.as_slice()),
+            None
         );
     }
 }

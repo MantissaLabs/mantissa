@@ -1,7 +1,6 @@
 use crate::store::replicated::open::open_arc_store;
 use crate::workload::model::{
-    WorkloadAdmissionGroupPhaseRank, WorkloadPhaseRank, WorkloadStoreValue,
-    parse_workload_timestamp,
+    WorkloadAdmissionGroupPhaseRank, WorkloadStoreValue, parse_workload_timestamp,
 };
 use chrono::{DateTime, Utc};
 use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
@@ -29,24 +28,33 @@ pub struct WorkloadCompactionRank;
 /// Total workload-domain ordering key matching each record selector's precedence.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum WorkloadCompactionRankValue {
-    /// Rank for replicated workload lifecycle rows.
-    Workload(WorkloadRecordRank),
+    /// Rank for replicated task state and task removals.
+    Task(TaskRecordRank),
     /// Rank for grouped workload admission decisions.
     AdmissionGroup(WorkloadAdmissionGroupRank),
     /// Rank for service-generation progress rows.
     ServiceProgress(ServiceGenerationProgressRank),
 }
 
-/// Ordering fields for replicated workload lifecycle rows.
+/// Ordering fields shared by task state and task removals.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct WorkloadRecordRank {
+pub struct TaskRecordRank {
     task_epoch: u64,
-    phase_version: u64,
-    updated_at: Option<DateTime<Utc>>,
-    phase: WorkloadPhaseRank,
-    definition_complete: bool,
-    node_id: Uuid,
-    tie_breaker: Box<Reverse<WorkloadStoreValue>>,
+    state: TaskRecordStateRank,
+}
+
+/// Orders a removal after task state from the same assignment epoch.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum TaskRecordStateRank {
+    Workload {
+        phase_version: u64,
+        updated_at: Option<DateTime<Utc>>,
+        phase_rank: u8,
+        definition_complete: bool,
+        node_id: Uuid,
+        tie_breaker: Box<Reverse<WorkloadStoreValue>>,
+    },
+    Removal,
 }
 
 /// Ordering fields for replicated workload admission decisions.
@@ -75,14 +83,22 @@ impl MvRegCompactionRanker<WorkloadStoreValue, Uuid> for WorkloadCompactionRank 
     fn rank(entry: &MvRegEntry<WorkloadStoreValue, Uuid>) -> Self::Rank {
         match entry.value() {
             WorkloadStoreValue::Workload(value) => {
-                WorkloadCompactionRankValue::Workload(WorkloadRecordRank {
+                WorkloadCompactionRankValue::Task(TaskRecordRank {
                     task_epoch: value.task_epoch,
-                    phase_version: value.phase_version,
-                    updated_at: parse_workload_timestamp(&value.updated_at, &value.created_at),
-                    phase: value.state.precedence_rank(),
-                    definition_complete: value.definition_complete,
-                    node_id: value.node_id,
-                    tie_breaker: Box::new(Reverse(entry.value().clone())),
+                    state: TaskRecordStateRank::Workload {
+                        phase_version: value.phase_version,
+                        updated_at: parse_workload_timestamp(&value.updated_at, &value.created_at),
+                        phase_rank: value.state.precedence_rank() as u8,
+                        definition_complete: value.definition_complete,
+                        node_id: value.node_id,
+                        tie_breaker: Box::new(Reverse(entry.value().clone())),
+                    },
+                })
+            }
+            WorkloadStoreValue::Removal(removal) => {
+                WorkloadCompactionRankValue::Task(TaskRecordRank {
+                    task_epoch: removal.task_epoch,
+                    state: TaskRecordStateRank::Removal,
                 })
             }
             WorkloadStoreValue::AdmissionGroup(record) => {

@@ -842,7 +842,7 @@ pub enum WorkloadEvent {
     UpsertStatus(Box<WorkloadStatus>),
     UpsertAdmissionGroup(Box<WorkloadAdmissionGroupRecord>),
     UpsertServiceProgress(Box<ServiceGenerationProgressRecord>),
-    Remove { id: Uuid },
+    Remove { id: Uuid, task_epoch: u64 },
 }
 
 impl WorkloadEvent {
@@ -920,8 +920,16 @@ fn compact_status_propagation(owner: Option<&WorkloadOwner>) -> WorkloadPropagat
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
 pub enum WorkloadStoreValue {
     Workload(Box<WorkloadValue>),
+    Removal(WorkloadRemoval),
     AdmissionGroup(Box<WorkloadAdmissionGroupRecord>),
     ServiceProgress(Box<ServiceGenerationProgressRecord>),
+}
+
+/// Durable task removal stored alongside task state in the workload CRDT.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize, Hash)]
+pub struct WorkloadRemoval {
+    pub id: Uuid,
+    pub task_epoch: u64,
 }
 
 impl WorkloadStoreValue {
@@ -929,14 +937,22 @@ impl WorkloadStoreValue {
     pub fn workload(&self) -> Option<&WorkloadValue> {
         match self {
             Self::Workload(value) => Some(value.as_ref()),
-            Self::AdmissionGroup(_) | Self::ServiceProgress(_) => None,
+            Self::Removal(_) | Self::AdmissionGroup(_) | Self::ServiceProgress(_) => None,
+        }
+    }
+
+    /// Returns the contained task removal when this row records a deletion.
+    pub fn removal(&self) -> Option<&WorkloadRemoval> {
+        match self {
+            Self::Removal(removal) => Some(removal),
+            Self::Workload(_) | Self::AdmissionGroup(_) | Self::ServiceProgress(_) => None,
         }
     }
 
     /// Returns the contained admission record when this row stores a group decision.
     pub fn admission_group(&self) -> Option<&WorkloadAdmissionGroupRecord> {
         match self {
-            Self::Workload(_) | Self::ServiceProgress(_) => None,
+            Self::Workload(_) | Self::Removal(_) | Self::ServiceProgress(_) => None,
             Self::AdmissionGroup(record) => Some(record.as_ref()),
         }
     }
@@ -945,7 +961,7 @@ impl WorkloadStoreValue {
     pub fn service_progress(&self) -> Option<&ServiceGenerationProgressRecord> {
         match self {
             Self::ServiceProgress(record) => Some(record.as_ref()),
-            Self::Workload(_) | Self::AdmissionGroup(_) => None,
+            Self::Workload(_) | Self::Removal(_) | Self::AdmissionGroup(_) => None,
         }
     }
 }
@@ -954,6 +970,13 @@ impl From<WorkloadValue> for WorkloadStoreValue {
     /// Wraps a workload value for storage in the shared workload CRDT domain.
     fn from(value: WorkloadValue) -> Self {
         Self::Workload(Box::new(value))
+    }
+}
+
+impl From<WorkloadRemoval> for WorkloadStoreValue {
+    /// Wraps a durable task removal for storage in the workload CRDT domain.
+    fn from(removal: WorkloadRemoval) -> Self {
+        Self::Removal(removal)
     }
 }
 
@@ -1353,7 +1376,7 @@ pub(crate) fn workload_event_id(event: &WorkloadEvent) -> Uuid {
         WorkloadEvent::UpsertStatus(status) => status.id,
         WorkloadEvent::UpsertAdmissionGroup(record) => record.id,
         WorkloadEvent::UpsertServiceProgress(record) => record.id,
-        WorkloadEvent::Remove { id } => *id,
+        WorkloadEvent::Remove { id, .. } => *id,
     }
 }
 
@@ -1363,11 +1386,28 @@ pub(crate) fn should_replace_workload_event(
     candidate: &WorkloadEvent,
 ) -> bool {
     match (current, candidate) {
+        (WorkloadEvent::Remove { task_epoch, .. }, WorkloadEvent::UpsertSpec(candidate)) => {
+            candidate.task_epoch > *task_epoch
+        }
+        (WorkloadEvent::Remove { task_epoch, .. }, WorkloadEvent::UpsertStatus(candidate)) => {
+            candidate.task_epoch > *task_epoch
+        }
+        (WorkloadEvent::UpsertSpec(current), WorkloadEvent::Remove { task_epoch, .. }) => {
+            *task_epoch >= current.task_epoch
+        }
+        (WorkloadEvent::UpsertStatus(current), WorkloadEvent::Remove { task_epoch, .. }) => {
+            *task_epoch >= current.task_epoch
+        }
         (
-            WorkloadEvent::Remove { .. },
-            WorkloadEvent::UpsertSpec(_) | WorkloadEvent::UpsertStatus(_),
-        ) => false,
-        (_, WorkloadEvent::Remove { .. }) => true,
+            WorkloadEvent::Remove {
+                task_epoch: current,
+                ..
+            },
+            WorkloadEvent::Remove {
+                task_epoch: candidate,
+                ..
+            },
+        ) => candidate > current,
         (WorkloadEvent::UpsertSpec(current_spec), WorkloadEvent::UpsertSpec(candidate_spec)) => {
             should_accept_workload_spec(current_spec, candidate_spec)
         }
@@ -1486,6 +1526,11 @@ pub(crate) fn should_accept_service_generation_progress_record(
 pub(crate) trait WorkloadValueSource {
     /// Returns the workload projection carried by this value when one exists.
     fn workload_value(&self) -> Option<&WorkloadValue>;
+
+    /// Returns the highest task epoch deleted by this value when it is a removal.
+    fn removed_task_epoch(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl WorkloadValueSource for WorkloadValue {
@@ -1500,17 +1545,37 @@ impl WorkloadValueSource for WorkloadStoreValue {
     fn workload_value(&self) -> Option<&WorkloadValue> {
         self.workload()
     }
+
+    /// Returns the task epoch covered by a durable workload removal.
+    fn removed_task_epoch(&self) -> Option<u64> {
+        self.removal().map(|removal| removal.task_epoch)
+    }
+}
+
+/// Returns the highest task epoch covered by concurrent durable removals.
+pub(crate) fn select_removed_task_epoch(values: &[WorkloadStoreValue]) -> Option<u64> {
+    values
+        .iter()
+        .filter_map(WorkloadValueSource::removed_task_epoch)
+        .max()
 }
 
 /// Selects the most relevant workload value from concurrent CRDT versions.
 pub(crate) fn select_best_workload_value<T: WorkloadValueSource>(
     values: &[T],
 ) -> Option<WorkloadValue> {
+    let removed_through_epoch = values
+        .iter()
+        .filter_map(WorkloadValueSource::removed_task_epoch)
+        .max();
     let mut best: Option<&WorkloadValue> = None;
     for value in values {
         let Some(value) = value.workload_value() else {
             continue;
         };
+        if removed_through_epoch.is_some_and(|removed| value.task_epoch <= removed) {
+            continue;
+        }
         match best {
             None => best = Some(value),
             Some(current) => {
@@ -1932,7 +1997,7 @@ mod tests {
         WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord, WorkloadAdmissionState,
         WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadPropagationClass,
         WorkloadServiceMetadata, WorkloadSpec, WorkloadStatus, compare_workload_spec_causality,
-        compute_service_generation_progress_id,
+        compute_service_generation_progress_id, should_replace_workload_event,
     };
     use chrono::Utc;
     use std::cmp::Ordering;
@@ -2115,9 +2180,35 @@ mod tests {
         );
 
         assert_eq!(
-            WorkloadEvent::Remove { id: Uuid::new_v4() }.propagation_class(),
+            WorkloadEvent::Remove {
+                id: Uuid::new_v4(),
+                task_epoch: 0,
+            }
+            .propagation_class(),
             WorkloadPropagationClass::GlobalCritical
         );
+    }
+
+    /// Task state and removals must have the same result in every arrival order.
+    #[test]
+    fn workload_removal_ordering_uses_task_epoch() {
+        let mut epoch_four = test_workload_spec(WorkloadPhase::Stopping, None);
+        epoch_four.task_epoch = 4;
+        let task_id = epoch_four.id;
+        let removal = WorkloadEvent::Remove {
+            id: task_id,
+            task_epoch: 4,
+        };
+        let stale_state = WorkloadEvent::UpsertSpec(Box::new(epoch_four.clone()));
+
+        assert!(should_replace_workload_event(&stale_state, &removal));
+        assert!(!should_replace_workload_event(&removal, &stale_state));
+
+        let mut epoch_five = epoch_four;
+        epoch_five.task_epoch = 5;
+        let new_state = WorkloadEvent::UpsertSpec(Box::new(epoch_five));
+        assert!(should_replace_workload_event(&removal, &new_state));
+        assert!(!should_replace_workload_event(&new_state, &removal));
     }
 
     /// Builds one compact status record for propagation policy tests.

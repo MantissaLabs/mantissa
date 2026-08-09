@@ -2,7 +2,8 @@ use super::Message;
 use crate::topology::TopologyEvent;
 use crate::workload::model::WorkloadPropagationClass;
 use mantissa_protocol::gossip;
-use mantissa_protocol::gossip::gossip_message::Which::{SecretMasterKey, Topology};
+use mantissa_protocol::gossip::gossip_message::Which::{SecretMasterKey, Topology, Workload};
+use mantissa_protocol::workload::workload_event;
 
 /// Gossip transport plane selector.
 ///
@@ -45,11 +46,16 @@ pub(super) fn gossip_plane_for_message(message: &Message) -> GossipPlane {
 }
 
 /// Maps intended workload propagation classes onto today's transport plane.
-fn workload_gossip_plane(_class: WorkloadPropagationClass) -> GossipPlane {
-    // This implementation step only classifies propagation intent. All workload
-    // updates still use the existing active-view gossip path until targeted
-    // routes are introduced.
-    GossipPlane::ViewScoped
+fn workload_gossip_plane(class: WorkloadPropagationClass) -> GossipPlane {
+    match class {
+        // A task removal must reach the cluster even while its owner is leaving or views are
+        // changing. The global metadata path uses every known peer and relays the removal.
+        WorkloadPropagationClass::GlobalCritical => GossipPlane::GlobalMetadata,
+        WorkloadPropagationClass::TargetedRequired
+        | WorkloadPropagationClass::OwnerQuorumRepair
+        | WorkloadPropagationClass::CompactOwnerQuorum
+        | WorkloadPropagationClass::LocalOnly => GossipPlane::ViewScoped,
+    }
 }
 
 /// Selects the gossip plane for one inbound wire message.
@@ -66,6 +72,11 @@ pub(super) fn gossip_plane_for_wire_message(
             }
             _ => GossipPlane::ViewScoped,
         },
+        Ok(Workload(Ok(reader)))
+            if matches!(reader.get_event(), Ok(workload_event::EventType::Remove)) =>
+        {
+            GossipPlane::GlobalMetadata
+        }
         Ok(SecretMasterKey(_)) => GossipPlane::GlobalMetadata,
         _ => GossipPlane::ViewScoped,
     }
@@ -90,6 +101,39 @@ mod tests {
         SecretMasterKeyCurrent, SecretMasterKeySyncRecord,
     };
     use uuid::Uuid;
+
+    /// Task removals use the path that remains available while their owner leaves the cluster.
+    #[test]
+    fn task_removals_use_the_global_plane() {
+        let task_id = Uuid::new_v4();
+        let message = Message::Workload {
+            id: Uuid::new_v4(),
+            event: crate::workload::model::WorkloadEvent::Remove {
+                id: task_id,
+                task_epoch: 4,
+            },
+        };
+
+        assert_eq!(
+            gossip_plane_for_message(&message),
+            GossipPlane::GlobalMetadata
+        );
+        assert!(should_relay_inbound_message(false, &message));
+
+        let mut wire = capnp::message::Builder::new_default();
+        let mut wire_message = wire.init_root::<gossip::gossip_message::Builder<'_>>();
+        wire_message
+            .reborrow()
+            .init_workload()
+            .set_event(workload_event::EventType::Remove);
+        let wire_message = wire
+            .get_root_as_reader::<gossip::gossip_message::Reader<'_>>()
+            .expect("read workload removal");
+        assert_eq!(
+            gossip_plane_for_wire_message(wire_message),
+            GossipPlane::GlobalMetadata
+        );
+    }
 
     /// Transition hints must cross split boundaries and relay even when generic relay is disabled.
     #[test]

@@ -24,7 +24,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, warn};
+use tokio::sync::oneshot;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub const DEFAULT_FANOUT: usize = 5;
@@ -37,8 +38,16 @@ const DEFAULT_GOSSIP_DISPATCH_BATCH_MAX: usize = 128;
 const DEFAULT_GOSSIP_RPC_BATCH_MAX: usize = DEFAULT_GOSSIP_DISPATCH_BATCH_MAX;
 /// Default number of peer sends allowed concurrently within one outbound dispatch batch.
 const DEFAULT_GOSSIP_SEND_PARALLELISM: usize = 1;
+/// Maximum time one peer may hold the outbound gossip worker.
+const DEFAULT_GOSSIP_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// Process-wide counter tracking how many outbound workload gossip updates were coalesced.
 static GOSSIP_COALESCED_TASK_UPDATES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Commands that must be handled by the outbound gossip worker itself.
+pub(crate) enum OutboundControl {
+    /// Attempts every message already queued before acknowledging the caller.
+    Flush(oneshot::Sender<()>),
+}
 
 /// Coalesces one pending outbound gossip batch by task id and digest node id.
 ///
@@ -169,13 +178,14 @@ fn gossip_send_parallelism_from_env(default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Reads the optional per-peer gossip send timeout (milliseconds) from the environment.
-fn gossip_send_timeout_from_env() -> Option<Duration> {
+/// Reads the per-peer gossip send timeout (milliseconds) from the environment.
+fn gossip_send_timeout_from_env(default: Duration) -> Duration {
     std::env::var("MANTISSA_GOSSIP_SEND_TIMEOUT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
+        .unwrap_or(default)
 }
 
 /// Derives one deterministic cursor seed from the local peer id.
@@ -194,6 +204,7 @@ fn fanout_cursor_seed(peer_id: Uuid) -> usize {
 /// Receives locally-produced messages and periodically gossips them to selected peers.
 pub(crate) async fn start<C>(
     event_rx: Receiver<Message>,
+    control_rx: Receiver<OutboundControl>,
     context: C,
     dedupe_state: DedupeStateHandle,
     fanout: Option<usize>,
@@ -207,8 +218,9 @@ pub(crate) async fn start<C>(
     let dispatch_batch_max = gossip_dispatch_batch_max_from_env(DEFAULT_GOSSIP_DISPATCH_BATCH_MAX);
     let rpc_batch_max = gossip_rpc_batch_max_from_env(DEFAULT_GOSSIP_RPC_BATCH_MAX);
     let send_parallelism = gossip_send_parallelism_from_env(DEFAULT_GOSSIP_SEND_PARALLELISM);
-    let send_timeout = gossip_send_timeout_from_env();
+    let send_timeout = gossip_send_timeout_from_env(DEFAULT_GOSSIP_SEND_TIMEOUT);
     let mut fanout_cursor = fanout_cursor_seed(context.local_peer_id());
+    let mut flush_waiters: Vec<oneshot::Sender<()>> = Vec::new();
 
     loop {
         tokio::select! {
@@ -227,6 +239,9 @@ pub(crate) async fn start<C>(
                     // runs on a separate loop, and anti-entropy sync already guarantees
                     // convergence without per-tick heartbeat payloads.
                     buffer = pending;
+                    for waiter in std::mem::take(&mut flush_waiters) {
+                        let _ = waiter.send(());
+                    }
                     ticker.reset_after(jittered_interval(tick));
                     continue;
                 }
@@ -247,7 +262,7 @@ pub(crate) async fn start<C>(
                         "coalesced outbound workload gossip updates"
                     );
                     if should_emit_diag_sample(total_coalesced_task_updates) {
-                        warn!(
+                        info!(
                             target: "diag.gossip.coalesce",
                             before_count,
                             after_count = pending.len(),
@@ -284,6 +299,9 @@ pub(crate) async fn start<C>(
                 .await;
                 ticker.reset_after(jittered_interval(tick));
                 buffer = Vec::new();
+                for waiter in std::mem::take(&mut flush_waiters) {
+                    let _ = waiter.send(());
+                }
             }
 
             Ok(msg) = event_rx.recv() => {
@@ -294,6 +312,22 @@ pub(crate) async fn start<C>(
                     enqueued_at: Instant::now(),
                     message: msg,
                 });
+            }
+
+            Ok(OutboundControl::Flush(waiter)) = control_rx.recv() => {
+                // The message and control channels are separate. Drain the message channel here
+                // so a flush cannot overtake messages that the caller queued first.
+                while let Ok(msg) = event_rx.try_recv() {
+                    let active_view = context.active_cluster_view();
+                    let mut dedupe = dedupe_state.lock().await;
+                    dedupe.record_outbound(active_view, msg.id());
+                    buffer.push(QueuedMessage {
+                        enqueued_at: Instant::now(),
+                        message: msg,
+                    });
+                }
+                flush_waiters.push(waiter);
+                ticker.reset_immediately();
             }
 
             // channel closed
@@ -331,7 +365,7 @@ struct DispatchOptions {
     dispatch_batch_max: usize,
     rpc_batch_max: usize,
     send_parallelism: usize,
-    send_timeout: Option<Duration>,
+    send_timeout: Duration,
 }
 
 /// Dispatches one plane-specific outbound gossip batch to the selected peers.
@@ -372,6 +406,15 @@ async fn dispatch_gossip_plane<C>(
     };
     let self_id = context.local_peer_id();
     let cluster_view = context.active_cluster_view();
+    let send_parallelism = match plane {
+        // Global metadata is low-rate and selects at most the default fanout during normal
+        // operation. Contact that small set together so a dead peer cannot delay a live peer.
+        GossipPlane::GlobalMetadata => options
+            .send_parallelism
+            .max(DEFAULT_FANOUT)
+            .min(peers.len().max(1)),
+        GossipPlane::ViewScoped => options.send_parallelism,
+    };
 
     debug!(
         target: "gossip",
@@ -422,7 +465,7 @@ async fn dispatch_gossip_plane<C>(
                 cluster_view,
                 plane,
             ));
-            if inflight.len() >= options.send_parallelism {
+            if inflight.len() >= send_parallelism {
                 let _ = inflight.next().await;
             }
         }
@@ -439,35 +482,34 @@ async fn send_gossip_to_peer<C>(
     peer: &PeerHandle,
     context: &C,
     rpc_batch_max: usize,
-    send_timeout: Option<Duration>,
+    send_timeout: Duration,
     cluster_view: ClusterViewId,
     plane: GossipPlane,
 ) where
     C: GossipContext + ?Sized,
 {
     for outbound_batch in outbound.chunks(rpc_batch_max) {
-        let send_result = if let Some(timeout) = send_timeout {
-            match tokio::time::timeout(timeout, send_gossip(outbound_batch, peer, context, plane))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    crate::observability::metrics::record_gossip_send_failure("timeout");
-                    warn!(
-                        target: "diag.gossip.send",
-                        cluster_view = %cluster_view,
-                        gossip_plane = plane.as_str(),
-                        peer = %peer.id,
-                        addr = %peer.address,
-                        message_count = outbound_batch.len(),
-                        timeout_ms = timeout.as_millis() as u64,
-                        "gossip send timed out"
-                    );
-                    break;
-                }
+        let send_result = match tokio::time::timeout(
+            send_timeout,
+            send_gossip(outbound_batch, peer, context, plane),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                crate::observability::metrics::record_gossip_send_failure("timeout");
+                warn!(
+                    target: "diag.gossip.send",
+                    cluster_view = %cluster_view,
+                    gossip_plane = plane.as_str(),
+                    peer = %peer.id,
+                    addr = %peer.address,
+                    message_count = outbound_batch.len(),
+                    timeout_ms = send_timeout.as_millis() as u64,
+                    "gossip send timed out"
+                );
+                break;
             }
-        } else {
-            send_gossip(outbound_batch, peer, context, plane).await
         };
 
         match send_result {

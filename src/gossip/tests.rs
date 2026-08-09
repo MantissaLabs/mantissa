@@ -113,6 +113,7 @@ fn message_for_forwarding_strips_join_client_capability() {
             ),
             identity_sig: vec![0u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             scheduling: Box::new(
                 crate::topology::peers::PeerSchedulingState::schedulable_default(Uuid::new_v4()),
             ),
@@ -315,7 +316,10 @@ fn coalesce_pending_messages_prefers_task_remove() {
         },
         Message::Workload {
             id: Uuid::new_v4(),
-            event: WorkloadEvent::Remove { id: task_id },
+            event: WorkloadEvent::Remove {
+                id: task_id,
+                task_epoch: 4,
+            },
         },
     ];
 
