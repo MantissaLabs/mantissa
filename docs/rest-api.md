@@ -471,6 +471,20 @@ curl -sS "${AUTH[@]}" \
   "$REST/v1/volumes"
 ```
 
+Create, retain, restore, or permanently remove a replicated volume:
+
+```bash
+curl -sS "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"demo-replicated","driver":"replicated","requested_bytes":1073741824}' \
+  "$REST/v1/volumes"
+curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/volumes/demo-replicated"
+curl -sS -X POST "${AUTH[@]}" \
+  "$REST/v1/volumes/demo-replicated/restore"
+curl -sS -X DELETE "${AUTH[@]}" \
+  "$REST/v1/volumes/demo-replicated?delete_data=true"
+```
+
 Create a secret:
 
 ```bash
@@ -499,7 +513,7 @@ Exposed now:
 - jobs list/submit/get/cancel/delete;
 - services list/deploy/get/status/delete;
 - networks list/create/get/peers/attachments/delete;
-- volumes list/create/import/get/status/delete;
+- volumes list/create/import/get/status/restore/delete;
 - tasks list/start/get/logs/attach/exec/stop;
 - secrets list/create/update/get/delete;
 - scheduler summary.

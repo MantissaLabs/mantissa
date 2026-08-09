@@ -149,15 +149,13 @@ hardening, disk encryption or a mature external KMS story.
 
 ## Volumes
 
-Volumes support is currently limited to local volumes.
+Mantissa supports local volumes and three-copy replicated volumes. Both are
+limited to `read_write_once`. Replicated writes require a Raft quorum, and a
+retained replicated volume also needs a quorum before it can be restored.
 
-The control-plane object is replicated, but the volume itself is not. We do not
-support distributed volumes yet. A local volume is bound to one node, and drain will
-not pretend it can be evacuated transparently. Failover requires the underlying
-storage to come back on that node and scheduling will always place a task/job on a
-node that hosts the volume it is bound to. There is no external driver support, no
-read-write-many mode, no snapshotting and live migration and no transparent cross-node
-volume replication yet.
+Local volumes remain bound to one node. Drain does not pretend their data can
+move automatically. There is no external driver support, read-write-many mode,
+snapshotting, or live migration yet.
 
 ## GPUs
 

@@ -31,7 +31,8 @@ Common commands:
 - `mantissa services run <manifest> --detach` - submit a service deployment and print the service id
 - `mantissa services run <manifest> --timeout 10m` - bound how long progress following waits
 - `mantissa services list|stop ...` - inspect or stop services; autoscaled templates render as `api (3x, auto 2-8)`
-- `mantissa volumes create|import|list|inspect|status|delete ...` - manage named local volumes
+- `mantissa volumes create|import|list|inspect|status|restore|delete ...` -
+  manage named local and replicated volumes
 - `mantissa info` - emit local system and capacity diagnostics
 - `mantissa config show|validate|path` - inspect configuration
 

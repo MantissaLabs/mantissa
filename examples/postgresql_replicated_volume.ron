@@ -1,10 +1,9 @@
 (
-    name: "postgres-local-volume",
+    name: "postgres-replicated-volume",
     volumes: [
         (
-            name: "pgdata",
-            driver: local((
-                source: managed,
+            name: "postgres-replicated-data",
+            driver: replicated((
                 // postgres:16-alpine runs the database as UID and GID 70.
                 ownership: user(uid: 70, gid: 70),
             )),
@@ -15,7 +14,7 @@
             labels: [
                 (
                     key: "app",
-                    value: "postgres-local-volume",
+                    value: "postgres-replicated-volume",
                 ),
             ],
         ),
@@ -64,7 +63,7 @@
             secret_files: [],
             volumes: [
                 (
-                    source: "pgdata",
+                    source: "postgres-replicated-data",
                     target: "/var/lib/postgresql/data",
                     read_only: false,
                 ),

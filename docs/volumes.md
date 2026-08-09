@@ -1,177 +1,69 @@
 # Volumes
 
-Mantissa currently ships one real volume backend: a cluster-scoped volume
-object backed by node-local storage.
+Mantissa supports local and replicated volumes. Both are named cluster objects
+that workloads mount by name or ID. The current access mode is
+`read_write_once`, so only one node may mount a volume for writing at a time.
 
-That model is intentionally honest:
+## Drivers
 
-- the volume object is replicated cluster-wide,
-- the data path lives on exactly one node,
-- scheduling respects that locality,
-- failover does not pretend a local disk became distributed storage.
+The `local` driver stores data on one node. A managed local volume uses a path
+created by Mantissa. An imported local volume points at an existing absolute
+host path. Scheduling keeps workloads that use either form on that node.
 
-## Current Scope
+The `replicated` driver stores three copies on three different nodes. Raft
+elects the writer and commits its writer fence with a quorum. The separate
+block data path sends each change to the current copies in order. The node
+running the workload exposes the volume through ublk and mounts its ext4
+filesystem. Losing quorum fences writes until the volume can make a safe
+control decision again.
 
-Supported today:
+Replicated volumes require a capacity and `wait_for_first_consumer` binding.
+The scheduler chooses the workload node and the storage controller selects the
+three nodes that hold the copies.
 
-- local driver volumes,
-- `read_write_once` access mode,
-- `immediate` and `wait_for_first_consumer` binding,
-- `retain` and `delete` reclaim policies,
-- managed local paths and imported host paths,
-- service, job, and direct task mounts.
+External drivers, read-write-many mounts, snapshots, and live migration are
+not supported yet.
 
-Not implemented yet:
+## Cluster State
 
-- external drivers,
-- read-write-many semantics,
-- transparent cross-node replication,
-- live migration.
+Mantissa stores a cluster-wide volume specification and one status row for
+each node holding or mounting the volume. A replicated volume also stores its
+three selected nodes and Raft group ID. These rows let `volumes list` and
+`volumes inspect` report creation, attachment, replica health, retention, and
+restore progress.
 
-## Data Model
+The stored state is reconciled after a daemon restart. It does not replace the
+Raft log or the data files held by the three replica nodes.
 
-Mantissa replicates two related rows:
-
-1. a cluster-wide `VolumeSpecValue`,
-2. per-node `VolumeNodeStateValue` rows for realized local state.
-
-`VolumeSpecValue` carries:
-
-- identity (`id`, `name`, labels),
-- driver,
-- access mode,
-- binding mode,
-- reclaim policy,
-- optional requested capacity,
-- bound node metadata,
-- operator-facing status and reason fields.
-
-`VolumeNodeStateValue` carries:
-
-- owning node,
-- concrete local path,
-- node-local readiness state,
-- optional capacity and used bytes,
-- the list of tasks currently publishing the mount on that node.
-
-## Driver and Binding Modes
-
-### Local Driver
-
-The built-in driver is `local`.
-
-Managed local volumes create data under the configured local volume root.
-Imported local volumes point at an existing absolute host path on a selected
-node.
-
-### Access Mode
-
-The only current access mode is `read_write_once`.
-
-That means the volume may only be mounted read-write from one node. Mantissa
-enforces that by binding the volume to a single node and treating that binding
-as a hard placement constraint.
-
-### Binding Modes
-
-`immediate`
-
-- requires an explicit node at creation time,
-- is used for imported paths,
-- creates a bound volume object immediately.
-
-`wait_for_first_consumer`
-
-- starts unbound,
-- lets the scheduler pick the first hosting node,
-- persists that binding before lease reservation and workload start.
-
-## Lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Pending
-    Pending --> Bound
-    Bound --> Ready
-    Ready --> InUse
-    InUse --> Ready
-    Ready --> Deleting
-    Bound --> Failed
-    Ready --> Failed
-```
-
-At the node-local layer, the realized row moves through:
-
-- `Pending`
-- `Provisioning`
-- `Ready`
-- `Published`
-- `Deleting`
-- `Error`
-
-In practice, managed local volumes usually move from `Pending` to `Ready` once
-the local controller materializes the path, then to `Published` while tasks are
-actively using them.
-
-## Scheduling Semantics
-
-Volume locality is applied before scheduler placement:
-
-- already bound volumes force the task onto the bound node,
-- conflicting bound nodes across mounts are rejected,
-- `wait_for_first_consumer` bindings are committed before slot reservation,
-- fallback placement is disabled when a bound local volume requires a pinned
-  target.
-
-This is why a volume-backed service or job behaves differently from a purely
-stateless workload. The scheduler is still distributed, but the bound node is a
-hard constraint.
-
-Relevant code:
-
-- `src/workload/manager/volumes.rs`
-- `src/services/manager.rs`
-
-## Local Realization
-
-The `VolumeController` on the bound node keeps local-driver paths realized and
-updates node-state rows with:
-
-- the local filesystem path,
-- used bytes,
-- readiness or error state,
-- published task ids.
-
-Managed local volume paths live under the configured local volume root.
-Imported local volumes keep their existing host path and must already exist as
-directories.
-
-Relevant code:
-
-- `src/volumes/controller.rs`
-- `src/volumes/local.rs`
-
-## CLI
+## Create and Inspect
 
 Create a managed local volume:
 
 ```bash
-mantissa volumes create --name cache --binding wait-for-first-consumer --capacity-mb 1024
+mantissa volumes create \
+  --name cache \
+  --capacity-mb 1024
 ```
 
-Create an immediately bound managed local volume:
+Create a replicated volume:
 
 ```bash
-mantissa volumes create --name dbdata --binding immediate --node node-a --capacity-mb 10240
+mantissa volumes create \
+  --name dbdata \
+  --driver replicated \
+  --capacity-mb 10240
 ```
 
-Import an existing host path:
+Import an existing path from one node:
 
 ```bash
-mantissa volumes import --name shared-seed --node node-a --path /srv/mantissa/seed-data
+mantissa volumes import \
+  --name seed-data \
+  --node node-a \
+  --path /srv/mantissa/seed-data
 ```
 
-Inspect cluster state:
+Inspect volume and per-node state:
 
 ```bash
 mantissa volumes list
@@ -179,61 +71,95 @@ mantissa volumes inspect dbdata
 mantissa volumes status dbdata
 ```
 
-Delete a volume object:
+Retained replicated volumes remain in `volumes list`. `volumes inspect` shows
+which of their three nodes are available and explains whether a quorum exists
+for restore.
+
+## Use From a Workload
+
+Direct tasks mount an existing volume by selector:
+
+```bash
+mantissa tasks start postgres \
+  --image postgres:16 \
+  --volume dbdata:/var/lib/postgresql/data
+```
+
+Jobs and services can declare volumes in their RON manifests and mount them by
+name. See `examples/postgresql_local_volume.ron` and
+`examples/postgresql_replicated_volume.ron`.
+
+## Delete, Retain, and Restore
+
+Mantissa refuses to delete or retain a volume while a task is using it.
+
+The normal delete command follows the volume's reclaim policy:
 
 ```bash
 mantissa volumes delete dbdata
 ```
 
-## Mounting From Tasks, Jobs, and Services
+For a managed volume with `reclaim=delete`, Mantissa removes the backing data.
+For a local volume with `reclaim=retain`, it removes the volume object but
+leaves the path on disk. Imported paths are always preserved because Mantissa
+did not create them.
 
-Direct tasks mount existing volume objects by selector:
+For a replicated volume with `reclaim=retain`, deletion has a different and
+intentional meaning: Mantissa stops the Raft group but keeps the volume object,
+its group metadata, and all three data copies. The volume moves to `retained`
+and remains visible. Restore reuses the same volume ID, Raft group, selected
+nodes, and stored data:
 
 ```bash
-mantissa tasks start postgres --image postgres:16 --volume dbdata:/var/lib/postgresql/data
+mantissa volumes restore dbdata
 ```
 
-Jobs and services can declare top-level volumes in their RON manifests and then
-mount them by name from the execution or task template.
+Restore needs at least two of the three saved replica nodes to commit the Raft
+change. The volume first moves to `restoring`. It becomes `ready` after all
+three data copies are available and match. If a saved node stays unavailable,
+the normal replica repair process can build a replacement copy on another
+eligible node.
 
-Examples in the tree:
+To permanently remove a retained replicated volume and all of its copies, use:
 
-- `examples/job_with_volume.ron`
-- `examples/postgresql_local_volume.ron`
+```bash
+mantissa volumes delete dbdata --delete-data
+```
 
-## Delete and Reclaim Semantics
+`--delete-data` is a one-time destructive action. It does not change the
+stored reclaim policy. When used for the first delete, it can also permanently
+remove a managed local volume whose policy is `retain`. It is rejected for
+imported paths.
 
-Deletion is refused while any node-state row still shows published task ids.
+Deletion and retention are asynchronous for replicated volumes. The first
+command may report that work has started. Repeating the command is safe, and
+`volumes inspect` shows the current state until the work finishes.
 
-For managed local volumes:
+## Scheduling and Failure Handling
 
-- `retain` removes the control-plane object but preserves the data path,
-- `delete` removes the managed data path as well.
+A bound local volume is a hard placement constraint. Node drain reports local
+volume tasks as blockers because their data cannot move automatically.
 
-Destructive `reclaim=delete` for managed local volumes must be executed on the
-owning node. Mantissa rejects the delete from a different node.
+A replicated volume is attached to one workload node at a time. If that node
+fails, Mantissa can attach the volume on another replica node after Raft has a
+quorum and the previous writer is fenced. A draining node is not selected for
+new replica placement.
 
-Imported paths are always preserved because Mantissa did not create the data.
+When a required volume is unavailable, Mantissa marks the workload
+`VolumeUnavailable`. Services wait for storage recovery instead of starting a
+container without its data.
 
-## Drain Interaction
+## REST API
 
-Node drain treats local-volume tasks conservatively.
+The equivalent REST operations are:
 
-If a node still hosts active local-volume tasks, drain reports a blocker and
-requires the operator to stop those tasks first. This keeps Mantissa from
-pretending that node-local data can evacuate transparently.
-
-For the operator workflow, see `docs/node-maintenance.md`.
-
-## Failure Modes
-
-When a workload cannot access a required local volume on its node, Mantissa
-marks the workload `VolumeUnavailable`. Services surface that as
-`ServiceStatus::VolumeUnavailable` until the bound path becomes usable again.
-
-This is especially important for imported paths and other pinned local volumes:
-they recover in place once the node-local prerequisite returns, not by falling
-back to another node.
+```text
+GET    /v1/volumes
+GET    /v1/volumes/{selector}
+DELETE /v1/volumes/{selector}
+DELETE /v1/volumes/{selector}?delete_data=true
+POST   /v1/volumes/{selector}/restore
+```
 
 ## Code Map
 
@@ -241,9 +167,11 @@ back to another node.
 - `src/volumes/service.rs`
 - `src/volumes/registry.rs`
 - `src/volumes/controller.rs`
+- `src/volumes/replicated/`
 - `src/workload/manager/volumes.rs`
-- `crates/mantissa-client/src/volumes/*.rs`
-- `crates/mantissa-cli/src/volumes/*.rs`
+- `crates/mantissa-volume/`
+- `crates/mantissa-client/src/volumes/`
+- `crates/mantissa-cli/src/volumes/`
 
 ## Related Documents
 
