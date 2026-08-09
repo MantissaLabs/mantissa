@@ -52,10 +52,11 @@ pub(super) struct InstanceLaunchRequest<'a> {
 }
 
 impl WorkloadManager {
-    /// Builds one runtime instance launch request and guarantees the process is started.
+    /// Builds one admitted runtime instance launch request and guarantees the process is started.
     ///
     /// Both single-task and batch startup paths call this helper so create/start behavior cannot
-    /// drift between the two code paths.
+    /// drift between the two code paths. Callers hold the local launch barrier across their full
+    /// state transition, which prevents daemon quiescence from racing final task publications.
     pub(super) async fn launch_task_instance(
         &self,
         request: &InstanceLaunchRequest<'_>,
@@ -507,7 +508,7 @@ mod tests {
                     version_id: None,
                 },
                 mode: None,
-                ownership: crate::volumes::types::LocalVolumeOwnership::Daemon,
+                ownership: crate::volumes::types::FilesystemOwnership::Daemon,
                 path_env_name: None,
             }],
             &[

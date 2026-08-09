@@ -24,7 +24,8 @@ use crate::workload::model::{
     WorkloadAdmissionGroupRecord, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
     WorkloadPhase, WorkloadSpec, WorkloadStateFilter, WorkloadStatus, WorkloadStoreValue,
     WorkloadValue, compute_service_generation_progress_id, select_best_admission_group_record,
-    select_best_service_generation_progress_record, should_replace_workload_event,
+    select_best_service_generation_progress_record, select_removed_task_epoch,
+    should_replace_workload_event,
 };
 pub(crate) use crate::workload::model::{
     merge_definition_into_value, merge_status_into_value, spec_to_status, spec_to_value,
@@ -46,7 +47,10 @@ use std::io::{self, ErrorKind};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::{
     Mutex as AsyncMutex, Notify, RwLock, Semaphore,
     mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender},
@@ -83,8 +87,6 @@ const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 const WORKLOAD_START_MAX_ATTEMPTS: usize = 5;
 /// Backoff before retrying a start when remote secret material has not converged yet.
 const REMOTE_SECRET_RETRY_DELAY: Duration = Duration::from_millis(200);
-/// Retention window for remove watermarks used to suppress stale upsert replay.
-const REMOVE_WATERMARK_RETENTION_SECS: i64 = 30 * 60;
 /// Maximum time one dirty workload update may wait before it is flushed into the shared gossip queue.
 const WORKLOAD_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of fanout rounds one logical workload update should survive before it ages out.
@@ -307,13 +309,6 @@ fn validate_existing_service_shard_execution(
     Ok(())
 }
 
-/// Remove tombstone metadata used to suppress stale workload upsert replay.
-#[derive(Clone)]
-struct RemoveTombstone {
-    watermark: DateTime<Utc>,
-    max_epoch: u64,
-}
-
 /// Buffered outbound gossip state for one workload id before it enters the shared gossip queue.
 #[derive(Clone)]
 struct DirtyWorkloadGossipRecord {
@@ -340,8 +335,10 @@ impl DirtyWorkloadGossipRecord {
     fn merge(&mut self, event: WorkloadEvent) {
         match &event {
             WorkloadEvent::Remove { .. } => {
-                self.definition = None;
-                self.latest = event;
+                if should_replace_workload_event(&self.latest, &event) {
+                    self.definition = None;
+                    self.latest = event;
+                }
             }
             WorkloadEvent::UpsertSpec(spec) => {
                 if let Some(current) = self.definition.as_ref() {
@@ -353,18 +350,14 @@ impl DirtyWorkloadGossipRecord {
                     self.definition = Some((**spec).clone());
                 }
 
-                if matches!(self.latest, WorkloadEvent::Remove { .. })
-                    || should_replace_workload_event(&self.latest, &event)
-                {
+                if should_replace_workload_event(&self.latest, &event) {
                     self.latest = event;
                 }
             }
             WorkloadEvent::UpsertStatus(_)
             | WorkloadEvent::UpsertAdmissionGroup(_)
             | WorkloadEvent::UpsertServiceProgress(_) => {
-                if matches!(self.latest, WorkloadEvent::Remove { .. })
-                    || should_replace_workload_event(&self.latest, &event)
-                {
+                if should_replace_workload_event(&self.latest, &event) {
                     self.latest = event;
                 }
             }
@@ -375,7 +368,10 @@ impl DirtyWorkloadGossipRecord {
     /// Expands the buffered outbound state into the concrete events that should be flushed.
     fn events(&self) -> Vec<WorkloadEvent> {
         match &self.latest {
-            WorkloadEvent::Remove { id } => vec![WorkloadEvent::Remove { id: *id }],
+            WorkloadEvent::Remove { id, task_epoch } => vec![WorkloadEvent::Remove {
+                id: *id,
+                task_epoch: *task_epoch,
+            }],
             WorkloadEvent::UpsertStatus(status) => {
                 let mut events = Vec::with_capacity(2);
                 if let Some(spec) = self.definition.as_ref() {
@@ -501,6 +497,10 @@ struct WorkloadManagerRuntime {
 
 #[derive(Clone)]
 struct WorkloadManagerLocalState {
+    // Monotonic daemon-lifetime gate that rejects workload starts after shutdown begins.
+    shutdown_started: Arc<AtomicBool>,
+    // Drains the narrow mount/create/start window before replicated-volume cleanup begins.
+    local_launch_barrier: Arc<RwLock<()>>,
     // Best-effort mapping from workload id to the current backend-qualified runtime reference.
     local_instances: Arc<AsyncMutex<HashMap<Uuid, RuntimeInstanceRef>>>,
     // Per-workload decoded spec cache reused while the backing store stays unchanged.
@@ -519,8 +519,6 @@ struct WorkloadManagerLocalState {
     inflight_stops: Arc<AsyncMutex<HashSet<Uuid>>>,
     // Reconcile deduplication guard so only one reconcile workflow runs per workload.
     inflight_reconciles: Arc<AsyncMutex<HashSet<Uuid>>>,
-    // Short-lived remove tombstones used to reject stale post-remove upserts.
-    removed_task_watermarks: Arc<AsyncMutex<HashMap<Uuid, RemoveTombstone>>>,
     // Recent retryable remote prepare failures used to deprioritize stale peers locally.
     remote_prepare_feedback: RemotePrepareFeedbackRegistry,
     // Per-workload dirty gossip buffer collapsed before updates enter the shared gossip queue.
@@ -555,6 +553,12 @@ struct WorkloadManagerNetworking {
 struct WorkloadManagerVolumes {
     // Volume registry handle for spec/node-state reconciliation.
     volume_registry: VolumeRegistry,
+    // Serializes first-consumer binding writes made by this node.
+    binding_lock: Arc<AsyncMutex<()>>,
+    // Weak storage handle so exported workload APIs cannot keep a stopped daemon alive.
+    replicated: Option<Weak<dyn volumes::ReplicatedVolumeAccess>>,
+    // Short-lived locks that protect local task consumer lists and last-user detach.
+    mount_locks: volumes::MountLocks,
     // Local filesystem root for mounted node-local volume paths.
     local_volume_root: PathBuf,
     // Enables/disables local capacity enforcement for node-local volumes.
@@ -746,6 +750,7 @@ pub struct WorkloadManagerConfig {
     pub network_registry: NetworkRegistry,
     pub network_controller: Option<NetworkController>,
     pub volume_registry: VolumeRegistry,
+    pub replicated_volume_runtime: Option<Arc<crate::volumes::replicated::ReplicatedVolumeRuntime>>,
     pub secret_registry: SecretRegistry,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
     pub forwarding_events: Option<UnboundedSender<ForwardingEvent>>,
@@ -770,6 +775,7 @@ impl WorkloadManager {
             network_registry,
             network_controller,
             volume_registry,
+            replicated_volume_runtime,
             secret_registry,
             secret_keyring,
             forwarding_events,
@@ -811,6 +817,8 @@ impl WorkloadManager {
                 runtime_config: runtime_config.unwrap_or_default(),
             },
             local_state: WorkloadManagerLocalState {
+                shutdown_started: Arc::new(AtomicBool::new(false)),
+                local_launch_barrier: Arc::new(RwLock::new(())),
                 local_instances: Arc::new(AsyncMutex::new(HashMap::new())),
                 workload_spec_cache: Arc::new(Mutex::new(HashMap::new())),
                 workload_value_index: Arc::new(Mutex::new(None)),
@@ -820,7 +828,6 @@ impl WorkloadManager {
                 attachment_assignment_lock: Arc::new(AsyncMutex::new(())),
                 inflight_stops: Arc::new(AsyncMutex::new(HashSet::new())),
                 inflight_reconciles: Arc::new(AsyncMutex::new(HashSet::new())),
-                removed_task_watermarks: Arc::new(AsyncMutex::new(HashMap::new())),
                 remote_prepare_feedback: RemotePrepareFeedbackRegistry::new(),
                 dirty_gossip_workloads: Arc::new(AsyncMutex::new(HashMap::new())),
                 dirty_gossip_notify: Arc::new(Notify::new()),
@@ -838,10 +845,36 @@ impl WorkloadManager {
             },
             volumes: WorkloadManagerVolumes {
                 volume_registry,
+                binding_lock: Arc::new(AsyncMutex::new(())),
+                replicated: replicated_volume_runtime.map(|runtime| {
+                    let runtime: Arc<dyn volumes::ReplicatedVolumeAccess> = runtime;
+                    Arc::downgrade(&runtime)
+                }),
+                mount_locks: volumes::MountLocks::default(),
                 local_volume_root,
                 enforce_local_volume_capacity,
             },
         }
+    }
+
+    /// Closes workload admission and drains local runtime launches before storage cleanup starts.
+    ///
+    /// The flag closes new scheduling immediately. Waiting for the write side of the launch
+    /// barrier then proves that no accepted launch can still create a replicated mount or runtime
+    /// instance after this method returns. Stop and detach paths deliberately remain available.
+    pub(crate) async fn begin_shutdown(&self) {
+        self.local_state
+            .shutdown_started
+            .store(true, Ordering::Release);
+        let _launches_drained = self.local_state.local_launch_barrier.write().await;
+    }
+
+    /// Rejects new workload admission after this daemon has entered shutdown.
+    fn ensure_workload_admission_open(&self) -> Result<(), anyhow::Error> {
+        if self.local_state.shutdown_started.load(Ordering::Acquire) {
+            return Err(anyhow!("workload manager is shutting down"));
+        }
+        Ok(())
     }
 
     /// Tells one peer to prioritize pulling workload rows from this node.
@@ -938,74 +971,35 @@ impl WorkloadManager {
                 .unwrap_or(false)
     }
 
-    /// Records the latest remove watermark and epoch used to suppress stale remote task upserts.
-    async fn record_remove_watermark(
+    /// Returns true when one inbound workload update is covered by a durable removal.
+    async fn should_ignore_removed_task(
         &self,
         task_id: Uuid,
-        watermark: DateTime<Utc>,
-        max_epoch: u64,
-    ) {
-        let mut guard = self.local_state.removed_task_watermarks.lock().await;
-        let cutoff = Utc::now() - chrono::Duration::seconds(REMOVE_WATERMARK_RETENTION_SECS);
-        guard.retain(|_, tombstone| tombstone.watermark >= cutoff);
-        match guard.get_mut(&task_id) {
-            Some(current) => {
-                if watermark > current.watermark {
-                    current.watermark = watermark;
-                }
-                current.max_epoch = current.max_epoch.max(max_epoch);
-            }
-            None => {
-                guard.insert(
-                    task_id,
-                    RemoveTombstone {
-                        watermark,
-                        max_epoch,
-                    },
-                );
-            }
-        }
+        task_epoch: u64,
+    ) -> Result<bool, anyhow::Error> {
+        let removed_through_epoch = self
+            .core
+            .store
+            .get_snapshot(&UuidKey::from(task_id))
+            .map_err(|error| anyhow!("task removal lookup failed: {error}"))?
+            .and_then(|snapshot| select_removed_task_epoch(snapshot.as_slice()));
+        Ok(removed_through_epoch.is_some_and(|removed| task_epoch <= removed))
     }
 
-    /// Clears the remove watermark once a fresh workload incarnation has been accepted.
-    async fn clear_remove_watermark(&self, task_id: Uuid) {
-        self.local_state
-            .removed_task_watermarks
-            .lock()
-            .await
-            .remove(&task_id);
-    }
-
-    /// Returns true when one inbound workload update should be ignored because it predates a known remove.
-    async fn should_ignore_removed_task(&self, task_id: Uuid, task_epoch: u64) -> bool {
-        let tombstone = {
-            let guard = self.local_state.removed_task_watermarks.lock().await;
-            guard.get(&task_id).cloned()
-        };
-
-        if let Some(tombstone) = tombstone {
-            if task_epoch > tombstone.max_epoch {
-                self.clear_remove_watermark(task_id).await;
-                return false;
-            }
-
-            return true;
-        }
-
-        // Durable tombstones outlive the in-memory remove watermark and do not carry enough
-        // causal detail to safely reject one future incarnation forever. Once the watermark
-        // window elapses we must allow upserts again so split/merge convergence can recover.
-        false
-    }
-
-    /// Returns true when an inbound full task definition predates a known remove watermark.
-    async fn should_ignore_removed_upsert(&self, spec: &WorkloadSpec) -> bool {
+    /// Returns true when an inbound full task definition is covered by a durable removal.
+    async fn should_ignore_removed_upsert(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<bool, anyhow::Error> {
         self.should_ignore_removed_task(spec.id, spec.task_epoch)
             .await
     }
 
-    /// Returns true when an inbound compact task status predates a known remove watermark.
-    async fn should_ignore_removed_status(&self, status: &WorkloadStatus) -> bool {
+    /// Returns true when an inbound compact task status is covered by a durable removal.
+    async fn should_ignore_removed_status(
+        &self,
+        status: &WorkloadStatus,
+    ) -> Result<bool, anyhow::Error> {
         self.should_ignore_removed_task(status.id, status.task_epoch)
             .await
     }
@@ -1243,6 +1237,7 @@ impl WorkloadManager {
             return Ok(Vec::new());
         }
 
+        self.ensure_workload_admission_open()?;
         self.ensure_secret_dependencies(&requests)?;
 
         let mut intents = Self::build_start_intents(requests)?;
@@ -1263,6 +1258,9 @@ impl WorkloadManager {
             self.bind_assignment_volumes(&assignment, &intents)
                 .await
                 .context("failed to validate local volumes for gang workload group")?;
+            self.ensure_replicated_volumes_ready(&intents)
+                .await
+                .context("replicated volumes are not ready for gang workload group")?;
 
             attempt += 1;
             let remote_peer_count = assignment
@@ -1662,7 +1660,10 @@ impl WorkloadManager {
         I: IntoIterator<Item = &'a WorkloadSpec>,
     {
         for spec in specs {
-            if let Err(err) = self.remove_spec(spec.id).await {
+            if let Err(err) = self
+                .remove_spec_through_epoch(spec.id, spec.task_epoch)
+                .await
+            {
                 warn!(
                     target: "task",
                     "failed to remove pending group workload {} during rollback: {err}",
@@ -1882,6 +1883,7 @@ impl WorkloadManager {
             return Ok(Vec::new());
         }
 
+        self.ensure_workload_admission_open()?;
         self.ensure_secret_dependencies(&requests)?;
 
         let mut intents = Self::build_start_intents(requests)?;
@@ -1889,6 +1891,7 @@ impl WorkloadManager {
 
         let mut attempt = 0usize;
         let mut scheduling_retry_attempts = 0usize;
+        let mut volume_wait_attempts = 0usize;
         let scheduling_retry_max_attempts = scheduling_retry_max_attempts_override
             .unwrap_or_else(|| scheduling_retry_max_attempts_for_intents(&intents));
 
@@ -1918,9 +1921,33 @@ impl WorkloadManager {
                 }
             };
 
-            self.bind_assignment_volumes(&assignment, &intents)
+            let bound_new_volumes = self
+                .bind_assignment_volumes(&assignment, &intents)
                 .await
                 .context("failed to bind local volumes for task batch")?;
+            if bound_new_volumes {
+                self.apply_volume_locality_to_intents(&mut intents).await?;
+                continue;
+            }
+
+            let volume_change = self.volumes.volume_registry.change_version();
+            if let Err(err) = self.ensure_replicated_volumes_ready(&intents).await {
+                volume_wait_attempts += 1;
+                if volume_wait_attempts >= scheduling_retry_max_attempts {
+                    return Err(err.context("replicated volumes did not become ready"));
+                }
+                let backoff = scheduling_retry_backoff(volume_wait_attempts);
+                debug!(
+                    target: "task",
+                    "replicated volumes are not ready; waiting up to {backoff:?}: {err}"
+                );
+                tokio::select! {
+                    _ = self.volumes.volume_registry.wait_for_change(volume_change) => {}
+                    _ = sleep(backoff) => {}
+                }
+                continue;
+            }
+            volume_wait_attempts = 0;
 
             attempt += 1;
             let remote_peer_count = assignment
@@ -2049,8 +2076,8 @@ impl WorkloadManager {
                     self.signal_remote_stop(&remote_specs).await;
                     self.abort_remote_leases(&reserved_remote).await;
                     reserved_remote.clear();
-                    // start_local_instances already runs cleanup_batch on failure, which releases
-                    // any local slot/GPU reservations touched by this attempt.
+                    // start_local_instances releases resources for final failures. A task blocked
+                    // by its volume keeps its assignment so local reconciliation can retry it.
                     reserved_local_resources.take();
                     return Err(err);
                 }
@@ -2202,14 +2229,19 @@ impl WorkloadManager {
             .get_snapshot(&key)
             .map_err(|e| anyhow!("owned workload status lookup failed: {e}"))?;
 
-        if let Some(value) = snapshot.and_then(|snapshot| {
-            crate::workload::model::select_best_workload_value(snapshot.as_slice())
-        }) {
-            if value.node_id != self.local_node_id {
-                return Ok(OwnedWorkloadStatus::NotOwned(value.node_id));
+        if let Some(snapshot) = snapshot.as_ref() {
+            if let Some(value) =
+                crate::workload::model::select_best_workload_value(snapshot.as_slice())
+            {
+                if value.node_id != self.local_node_id {
+                    return Ok(OwnedWorkloadStatus::NotOwned(value.node_id));
+                }
+                let spec = value_to_spec(id, value);
+                return Ok(OwnedWorkloadStatus::Status(Box::new(spec_to_status(&spec))));
             }
-            let spec = value_to_spec(id, value);
-            return Ok(OwnedWorkloadStatus::Status(Box::new(spec_to_status(&spec))));
+            if select_removed_task_epoch(snapshot.as_slice()).is_some() {
+                return Ok(OwnedWorkloadStatus::Removed);
+            }
         }
 
         if self
@@ -3192,6 +3224,11 @@ fn gang_planning_error_context(cause: &SchedulingError, request_summary: &str) -
                 "local network specs are unavailable while planning gang reservation for task '{task}' ({request_summary})"
             )
         }
+        SchedulingError::VolumeStorageBlocked { task } => {
+            format!(
+                "replicated volume storage is unavailable while planning gang reservation for task '{task}' ({request_summary})"
+            )
+        }
         SchedulingError::PlacementConstraintsBlocked { task, constraints } => {
             format!(
                 "placement constraints are blocking gang reservation for task '{task}' ({request_summary}); {constraints}"
@@ -3313,6 +3350,7 @@ fn is_retryable_scheduling_error(err: &anyhow::Error) -> bool {
                     | SchedulingError::TargetSchedulerViewMissing { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
+                    | SchedulingError::VolumeStorageBlocked { .. }
             )
         })
 }
@@ -3331,6 +3369,9 @@ fn workload_start_error_exhausted_attempts(err: &anyhow::Error) -> bool {
 /// Higher-level controllers should keep work pending not only for short-lived convergence
 /// failures, but also for pure capacity shortages that may resolve once older workloads drain.
 pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
+    if state::is_volume_access_error(err) {
+        return true;
+    }
     if err.chain().any(|cause| {
         cause
             .downcast_ref::<ServiceShardAssignmentFailure>()
@@ -3356,6 +3397,7 @@ pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
                     | SchedulingError::TargetNodeUnavailable { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
+                    | SchedulingError::VolumeStorageBlocked { .. }
             )
         })
 }
@@ -3365,6 +3407,9 @@ pub(crate) fn workload_start_error_is_retryable(err: &anyhow::Error) -> bool {
 /// Services already have explicit rollout failure semantics, so pure capacity shortages should
 /// consume that controller budget instead of leaving the service indefinitely pending.
 pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error) -> bool {
+    if state::is_volume_access_error(err) {
+        return true;
+    }
     if err.chain().any(|cause| {
         cause
             .downcast_ref::<ServiceShardAssignmentFailure>()
@@ -3386,6 +3431,7 @@ pub(crate) fn workload_start_error_requires_service_requeue(err: &anyhow::Error)
                     | SchedulingError::TargetSchedulerViewMissing { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
+                    | SchedulingError::VolumeStorageBlocked { .. }
             )
         })
 }
@@ -3399,6 +3445,9 @@ pub(crate) fn workload_start_error_contains_host_ports_blocked(err: &anyhow::Err
 
 /// Builds a concise service-facing detail for retryable workload start failures.
 pub(crate) fn workload_start_retryable_detail(err: &anyhow::Error) -> Option<String> {
+    if state::is_volume_access_error(err) {
+        return Some(err.to_string());
+    }
     if let Some(failure) = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<ServiceShardAssignmentFailure>())
@@ -3426,6 +3475,9 @@ pub(crate) fn workload_start_retryable_detail(err: &anyhow::Error) -> Option<Str
             )),
             SchedulingError::LocalNetworksBlocked { task } => Some(format!(
                 "waiting for local network specs before starting task '{task}'"
+            )),
+            SchedulingError::VolumeStorageBlocked { task } => Some(format!(
+                "waiting for replicated volume storage before starting task '{task}'"
             )),
             _ => None,
         })
@@ -3502,6 +3554,9 @@ pub(crate) fn workload_start_error_is_terminal_service_launch(err: &anyhow::Erro
 pub(crate) fn classify_service_shard_assignment_failure(
     err: &anyhow::Error,
 ) -> ServiceShardAssignmentFailureClass {
+    if state::is_volume_access_error(err) {
+        return ServiceShardAssignmentFailureClass::Retryable;
+    }
     if workload_start_error_exhausted_attempts(err) {
         return ServiceShardAssignmentFailureClass::Retryable;
     }
@@ -3516,6 +3571,7 @@ pub(crate) fn classify_service_shard_assignment_failure(
                     | SchedulingError::TargetSchedulerViewMissing { .. }
                     | SchedulingError::NetworksBlocked { .. }
                     | SchedulingError::LocalNetworksBlocked { .. }
+                    | SchedulingError::VolumeStorageBlocked { .. }
             )
         })
     {
@@ -3737,6 +3793,10 @@ struct StopTaskGuard {
 impl Drop for StopTaskGuard {
     /// Releases the in-flight stop marker after the stop workflow returns.
     fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.try_lock() {
+            inflight.remove(&self.task_id);
+            return;
+        }
         let inflight = self.inflight.clone();
         let task_id = self.task_id;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -3756,6 +3816,10 @@ struct ReconcileTaskGuard {
 impl Drop for ReconcileTaskGuard {
     /// Releases the in-flight reconcile marker after the reconcile workflow returns.
     fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.try_lock() {
+            inflight.remove(&self.task_id);
+            return;
+        }
         let inflight = self.inflight.clone();
         let task_id = self.task_id;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {

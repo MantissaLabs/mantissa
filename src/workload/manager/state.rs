@@ -21,13 +21,14 @@ use crate::scheduler::{
     SlotState,
 };
 use crate::services::types::compute_service_id;
-use crate::volumes::LocalVolumeAccessError;
+use crate::volumes::VolumeAccessError;
 use crate::workload::model::{
     ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
-    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata,
-    WorkloadSpec, WorkloadStoreValue, WorkloadValue, compute_service_generation_progress_id,
-    parse_workload_timestamp as parse_task_timestamp, select_best_admission_group_record,
-    select_best_workload_value, workload_event_id,
+    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadRemoval,
+    WorkloadServiceMetadata, WorkloadSpec, WorkloadStoreValue, WorkloadValue,
+    compute_service_generation_progress_id, parse_workload_timestamp as parse_task_timestamp,
+    select_best_admission_group_record, select_best_workload_value, select_removed_task_epoch,
+    workload_event_id,
 };
 use crate::workload::types::{
     WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicyKind,
@@ -959,14 +960,29 @@ impl WorkloadManager {
         task_id: Uuid,
         value: &WorkloadValue,
     ) -> Result<(), anyhow::Error> {
-        self.core
+        let mut removed_through_epoch = None;
+        let changed = self
+            .core
             .store
-            .upsert(
-                &UuidKey::from(task_id),
-                WorkloadStoreValue::from(value.clone()),
-            )
+            .update_value(&UuidKey::from(task_id), |snapshot| {
+                removed_through_epoch =
+                    snapshot.and_then(|snapshot| select_removed_task_epoch(snapshot.as_slice()));
+                if removed_through_epoch.is_some_and(|removed| value.task_epoch <= removed) {
+                    return None;
+                }
+                Some(WorkloadStoreValue::from(value.clone()))
+            })
             .await
-            .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))
+            .map_err(|e| anyhow::anyhow!("task upsert failed: {e}"))?;
+
+        if !changed && let Some(removed_epoch) = removed_through_epoch {
+            return Err(anyhow!(
+                "task {task_id} assignment epoch {} was removed through epoch {removed_epoch}",
+                value.task_epoch
+            ));
+        }
+
+        Ok(())
     }
 
     /// Computes the next task assignment epoch for the provided ownership/slot tuple.
@@ -984,23 +1000,11 @@ impl WorkloadManager {
             .map_err(|e| anyhow::anyhow!("task lookup failed for assignment epoch: {e}"))?;
 
         let Some(snapshot) = snapshot else {
-            if let Some(max_epoch) = self
-                .local_state
-                .removed_task_watermarks
-                .lock()
-                .await
-                .get(&id)
-                .map(|tombstone| tombstone.max_epoch)
-            {
-                return Ok(max_epoch.saturating_add(1));
-            }
-            let has_tombstone = self.core.store.has_tombstone(&key).map_err(|e| {
-                anyhow::anyhow!("task tombstone lookup failed for assignment epoch: {e}")
-            })?;
-            return Ok(if has_tombstone { 1 } else { 0 });
-        };
-        let Some(current) = select_best_workload_value(snapshot.as_slice()) else {
             return Ok(0);
+        };
+        let removed_epoch = select_removed_task_epoch(snapshot.as_slice());
+        let Some(current) = select_best_workload_value(snapshot.as_slice()) else {
+            return Ok(removed_epoch.map_or(0, |epoch| epoch.saturating_add(1)));
         };
         let max_epoch = snapshot
             .as_slice()
@@ -1008,7 +1012,8 @@ impl WorkloadManager {
             .filter_map(WorkloadStoreValue::workload)
             .map(|value| value.task_epoch)
             .max()
-            .unwrap_or(current.task_epoch);
+            .unwrap_or(current.task_epoch)
+            .max(removed_epoch.unwrap_or(0));
 
         // Split/merge can leave concurrent values for the same task id on different owners.
         // Reusing the selected winner's epoch would let stale owners keep publishing status for
@@ -1044,77 +1049,80 @@ impl WorkloadManager {
             })
             .collect();
 
-        self.core
+        let mut rejected = None;
+        let accepted = self
+            .core
             .store
-            .upsert_many(entries)
+            .upsert_many_if(entries, |_, snapshot, value| {
+                let Some(value) = value.workload() else {
+                    return true;
+                };
+                let removed_epoch =
+                    snapshot.and_then(|snapshot| select_removed_task_epoch(snapshot.as_slice()));
+                if removed_epoch.is_some_and(|removed| value.task_epoch <= removed) {
+                    rejected = Some((value.id, value.task_epoch, removed_epoch.unwrap_or(0)));
+                    return false;
+                }
+                true
+            })
             .await
             .map_err(|e| anyhow::anyhow!("task batch upsert failed: {e}"))?;
+
+        if !accepted && let Some((task_id, task_epoch, removed_epoch)) = rejected {
+            return Err(anyhow!(
+                "task {task_id} assignment epoch {task_epoch} was removed through epoch {removed_epoch}"
+            ));
+        }
 
         Ok(())
     }
 
-    /// Removes a task snapshot from the store.
-    pub(super) async fn remove_spec(&self, id: Uuid) -> Result<(), anyhow::Error> {
+    /// Records a task removal unless a newer assignment is already stored.
+    pub(super) async fn remove_spec_through_epoch(
+        &self,
+        id: Uuid,
+        removed_through_epoch: u64,
+    ) -> Result<bool, anyhow::Error> {
         let key = UuidKey::from(id);
-        let prior_max_epoch = {
-            let guard = self.local_state.removed_task_watermarks.lock().await;
-            guard.get(&id).map(|tombstone| tombstone.max_epoch)
-        };
-        let prior_value = self
+        let mut newer_epoch = None;
+        let mut already_removed = false;
+        let changed = self
             .core
             .store
-            .get_snapshot(&key)
-            .map_err(|e| anyhow::anyhow!("task lookup failed before remove: {e}"))?
-            .and_then(|snapshot| select_best_workload_value(snapshot.as_slice()));
-        if prior_value.is_none()
-            && self
-                .core
-                .store
-                .has_tombstone(&key)
-                .map_err(|e| anyhow::anyhow!("task tombstone lookup failed before remove: {e}"))?
-        {
-            // The durable tombstone already represents this delete. Refresh only the in-memory
-            // watermark so stale upserts stay suppressed without moving the workload MST root.
-            self.record_remove_watermark(id, Utc::now(), prior_max_epoch.unwrap_or(0))
-                .await;
-            self.evict_cached_spec(id);
-            return Ok(());
-        }
+            .update_value(&key, |snapshot| {
+                if let Some(current) =
+                    snapshot.and_then(|snapshot| select_best_workload_value(snapshot.as_slice()))
+                    && current.task_epoch > removed_through_epoch
+                {
+                    newer_epoch = Some(current.task_epoch);
+                    return None;
+                }
 
-        if prior_value
-            .as_ref()
-            .is_some_and(|value| value.node_id == self.local_node_id)
-            && let Err(err) = self
-                .teardown_runtime_attachments(id, HashSet::new(), true)
-                .await
-        {
-            warn!(
-                target: "task",
-                task = %id,
-                "failed to remove local network attachments before task removal: {err:#}"
-            );
-        }
+                if snapshot
+                    .and_then(|snapshot| select_removed_task_epoch(snapshot.as_slice()))
+                    .is_some_and(|stored| stored >= removed_through_epoch)
+                {
+                    already_removed = true;
+                    return None;
+                }
 
-        let (watermark, max_epoch) = prior_value
-            .map(|value| {
-                (
-                    parse_task_timestamp(&value.updated_at, &value.created_at)
-                        .unwrap_or_else(Utc::now),
-                    value.task_epoch,
+                Some(
+                    WorkloadRemoval {
+                        id,
+                        task_epoch: removed_through_epoch,
+                    }
+                    .into(),
                 )
             })
-            // Duplicate remove events can arrive after the row is already gone. Reuse the
-            // existing watermark epoch instead of poisoning the id with an unbounded epoch.
-            .unwrap_or_else(|| (Utc::now(), prior_max_epoch.unwrap_or(0)));
-
-        self.core
-            .store
-            .remove(&key)
             .await
             .map_err(|e| anyhow::anyhow!("task remove failed: {e}"))?;
-        self.record_remove_watermark(id, watermark, max_epoch).await;
+
+        if newer_epoch.is_some() {
+            return Ok(false);
+        }
+        debug_assert!(changed || already_removed);
         self.evict_cached_spec(id);
-        Ok(())
+        Ok(true)
     }
 
     /// Updates one task lifecycle state/phase snapshot and gossips it when changed.
@@ -1317,7 +1325,8 @@ impl WorkloadManager {
             .context(format!("runtime image pull failed for image {image}")))
     }
 
-    fn tx(&self) -> Sender<Message> {
+    /// Returns the shared outbound queue used by workload lifecycle updates.
+    pub(super) fn tx(&self) -> Sender<Message> {
         self.core.tx.clone()
     }
 
@@ -2011,10 +2020,94 @@ impl WorkloadManager {
             debug!(
                 target: "task",
                 task = %id,
-                "stop workflow already in progress; skipping duplicate stop attempt"
+                "stop workflow already in progress; deferring duplicate stop attempt"
             );
-            return Ok(spec);
+            return Err(anyhow!(
+                "stop workflow for task {id} is already in progress"
+            ));
         };
+
+        let mut updated = spec.clone();
+        if !matches!(spec.state, WorkloadPhase::Stopping) {
+            updated.phase_version = updated.phase_version.saturating_add(1);
+            updated.state = WorkloadPhase::Stopping;
+            updated.phase_reason = None;
+            updated.phase_progress = None;
+            updated.updated_at = Utc::now().to_rfc3339();
+            self.persist_spec(&updated).await?;
+            self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
+                .await?;
+        }
+
+        self.stop_local_task_resources(&spec).await?;
+
+        if !matches!(updated.state, WorkloadPhase::Stopped) {
+            updated.phase_version = updated.phase_version.saturating_add(1);
+        }
+        updated.state = WorkloadPhase::Stopped;
+        updated.phase_reason = None;
+        updated.phase_progress = None;
+        updated.updated_at = Utc::now().to_rfc3339();
+        if !spec.slot_ids.is_empty() {
+            for slot_id in &spec.slot_ids {
+                self.release_slot(*slot_id)
+                    .await
+                    .with_context(|| "scheduler release failed during stop".to_string())?;
+            }
+            updated.slot_ids.clear();
+            updated.slot_id = None;
+            updated.cpu_millis = 0;
+            updated.memory_bytes = 0;
+        }
+
+        self.persist_spec(&updated).await?;
+        self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
+            .await?;
+        self.cleanup_orphaned_slots().await;
+        self.remove_spec_through_epoch(id, updated.task_epoch)
+            .await?;
+        self.enqueue_gossip(WorkloadEvent::Remove {
+            id,
+            task_epoch: updated.task_epoch,
+        })
+        .await?;
+        if let Err(err) = self.cleanup_orphaned_local_attachments().await {
+            warn!(
+                target: "task",
+                task = %id,
+                "failed to run orphaned attachment cleanup after stop: {err}"
+            );
+        }
+        Ok(updated)
+    }
+
+    /// Quiesces one task's local resources for daemon shutdown without changing durable demand.
+    ///
+    /// A daemon restart is not a workload stop. The persisted phase and scheduler reservations
+    /// remain intact so ordinary startup reconciliation can recreate the runtime. Failed cleanup
+    /// also remains retryable because the same task row selects this method on the next pass.
+    pub(super) async fn quiesce_local_task_for_daemon_shutdown(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<(), anyhow::Error> {
+        let id = spec.id;
+        let Some(_stop_guard) = self.try_begin_stop(id).await else {
+            debug!(
+                target: "task",
+                task = %id,
+                "stop workflow already in progress; deferring daemon quiescence"
+            );
+            return Err(anyhow!(
+                "stop workflow for task {id} is already in progress"
+            ));
+        };
+
+        self.stop_local_task_resources(spec).await
+    }
+
+    /// Stops and removes one task's local runtime-owned resources without editing its task row.
+    async fn stop_local_task_resources(&self, spec: &WorkloadSpec) -> Result<(), anyhow::Error> {
+        let id = spec.id;
         let identifier_entry = {
             let mut guard = self.local_state.local_instances.lock().await;
             guard.remove(&id)
@@ -2048,18 +2141,6 @@ impl WorkloadManager {
             }
         };
 
-        let mut updated = spec.clone();
-        if !matches!(spec.state, WorkloadPhase::Stopping) {
-            updated.phase_version = updated.phase_version.saturating_add(1);
-            updated.state = WorkloadPhase::Stopping;
-            updated.phase_reason = None;
-            updated.phase_progress = None;
-            updated.updated_at = Utc::now().to_rfc3339();
-            self.persist_spec(&updated).await?;
-            self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
-                .await?;
-        }
-
         if let Err(err) = self.set_task_traffic_published(id, false).await {
             warn!(
                 target: "task",
@@ -2073,7 +2154,7 @@ impl WorkloadManager {
         let stop_deadline =
             Instant::now() + self.effective_task_stop_timeout(spec.termination_grace_period_secs);
         if let Some(instance_identifier) = instance_identifier.as_ref() {
-            self.run_pre_stop_hook(&spec, instance_identifier, stop_deadline)
+            self.run_pre_stop_hook(spec, instance_identifier, stop_deadline)
                 .await;
 
             match self
@@ -2082,8 +2163,8 @@ impl WorkloadManager {
             {
                 Ok(()) => {}
                 Err(err) => {
-                    // Keep the task in `Stopping` so the periodic reconcile loop can retry after one
-                    // bounded runtime timeout instead of pinning the stop guard forever.
+                    // The caller retains its durable task row, so the next stop or shutdown pass
+                    // resolves the same named runtime and retries after this bounded timeout.
                     return Err(err);
                 }
             }
@@ -2104,13 +2185,9 @@ impl WorkloadManager {
         }
 
         self.cleanup_secret_artifacts(id).await;
-        if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
-            warn!(
-                target: "task",
-                task = %id,
-                "failed to unpublish local volume mounts during stop: {err:#}"
-            );
-        }
+        self.unpublish_task_volume_mounts(spec)
+            .await
+            .with_context(|| format!("failed to unpublish local volume mounts for task {id}"))?;
 
         // This path is already stopping a locally owned task. Force registry cleanup so a
         // concurrent task-spec removal cannot make attachment teardown leave stale demand rows.
@@ -2124,40 +2201,7 @@ impl WorkloadManager {
                 id
             );
         }
-
-        if !matches!(updated.state, WorkloadPhase::Stopped) {
-            updated.phase_version = updated.phase_version.saturating_add(1);
-        }
-        updated.state = WorkloadPhase::Stopped;
-        updated.phase_reason = None;
-        updated.phase_progress = None;
-        updated.updated_at = Utc::now().to_rfc3339();
-        if !spec.slot_ids.is_empty() {
-            for slot_id in &spec.slot_ids {
-                self.release_slot(*slot_id)
-                    .await
-                    .with_context(|| "scheduler release failed during stop".to_string())?;
-            }
-            updated.slot_ids.clear();
-            updated.slot_id = None;
-            updated.cpu_millis = 0;
-            updated.memory_bytes = 0;
-        }
-
-        self.persist_spec(&updated).await?;
-        self.enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(updated.clone())))
-            .await?;
-        self.cleanup_orphaned_slots().await;
-        self.remove_spec(id).await?;
-        self.enqueue_gossip(WorkloadEvent::Remove { id }).await?;
-        if let Err(err) = self.cleanup_orphaned_local_attachments().await {
-            warn!(
-                target: "task",
-                task = %id,
-                "failed to run orphaned attachment cleanup after stop: {err}"
-            );
-        }
-        Ok(updated)
+        Ok(())
     }
 
     /// Executes the task pre-stop hook inside the running runtime instance before termination begins.
@@ -2780,12 +2824,24 @@ impl WorkloadManager {
         &self,
         spec: WorkloadSpec,
     ) -> Result<(), anyhow::Error> {
+        // The read guard covers the complete reconcile attempt, including its final publications.
+        // Shutdown closes admission before taking the write side, so no lifecycle update can race
+        // after the daemon has started quiescing the runtime that update describes.
+        let _launch_guard = self.local_state.local_launch_barrier.read().await;
+        if self
+            .local_state
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
         let mut working = self.load_spec(spec.id).await.unwrap_or(spec);
         if working.node_id != self.local_node_id {
             return Ok(());
         }
         if let Err(err) = self.ensure_task_volumes_accessible(&working.volumes).await {
-            let err = if is_local_volume_access_error(&err) {
+            let err = if is_volume_access_error(&err) {
                 self.mark_task_volume_unavailable(working, err).await
             } else {
                 self.mark_task_failed(working, err).await
@@ -2853,7 +2909,7 @@ impl WorkloadManager {
             return Ok(());
         }
         if let Err(err) = self.ensure_task_volumes_accessible(&working.volumes).await {
-            let err = if is_local_volume_access_error(&err) {
+            let err = if is_volume_access_error(&err) {
                 self.mark_task_volume_unavailable(working, err).await
             } else {
                 self.mark_task_failed(working, err).await
@@ -2917,7 +2973,11 @@ impl WorkloadManager {
         {
             Ok(instance_id) => instance_id,
             Err(err) => {
-                let err = self.mark_task_failed(working, err).await;
+                let err = if is_volume_access_error(&err) {
+                    self.mark_task_volume_unavailable(working, err).await
+                } else {
+                    self.mark_task_failed(working, err).await
+                };
                 return Err(err);
             }
         };
@@ -3229,13 +3289,14 @@ impl WorkloadManager {
                 }
             }
             self.cleanup_secret_artifacts(spec.id).await;
-            if let Err(err) = self.unpublish_task_volume_mounts(&spec).await {
-                warn!(
-                    target: "task",
-                    task = %spec.id,
-                    "failed to unpublish local volume mounts for instance-less task: {err:#}"
-                );
-            }
+            self.unpublish_task_volume_mounts(&spec)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to unpublish local volume mounts for instance-less task {}",
+                        spec.id
+                    )
+                })?;
             if let Err(err) = self
                 .teardown_runtime_attachments(spec.id, HashSet::new(), true)
                 .await
@@ -3246,9 +3307,13 @@ impl WorkloadManager {
                     spec.id
                 );
             }
-            self.remove_spec(spec.id).await?;
-            self.enqueue_gossip(WorkloadEvent::Remove { id: spec.id })
+            self.remove_spec_through_epoch(spec.id, spec.task_epoch)
                 .await?;
+            self.enqueue_gossip(WorkloadEvent::Remove {
+                id: spec.id,
+                task_epoch: spec.task_epoch,
+            })
+            .await?;
             self.cleanup_orphaned_slots().await;
             if let Err(err) = self.cleanup_orphaned_local_attachments().await {
                 warn!(
@@ -3281,10 +3346,17 @@ impl WorkloadManager {
         };
 
         match spec.state {
-            WorkloadPhase::Pending
-            | WorkloadPhase::Pulling
-            | WorkloadPhase::Creating
-            | WorkloadPhase::VolumeUnavailable => self.ensure_task_running(spec).await,
+            WorkloadPhase::Pending | WorkloadPhase::Pulling | WorkloadPhase::Creating => {
+                self.ensure_task_running(spec).await
+            }
+            WorkloadPhase::VolumeUnavailable
+                if spec.slot_ids.is_empty() && spec.slot_id.is_none() =>
+            {
+                // This task cannot restart in place. Its service controller will replace it
+                // through normal scheduling, while standalone callers may stop and resubmit it.
+                Ok(())
+            }
+            WorkloadPhase::VolumeUnavailable => self.ensure_task_running(spec).await,
             WorkloadPhase::Running => self.ensure_task_running(spec).await,
             WorkloadPhase::Stopping | WorkloadPhase::Stopped => {
                 self.ensure_task_stopped(spec).await
@@ -3411,14 +3483,19 @@ impl WorkloadManager {
                 return Err(err);
             }
         } else {
-            self.remove_spec(spec.id).await.with_context(|| {
-                format!(
-                    "failed to remove aborted admission group task {} ({})",
-                    spec.name, spec.id
-                )
-            })?;
+            self.remove_spec_through_epoch(spec.id, spec.task_epoch)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove aborted admission group task {} ({})",
+                        spec.name, spec.id
+                    )
+                })?;
             if let Err(err) = self
-                .enqueue_gossip_best_effort(WorkloadEvent::Remove { id: spec.id })
+                .enqueue_gossip_best_effort(WorkloadEvent::Remove {
+                    id: spec.id,
+                    task_epoch: spec.task_epoch,
+                })
                 .await
             {
                 warn!(
@@ -3474,7 +3551,7 @@ impl WorkloadManager {
                 spec.id
             );
         }
-        self.remove_spec(spec.id)
+        self.remove_spec_through_epoch(spec.id, spec.task_epoch)
             .await
             .with_context(|| format!("failed to remove expired pending group task {}", spec.id))?;
         debug!(
@@ -3571,7 +3648,7 @@ impl WorkloadManager {
             self.cache_workload_value_index(change_clock, workload_values.clone());
         } else {
             for id in invalid_ids {
-                let _ = self.remove_spec(id).await;
+                self.evict_cached_spec(id);
             }
         }
 
@@ -3640,6 +3717,9 @@ impl WorkloadManager {
 
         for instance in instances {
             let Some(task_id) = Self::runtime_workload_id(&instance.info) else {
+                continue;
+            };
+            let Some(_reconcile_guard) = self.try_begin_reconcile(task_id).await else {
                 continue;
             };
 
@@ -3877,6 +3957,18 @@ impl WorkloadManager {
 
     /// Periodically reconciles all locally owned tasks so missed gossip updates still apply.
     pub(super) async fn reconcile_local_tasks(&self) -> Result<(), anyhow::Error> {
+        // Serialize the inventory scan with shutdown admission. Tasks spawned by this scan claim
+        // the same read side in `ensure_task_running`, so they either finish before shutdown or
+        // observe the monotonic closed gate without mutating durable task state.
+        let _launch_guard = self.local_state.local_launch_barrier.read().await;
+        if self
+            .local_state
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
         if let Err(err) = self.core.scheduler.reap_expired_leases().await {
             warn!(
                 target: "task",
@@ -3888,6 +3980,23 @@ impl WorkloadManager {
             warn!(
                 target: "task",
                 "failed to reconcile gang admission groups: {err}"
+            );
+        }
+
+        if let Err(err) = self.reconcile_local_runtime_inventory().await {
+            warn!(
+                target: "task",
+                "failed to reconcile local instance inventory: {err}"
+            );
+        }
+
+        // Remove consumers left by a failed launch or lost final update before claiming task
+        // reconcile guards below. Otherwise the task that needs the cleanup can starve its own
+        // level repair on every periodic pass.
+        for error in self.reconcile_stale_replicated_volume_publications().await {
+            warn!(
+                target: "task",
+                "failed to reconcile stale replicated-volume publication: {error}"
             );
         }
 
@@ -3910,6 +4019,9 @@ impl WorkloadManager {
             .collect();
 
         for spec in local_specs {
+            let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await else {
+                continue;
+            };
             if matches!(spec.state, WorkloadPhase::Running)
                 && self
                     .refresh_running_task_from_runtime_inventory(&spec, runtime_inventory.as_ref())
@@ -3917,9 +4029,6 @@ impl WorkloadManager {
             {
                 continue;
             }
-            let Some(reconcile_guard) = self.try_begin_reconcile(spec.id).await else {
-                continue;
-            };
             let manager = self.clone();
             let spec_for_reconcile = spec.clone();
             tokio::task::spawn_local(async move {
@@ -3935,13 +4044,6 @@ impl WorkloadManager {
                     );
                 }
             });
-        }
-
-        if let Err(err) = self.reconcile_local_runtime_inventory().await {
-            warn!(
-                target: "task",
-                "failed to reconcile local instance inventory: {err}"
-            );
         }
 
         if let Err(err) = self.reconcile_local_slot_reservations().await {
@@ -4547,10 +4649,9 @@ impl WorkloadManager {
     }
 }
 
-/// Returns true when the error chain represents a recoverable local-volume access problem.
-pub(super) fn is_local_volume_access_error(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.is::<LocalVolumeAccessError>())
+/// Returns true when the error chain represents a recoverable volume access problem.
+pub(super) fn is_volume_access_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<VolumeAccessError>())
 }
 
 /// Returns true when a task value has been updated within the provided grace window.

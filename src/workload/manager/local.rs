@@ -15,7 +15,7 @@ use super::ReconcileTaskGuard;
 use super::WorkloadManager;
 use super::launch::InstanceLaunchRequest;
 use super::planner::BatchStartPlan;
-use super::state::is_local_volume_access_error;
+use super::state::is_volume_access_error;
 
 impl WorkloadManager {
     /// Starts every local runtime instance in the batch and persists their specs in index order.
@@ -27,6 +27,10 @@ impl WorkloadManager {
             return Ok(Vec::new());
         }
 
+        // Keep the whole accepted local launch atomic with daemon quiescence, including its
+        // durable Running row and volume publication after the runtime process starts.
+        let _launch_guard = self.local_state.local_launch_barrier.read().await;
+        self.ensure_workload_admission_open()?;
         let _launch_guards = self.claim_batch_reconcile_guards(plans).await?;
 
         let pending_specs = match self
@@ -35,17 +39,30 @@ impl WorkloadManager {
         {
             Ok(specs) => specs,
             Err(err) => {
-                self.cleanup_batch(plans).await;
+                self.cleanup_batch(plans, true).await;
                 return Err(err);
             }
         };
 
         if let Err(err) = self.launch_batch_instances(plans).await {
-            self.cleanup_batch(plans).await;
-            if is_local_volume_access_error(&err) {
-                self.persist_pending_volume_unavailable_specs(&pending_specs, &err)
-                    .await;
+            if is_volume_access_error(&err) {
+                self.cleanup_batch(plans, false).await;
+                let blocked_specs = self
+                    .persist_pending_volume_unavailable_specs(&pending_specs, &err)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to preserve retryable task demand after volume launch error: \
+                             {err:#}"
+                        )
+                    })?;
+                return Ok(plans
+                    .iter()
+                    .zip(blocked_specs)
+                    .map(|(plan, spec)| (plan.index, spec))
+                    .collect());
             } else {
+                self.cleanup_batch(plans, true).await;
                 self.rollback_pending_specs(&pending_specs).await;
             }
             return Err(err);
@@ -64,7 +81,7 @@ impl WorkloadManager {
                 Ok(ordered)
             }
             Err(err) => {
-                self.cleanup_batch(plans).await;
+                self.cleanup_batch(plans, true).await;
                 self.rollback_pending_specs(&pending_specs).await;
                 Err(err)
             }
@@ -82,6 +99,10 @@ impl WorkloadManager {
             return Ok(Vec::new());
         }
 
+        // A committed gang member must likewise finish launch or observe closed admission before
+        // shutdown can enumerate and quiesce local replicated-volume consumers.
+        let _launch_guard = self.local_state.local_launch_barrier.read().await;
+        self.ensure_workload_admission_open()?;
         let _launch_guards = self.claim_batch_reconcile_guards(plans).await?;
         let pending_specs = match self
             .persist_pending_batch_with_admission(
@@ -98,7 +119,7 @@ impl WorkloadManager {
                     "local gang workload publication failed after commit decision",
                 )
                 .await;
-                self.cleanup_batch(plans).await;
+                self.cleanup_batch(plans, true).await;
                 return Err(err);
             }
         };
@@ -109,13 +130,11 @@ impl WorkloadManager {
                 "local gang execution failed after commit decision",
             )
             .await;
-            self.cleanup_batch(plans).await;
-            if is_local_volume_access_error(&err) {
-                self.persist_pending_volume_unavailable_specs(&pending_specs, &err)
-                    .await;
-            } else {
-                self.rollback_pending_specs(&pending_specs).await;
-            }
+            self.cleanup_batch(plans, true).await;
+            // A gang failure aborts the entire admission decision, so unlike
+            // incremental demand there is no independently retryable member
+            // to preserve after its scheduler leases are released.
+            self.rollback_pending_specs(&pending_specs).await;
             return Err(err);
         }
 
@@ -138,7 +157,7 @@ impl WorkloadManager {
                     "local gang workload commit failed after runtime launch",
                 )
                 .await;
-                self.cleanup_batch(plans).await;
+                self.cleanup_batch(plans, true).await;
                 self.rollback_pending_specs(&pending_specs).await;
                 Err(err)
             }
@@ -263,7 +282,10 @@ impl WorkloadManager {
     /// Cleans up pending specs when a local launch fails to keep the store consistent.
     async fn rollback_pending_specs(&self, specs: &[WorkloadSpec]) {
         for spec in specs {
-            if let Err(err) = self.remove_spec(spec.id).await {
+            if let Err(err) = self
+                .remove_spec_through_epoch(spec.id, spec.task_epoch)
+                .await
+            {
                 warn!(
                     target: "task",
                     "failed to rollback pending task {}: {err}",
@@ -273,30 +295,29 @@ impl WorkloadManager {
         }
     }
 
-    /// Persists recoverable volume-blocked state for pending specs so reconciliation can retry.
+    /// Persists recoverable volume-blocked state without losing its scheduler assignment.
     async fn persist_pending_volume_unavailable_specs(
         &self,
         specs: &[WorkloadSpec],
         error: &anyhow::Error,
-    ) {
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
         let reason = error.to_string();
+        let mut blocked_specs = Vec::with_capacity(specs.len());
         for spec in specs {
             let mut blocked = spec.clone();
             blocked.phase_version = blocked.phase_version.saturating_add(1);
             blocked.state = WorkloadPhase::VolumeUnavailable;
             blocked.phase_reason = Some(reason.clone());
             blocked.phase_progress = None;
-            blocked.slot_ids.clear();
-            blocked.slot_id = None;
             blocked.updated_at = Utc::now().to_rfc3339();
-            if let Err(err) = self.persist_spec(&blocked).await {
-                warn!(
-                    target: "task",
-                    "failed to persist volume-unavailable state for pending task {}: {err}",
-                    blocked.id
-                );
-                continue;
-            }
+            blocked_specs.push(blocked);
+        }
+
+        self.persist_specs_batch(&blocked_specs)
+            .await
+            .context("failed to persist volume-unavailable task batch")?;
+
+        for blocked in &blocked_specs {
             if let Err(err) = self
                 .enqueue_gossip(WorkloadEvent::UpsertSpec(Box::new(blocked.clone())))
                 .await
@@ -308,6 +329,8 @@ impl WorkloadManager {
                 );
             }
         }
+
+        Ok(blocked_specs)
     }
 
     async fn launch_batch_instances(
@@ -499,7 +522,8 @@ impl WorkloadManager {
         Ok(())
     }
 
-    async fn cleanup_batch(&self, plans: &[BatchStartPlan]) {
+    /// Removes partial runtime state and optionally releases scheduler resources.
+    async fn cleanup_batch(&self, plans: &[BatchStartPlan], release_resources: bool) {
         for plan in plans {
             if let Some(instance_id) = plan.instance_id.as_ref() {
                 if let Err(err) = self
@@ -535,14 +559,26 @@ impl WorkloadManager {
             }
 
             self.cleanup_secret_artifacts(plan.id).await;
+            if let Err(err) = self
+                .unpublish_task_volume_mounts_for_task(plan.id, &plan.volumes)
+                .await
+            {
+                warn!(
+                    target: "task",
+                    task = %plan.id,
+                    "failed to clean up task volume mounts after launch rollback: {err:#}"
+                );
+            }
 
-            for slot in &plan.slots {
-                if let Err(err) = self.release_slot(slot.slot_id).await {
-                    warn!(
-                        target: "task",
-                        "failed to release slot {} during rollback: {err}",
-                        slot.slot_id
-                    );
+            if release_resources {
+                for slot in &plan.slots {
+                    if let Err(err) = self.release_slot(slot.slot_id).await {
+                        warn!(
+                            target: "task",
+                            "failed to release slot {} during rollback: {err}",
+                            slot.slot_id
+                        );
+                    }
                 }
             }
         }

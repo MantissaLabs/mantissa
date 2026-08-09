@@ -1,9 +1,10 @@
 #![allow(clippy::unwrap_used)]
 
-use super::planner::{SchedulingError, StartIntent};
+use super::planner::{Assignment, RemoteStartPlan, SchedulingError, StartIntent};
 use super::reservation::{
     DEFAULT_PREPARED_LEASE_TTL_MS, RemotePrepareRejection, RemotePrepareRejectionReason,
 };
+use super::state::is_volume_access_error;
 use super::*;
 
 use crate::agents::types::{
@@ -23,8 +24,8 @@ use crate::runtime::types::{
     ResourceLimits, RuntimeAttachOptions, RuntimeAttachmentTarget, RuntimeBackend,
     RuntimeCapabilities, RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeExecOptions,
     RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
-    RuntimeResult, RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode, RuntimeStateInfo,
-    RuntimeSupportContract, RuntimeSupportProfile,
+    RuntimeMount, RuntimeResult, RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode,
+    RuntimeStateInfo, RuntimeSupportContract, RuntimeSupportProfile,
 };
 use crate::scheduler::digest::SchedulerDigestRegistry;
 use crate::scheduler::{
@@ -46,15 +47,21 @@ use crate::store::replicated::scheduler::open_scheduler_store;
 use crate::store::replicated::scheduler_digests::open_scheduler_digest_store;
 use crate::store::replicated::secrets::open_secret_store;
 use crate::store::replicated::services::open_service_store;
-use crate::store::replicated::volumes::{open_volume_node_store, open_volume_spec_store};
+use crate::store::replicated::volumes::{
+    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
+    open_volume_node_store, open_volume_spec_store,
+};
 use crate::store::replicated::workloads::open_workload_store;
 use crate::task::types::{TaskStateFilter, TaskStateKind};
 use crate::topology::peers::PeerSchedulingState;
 use crate::volumes::VolumeRegistry;
 use crate::volumes::local::managed_volume_data_path;
+use crate::volumes::replicated::{REPLICATED_VOLUME_FORMAT_VERSION, ReplicatedVolumeSupport};
 use crate::volumes::types::{
-    LocalVolumeOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
-    VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
+    FilesystemOwnership, LocalVolumeSpec, ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan,
+    ReplicatedVolumeSpec, SavedVolumeDescriptor, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
+    VolumeStatus, compute_replicated_volume_group_id,
 };
 use crate::workload::model::{
     ExecutionPlatform, ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase,
@@ -76,6 +83,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::SigningKey;
 use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::server::cluster_session;
+use mantissa_store::gc::StoreGcPolicy;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
@@ -189,6 +197,7 @@ struct MockRuntimeBackend {
     stopped: Arc<AsyncMutex<Vec<String>>>,
     stop_timeouts: Arc<AsyncMutex<Vec<Option<std::time::Duration>>>>,
     stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
+    stop_errors: Arc<AsyncMutex<HashMap<String, String>>>,
     removed: Arc<AsyncMutex<Vec<String>>>,
     remove_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     open_stdin: Arc<AsyncMutex<Vec<bool>>>,
@@ -212,6 +221,60 @@ struct MockRuntimeBackend {
     pull_errors: Arc<AsyncMutex<VecDeque<RuntimeError>>>,
     pull_calls: Arc<AsyncMutex<Vec<String>>>,
     pull_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
+}
+
+struct FakeReplicatedVolumeAccess {
+    ready: AtomicBool,
+    ready_calls: AtomicUsize,
+    mounted: AtomicBool,
+    fail_mount: AtomicBool,
+    fail_unmount: AtomicBool,
+    mount_path: std::path::PathBuf,
+    mount_calls: AtomicUsize,
+    unmount_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl super::volumes::ReplicatedVolumeAccess for FakeReplicatedVolumeAccess {
+    /// Returns the fake runtime's authoritative local mount path.
+    async fn local_mount_paths(&self) -> Result<std::collections::BTreeSet<std::path::PathBuf>> {
+        Ok([self.mount_path.clone()].into_iter().collect())
+    }
+
+    /// Returns the readiness selected by the test.
+    async fn is_ready(&self, _key: mantissa_volume::catalog::ReplicaKey) -> Result<bool> {
+        self.ready_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(self.ready.load(Ordering::Acquire))
+    }
+
+    /// Returns whether the fake kernel inventory still contains the mount.
+    async fn is_mounted(&self, _key: mantissa_volume::catalog::ReplicaKey) -> Result<bool> {
+        Ok(self.mounted.load(Ordering::Acquire))
+    }
+
+    /// Records one mount request and returns the fixed test path.
+    async fn mount(
+        &self,
+        _key: mantissa_volume::catalog::ReplicaKey,
+        _ownership: FilesystemOwnership,
+    ) -> Result<std::path::PathBuf> {
+        self.mount_calls.fetch_add(1, Ordering::AcqRel);
+        if self.fail_mount.load(Ordering::Acquire) {
+            anyhow::bail!("test mount failure");
+        }
+        self.mounted.store(true, Ordering::Release);
+        Ok(self.mount_path.clone())
+    }
+
+    /// Records one unmount request.
+    async fn unmount(&self, _key: mantissa_volume::catalog::ReplicaKey) -> Result<()> {
+        self.unmount_calls.fetch_add(1, Ordering::AcqRel);
+        if self.fail_unmount.load(Ordering::Acquire) {
+            anyhow::bail!("test unmount failure");
+        }
+        self.mounted.store(false, Ordering::Release);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -284,6 +347,9 @@ impl RuntimeBackend for MockRuntimeBackend {
         }
         self.stopped.lock().await.push(instance_id.to_string());
         self.stop_timeouts.lock().await.push(timeout);
+        if let Some(message) = self.stop_errors.lock().await.remove(instance_id) {
+            return Err(RuntimeError::backend(None, message));
+        }
         let mut inspect = self.inspect.lock().await;
         for info in inspect.values_mut() {
             if info.id == instance_id || info.name == instance_id {
@@ -984,7 +1050,25 @@ async fn setup_manager_with_forwarding(
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume node store");
-    let volume_registry = VolumeRegistry::new(volume_spec_store, volume_node_store);
+    let volume_plan_store = open_replicated_volume_plan_store(volume_db.clone(), actor)
+        .expect("open volume plan store");
+    volume_plan_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume plan store");
+    let volume_group_status_store =
+        open_replicated_volume_group_status_store(volume_db.clone(), actor)
+            .expect("open volume group status store");
+    volume_group_status_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume group status store");
+    let volume_registry = VolumeRegistry::new(
+        volume_spec_store,
+        volume_node_store,
+        volume_plan_store,
+        volume_group_status_store,
+    );
     let (master_db, _master_dir) = temp_db("master");
     let master_envelope_provider = Arc::new(
         crate::secrets::master_key::envelope::PassphraseProvider::for_test()
@@ -1043,6 +1127,7 @@ async fn setup_manager_with_forwarding(
         network_registry: network_registry.clone(),
         network_controller: None,
         volume_registry,
+        replicated_volume_runtime: None,
         secret_registry,
         secret_keyring: secret_keyring.clone(),
         forwarding_events,
@@ -1285,7 +1370,7 @@ async fn create_managed_local_volume(
 ) -> VolumeSpecValue {
     let spec = VolumeSpecValue::new(VolumeSpecDraft {
         name: name.to_string(),
-        driver: VolumeDriver::Local(LocalVolumeSpec::managed(LocalVolumeOwnership::Daemon)),
+        driver: VolumeDriver::Local(LocalVolumeSpec::managed(FilesystemOwnership::Daemon)),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode,
         reclaim_policy: VolumeReclaimPolicy::Retain,
@@ -1300,6 +1385,93 @@ async fn create_managed_local_volume(
         .upsert_spec(spec.clone())
         .await
         .expect("upsert managed local volume");
+    spec
+}
+
+/// Stores one ready replicated volume and its public plan rows for workload tests.
+async fn create_ready_replicated_volume(manager: &WorkloadManager, name: &str) -> VolumeSpecValue {
+    let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
+        name: name.to_string(),
+        driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
+            ownership: FilesystemOwnership::Daemon,
+        }),
+        access_mode: VolumeAccessMode::ReadWriteOnce,
+        binding_mode: VolumeBindingMode::WaitForFirstConsumer,
+        reclaim_policy: VolumeReclaimPolicy::Retain,
+        requested_bytes: Some(64 * 1_024 * 1_024),
+        labels: Vec::new(),
+        bound_node_id: Some(manager.local_node_id),
+        bound_node_name: Some(manager.local_node_name.clone()),
+    });
+    spec.binding_operation_id = Some(Uuid::new_v4());
+    spec.binding_revision = 1;
+    spec.plan_coordinator_node_id = Some(manager.local_node_id);
+    manager
+        .volumes
+        .volume_registry
+        .upsert_spec(spec.clone())
+        .await
+        .expect("upsert replicated volume");
+
+    let descriptor = SavedVolumeDescriptor::for_volume(
+        spec.id,
+        spec.volume_epoch,
+        spec.requested_bytes.expect("replicated capacity"),
+    )
+    .expect("build replicated descriptor");
+    let replicas = [manager.local_node_id, Uuid::new_v4(), Uuid::new_v4()];
+    let plan = ReplicatedVolumePlan::new(
+        spec.id,
+        spec.volume_epoch,
+        Uuid::new_v4(),
+        manager.local_node_id,
+        replicas,
+        descriptor,
+    );
+    manager
+        .volumes
+        .volume_registry
+        .upsert_plan(plan.clone())
+        .await
+        .expect("upsert replicated plan");
+
+    let group_id =
+        compute_replicated_volume_group_id(plan.descriptor.volume_id, plan.descriptor.generation);
+
+    let state = VolumeNodeStateValue::new(
+        spec.id,
+        manager.local_node_id,
+        manager.local_node_name.clone(),
+        None,
+        VolumeNodeState::Ready,
+        spec.requested_bytes,
+        spec.volume_epoch,
+    )
+    .with_group_id(group_id);
+    manager
+        .volumes
+        .volume_registry
+        .upsert_node_state(state)
+        .await
+        .expect("upsert replicated node state");
+
+    let mut group = ReplicatedVolumeGroupStatusValue::new(
+        spec.id,
+        spec.volume_epoch,
+        group_id,
+        manager.local_node_id,
+        VolumeStatus::Ready,
+        12,
+    );
+    group.copy_node_ids = replicas.to_vec();
+    group.voter_node_ids = replicas.to_vec();
+    manager
+        .volumes
+        .volume_registry
+        .upsert_group_status(group)
+        .await
+        .expect("upsert replicated group status");
+
     spec
 }
 
@@ -1395,7 +1567,7 @@ async fn owned_workload_status_reports_exact_local_state() {
     ));
 
     manager
-        .remove_spec(foreign.id)
+        .remove_spec_through_epoch(foreign.id, foreign.task_epoch)
         .await
         .expect("remove foreign workload");
     assert!(matches!(
@@ -2266,6 +2438,55 @@ async fn dirty_gossip_flush_retries_latest_event_for_bounded_coverage_rounds() {
     assert!(
         next.is_err(),
         "coverage rounds should stop once the bounded dirty budget is exhausted"
+    );
+}
+
+#[tokio::test]
+async fn dirty_gossip_remove_is_not_replaced_by_late_task_state() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let remote_node = Uuid::new_v4();
+    let now = Utc::now();
+    let stopping = build_remote_task_spec(
+        task_id,
+        remote_node,
+        WorkloadPhase::Stopping,
+        2,
+        4,
+        now.to_rfc3339(),
+    );
+
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::Remove {
+            id: task_id,
+            task_epoch: 2,
+        })
+        .await
+        .expect("buffer task removal");
+    manager
+        .enqueue_gossip_best_effort(WorkloadEvent::UpsertSpec(Box::new(stopping)))
+        .await
+        .expect("buffer late stopping state");
+
+    manager
+        .flush_dirty_gossip_events()
+        .await
+        .expect("flush buffered task removal");
+    let outbound = manager.core.rx.recv().await.expect("receive task removal");
+    assert!(matches!(
+        outbound,
+        Message::Workload {
+            event: WorkloadEvent::Remove { id, .. },
+            ..
+        } if id == task_id
+    ));
+
+    let extra =
+        tokio::time::timeout(std::time::Duration::from_millis(20), manager.core.rx.recv()).await;
+    assert!(
+        extra.is_err(),
+        "late task state must not replace or accompany its buffered removal"
     );
 }
 
@@ -3581,6 +3802,115 @@ async fn reconcile_local_tasks_does_not_duplicate_batch_launch_in_progress() {
 }
 
 #[tokio::test]
+async fn begin_shutdown_waits_for_complete_local_launch_publication() {
+    let attachment = Arc::new(BlockingAttachmentProvisioner::default());
+    let (manager, scheduler, mock_cm, network_registry) =
+        setup_manager_with_forwarding(None, Some(attachment.clone())).await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let network = NetworkSpecValue::new(NetworkSpecDraft {
+        name: "shutdown-launch-net".to_string(),
+        description: "shutdown launch barrier".to_string(),
+        driver: NetworkDriver::Vxlan,
+        subnet_cidr: "10.48.0.0/24".to_string(),
+        vni: 0,
+        mtu: 0,
+        sealed: false,
+        bpf_programs: vec![],
+    });
+    network_registry
+        .upsert_spec(network.clone())
+        .await
+        .expect("upsert network spec");
+    network_registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            network.id,
+            manager.local_node_id,
+            "local-node",
+            NetworkPeerState::Ready,
+            None,
+        ))
+        .await
+        .expect("upsert local network peer state");
+
+    let request = WorkloadStartRequest {
+        name: "shutdown-launch".into(),
+        execution: ResolvedExecutionSpec {
+            networks: vec![network.id],
+            ..empty_resolved_execution("img")
+        },
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        owner: None,
+        dependency_requirements: Vec::new(),
+        service_placement_preferences: Vec::new(),
+        target_node: None,
+    };
+
+    let launch_manager = manager.clone();
+    let shutdown_manager = manager.clone();
+    let attachment_for_shutdown = attachment.clone();
+    let (launch_result, ()) = tokio::join!(
+        async move { launch_manager.start_workloads_batch(vec![request]).await },
+        async move {
+            attachment_for_shutdown.wait_for_first_attempt().await;
+            let shutdown = shutdown_manager.begin_shutdown();
+            tokio::pin!(shutdown);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
+                    .await
+                    .is_err(),
+                "shutdown must wait until the accepted launch publishes its final state"
+            );
+            attachment_for_shutdown.release_first_attempt();
+            tokio::time::timeout(std::time::Duration::from_secs(2), &mut shutdown)
+                .await
+                .expect("shutdown barrier should finish after launch publication");
+        }
+    );
+
+    let specs = launch_result.expect("accepted launch should finish before shutdown");
+    assert_eq!(specs.len(), 1);
+    assert!(matches!(specs[0].state, WorkloadPhase::Running));
+    assert_eq!(mock_cm.created.lock().await.len(), 1);
+    assert!(matches!(
+        manager
+            .load_spec(specs[0].id)
+            .await
+            .expect("load fully published task")
+            .state,
+        WorkloadPhase::Running
+    ));
+    let error = manager
+        .start_workload(
+            "after-shutdown",
+            "img",
+            vec![],
+            100,
+            32 * 1_024 * 1_024,
+            None,
+        )
+        .await
+        .expect_err("closed admission must reject later launches");
+    assert!(
+        error
+            .to_string()
+            .contains("workload manager is shutting down")
+    );
+}
+
+#[tokio::test]
 async fn reconcile_running_task_restarts_when_container_is_missing() {
     let (manager, scheduler, mock_cm, _network_registry) = setup_manager().await;
 
@@ -4791,6 +5121,54 @@ async fn reconcile_inventory_uses_drain_stop_timeout_for_unowned_runtime() {
     assert_eq!(stop_timeouts[0], Some(std::time::Duration::from_secs(4)));
 }
 
+/// Inventory adoption must not race a task workflow that is stopping or replacing its runtime.
+#[tokio::test]
+async fn reconcile_inventory_skips_tasks_with_an_active_reconcile() {
+    let (manager, _scheduler, mock_runtime, _network_registry) = setup_manager().await;
+    let mut spec = test_task_spec(&manager, "guarded-inventory-adoption");
+    spec.state = WorkloadPhase::Running;
+    manager.persist_spec(&spec).await.expect("persist task");
+
+    mock_runtime.listed.lock().await.push(running_runtime_info(
+        "guarded-runtime",
+        &format!("mantissa-{}", spec.id),
+        &spec.image,
+    ));
+    let reconcile_guard = manager
+        .try_begin_reconcile(spec.id)
+        .await
+        .expect("claim task reconcile");
+
+    manager
+        .reconcile_local_runtime_inventory()
+        .await
+        .expect("scan guarded runtime inventory");
+    assert!(
+        !manager
+            .local_state
+            .local_instances
+            .lock()
+            .await
+            .contains_key(&spec.id),
+        "inventory must not adopt a runtime owned by another task workflow"
+    );
+
+    drop(reconcile_guard);
+    manager
+        .reconcile_local_runtime_inventory()
+        .await
+        .expect("adopt runtime after task reconcile ends");
+    assert!(
+        manager
+            .local_state
+            .local_instances
+            .lock()
+            .await
+            .contains_key(&spec.id),
+        "the next inventory pass must adopt the still-running instance"
+    );
+}
+
 #[tokio::test]
 async fn request_task_stop_uses_container_name_when_cache_missing() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
@@ -4911,14 +5289,16 @@ async fn reconcile_requested_stop_removes_instance_less_stopping_task() {
         .await
         .expect("finish stop cleanup");
 
-    assert!(
-        manager
-            .core
-            .store
-            .get_snapshot(&UuidKey::from(spec.id))
-            .expect("raw task snapshot after explicit stop cleanup")
-            .is_none(),
-        "instance-less stopping task should be removed from the workload store by explicit stop cleanup"
+    let snapshot = manager
+        .core
+        .store
+        .get_snapshot(&UuidKey::from(spec.id))
+        .expect("raw task snapshot after explicit stop cleanup")
+        .expect("explicit stop cleanup should leave a durable removal record");
+    assert_eq!(
+        select_removed_task_epoch(snapshot.as_slice()),
+        Some(spec.task_epoch),
+        "explicit stop cleanup should prevent stale task state from restoring the task"
     );
     assert!(
         manager.load_spec(spec.id).await.is_err(),
@@ -5111,8 +5491,17 @@ async fn reconcile_stopping_task_serializes_duplicate_stop_attempts() {
         manager.reconcile_local_task(spec.clone()),
         manager.reconcile_local_task(spec.clone())
     );
-    first.expect("first reconcile stop attempt");
-    second.expect("second reconcile stop attempt");
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "only the stop owner may report completion"
+    );
+    let deferred = outcomes
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .expect("duplicate stop must report retryable in-progress state");
+    assert!(deferred.to_string().contains("already in progress"));
 
     assert_eq!(
         mock_cm.stopped.lock().await.len(),
@@ -7718,11 +8107,14 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
         .expect("start container");
 
     manager
-        .remove_spec(original.id)
+        .remove_spec_through_epoch(original.id, original.task_epoch)
         .await
         .expect("remove task spec");
     manager
-        .handle_event(WorkloadEvent::Remove { id: original.id })
+        .handle_event(WorkloadEvent::Remove {
+            id: original.id,
+            task_epoch: original.task_epoch,
+        })
         .await
         .expect("apply duplicate remove event");
 
@@ -7753,7 +8145,7 @@ async fn duplicate_remove_event_does_not_poison_future_epoch_upsert() {
 }
 
 #[tokio::test]
-async fn repeated_remove_spec_does_not_move_tombstoned_root() {
+async fn repeated_remove_spec_does_not_move_removed_task_root() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -7768,14 +8160,14 @@ async fn repeated_remove_spec_does_not_move_tombstoned_root() {
         .expect("start container");
 
     manager
-        .remove_spec(original.id)
+        .remove_spec_through_epoch(original.id, original.task_epoch)
         .await
         .expect("remove task spec");
     let root_after_remove = manager.core.store.root_digest().await;
     let clock_after_remove = manager.core.store.change_clock();
 
     manager
-        .remove_spec(original.id)
+        .remove_spec_through_epoch(original.id, original.task_epoch)
         .await
         .expect("repeat task spec remove");
 
@@ -7784,7 +8176,7 @@ async fn repeated_remove_spec_does_not_move_tombstoned_root() {
 }
 
 #[tokio::test]
-async fn next_epoch_after_remove_uses_watermark_increment() {
+async fn next_epoch_after_remove_uses_durable_removal() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -7798,7 +8190,7 @@ async fn next_epoch_after_remove_uses_watermark_increment() {
         .await
         .expect("start container");
     manager
-        .remove_spec(started.id)
+        .remove_spec_through_epoch(started.id, started.task_epoch)
         .await
         .expect("remove task spec");
 
@@ -7810,36 +8202,6 @@ async fn next_epoch_after_remove_uses_watermark_increment() {
         next,
         started.task_epoch.saturating_add(1),
         "removed task should restart on a newer epoch"
-    );
-}
-
-#[tokio::test]
-async fn next_epoch_after_remove_without_watermark_uses_tombstone_floor() {
-    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
-
-    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
-    scheduler
-        .init_slots(vec![slot_spec])
-        .await
-        .expect("init slots");
-
-    let started = manager
-        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
-        .await
-        .expect("start container");
-    manager
-        .remove_spec(started.id)
-        .await
-        .expect("remove task spec");
-    manager.clear_remove_watermark(started.id).await;
-
-    let next = manager
-        .next_task_epoch_for_assignment(started.id, manager.local_node_id, &[1])
-        .await
-        .expect("next epoch");
-    assert_eq!(
-        next, 1,
-        "durable tombstone should force a non-zero restart epoch"
     );
 }
 
@@ -7929,13 +8291,21 @@ async fn stale_remove_event_does_not_delete_active_local_task() {
         .await
         .expect("init slots");
 
-    let running = manager
+    let mut running = manager
         .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
         .await
         .expect("start container");
+    running.task_epoch = 1;
+    manager
+        .persist_spec(&running)
+        .await
+        .expect("advance active task epoch");
 
     manager
-        .handle_event(WorkloadEvent::Remove { id: running.id })
+        .handle_event(WorkloadEvent::Remove {
+            id: running.id,
+            task_epoch: 0,
+        })
         .await
         .expect("handle stale remove");
 
@@ -7949,7 +8319,7 @@ async fn stale_remove_event_does_not_delete_active_local_task() {
 }
 
 #[tokio::test]
-async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
+async fn stale_upsert_after_durable_remove_is_ignored_until_newer_epoch() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -7964,7 +8334,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
         .expect("start container");
 
     manager
-        .remove_spec(original.id)
+        .remove_spec_through_epoch(original.id, original.task_epoch)
         .await
         .expect("remove task spec");
 
@@ -8007,7 +8377,7 @@ async fn stale_upsert_after_remove_watermark_is_ignored_until_newer_epoch() {
 }
 
 #[tokio::test]
-async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
+async fn durable_removal_rejects_stale_upsert_without_memory_cache() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -8022,10 +8392,9 @@ async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
         .expect("start container");
 
     manager
-        .remove_spec(original.id)
+        .remove_spec_through_epoch(original.id, original.task_epoch)
         .await
         .expect("remove task spec");
-    manager.clear_remove_watermark(original.id).await;
 
     original.node_id = Uuid::new_v4();
     original.node_name = "remote-node".to_string();
@@ -8035,20 +8404,117 @@ async fn upsert_after_remove_without_watermark_is_accepted_for_reconvergence() {
         .handle_event(WorkloadEvent::UpsertSpec(Box::new(original.clone())))
         .await
         .expect("upsert should be handled");
-    let after_upsert = manager
+    let after_stale = manager
         .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list after upsert");
     assert!(
-        !after_upsert.is_empty(),
-        "upsert should be accepted once remove watermark is no longer present"
+        after_stale.is_empty(),
+        "the durable removal must reject the stale epoch without an in-memory cache"
     );
-    assert_eq!(after_upsert[0].id, original.id);
-    assert_eq!(after_upsert[0].node_id, original.node_id);
+
+    original.task_epoch = original.task_epoch.saturating_add(1);
+    manager
+        .handle_event(WorkloadEvent::UpsertSpec(Box::new(original.clone())))
+        .await
+        .expect("new task epoch should be handled");
+    let after_new_epoch = manager
+        .list_workloads(&TaskStateFilter::all())
+        .await
+        .expect("list after new task epoch");
+    assert_eq!(after_new_epoch.len(), 1);
+    assert_eq!(after_new_epoch[0].id, original.id);
+    assert_eq!(after_new_epoch[0].task_epoch, original.task_epoch);
 }
 
 #[tokio::test]
-async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
+async fn durable_removal_rejects_a_late_local_write_from_the_same_epoch() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut original = manager
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    manager
+        .remove_spec_through_epoch(original.id, original.task_epoch)
+        .await
+        .expect("remove task spec");
+
+    original.state = WorkloadPhase::Stopping;
+    let error = manager
+        .persist_spec(&original)
+        .await
+        .expect_err("same-epoch local state must not replace a durable removal");
+    assert!(
+        error.to_string().contains("was removed through epoch"),
+        "late local write should report the durable removal: {error:#}"
+    );
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list after rejected local write")
+            .is_empty(),
+        "the rejected local write must not recreate the task"
+    );
+}
+
+#[tokio::test]
+async fn durable_removal_rejects_the_whole_late_local_batch() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+
+    let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    scheduler
+        .init_slots(vec![slot_spec])
+        .await
+        .expect("init slots");
+
+    let mut removed = manager
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    manager
+        .remove_spec_through_epoch(removed.id, removed.task_epoch)
+        .await
+        .expect("remove task spec");
+    removed.state = WorkloadPhase::Stopping;
+    let fresh = test_task_spec(&manager, "fresh-batch-task");
+
+    let error = manager
+        .persist_specs_batch(&[fresh.clone(), removed])
+        .await
+        .expect_err("a stale task should reject its whole batch");
+    assert!(
+        error.to_string().contains("was removed through epoch"),
+        "rejected batch should report the durable removal: {error:#}"
+    );
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list after rejected batch")
+            .is_empty(),
+        "a rejected batch must not persist its other task"
+    );
+    assert!(
+        manager
+            .core
+            .store
+            .get_snapshot(&UuidKey::from(fresh.id))
+            .expect("read fresh task row")
+            .is_none(),
+        "the unrelated task in the rejected batch must not be written"
+    );
+}
+
+#[tokio::test]
+async fn stale_delta_after_durable_remove_does_not_recreate_row() {
     let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
 
     let slot_spec = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
@@ -8063,10 +8529,9 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         .expect("start container");
 
     manager
-        .remove_spec(original.id)
+        .remove_spec_through_epoch(original.id, original.task_epoch)
         .await
         .expect("remove task spec");
-    manager.clear_remove_watermark(original.id).await;
 
     let remote_node = Uuid::new_v4();
     let stale_delta = WorkloadValue::new(WorkloadValueDraft {
@@ -8126,6 +8591,7 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
     let (regs, tombs) = remote_store
         .export_page_ranges_delta(&remote_ranges)
         .expect("export remote delta");
+    let stale_registers = regs.clone();
     manager
         .core
         .store
@@ -8139,7 +8605,63 @@ async fn stale_delta_after_remove_without_watermark_does_not_recreate_row() {
         .expect("list after stale delta");
     assert!(
         after_stale.is_empty(),
-        "local tombstone should block stale delta replay for removed task rows"
+        "durable removal should block stale delta replay for removed task rows"
+    );
+
+    let report = manager
+        .core
+        .store
+        .compact_registers(&StoreGcPolicy {
+            tombstone_min_retention_ms: 0,
+            tombstone_batch_limit: 0,
+            mvreg_batch_limit: 16,
+            mvreg_max_values: Some(1),
+        })
+        .await
+        .expect("compact concurrent task state and removal");
+    assert_eq!(report.registers_compacted, 1);
+    manager
+        .core
+        .store
+        .apply_delta_chunk_update_mst(stale_registers, Vec::new())
+        .await
+        .expect("replay stale task state after compaction");
+    assert!(
+        manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .expect("list after stale post-compaction replay")
+            .is_empty(),
+        "compaction must keep enough CRDT history to reject stale task state"
+    );
+
+    let local_ranges = manager
+        .core
+        .store
+        .page_range_summary()
+        .await
+        .expect("local page ranges after conflict");
+    let (regs, tombs) = manager
+        .core
+        .store
+        .export_page_ranges_delta(&local_ranges)
+        .expect("export resolved local delta");
+    remote_store
+        .apply_delta_chunk_update_mst(regs, tombs)
+        .await
+        .expect("apply resolved delta to remote store");
+    assert_eq!(
+        manager.core.store.root_digest().await,
+        remote_store.root_digest().await,
+        "both stores must converge after receiving task state and removal in opposite orders"
+    );
+    let remote_snapshot = remote_store
+        .get_snapshot(&UuidKey::from(original.id))
+        .expect("read converged remote row")
+        .expect("converged row should retain the durable removal");
+    assert!(
+        select_best_workload_value(remote_snapshot.as_slice()).is_none(),
+        "the converged row must remain removed"
     );
 }
 
@@ -9224,6 +9746,91 @@ async fn repair_runtime_attachments_purges_unowned_local_rows() {
 }
 
 #[tokio::test]
+async fn repair_runtime_attachments_purges_rows_without_a_runtime_instance() {
+    let (manager, _scheduler, _mock_cm, network_registry) = setup_manager().await;
+
+    let task_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let now = Utc::now().to_rfc3339();
+    let local_value = WorkloadValue::new(WorkloadValueDraft {
+        id: task_id,
+        name: "stopped-local-task".to_string(),
+        image: "img".to_string(),
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        state: WorkloadPhase::Running,
+        phase_reason: None,
+        phase_progress: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        command: vec![],
+        tty: false,
+        node_id: manager.local_node_id,
+        node_name: "local-node".to_string(),
+        slot_ids: vec![1],
+        networks: vec![network_id],
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: Vec::new(),
+        ports: Vec::new(),
+        owner: None,
+        lease_id: None,
+        lease_coordinator_node_id: None,
+        task_epoch: 0,
+        phase_version: 0,
+        launch_attempt: 0,
+        last_terminal_observed_launch: None,
+    });
+    manager
+        .core
+        .store
+        .upsert(&UuidKey::from(task_id), local_value.into())
+        .await
+        .expect("insert local task value");
+
+    network_registry
+        .upsert_attachment(NetworkAttachmentValue::new(NetworkAttachmentDraft {
+            id: crate::network::types::compute_network_attachment_id(task_id, network_id),
+            task_id,
+            node_id: manager.local_node_id,
+            instance_id: format!("mantissa-{task_id}"),
+            network_id,
+            task_updated_at: Some(now),
+            requested_ip: Some("10.80.0.2".to_string()),
+            assigned_ip: Some("10.80.0.2".to_string()),
+            mac: Some("02:11:22:33:44:99".to_string()),
+            state: NetworkAttachmentState::Ready,
+            error: None,
+            traffic_published: true,
+            service_name: Some("svc".to_string()),
+            template_name: Some("backend".to_string()),
+        }))
+        .await
+        .expect("insert stale local attachment");
+
+    manager
+        .repair_runtime_attachments()
+        .await
+        .expect("repair runtime attachments");
+
+    assert!(
+        network_registry
+            .list_attachments_for_task(task_id)
+            .expect("list attachments after repair")
+            .is_empty(),
+        "repair should remove attachment rows whose runtime instance is gone"
+    );
+}
+
+#[tokio::test]
 async fn attachment_ready_triggers_forwarding_event() {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (manager, scheduler, _mock_cm, network_registry) =
@@ -9639,6 +10246,7 @@ fn scheduling_retry_budget_stays_wide_for_untargeted_starts() {
         dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
         target_node: None,
+        allowed_volume_nodes: None,
     }];
 
     assert_eq!(scheduling_retry_max_attempts_for_intents(&intents), 30);
@@ -9676,6 +10284,7 @@ fn scheduling_retry_budget_is_shorter_for_targeted_starts() {
         dependency_requirements: Vec::new(),
         service_placement_preferences: Vec::new(),
         target_node: Some(Uuid::new_v4()),
+        allowed_volume_nodes: None,
     }];
 
     assert_eq!(scheduling_retry_max_attempts_for_intents(&intents), 8);
@@ -10110,12 +10719,13 @@ async fn local_volume_wait_for_first_consumer_binds_on_first_start() {
         Some(manager.local_node_name.as_str())
     );
     assert!(
-        matches!(
-            bound.status,
-            VolumeStatus::Bound | VolumeStatus::Ready | VolumeStatus::InUse
-        ),
-        "volume should be durably bound before publication, got {:?}",
-        bound.status
+        bound.binding_operation_id.is_some(),
+        "first-consumer binding should save its retry ID"
+    );
+    assert_eq!(bound.binding_revision, 1);
+    assert!(
+        !bound.is_delete_marker(),
+        "volume should remain live after durable binding"
     );
 
     let node_state = manager
@@ -10147,6 +10757,1066 @@ async fn local_volume_wait_for_first_consumer_binds_on_first_start() {
         volume_mounts[0],
         vec![format!("{}:/var/lib/data:rw", expected_path.display())]
     );
+}
+
+#[tokio::test]
+async fn one_workload_binding_uses_one_id_for_all_new_volumes() {
+    let (manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+    let first = create_managed_local_volume(
+        &manager,
+        "first-data",
+        VolumeBindingMode::WaitForFirstConsumer,
+        None,
+        None,
+    )
+    .await;
+    let second = create_managed_local_volume(
+        &manager,
+        "second-data",
+        VolumeBindingMode::WaitForFirstConsumer,
+        None,
+        None,
+    )
+    .await;
+    let mut request = standalone_volume_task_request(&first, "/first");
+    request
+        .execution
+        .volumes
+        .push(crate::task::types::TaskVolumeMount {
+            volume_id: second.id,
+            volume_name: second.name.clone(),
+            target: "/second".to_string(),
+            read_only: false,
+        });
+
+    manager
+        .start_workloads_batch(vec![request])
+        .await
+        .expect("start task with two new volumes");
+
+    let first = manager
+        .volumes
+        .volume_registry
+        .get_spec(first.id)
+        .expect("read first volume")
+        .expect("first volume exists");
+    let second = manager
+        .volumes
+        .volume_registry
+        .get_spec(second.id)
+        .expect("read second volume")
+        .expect("second volume exists");
+    assert!(first.binding_operation_id.is_some());
+    assert_eq!(first.binding_operation_id, second.binding_operation_id);
+    assert_eq!(first.binding_revision, 1);
+    assert_eq!(second.binding_revision, 1);
+    assert_eq!(first.bound_node_id, second.bound_node_id);
+}
+
+#[tokio::test]
+async fn drained_replicated_binding_moves_to_an_active_copy_before_reservation() {
+    let (manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let volume = create_ready_replicated_volume(&manager, "replicated-rebind").await;
+    set_local_drain_requested(&manager, true, None).await;
+    let group = manager
+        .volumes
+        .volume_registry
+        .get_group_status(volume.id)
+        .expect("read replicated group")
+        .expect("replicated group exists");
+    let next_node = group
+        .copy_node_ids
+        .iter()
+        .copied()
+        .find(|node_id| *node_id != manager.local_node_id)
+        .expect("replicated group has a remote active copy");
+    let task_id = Uuid::new_v4();
+    let mount = crate::workload::model::WorkloadVolumeMount {
+        volume_id: volume.id,
+        volume_name: volume.name.clone(),
+        target: "/data".to_string(),
+        read_only: false,
+    };
+    let intent = StartIntent {
+        index: 0,
+        id: task_id,
+        name: "rebound-consumer".to_string(),
+        image: "img".to_string(),
+        command: Vec::new(),
+        tty: false,
+        cpu_millis: 100,
+        memory_bytes: 64 * 1_024 * 1_024,
+        gpu_count: 0,
+        gpu_device_ids: Vec::new(),
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: crate::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        required_runtime_features: Vec::new(),
+        preassigned_slots: Vec::new(),
+        restart_policy: None,
+        termination_grace_period_secs: None,
+        pre_stop_command: None,
+        liveness: None,
+        env: Vec::new(),
+        secret_files: Vec::new(),
+        volumes: vec![mount.clone()],
+        networks: Vec::new(),
+        ports: Vec::new(),
+        placement: Default::default(),
+        owner: None,
+        dependency_requirements: Vec::new(),
+        service_placement_preferences: Vec::new(),
+        target_node: None,
+        allowed_volume_nodes: None,
+    };
+    let assignment = Assignment {
+        local_version: 0,
+        local: Vec::new(),
+        remote: vec![RemoteStartPlan {
+            index: 0,
+            id: task_id,
+            name: "rebound-consumer".to_string(),
+            image: "img".to_string(),
+            execution_platform: ExecutionPlatform::Oci,
+            isolation_mode: crate::workload::model::IsolationMode::Standard,
+            isolation_profile: None,
+            command: Vec::new(),
+            tty: false,
+            cpu_millis: 100,
+            memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
+            peer_id: next_node,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            secret_files: Vec::new(),
+            volumes: vec![mount],
+            networks: Vec::new(),
+            ports: Vec::new(),
+            owner: None,
+            dependency_requirements: Vec::new(),
+        }],
+    };
+
+    assert!(
+        manager
+            .bind_assignment_volumes(&assignment, &[intent])
+            .await
+            .expect("move stale replicated binding")
+    );
+    let moved = manager
+        .volumes
+        .volume_registry
+        .get_spec(volume.id)
+        .expect("read moved volume")
+        .expect("moved volume exists");
+    assert_eq!(moved.bound_node_id, Some(next_node));
+    assert_eq!(moved.binding_revision, volume.binding_revision + 1);
+}
+
+#[tokio::test]
+async fn replicated_volume_detaches_after_its_last_local_task() {
+    let (mut manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let mount_root = tempdir().expect("create replicated mount path");
+    let runtime = Arc::new(FakeReplicatedVolumeAccess {
+        ready: AtomicBool::new(true),
+        ready_calls: AtomicUsize::new(0),
+        mounted: AtomicBool::new(false),
+        fail_mount: AtomicBool::new(false),
+        fail_unmount: AtomicBool::new(false),
+        mount_path: mount_root.path().to_path_buf(),
+        mount_calls: AtomicUsize::new(0),
+        unmount_calls: AtomicUsize::new(0),
+    });
+    let runtime_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = runtime.clone();
+    manager.volumes.replicated = Some(Arc::downgrade(&runtime_access));
+    let volume = create_ready_replicated_volume(&manager, "replicated-data").await;
+    let initial_state = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read initial replicated node state")
+        .expect("initial replicated node state exists");
+    manager
+        .volumes
+        .volume_registry
+        .remove_node_state(initial_state.id)
+        .await
+        .expect("remove node state to model first mount before observation publication");
+    let mounts = vec![crate::task::types::TaskVolumeMount {
+        volume_id: volume.id,
+        volume_name: volume.name.clone(),
+        target: "/data".to_string(),
+        read_only: false,
+    }];
+
+    let first_task = Uuid::new_v4();
+    let second_task = Uuid::new_v4();
+    let resolved = manager
+        .resolve_runtime_volume_mounts(first_task, &mounts)
+        .await
+        .expect("resolve replicated mount");
+    assert_eq!(
+        resolved,
+        vec![format!("{}:/data:rw", mount_root.path().display())]
+    );
+    let readiness_checks = runtime.ready_calls.load(Ordering::Acquire);
+    runtime.ready.store(false, Ordering::Release);
+    manager
+        .ensure_task_volumes_accessible(&mounts)
+        .await
+        .expect("local mount inventory must survive a missing public observation");
+    assert_eq!(
+        runtime.ready_calls.load(Ordering::Acquire),
+        readiness_checks,
+        "a mounted task must not reactivate Raft when public state is missing"
+    );
+
+    let (first_publish, second_publish) = tokio::join!(
+        manager.publish_task_volume_mounts_for_task(first_task, &mounts),
+        manager.publish_task_volume_mounts_for_task(second_task, &mounts),
+    );
+    first_publish.expect("publish first task");
+    second_publish.expect("publish second task");
+    let published = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read published replicated node state")
+        .expect("published replicated node state exists");
+    assert_eq!(
+        published.published_task_ids,
+        vec![first_task.min(second_task), first_task.max(second_task)]
+    );
+    assert_eq!(
+        runtime.mount_calls.load(Ordering::Acquire),
+        1,
+        "an existing shared mount should be reused"
+    );
+    manager
+        .publish_task_volume_mounts_for_task(first_task, &mounts)
+        .await
+        .expect("repeat existing task publication");
+    assert_eq!(
+        runtime.mount_calls.load(Ordering::Acquire),
+        1,
+        "repeated publication should not remount the volume"
+    );
+    let readiness_checks = runtime.ready_calls.load(Ordering::Acquire);
+    manager
+        .ensure_task_volumes_accessible(&mounts)
+        .await
+        .expect("a serving published mount must not reactivate Raft");
+    assert_eq!(
+        runtime.ready_calls.load(Ordering::Acquire),
+        readiness_checks,
+        "running-task inventory must use local serving facts instead of Raft readiness"
+    );
+    runtime.mounted.store(false, Ordering::Release);
+    let error = manager
+        .ensure_task_volumes_accessible(&mounts)
+        .await
+        .expect_err("stale public publication must not hide a missing kernel mount");
+    assert!(
+        is_volume_access_error(&error),
+        "a lost replicated mount must remain a retryable workload condition: {error:#}"
+    );
+    runtime.mounted.store(true, Ordering::Release);
+    manager
+        .unpublish_task_volume_mounts_for_task(Uuid::new_v4(), &mounts)
+        .await
+        .expect("ignore a task that never used this mount");
+    assert_eq!(runtime.unmount_calls.load(Ordering::Acquire), 0);
+    manager
+        .unpublish_task_volume_mounts_for_task(first_task, &mounts)
+        .await
+        .expect("remove first task");
+    assert_eq!(runtime.unmount_calls.load(Ordering::Acquire), 0);
+
+    manager
+        .unpublish_task_volume_mounts_for_task(second_task, &mounts)
+        .await
+        .expect("remove last task");
+    assert_eq!(runtime.unmount_calls.load(Ordering::Acquire), 1);
+    let state = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read replicated node state")
+        .expect("replicated node state exists");
+    assert!(state.published_task_ids.is_empty());
+    assert_eq!(state.state, VolumeNodeState::Ready);
+    assert!(state.local_path.is_none());
+    let group = manager
+        .volumes
+        .volume_registry
+        .get_group_status(volume.id)
+        .expect("read replicated group status")
+        .expect("replicated group status exists");
+    assert_eq!(group.status, VolumeStatus::Ready);
+    assert_eq!(group.attached_node_id, None);
+}
+
+#[tokio::test]
+async fn late_task_detach_does_not_replace_retention_status() {
+    let (mut manager, _scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let mount_root = tempdir().expect("create retained mount path");
+    let runtime = Arc::new(FakeReplicatedVolumeAccess {
+        ready: AtomicBool::new(true),
+        ready_calls: AtomicUsize::new(0),
+        mounted: AtomicBool::new(false),
+        fail_mount: AtomicBool::new(false),
+        fail_unmount: AtomicBool::new(false),
+        mount_path: mount_root.path().to_path_buf(),
+        mount_calls: AtomicUsize::new(0),
+        unmount_calls: AtomicUsize::new(0),
+    });
+    let runtime_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = runtime.clone();
+    manager.volumes.replicated = Some(Arc::downgrade(&runtime_access));
+    let volume = create_ready_replicated_volume(&manager, "retaining-data").await;
+    let mounts = vec![crate::task::types::TaskVolumeMount {
+        volume_id: volume.id,
+        volume_name: volume.name.clone(),
+        target: "/data".to_string(),
+        read_only: false,
+    }];
+    let task_id = Uuid::new_v4();
+    manager
+        .publish_task_volume_mounts_for_task(task_id, &mounts)
+        .await
+        .expect("publish retained test mount");
+
+    let mut retaining = manager
+        .volumes
+        .volume_registry
+        .get_spec(volume.id)
+        .expect("read volume before retention")
+        .expect("volume before retention");
+    retaining.request_retained().expect("request retention");
+    manager
+        .volumes
+        .volume_registry
+        .upsert_spec(retaining.clone())
+        .await
+        .expect("save retention request");
+    let mut retained_group = manager
+        .volumes
+        .volume_registry
+        .get_group_status(volume.id)
+        .expect("read group before retention")
+        .expect("group before retention");
+    retained_group.status = VolumeStatus::Retained;
+    retained_group.updated_at = Utc::now().to_rfc3339();
+    manager
+        .volumes
+        .volume_registry
+        .upsert_group_status(retained_group)
+        .await
+        .expect("save retained group status");
+
+    manager
+        .unpublish_task_volume_mounts_for_task(task_id, &mounts)
+        .await
+        .expect("finish late task detach");
+
+    assert!(
+        manager
+            .volumes
+            .volume_registry
+            .get_spec(volume.id)
+            .expect("read volume after late detach")
+            .is_some_and(|spec| spec.is_retaining())
+    );
+    assert!(
+        manager
+            .volumes
+            .volume_registry
+            .get_group_status(volume.id)
+            .expect("read group after late detach")
+            .is_some_and(|group| group.status == VolumeStatus::Retained)
+    );
+    assert_eq!(runtime.unmount_calls.load(Ordering::Acquire), 1);
+}
+
+/// Builds a manager with ready replicated storage for daemon shutdown tests.
+async fn setup_replicated_shutdown_test(
+    slot_count: u64,
+    volume_name: &str,
+) -> (
+    WorkloadManager,
+    Arc<MockRuntimeBackend>,
+    Arc<FakeReplicatedVolumeAccess>,
+    tempfile::TempDir,
+    VolumeSpecValue,
+) {
+    let (mut manager, scheduler, mock_runtime, _network_registry) = setup_manager().await;
+    let slots: Vec<_> = (1..=slot_count)
+        .map(|slot_id| SlotSpec::new(slot_id, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0)))
+        .collect();
+    scheduler.init_slots(slots).await.expect("init slots");
+    set_local_drain_requested(&manager, false, None).await;
+    manager
+        .core
+        .registry
+        .upsert_self_replicated_volumes(ReplicatedVolumeSupport {
+            address: "127.0.0.1:7578".to_string(),
+            format_version: REPLICATED_VOLUME_FORMAT_VERSION,
+            ublk: true,
+            accepts_replicas: true,
+            available_bytes: u64::MAX,
+            managed_bytes: u64::MAX,
+            updated_at_unix_ms: 1,
+            publication_generation: 1,
+        })
+        .await
+        .expect("publish replicated-volume support");
+
+    let mount_root = tempdir().expect("create replicated mount path");
+    let replicated = Arc::new(FakeReplicatedVolumeAccess {
+        ready: AtomicBool::new(true),
+        ready_calls: AtomicUsize::new(0),
+        mounted: AtomicBool::new(false),
+        fail_mount: AtomicBool::new(false),
+        fail_unmount: AtomicBool::new(false),
+        mount_path: mount_root.path().to_path_buf(),
+        mount_calls: AtomicUsize::new(0),
+        unmount_calls: AtomicUsize::new(0),
+    });
+    let replicated_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = replicated.clone();
+    manager.volumes.replicated = Some(Arc::downgrade(&replicated_access));
+    let volume = create_ready_replicated_volume(&manager, volume_name).await;
+
+    (manager, mock_runtime, replicated, mount_root, volume)
+}
+
+#[tokio::test]
+async fn daemon_shutdown_quiesces_tasks_and_preserves_durable_demand() {
+    let (manager, mock_runtime, replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(1, "shutdown-replicated-data").await;
+
+    let started = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start replicated-volume task");
+    let task = started.first().expect("started task");
+    let instance = "container-0".to_string();
+    assert_eq!(replicated.mount_calls.load(Ordering::Acquire), 1);
+
+    manager.begin_shutdown().await;
+    let report = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect("quiesce replicated-volume tasks");
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.quiesced, 1);
+    assert!(report.quiescence_errors.is_empty());
+    assert_eq!(
+        mock_runtime.stopped.lock().await.as_slice(),
+        &[instance],
+        "the runtime must stop before its block device is released"
+    );
+    assert_eq!(replicated.unmount_calls.load(Ordering::Acquire), 1);
+    let preserved = manager
+        .load_spec(task.id)
+        .await
+        .expect("daemon shutdown must preserve workload demand");
+    assert_eq!(preserved.state, task.state);
+    assert_eq!(preserved.task_epoch, task.task_epoch);
+    assert_eq!(preserved.phase_version, task.phase_version);
+    assert_eq!(preserved.slot_ids, task.slot_ids);
+    let scheduler = manager
+        .core
+        .scheduler
+        .snapshot()
+        .await
+        .expect("read scheduler after quiescence");
+    let reserved = scheduler
+        .slots
+        .iter()
+        .find(|slot| Some(slot.slot_id) == task.slot_id)
+        .expect("preserved task slot");
+    assert!(matches!(
+        reserved.state,
+        SlotState::Reserved(ref reservation) if reservation.task_id == Some(task.id)
+    ));
+
+    manager
+        .reconcile_local_tasks()
+        .await
+        .expect("shutdown reconcile is inert");
+    assert_eq!(mock_runtime.created.lock().await.len(), 1);
+    assert_eq!(
+        manager
+            .load_spec(task.id)
+            .await
+            .expect("preserved task")
+            .state,
+        task.state
+    );
+
+    while let Ok(message) = manager.core.rx.try_recv() {
+        assert!(
+            !matches!(
+            message,
+            Message::Workload {
+                event: WorkloadEvent::Remove { id, .. },
+                ..
+            } if id == task.id
+            ),
+            "daemon quiescence must not publish workload removal"
+        );
+    }
+    manager
+        .flush_workload_updates_for_shutdown()
+        .await
+        .expect("flush buffered workload updates");
+    while let Ok(message) = manager.core.rx.try_recv() {
+        assert!(
+            !matches!(
+                message,
+                Message::Workload {
+                event: WorkloadEvent::Remove { id, .. },
+                ..
+                } if id == task.id
+            ),
+            "dirty workload flush must not synthesize task removal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn daemon_shutdown_retries_detach_with_unchanged_task_demand() {
+    let (manager, _mock_runtime, replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(1, "shutdown-retry-detach-data").await;
+    let started = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start replicated-volume task");
+    let task = started.first().expect("started task");
+    replicated.fail_unmount.store(true, Ordering::Release);
+
+    manager.begin_shutdown().await;
+    let error = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect_err("failed detach must keep shutdown incomplete");
+    assert!(
+        error.to_string().contains("test unmount failure"),
+        "detach failure should remain visible: {error:#}"
+    );
+    let preserved = manager
+        .load_spec(task.id)
+        .await
+        .expect("failed detach must retain its task demand");
+    assert_eq!(preserved.state, task.state);
+    assert_eq!(preserved.slot_ids, task.slot_ids);
+    assert_eq!(preserved.phase_version, task.phase_version);
+    let published = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read published node state")
+        .expect("published node state exists");
+    assert_eq!(published.published_task_ids, vec![task.id]);
+
+    replicated.fail_unmount.store(false, Ordering::Release);
+    let report = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect("retry detach after transient failure");
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.quiesced, 1);
+    let preserved = manager
+        .load_spec(task.id)
+        .await
+        .expect("successful detach must preserve task demand");
+    assert_eq!(preserved.state, task.state);
+    assert_eq!(preserved.slot_ids, task.slot_ids);
+    let detached = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read detached node state")
+        .expect("detached node state exists");
+    assert!(detached.published_task_ids.is_empty());
+    assert!(!replicated.mounted.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn stale_replicated_publication_converges_after_task_metadata_is_gone() {
+    let (manager, mock_runtime, replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(1, "shutdown-stale-publication-data").await;
+    let started = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start replicated-volume task");
+    let task = started.first().expect("started task");
+
+    manager
+        .remove_spec_through_epoch(task.id, task.task_epoch)
+        .await
+        .expect("remove task metadata before its detach observation");
+    manager
+        .local_state
+        .local_instances
+        .lock()
+        .await
+        .remove(&task.id);
+    mock_runtime.inspect.lock().await.clear();
+
+    let errors = manager
+        .reconcile_stale_replicated_volume_publications()
+        .await;
+    assert!(
+        errors.is_empty(),
+        "stale publication cleanup failed: {errors:?}"
+    );
+    let detached = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read reconciled node state")
+        .expect("reconciled node state exists");
+    assert!(detached.published_task_ids.is_empty());
+    assert!(!replicated.mounted.load(Ordering::Acquire));
+    assert_eq!(replicated.unmount_calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn stale_publication_waits_for_an_orphan_container_using_its_mount() {
+    let (manager, mock_runtime, replicated, mount_root, volume) =
+        setup_replicated_shutdown_test(1, "shutdown-orphan-publication-data").await;
+    let started = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start replicated-volume task");
+    let task = started.first().expect("started task");
+    manager
+        .remove_spec_through_epoch(task.id, task.task_epoch)
+        .await
+        .expect("remove task metadata before detach");
+    manager
+        .local_state
+        .local_instances
+        .lock()
+        .await
+        .remove(&task.id);
+    mock_runtime.inspect.lock().await.clear();
+    mock_runtime.listed.lock().await.push(RuntimeInfo {
+        id: "orphan-volume-user".to_string(),
+        name: "orphan-volume-user".to_string(),
+        image: "test".to_string(),
+        status: "running".to_string(),
+        state: RuntimeStateInfo {
+            running: Some(true),
+            ..Default::default()
+        },
+        mounts: vec![RuntimeMount {
+            source: mount_root.path().display().to_string(),
+            destination: "/data".to_string(),
+        }],
+        ..Default::default()
+    });
+
+    let errors = manager
+        .reconcile_stale_replicated_volume_publications()
+        .await;
+    assert!(errors.is_empty());
+    assert_eq!(replicated.unmount_calls.load(Ordering::Acquire), 0);
+    let published = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read protected publication")
+        .expect("protected publication exists");
+    assert_eq!(published.published_task_ids, vec![task.id]);
+
+    mock_runtime.listed.lock().await.clear();
+    let errors = manager
+        .reconcile_stale_replicated_volume_publications()
+        .await;
+    assert!(errors.is_empty());
+    assert_eq!(replicated.unmount_calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn workload_shutdown_rejects_new_starts_but_keeps_detach_available() {
+    let (manager, mock_runtime, replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(1, "shutdown-admission-data").await;
+    let started = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start existing replicated-volume task");
+
+    manager.begin_shutdown().await;
+    let error = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/other")])
+        .await
+        .expect_err("shutdown must reject new workload admission");
+    assert!(
+        error
+            .to_string()
+            .contains("workload manager is shutting down")
+    );
+    assert_eq!(mock_runtime.created.lock().await.len(), 1);
+
+    let report = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect("existing task detach must remain available during shutdown");
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.quiesced, 1);
+    assert!(manager.load_spec(started[0].id).await.is_ok());
+    assert!(!replicated.mounted.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn daemon_shutdown_attempts_every_task_and_blocks_on_running_container() {
+    let (manager, mock_runtime, replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(2, "shutdown-stop-failure-data").await;
+    let started = manager
+        .start_workloads_batch(vec![
+            standalone_volume_task_request(&volume, "/data"),
+            standalone_volume_task_request(&volume, "/data"),
+        ])
+        .await
+        .expect("start replicated-volume tasks");
+    assert_eq!(started.len(), 2);
+    mock_runtime
+        .stop_errors
+        .lock()
+        .await
+        .insert("container-0".to_string(), "test stop failure".to_string());
+    mock_runtime.listed.lock().await.push(running_runtime_info(
+        "container-0",
+        &format!("mantissa-{}", started[0].id),
+        "test",
+    ));
+
+    manager.begin_shutdown().await;
+    let error = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect_err("one running container must keep storage alive");
+    let mut attempted = mock_runtime.stopped.lock().await.clone();
+    attempted.sort();
+    assert_eq!(
+        attempted,
+        ["container-0".to_string(), "container-1".to_string()],
+        "a failed stop must not skip the remaining task"
+    );
+    assert!(
+        error.to_string().contains("test stop failure"),
+        "all stop failures should be reported: {error:#}"
+    );
+    assert_eq!(
+        replicated.unmount_calls.load(Ordering::Acquire),
+        0,
+        "storage must remain mounted while one task is still running"
+    );
+
+    mock_runtime.listed.lock().await.clear();
+    let report = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect("retry replicated-volume task quiescence");
+    assert_eq!(report.attempted, 2);
+    assert_eq!(report.quiesced, 2);
+    assert!(report.quiescence_errors.is_empty());
+    for task in &started {
+        assert!(manager.load_spec(task.id).await.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn daemon_shutdown_reports_cleanup_error_after_container_stops() {
+    let (manager, mock_runtime, _replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(1, "shutdown-cleanup-error-data").await;
+    let started = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start replicated-volume task");
+    let task = started.first().expect("started task");
+    mock_runtime
+        .stop_errors
+        .lock()
+        .await
+        .insert("container-0".to_string(), "test cleanup error".to_string());
+    mock_runtime
+        .listed
+        .lock()
+        .await
+        .push(runtime_info_with_state(
+            "container-0",
+            &format!("mantissa-{}", task.id),
+            "test",
+            "Exited",
+            "exited",
+            false,
+            0,
+            Some(0),
+            None,
+        ));
+
+    manager.begin_shutdown().await;
+    let report = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect("a stopped container must not block storage shutdown");
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.quiesced, 0);
+    assert_eq!(report.quiescence_errors.len(), 1);
+    assert!(report.quiescence_errors[0].contains("test cleanup error"));
+    assert!(manager.load_spec(task.id).await.is_ok());
+}
+
+#[tokio::test]
+async fn daemon_shutdown_finds_untracked_container_using_replicated_mount() {
+    let (manager, mock_runtime, _replicated, mount_root, volume) =
+        setup_replicated_shutdown_test(1, "shutdown-orphan-data").await;
+    manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start replicated-volume task");
+    let public_node_state = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read public volume node state")
+        .expect("public volume node state must exist");
+    manager
+        .volumes
+        .volume_registry
+        .remove_node_state(public_node_state.id)
+        .await
+        .expect("remove stale public mount status");
+
+    let orphan = RuntimeInfo {
+        id: "orphan-container".to_string(),
+        name: "orphan-container".to_string(),
+        image: "test".to_string(),
+        status: "running".to_string(),
+        state: RuntimeStateInfo {
+            raw_status: Some("running".to_string()),
+            running: Some(true),
+            ..Default::default()
+        },
+        mounts: vec![RuntimeMount {
+            source: mount_root.path().display().to_string(),
+            destination: "/data".to_string(),
+        }],
+        ..Default::default()
+    };
+    mock_runtime.listed.lock().await.push(orphan);
+
+    manager.begin_shutdown().await;
+    let error = manager
+        .quiesce_replicated_volume_tasks_for_shutdown()
+        .await
+        .expect_err("the untracked mount user must keep storage alive");
+    assert!(
+        error.to_string().contains("orphan-container"),
+        "the remaining mount user should be named: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn replicated_mount_failure_returns_one_blocked_task_and_keeps_its_slots_for_retry() {
+    let (mut manager, scheduler, _mock_cm, _network_registry) = setup_manager().await;
+    let slot = SlotSpec::new(1, SlotCapacity::new(500, 128 * 1_024 * 1_024, 0));
+    let slot_id = slot.slot_id;
+    scheduler.init_slots(vec![slot]).await.expect("init slots");
+    set_local_drain_requested(&manager, false, None).await;
+    manager
+        .core
+        .registry
+        .upsert_self_replicated_volumes(ReplicatedVolumeSupport {
+            address: "127.0.0.1:7578".to_string(),
+            format_version: REPLICATED_VOLUME_FORMAT_VERSION,
+            ublk: true,
+            accepts_replicas: true,
+            available_bytes: u64::MAX,
+            managed_bytes: u64::MAX,
+            updated_at_unix_ms: 1,
+            publication_generation: 1,
+        })
+        .await
+        .expect("publish replicated-volume support");
+
+    let mount_root = tempdir().expect("create replicated mount path");
+    let runtime = Arc::new(FakeReplicatedVolumeAccess {
+        ready: AtomicBool::new(true),
+        ready_calls: AtomicUsize::new(0),
+        mounted: AtomicBool::new(false),
+        fail_mount: AtomicBool::new(true),
+        fail_unmount: AtomicBool::new(false),
+        mount_path: mount_root.path().to_path_buf(),
+        mount_calls: AtomicUsize::new(0),
+        unmount_calls: AtomicUsize::new(0),
+    });
+    let runtime_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = runtime.clone();
+    manager.volumes.replicated = Some(Arc::downgrade(&runtime_access));
+    let volume = create_ready_replicated_volume(&manager, "blocked-replicated-data").await;
+    let task_id = Uuid::new_v4();
+    let mut request = standalone_volume_task_request(&volume, "/data");
+    request.id = Some(task_id);
+
+    let started = manager
+        .start_workloads_batch(vec![request])
+        .await
+        .expect("retryable volume demand should be accepted");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].id, task_id);
+    assert_eq!(started[0].state, WorkloadPhase::VolumeUnavailable);
+    assert!(
+        started[0]
+            .phase_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("replicated volume")),
+        "blocked result should explain its retryable volume failure: {:?}",
+        started[0].phase_reason
+    );
+
+    let task_rows = manager
+        .load_workload_value_index()
+        .await
+        .expect("load blocked task rows");
+    assert_eq!(task_rows.len(), 1, "one blocked task should remain");
+    assert!(task_rows.contains_key(&task_id));
+    let blocked = manager.load_spec(task_id).await.expect("load blocked task");
+    assert_eq!(blocked.state, WorkloadPhase::VolumeUnavailable);
+    assert_eq!(blocked.slot_ids, vec![slot_id]);
+    let snapshot = scheduler.snapshot().await.expect("scheduler snapshot");
+    let saved_slot = snapshot
+        .slots
+        .iter()
+        .find(|saved| saved.slot_id == slot_id)
+        .expect("saved slot");
+    assert!(matches!(
+        &saved_slot.state,
+        SlotState::Reserved(reservation)
+            if reservation.owner == manager.local_node_id
+                && reservation.task_id == Some(task_id)
+    ));
+    let node_state = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read replicated node state")
+        .expect("replicated node state exists");
+    assert!(node_state.published_task_ids.is_empty());
+    assert_eq!(runtime.mount_calls.load(Ordering::Acquire), 1);
+    assert_eq!(runtime.unmount_calls.load(Ordering::Acquire), 1);
+
+    runtime.fail_mount.store(false, Ordering::Release);
+    manager
+        .reconcile_local_task(blocked)
+        .await
+        .expect("retry blocked task");
+    let running = manager.load_spec(task_id).await.expect("load retried task");
+    assert_eq!(running.state, WorkloadPhase::Running);
+    assert_eq!(running.slot_ids, vec![slot_id]);
+    let task_rows = manager
+        .load_workload_value_index()
+        .await
+        .expect("load task rows");
+    assert_eq!(task_rows.len(), 1);
+    assert!(task_rows.contains_key(&task_id));
+    assert_eq!(
+        runtime.mount_calls.load(Ordering::Acquire),
+        2,
+        "the successful retry should reuse its first completed mount"
+    );
+}
+
+#[tokio::test]
+async fn periodic_reconcile_clears_failed_mount_publication_before_task_retry() {
+    let (manager, _mock_runtime, replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(1, "periodic-retry-publication-data").await;
+    replicated.fail_mount.store(true, Ordering::Release);
+    replicated.fail_unmount.store(true, Ordering::Release);
+    let task_id = Uuid::new_v4();
+    let mut request = standalone_volume_task_request(&volume, "/data");
+    request.id = Some(task_id);
+
+    manager
+        .start_workloads_batch(vec![request])
+        .await
+        .expect("retryable task demand should survive failed mount cleanup");
+    let blocked = manager.load_spec(task_id).await.expect("load blocked task");
+    assert_eq!(blocked.state, WorkloadPhase::VolumeUnavailable);
+    let published = manager
+        .volumes
+        .volume_registry
+        .get_node_state(volume.id, manager.local_node_id)
+        .expect("read failed publication")
+        .expect("failed publication exists");
+    assert_eq!(published.published_task_ids, vec![task_id]);
+
+    replicated.fail_mount.store(false, Ordering::Release);
+    replicated.fail_unmount.store(false, Ordering::Release);
+    let reconcile_manager = manager.clone();
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            reconcile_manager
+                .reconcile_local_tasks()
+                .await
+                .expect("run periodic workload reconciliation");
+            for _ in 0..1_000 {
+                if reconcile_manager
+                    .load_spec(task_id)
+                    .await
+                    .is_ok_and(|spec| matches!(spec.state, WorkloadPhase::Running))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    let running = manager.load_spec(task_id).await.expect("load retried task");
+    assert_eq!(running.state, WorkloadPhase::Running);
+    assert!(
+        replicated.unmount_calls.load(Ordering::Acquire) >= 2,
+        "periodic repair must retry the failed cleanup before remounting"
+    );
+    assert_eq!(replicated.mount_calls.load(Ordering::Acquire), 2);
+}
+
+#[tokio::test]
+async fn volume_unavailable_task_without_slots_waits_for_rescheduling() {
+    let (manager, _scheduler, mock_runtime, _network_registry) = setup_manager().await;
+    let mut blocked = test_task_spec(&manager, "old-volume-blocked-task");
+    blocked.state = WorkloadPhase::VolumeUnavailable;
+    blocked.phase_reason = Some("old mount failure".to_string());
+    blocked.slot_ids.clear();
+    blocked.slot_id = None;
+    manager
+        .persist_spec(&blocked)
+        .await
+        .expect("persist blocked task");
+
+    manager
+        .reconcile_local_task(blocked.clone())
+        .await
+        .expect("leave task for rescheduling");
+
+    let saved = manager
+        .load_spec(blocked.id)
+        .await
+        .expect("load blocked task");
+    assert_eq!(saved.state, WorkloadPhase::VolumeUnavailable);
+    assert!(saved.slot_ids.is_empty());
+    assert!(mock_runtime.created.lock().await.is_empty());
 }
 
 #[tokio::test]

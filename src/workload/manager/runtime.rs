@@ -129,12 +129,11 @@ impl WorkloadManager {
             let instance_id = match self.resolve_live_instance_ref_for_task(&spec).await {
                 Ok(Some(instance_id)) => instance_id,
                 Ok(None) => {
-                    warn!(
-                        target: "task",
-                        task = %attachment.task_id,
-                        attachment = %attachment.id,
-                        "skipping repair; runtime instance is no longer present"
-                    );
+                    // A repairable attachment cannot outlive its runtime
+                    // namespace. Removing this level-state row is safe if a
+                    // new instance is concurrently starting: its publication
+                    // path recreates the deterministic attachment.
+                    self.remove_local_attachment_record(&attachment).await;
                     continue;
                 }
                 Err(err) => {
@@ -412,6 +411,17 @@ impl WorkloadManager {
 
     /// Handles one runtime-reported task exit so non-restartable crashes become terminal state.
     async fn handle_runtime_task_exit(&self, task_id: Uuid, exit_code: i32) -> Result<()> {
+        // Intentional process stops during daemon quiescence are not workload exit observations.
+        // The barrier makes an earlier genuine exit finish before shutdown starts draining tasks.
+        let _launch_guard = self.local_state.local_launch_barrier.read().await;
+        if self
+            .local_state
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
         let mut spec = match self.load_spec(task_id).await {
             Ok(spec) => spec,
             Err(_) => return Ok(()),
@@ -508,12 +518,12 @@ impl WorkloadManager {
         match event {
             WorkloadEvent::UpsertSpec(spec_box) => {
                 let spec = *spec_box;
-                if self.should_ignore_removed_upsert(&spec).await {
+                if self.should_ignore_removed_upsert(&spec).await? {
                     debug!(
                         target: "task",
                         task = %spec.id,
                         state = ?spec.state,
-                        "ignoring stale task upsert after remove watermark"
+                        "ignoring task upsert covered by a durable removal"
                     );
                     return Ok(());
                 }
@@ -600,12 +610,12 @@ impl WorkloadManager {
             }
             WorkloadEvent::UpsertStatus(status_box) => {
                 let status: WorkloadStatus = *status_box;
-                if self.should_ignore_removed_status(&status).await {
+                if self.should_ignore_removed_status(&status).await? {
                     debug!(
                         target: "task",
                         task = %status.id,
                         state = ?status.state,
-                        "ignoring stale task status update after remove watermark"
+                        "ignoring task status covered by a durable removal"
                     );
                     return Ok(());
                 }
@@ -783,27 +793,15 @@ impl WorkloadManager {
 
                 Ok(())
             }
-            WorkloadEvent::Remove { id } => {
-                let current = self.load_spec(id).await.ok();
-                if let Some(spec) = current.as_ref() {
-                    let active_local = spec.node_id == self.local_node_id
-                        && matches!(
-                            spec.state,
-                            WorkloadPhase::Pending
-                                | WorkloadPhase::Pulling
-                                | WorkloadPhase::Creating
-                                | WorkloadPhase::Running
-                                | WorkloadPhase::Stopping
-                        );
-                    if active_local {
-                        debug!(
-                            target: "task",
-                            task = %id,
-                            state = ?spec.state,
-                            "ignoring stale remove event for active local task"
-                        );
-                        return Ok(());
-                    }
+            WorkloadEvent::Remove { id, task_epoch } => {
+                if !self.remove_spec_through_epoch(id, task_epoch).await? {
+                    debug!(
+                        target: "task",
+                        task = %id,
+                        removed_through_epoch = task_epoch,
+                        "ignoring task removal from an older assignment epoch"
+                    );
+                    return Ok(());
                 }
 
                 self.local_state.local_instances.lock().await.remove(&id);
@@ -817,11 +815,7 @@ impl WorkloadManager {
                     );
                 }
                 self.cleanup_secret_artifacts(id).await;
-                if current.is_some() {
-                    self.remove_spec(id).await
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
         }
     }
