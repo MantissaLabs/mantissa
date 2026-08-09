@@ -12,10 +12,11 @@ mod transport;
 
 pub use framing::{read_framed_len, write_framed};
 pub use handshake::{
-    ClientJoinHandshake, HandshakeKind, NoisePeerVerifier, NoisePskProvider, PeerHandshakeError,
-    ServerHandshake, ServerHandshakeError, client_handshake_join, client_handshake_join_with_probe,
-    client_handshake_peer, derive_psk_from_token, join_probe_client, join_probe_server,
-    server_handshake_join, server_handshake_join_with_first_frame,
+    AuthenticatedPeerStream, ClientJoinHandshake, HandshakeKind, NoisePeerVerifier,
+    NoisePskProvider, PeerHandshakeError, ServerHandshake, ServerHandshakeError,
+    client_handshake_join, client_handshake_join_with_probe, client_handshake_peer,
+    derive_psk_from_token, join_probe_client, join_probe_server, server_handshake_join,
+    server_handshake_join_with_first_frame, server_handshake_peer_identified_with_first_frame,
     server_handshake_peer_with_first_frame, server_handshake_select,
 };
 pub use keys::{NoiseKeys, load_or_generate_noise_keys, resolve_noise_key_path};

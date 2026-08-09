@@ -45,6 +45,15 @@ pub struct ClientJoinHandshake {
     pub probe_enabled: bool,
 }
 
+/// Peer stream and the static key proven by its Noise handshake.
+pub struct AuthenticatedPeerStream {
+    /// Established encrypted stream.
+    pub stream: NoiseStream,
+
+    /// Exact 32-byte static public key proven by the remote peer.
+    pub remote_static: [u8; 32],
+}
+
 /// Internal server-side join handshake state before the public result is built.
 struct ServerJoinHandshake {
     stream: NoiseStream,
@@ -413,11 +422,26 @@ async fn server_handshake_join_with_first_frame_probe(
 /// choose between the peer and join handshake patterns.
 pub async fn server_handshake_peer_with_first_frame(
     rd: OwnedReadHalf,
-    mut wr: OwnedWriteHalf,
+    wr: OwnedWriteHalf,
     keys: &NoiseKeys,
     first_frame: &[u8],
     verifier: Rc<dyn NoisePeerVerifier>,
 ) -> Result<NoiseStream, PeerHandshakeError> {
+    Ok(
+        server_handshake_peer_identified_with_first_frame(rd, wr, keys, first_frame, verifier)
+            .await?
+            .stream,
+    )
+}
+
+/// Runs a peer handshake and returns the remote static key it proved.
+pub async fn server_handshake_peer_identified_with_first_frame(
+    rd: OwnedReadHalf,
+    mut wr: OwnedWriteHalf,
+    keys: &NoiseKeys,
+    first_frame: &[u8],
+    verifier: Rc<dyn NoisePeerVerifier>,
+) -> Result<AuthenticatedPeerStream, PeerHandshakeError> {
     let pk_bytes = keys.private.to_bytes();
 
     let builder = snow::Builder::new(parsed_noise_params(NOISE_PARAMS_PEER)?)
@@ -439,6 +463,12 @@ pub async fn server_handshake_peer_with_first_frame(
     if !verifier.is_allowed(remote).await? {
         return Err(PeerHandshakeError::UnknownPeer);
     }
+    let remote_static = remote.try_into().map_err(|_| {
+        PeerHandshakeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer static key is not 32 bytes",
+        ))
+    })?;
 
     let n = hs
         .write_message(&[], &mut out)
@@ -449,7 +479,10 @@ pub async fn server_handshake_peer_with_first_frame(
         .into_stateless_transport_mode()
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    Ok(NoiseStream::new(rd, wr, transport))
+    Ok(AuthenticatedPeerStream {
+        stream: NoiseStream::new(rd, wr, transport),
+        remote_static,
+    })
 }
 
 /// Select the correct server-side handshake by inspecting the first frame.
