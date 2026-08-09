@@ -15,6 +15,7 @@ members = [
     "crates/mantissa-store",
     "crates/mantissa-protocol",
     "crates/mantissa-raft",
+    "crates/mantissa-volume",
     "crates/mantissa-net",
     "crates/mantissa-client",
     "crates/mantissa-cli",
