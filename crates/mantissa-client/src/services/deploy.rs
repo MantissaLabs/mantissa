@@ -13,7 +13,7 @@ use crate::workload_submit::{
     compute_network_id, ensure_declared_volumes,
 };
 use crate::workload_wire::{
-    write_admission_policy, write_deployment_policy, write_local_volume_ownership,
+    write_admission_policy, write_deployment_policy, write_filesystem_ownership,
     write_network_requirements, write_placement_policy_parts, write_port_bindings,
 };
 use anyhow::{Context, Result, anyhow};
@@ -115,7 +115,7 @@ fn write_secret_files(
         );
         write_secret_reference(secret_builder, &file.secret, &context)?;
         entry.set_mode(file.mode.unwrap_or(0));
-        write_local_volume_ownership(entry.reborrow().init_ownership(), &file.ownership);
+        write_filesystem_ownership(entry.reborrow().init_ownership(), &file.ownership);
         entry.set_path_env_name(file.path_env_name.as_deref().unwrap_or(""));
     }
     Ok(())
@@ -147,8 +147,11 @@ pub async fn deploy_manifest(
                     super::manifest::VolumeDriver::External(_) => {
                         DeclaredVolumeDriverKind::External
                     }
+                    super::manifest::VolumeDriver::Replicated(_) => {
+                        DeclaredVolumeDriverKind::Replicated
+                    }
                 },
-                local_ownership: match &volume.driver {
+                filesystem_ownership: match &volume.driver {
                     super::manifest::VolumeDriver::Local(local) => match &local.source {
                         super::manifest::LocalVolumeSource::Managed => {
                             Some(local.ownership.clone())
@@ -156,6 +159,9 @@ pub async fn deploy_manifest(
                         super::manifest::LocalVolumeSource::ImportedPath(_) => None,
                     },
                     super::manifest::VolumeDriver::External(_) => None,
+                    super::manifest::VolumeDriver::Replicated(replicated) => {
+                        Some(replicated.ownership.clone())
+                    }
                 },
                 access_mode: match volume.access_mode {
                     super::manifest::VolumeAccessMode::ReadWriteOnce => {

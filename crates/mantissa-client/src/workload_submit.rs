@@ -15,6 +15,7 @@ pub enum DeclaredVolumeDriverKind {
     LocalManaged,
     LocalImportedPath,
     External,
+    Replicated,
 }
 
 /// One manifest-facing volume label normalized for shared provisioning.
@@ -29,7 +30,7 @@ pub struct DeclaredVolumeLabel {
 pub struct DeclaredVolumeSpec {
     pub name: String,
     pub driver_kind: DeclaredVolumeDriverKind,
-    pub local_ownership: Option<volumes::LocalVolumeOwnership>,
+    pub filesystem_ownership: Option<volumes::FilesystemOwnership>,
     pub access_mode: volumes::VolumeAccessMode,
     pub binding_mode: volumes::VolumeBindingMode,
     pub reclaim_policy: volumes::VolumeReclaimPolicy,
@@ -571,10 +572,7 @@ pub async fn ensure_declared_volumes(
     }
 
     let existing = volumes::list(cfg).await?;
-    let existing_by_name: HashMap<String, volumes::VolumeSummary> = existing
-        .into_iter()
-        .map(|volume| (volume.name.clone(), volume))
-        .collect();
+    let existing_names: HashSet<String> = existing.into_iter().map(|volume| volume.name).collect();
 
     let mut resolved = HashMap::new();
     for volume in declared_volumes {
@@ -592,34 +590,56 @@ pub async fn ensure_declared_volumes(
                     volume.name
                 ));
             }
+            DeclaredVolumeDriverKind::Replicated => {}
         }
 
-        let spec = if let Some(existing) = existing_by_name.get(&volume.name) {
-            validate_declared_volume_compatibility(existing, volume)?;
-            volumes::inspect(cfg, &volume.name).await?.spec
+        let requested_bytes = volume
+            .capacity_mb
+            .map(volumes::capacity_mb_to_bytes)
+            .transpose()?;
+        let spec = if existing_names.contains(&volume.name) {
+            let existing = volumes::inspect(cfg, &volume.name).await?.spec;
+            validate_declared_volume_compatibility(&existing, volume, requested_bytes)?;
+            existing
         } else {
-            volumes::create_with_request(
-                cfg,
-                &volumes::VolumeCreateRequest {
-                    name: volume.name.clone(),
-                    ownership: volume.local_ownership.clone().unwrap_or_default(),
-                    binding_mode: volume.binding_mode,
-                    reclaim_policy: volume.reclaim_policy,
-                    requested_bytes: volume
-                        .capacity_mb
-                        .map(|value| value.saturating_mul(1_048_576)),
-                    labels: volume
-                        .labels
-                        .iter()
-                        .map(|label| volumes::VolumeLabel {
-                            key: label.key.clone(),
-                            value: label.value.clone(),
-                        })
-                        .collect(),
-                    node_selector: None,
+            let request = volumes::VolumeCreateRequest {
+                name: volume.name.clone(),
+                driver: match volume.driver_kind {
+                    DeclaredVolumeDriverKind::LocalManaged => volumes::VolumeCreateDriver::Local,
+                    DeclaredVolumeDriverKind::Replicated => volumes::VolumeCreateDriver::Replicated,
+                    DeclaredVolumeDriverKind::LocalImportedPath
+                    | DeclaredVolumeDriverKind::External => {
+                        unreachable!("unsupported manifest volume drivers were rejected above")
+                    }
                 },
-            )
-            .await?
+                ownership: volume.filesystem_ownership.clone().unwrap_or_default(),
+                binding_mode: volume.binding_mode,
+                reclaim_policy: volume.reclaim_policy,
+                requested_bytes,
+                labels: volume
+                    .labels
+                    .iter()
+                    .map(|label| volumes::VolumeLabel {
+                        key: label.key.clone(),
+                        value: label.value.clone(),
+                    })
+                    .collect(),
+                node_selector: None,
+            };
+            match volumes::create_with_request(cfg, &request).await {
+                Ok(spec) => spec,
+                Err(create_error) => match volumes::inspect(cfg, &volume.name).await {
+                    Ok(existing) => {
+                        validate_declared_volume_compatibility(
+                            &existing.spec,
+                            volume,
+                            requested_bytes,
+                        )?;
+                        existing.spec
+                    }
+                    Err(_) => return Err(create_error),
+                },
+            }
         };
 
         resolved.insert(
@@ -636,8 +656,9 @@ pub async fn ensure_declared_volumes(
 
 /// Validates that one existing cluster volume matches one manifest declaration.
 fn validate_declared_volume_compatibility(
-    existing: &volumes::VolumeSummary,
+    existing: &volumes::VolumeSpec,
     declared: &DeclaredVolumeSpec,
+    requested_bytes: Option<u64>,
 ) -> Result<()> {
     match (&existing.driver, declared.driver_kind) {
         (volumes::VolumeDriver::LocalManaged, DeclaredVolumeDriverKind::LocalManaged) => {}
@@ -646,6 +667,7 @@ fn validate_declared_volume_compatibility(
             DeclaredVolumeDriverKind::LocalImportedPath,
         ) => {}
         (volumes::VolumeDriver::External { .. }, DeclaredVolumeDriverKind::External) => {}
+        (volumes::VolumeDriver::Replicated, DeclaredVolumeDriverKind::Replicated) => {}
         _ => {
             return Err(anyhow!(
                 "existing volume '{}' does not match the manifest driver/source kind",
@@ -661,12 +683,151 @@ fn validate_declared_volume_compatibility(
         ));
     }
 
-    if existing.local_ownership != declared.local_ownership {
+    if existing.filesystem_ownership != declared.filesystem_ownership {
         return Err(anyhow!(
-            "existing volume '{}' does not match the manifest local ownership policy",
+            "existing volume '{}' does not match the manifest filesystem ownership",
+            declared.name
+        ));
+    }
+
+    if existing.binding_mode != declared.binding_mode {
+        return Err(anyhow!(
+            "existing volume '{}' does not match the manifest binding_mode",
+            declared.name
+        ));
+    }
+    if existing.reclaim_policy != declared.reclaim_policy {
+        return Err(anyhow!(
+            "existing volume '{}' does not match the manifest reclaim_policy",
+            declared.name
+        ));
+    }
+    if existing.requested_bytes != requested_bytes {
+        return Err(anyhow!(
+            "existing volume '{}' does not match the manifest capacity_mb",
+            declared.name
+        ));
+    }
+
+    let mut existing_labels: Vec<_> = existing
+        .labels
+        .iter()
+        .map(|label| (label.key.as_str(), label.value.as_str()))
+        .collect();
+    existing_labels.sort_unstable();
+    let mut declared_labels: Vec<_> = declared
+        .labels
+        .iter()
+        .map(|label| (label.key.as_str(), label.value.as_str()))
+        .collect();
+    declared_labels.sort_unstable();
+    if existing_labels != declared_labels {
+        return Err(anyhow!(
+            "existing volume '{}' does not match the manifest labels",
             declared.name
         ));
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    /// Builds matching replicated declarations and saved specs for reuse tests.
+    fn matching_replicated_volume() -> (DeclaredVolumeSpec, volumes::VolumeSpec) {
+        let declared = DeclaredVolumeSpec {
+            name: "data".to_string(),
+            driver_kind: DeclaredVolumeDriverKind::Replicated,
+            filesystem_ownership: Some(volumes::FilesystemOwnership::FsGroup { gid: 2_000 }),
+            access_mode: volumes::VolumeAccessMode::ReadWriteOnce,
+            binding_mode: volumes::VolumeBindingMode::WaitForFirstConsumer,
+            reclaim_policy: volumes::VolumeReclaimPolicy::Retain,
+            capacity_mb: Some(64),
+            labels: vec![DeclaredVolumeLabel {
+                key: "purpose".to_string(),
+                value: "database".to_string(),
+            }],
+        };
+        let spec = volumes::VolumeSpec {
+            id: Uuid::new_v4(),
+            name: declared.name.clone(),
+            driver: volumes::VolumeDriver::Replicated,
+            filesystem_ownership: declared.filesystem_ownership.clone(),
+            access_mode: declared.access_mode,
+            binding_mode: declared.binding_mode,
+            reclaim_policy: declared.reclaim_policy,
+            requested_bytes: Some(64 * 1024 * 1024),
+            labels: vec![volumes::VolumeLabel {
+                key: "purpose".to_string(),
+                value: "database".to_string(),
+            }],
+            bound_node_id: None,
+            bound_node_name: None,
+            volume_epoch: 0,
+            lifecycle_revision: 0,
+            lifecycle_request_id: Uuid::new_v4(),
+            desired_disposition: volumes::DesiredVolumeDisposition::Live,
+            remove_data: false,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        (declared, spec)
+    }
+
+    /// Checks exact manifest reuse and rejects changed capacity or policy.
+    #[test]
+    fn replicated_manifest_reuse_requires_the_same_request() {
+        let (declared, spec) = matching_replicated_volume();
+        assert!(
+            validate_declared_volume_compatibility(&spec, &declared, Some(64 * 1024 * 1024))
+                .is_ok()
+        );
+
+        let mut changed_capacity = declared.clone();
+        changed_capacity.capacity_mb = Some(128);
+        assert!(
+            validate_declared_volume_compatibility(
+                &spec,
+                &changed_capacity,
+                Some(128 * 1024 * 1024)
+            )
+            .expect_err("changed capacity")
+            .to_string()
+            .contains("capacity_mb")
+        );
+
+        let mut changed_policy = declared;
+        changed_policy.reclaim_policy = volumes::VolumeReclaimPolicy::Delete;
+        assert!(
+            validate_declared_volume_compatibility(&spec, &changed_policy, Some(64 * 1024 * 1024))
+                .expect_err("changed policy")
+                .to_string()
+                .contains("reclaim_policy")
+        );
+    }
+
+    /// Checks that a manifest cannot reuse a name with another driver or owner.
+    #[test]
+    fn replicated_manifest_reuse_rejects_changed_driver_or_owner() {
+        let (declared, mut spec) = matching_replicated_volume();
+        spec.driver = volumes::VolumeDriver::LocalManaged;
+        assert!(
+            validate_declared_volume_compatibility(&spec, &declared, Some(64 * 1024 * 1024))
+                .expect_err("changed driver")
+                .to_string()
+                .contains("driver")
+        );
+
+        let (_declared, spec) = matching_replicated_volume();
+        let mut changed_owner = declared;
+        changed_owner.filesystem_ownership = Some(volumes::FilesystemOwnership::Daemon);
+        assert!(
+            validate_declared_volume_compatibility(&spec, &changed_owner, Some(64 * 1024 * 1024))
+                .expect_err("changed owner")
+                .to_string()
+                .contains("filesystem ownership")
+        );
+    }
 }

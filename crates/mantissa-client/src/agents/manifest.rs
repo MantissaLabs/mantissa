@@ -243,8 +243,9 @@ impl AgentManifest {
                         }
                     },
                     VolumeDriver::External(_) => DeclaredVolumeDriverKind::External,
+                    VolumeDriver::Replicated(_) => DeclaredVolumeDriverKind::Replicated,
                 },
-                local_ownership: match &volume.driver {
+                filesystem_ownership: match &volume.driver {
                     VolumeDriver::Local(local) => match &local.source {
                         crate::jobs::manifest::LocalVolumeSource::Managed => {
                             Some(local.ownership.clone())
@@ -252,6 +253,7 @@ impl AgentManifest {
                         crate::jobs::manifest::LocalVolumeSource::ImportedPath(_) => None,
                     },
                     VolumeDriver::External(_) => None,
+                    VolumeDriver::Replicated(replicated) => Some(replicated.ownership.clone()),
                 },
                 access_mode: match volume.access_mode {
                     VolumeAccessMode::ReadWriteOnce => {
@@ -324,6 +326,23 @@ fn validate_declared_volumes(volumes: &[AgentVolumeSpec]) -> Result<HashSet<Stri
                 volume.name
             ));
         }
+        if let Some(capacity_mb) = volume.capacity_mb {
+            crate::volumes::capacity_mb_to_bytes(capacity_mb)?;
+        }
+        if matches!(&volume.driver, VolumeDriver::Replicated(_)) {
+            if !matches!(volume.binding_mode, VolumeBindingMode::WaitForFirstConsumer) {
+                return Err(anyhow!(
+                    "replicated volume '{}' must use wait_for_first_consumer binding",
+                    volume.name
+                ));
+            }
+            if volume.capacity_mb.is_none() {
+                return Err(anyhow!(
+                    "replicated volume '{}' must set capacity_mb",
+                    volume.name
+                ));
+            }
+        }
         if matches!(volume.binding_mode, VolumeBindingMode::Immediate)
             && matches!(
                 &volume.driver,
@@ -342,7 +361,7 @@ fn validate_declared_volumes(volumes: &[AgentVolumeSpec]) -> Result<HashSet<Stri
             &volume.driver,
             VolumeDriver::Local(crate::jobs::manifest::LocalVolumeSpec {
                 source: crate::jobs::manifest::LocalVolumeSource::ImportedPath(_),
-                ownership: crate::volumes::LocalVolumeOwnership::Daemon,
+                ownership: crate::volumes::FilesystemOwnership::Daemon,
             })
         ) {
             return Err(anyhow!(
@@ -727,7 +746,7 @@ mod tests {
                 name: "workspace".to_string(),
                 driver: VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::Managed,
-                    ownership: crate::volumes::LocalVolumeOwnership::Daemon,
+                    ownership: crate::volumes::FilesystemOwnership::Daemon,
                 }),
                 access_mode: VolumeAccessMode::ReadWriteOnce,
                 binding_mode: VolumeBindingMode::WaitForFirstConsumer,

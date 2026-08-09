@@ -125,7 +125,7 @@ pub struct SecretFileProjection {
     #[serde(default)]
     pub mode: Option<u32>,
     #[serde(default)]
-    pub ownership: crate::volumes::LocalVolumeOwnership,
+    pub ownership: crate::volumes::FilesystemOwnership,
     #[serde(default)]
     pub path_env_name: Option<String>,
 }
@@ -165,7 +165,7 @@ pub enum VolumeReclaimPolicy {
 pub struct LocalVolumeSpec {
     pub source: LocalVolumeSource,
     #[serde(default)]
-    pub ownership: crate::volumes::LocalVolumeOwnership,
+    pub ownership: crate::volumes::FilesystemOwnership,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -183,12 +183,21 @@ pub struct ExternalVolumeSpec {
     pub handle: String,
 }
 
+/// Mantissa-managed replicated volume settings.
+#[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReplicatedVolumeSpec {
+    #[serde(default)]
+    pub ownership: crate::volumes::FilesystemOwnership,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeDriver {
     Local(LocalVolumeSpec),
     External(ExternalVolumeSpec),
+    Replicated(ReplicatedVolumeSpec),
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -485,6 +494,23 @@ impl ServiceManifest {
                     volume.name
                 ));
             }
+            if let Some(capacity_mb) = volume.capacity_mb {
+                crate::volumes::capacity_mb_to_bytes(capacity_mb)?;
+            }
+            if matches!(volume.driver, VolumeDriver::Replicated(_)) {
+                if !matches!(volume.binding_mode, VolumeBindingMode::WaitForFirstConsumer) {
+                    return Err(anyhow!(
+                        "replicated volume '{}' must use wait_for_first_consumer binding",
+                        volume.name
+                    ));
+                }
+                if volume.capacity_mb.is_none() {
+                    return Err(anyhow!(
+                        "replicated volume '{}' must set capacity_mb",
+                        volume.name
+                    ));
+                }
+            }
             if matches!(volume.binding_mode, VolumeBindingMode::Immediate)
                 && matches!(
                     volume.driver,
@@ -505,7 +531,7 @@ impl ServiceManifest {
                 volume.driver,
                 VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::ImportedPath(_),
-                    ownership: crate::volumes::LocalVolumeOwnership::Daemon,
+                    ownership: crate::volumes::FilesystemOwnership::Daemon,
                 })
             ) {
                 return Err(anyhow!(
@@ -1178,6 +1204,55 @@ mod tests {
         }
     }
 
+    /// Checks that service manifests parse and validate replicated volumes.
+    #[test]
+    fn service_manifest_accepts_replicated_volume() {
+        let manifest: ServiceManifest = ron::from_str(
+            r#"
+            (
+                name: "database",
+                volumes: [
+                    (
+                        name: "data",
+                        driver: replicated((
+                            ownership: fs_group(gid: 2000),
+                        )),
+                        capacity_mb: Some(64),
+                    ),
+                ],
+                tasks: [
+                    (
+                        name: "database",
+                        image: "postgres:16",
+                        replicas: 1,
+                        resources: (
+                            cpu_millis: 250,
+                            memory_mb: 128,
+                        ),
+                        volumes: [
+                            (
+                                source: "data",
+                                target: "/var/lib/postgresql/data",
+                            ),
+                        ],
+                    ),
+                ],
+            )
+            "#,
+        )
+        .expect("parse replicated service volume");
+
+        manifest
+            .validate()
+            .expect("validate replicated service volume");
+        assert!(matches!(
+            &manifest.volumes[0].driver,
+            VolumeDriver::Replicated(ReplicatedVolumeSpec {
+                ownership: crate::volumes::FilesystemOwnership::FsGroup { gid: 2_000 }
+            })
+        ));
+    }
+
     #[test]
     fn replicated_service_manifest_uses_default_rolling_strategy() {
         let manifest =
@@ -1827,8 +1902,9 @@ mod tests {
         assert_eq!(manifest.deployment.min_healthy_secs, 15);
     }
 
+    /// The local PostgreSQL example must give its filesystem to the image's postgres user.
     #[test]
-    fn postgres_local_volume_example_manifest_loads() {
+    fn postgres_local_volume_example_keeps_postgres_ownership() {
         let manifest = load_manifest_from_path(&example_manifest("postgresql_local_volume.ron"))
             .expect("manifest");
 
@@ -1850,7 +1926,39 @@ mod tests {
             manifest.volumes[0].driver,
             VolumeDriver::Local(LocalVolumeSpec {
                 source: LocalVolumeSource::Managed,
-                ..
+                ownership: crate::volumes::FilesystemOwnership::User { uid: 70, gid: 70 },
+            })
+        ));
+    }
+
+    /// The replicated PostgreSQL example uses the image's user for its mounted filesystem.
+    #[test]
+    fn postgres_replicated_volume_example_keeps_postgres_ownership() {
+        let manifest =
+            load_manifest_from_path(&example_manifest("postgresql_replicated_volume.ron"))
+                .expect("manifest");
+
+        assert_eq!(manifest.name, "postgres-replicated-volume");
+        assert_eq!(manifest.volumes.len(), 1);
+        assert_eq!(manifest.task_templates.len(), 1);
+        assert_eq!(manifest.volumes[0].name, "postgres-replicated-data");
+        assert_eq!(manifest.task_templates[0].name, "db");
+        assert_eq!(manifest.task_templates[0].replicas, 1);
+        assert_eq!(manifest.task_templates[0].public_port, Some(5432));
+        assert_eq!(manifest.task_templates[0].networks, vec!["postgres-demo"]);
+        assert_eq!(manifest.task_templates[0].volumes.len(), 1);
+        assert_eq!(
+            manifest.task_templates[0].volumes[0].source,
+            "postgres-replicated-data"
+        );
+        assert_eq!(
+            manifest.task_templates[0].volumes[0].target,
+            "/var/lib/postgresql/data"
+        );
+        assert!(matches!(
+            manifest.volumes[0].driver,
+            VolumeDriver::Replicated(ReplicatedVolumeSpec {
+                ownership: crate::volumes::FilesystemOwnership::User { uid: 70, gid: 70 }
             })
         ));
     }
@@ -2243,7 +2351,7 @@ mod tests {
                 name: "pgdata".into(),
                 driver: VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::Managed,
-                    ownership: crate::volumes::LocalVolumeOwnership::Daemon,
+                    ownership: crate::volumes::FilesystemOwnership::Daemon,
                 }),
                 access_mode: VolumeAccessMode::ReadWriteOnce,
                 binding_mode: VolumeBindingMode::WaitForFirstConsumer,

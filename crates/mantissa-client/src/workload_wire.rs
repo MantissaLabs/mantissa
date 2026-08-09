@@ -1,7 +1,7 @@
 use crate::jobs::manifest::{
     EnvironmentVariable, LivenessKind, LivenessProbe, SecretFileProjection, SecretReference,
 };
-use crate::volumes::LocalVolumeOwnership;
+use crate::volumes::FilesystemOwnership;
 use crate::volumes::ResolvedVolumeMount;
 use crate::workload_submit::{
     DeploymentPolicySpec, ManifestPortBinding, ManifestPortProtocol, PlacementConstraint,
@@ -10,7 +10,7 @@ use crate::workload_submit::{
 };
 use capnp::Error as CapnpError;
 use capnp::struct_list;
-use mantissa_protocol::volumes::local_volume_ownership;
+use mantissa_protocol::volumes::filesystem_ownership;
 use mantissa_protocol::workload::{
     admission_policy, deployment_policy, environment_var, liveness_probe, network_requirement,
     placement_constraint, placement_constraint_selector, placement_policy, port_binding,
@@ -227,26 +227,26 @@ pub fn write_secret_files(
         entry.set_path(&file.path);
         write_secret_reference(entry.reborrow().init_secret(), &file.secret);
         entry.set_mode(file.mode.unwrap_or(0));
-        write_local_volume_ownership(entry.reborrow().init_ownership(), &file.ownership);
+        write_filesystem_ownership(entry.reborrow().init_ownership(), &file.ownership);
         entry.set_path_env_name(file.path_env_name.as_deref().unwrap_or(""));
     }
 }
 
 /// Encodes one managed-filesystem ownership policy into the shared workload wire builder.
-pub fn write_local_volume_ownership(
-    mut builder: local_volume_ownership::Builder<'_>,
-    ownership: &LocalVolumeOwnership,
+pub fn write_filesystem_ownership(
+    mut builder: filesystem_ownership::Builder<'_>,
+    ownership: &FilesystemOwnership,
 ) {
     match ownership {
-        LocalVolumeOwnership::Daemon => {
+        FilesystemOwnership::Daemon => {
             builder.set_daemon(());
         }
-        LocalVolumeOwnership::User { uid, gid } => {
+        FilesystemOwnership::User { uid, gid } => {
             let mut user = builder.reborrow().init_user();
             user.set_uid(*uid);
             user.set_gid(*gid);
         }
-        LocalVolumeOwnership::FsGroup { gid } => {
+        FilesystemOwnership::FsGroup { gid } => {
             let mut fs_group = builder.reborrow().init_fs_group();
             fs_group.set_gid(*gid);
         }

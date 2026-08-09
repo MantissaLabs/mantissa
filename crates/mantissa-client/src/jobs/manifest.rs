@@ -115,7 +115,7 @@ pub struct SecretFileProjection {
     #[serde(default)]
     pub mode: Option<u32>,
     #[serde(default)]
-    pub ownership: crate::volumes::LocalVolumeOwnership,
+    pub ownership: crate::volumes::FilesystemOwnership,
     #[serde(default)]
     pub path_env_name: Option<String>,
 }
@@ -160,7 +160,7 @@ pub enum VolumeReclaimPolicy {
 pub struct LocalVolumeSpec {
     pub source: LocalVolumeSource,
     #[serde(default)]
-    pub ownership: crate::volumes::LocalVolumeOwnership,
+    pub ownership: crate::volumes::FilesystemOwnership,
 }
 
 /// Local volume source declared in the manifest.
@@ -180,6 +180,14 @@ pub struct ExternalVolumeSpec {
     pub handle: String,
 }
 
+/// Mantissa-managed replicated volume settings.
+#[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReplicatedVolumeSpec {
+    #[serde(default)]
+    pub ownership: crate::volumes::FilesystemOwnership,
+}
+
 /// Driver backing for one declared manifest volume.
 #[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -187,6 +195,7 @@ pub struct ExternalVolumeSpec {
 pub enum VolumeDriver {
     Local(LocalVolumeSpec),
     External(ExternalVolumeSpec),
+    Replicated(ReplicatedVolumeSpec),
 }
 
 /// Top-level declared volume for one job manifest.
@@ -334,13 +343,15 @@ impl JobManifest {
                         }
                     },
                     VolumeDriver::External(_) => DeclaredVolumeDriverKind::External,
+                    VolumeDriver::Replicated(_) => DeclaredVolumeDriverKind::Replicated,
                 },
-                local_ownership: match &volume.driver {
+                filesystem_ownership: match &volume.driver {
                     VolumeDriver::Local(local) => match &local.source {
                         LocalVolumeSource::Managed => Some(local.ownership.clone()),
                         LocalVolumeSource::ImportedPath(_) => None,
                     },
                     VolumeDriver::External(_) => None,
+                    VolumeDriver::Replicated(replicated) => Some(replicated.ownership.clone()),
                 },
                 access_mode: match volume.access_mode {
                     VolumeAccessMode::ReadWriteOnce => {
@@ -411,6 +422,23 @@ fn validate_declared_volumes(volumes: &[JobVolumeSpec]) -> Result<HashSet<String
                 volume.name
             ));
         }
+        if let Some(capacity_mb) = volume.capacity_mb {
+            crate::volumes::capacity_mb_to_bytes(capacity_mb)?;
+        }
+        if matches!(volume.driver, VolumeDriver::Replicated(_)) {
+            if !matches!(volume.binding_mode, VolumeBindingMode::WaitForFirstConsumer) {
+                return Err(anyhow!(
+                    "replicated volume '{}' must use wait_for_first_consumer binding",
+                    volume.name
+                ));
+            }
+            if volume.capacity_mb.is_none() {
+                return Err(anyhow!(
+                    "replicated volume '{}' must set capacity_mb",
+                    volume.name
+                ));
+            }
+        }
         if matches!(volume.binding_mode, VolumeBindingMode::Immediate)
             && matches!(
                 volume.driver,
@@ -429,7 +457,7 @@ fn validate_declared_volumes(volumes: &[JobVolumeSpec]) -> Result<HashSet<String
             volume.driver,
             VolumeDriver::Local(LocalVolumeSpec {
                 source: LocalVolumeSource::ImportedPath(_),
-                ownership: crate::volumes::LocalVolumeOwnership::Daemon,
+                ownership: crate::volumes::FilesystemOwnership::Daemon,
             })
         ) {
             return Err(anyhow!(
@@ -713,7 +741,7 @@ mod tests {
                 name: "workspace".to_string(),
                 driver: VolumeDriver::Local(LocalVolumeSpec {
                     source: LocalVolumeSource::Managed,
-                    ownership: crate::volumes::LocalVolumeOwnership::Daemon,
+                    ownership: crate::volumes::FilesystemOwnership::Daemon,
                 }),
                 access_mode: VolumeAccessMode::ReadWriteOnce,
                 binding_mode: VolumeBindingMode::WaitForFirstConsumer,
@@ -749,6 +777,46 @@ mod tests {
             deployment: JobDeploymentPolicySpec::default(),
             admission: WorkloadAdmissionPolicy::default(),
         }
+    }
+
+    /// Checks that jobs accept replicated volumes and keep their ownership.
+    #[test]
+    fn job_manifest_accepts_replicated_volume() {
+        let mut manifest = base_manifest();
+        manifest.volumes[0].driver = VolumeDriver::Replicated(ReplicatedVolumeSpec {
+            ownership: crate::volumes::FilesystemOwnership::FsGroup { gid: 2_000 },
+        });
+        manifest.volumes[0].capacity_mb = Some(64);
+
+        manifest.validate().expect("valid replicated job volume");
+        let declared = manifest.declared_volume_specs();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(
+            declared[0].driver_kind,
+            DeclaredVolumeDriverKind::Replicated
+        );
+        assert_eq!(
+            declared[0].filesystem_ownership,
+            Some(crate::volumes::FilesystemOwnership::FsGroup { gid: 2_000 })
+        );
+    }
+
+    /// Checks that jobs reject a replicated volume without a capacity.
+    #[test]
+    fn job_manifest_requires_replicated_volume_capacity() {
+        let mut manifest = base_manifest();
+        manifest.volumes[0].driver = VolumeDriver::Replicated(ReplicatedVolumeSpec {
+            ownership: crate::volumes::FilesystemOwnership::Daemon,
+        });
+        manifest.volumes[0].capacity_mb = None;
+
+        assert!(
+            manifest
+                .validate()
+                .expect_err("missing replicated capacity")
+                .to_string()
+                .contains("must set capacity_mb")
+        );
     }
 
     /// Rejects liveness exec probes that omit their command.
