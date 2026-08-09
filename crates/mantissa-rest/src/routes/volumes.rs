@@ -5,13 +5,13 @@ use crate::{
     routes::worker_error_to_rest,
     state::AppState,
     types::volumes::{
-        VolumeCreateRequest, VolumeDeleteResponse, VolumeImportRequest, VolumeInspect, VolumeSpec,
-        VolumeSummary,
+        VolumeCreateRequest, VolumeDeleteQuery, VolumeDeleteResponse, VolumeImportRequest,
+        VolumeInspect, VolumeSpec, VolumeSummary,
     },
 };
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 
 /// Lists volumes visible to the local daemon.
@@ -33,7 +33,7 @@ pub async fn list(
         .map_err(worker_error_to_rest)
 }
 
-/// Creates one managed local volume through the local daemon.
+/// Creates one Mantissa-managed volume through the local daemon.
 #[utoipa::path(
     post,
     path = "/v1/volumes",
@@ -96,22 +96,47 @@ pub async fn get(
         .map_err(worker_error_to_rest)
 }
 
-/// Deletes one volume by UUID text or exact volume name.
+/// Retains or permanently deletes one volume by UUID text or exact name.
 #[utoipa::path(
     delete,
     path = "/v1/volumes/{selector}",
     tag = "volumes",
-    params(("selector" = String, Path, description = "Volume UUID string or exact volume name.")),
+    params(
+        ("selector" = String, Path, description = "Volume UUID string or exact volume name."),
+        ("delete_data" = Option<bool>, Query, description = "Permanently remove managed backing data. Defaults to false.")
+    ),
     responses((status = 200, description = "Volume delete result.", body = VolumeDeleteResponse))
 )]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(selector): Path<String>,
+    Query(query): Query<VolumeDeleteQuery>,
 ) -> Result<Json<VolumeDeleteResponse>, RestError> {
     state
         .client()
-        .delete_volume(selector)
+        .delete_volume(selector, query.delete_data)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Restores one retained replicated volume by UUID text or exact name.
+#[utoipa::path(
+    post,
+    path = "/v1/volumes/{selector}/restore",
+    tag = "volumes",
+    params(("selector" = String, Path, description = "Volume UUID string or exact volume name.")),
+    responses((status = 200, description = "Volume restore request accepted.", body = VolumeSpec))
+)]
+pub async fn restore(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(selector): Path<String>,
+) -> Result<Json<VolumeSpec>, RestError> {
+    state
+        .client()
+        .restore_volume(selector)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

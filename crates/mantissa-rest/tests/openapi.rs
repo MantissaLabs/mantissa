@@ -40,6 +40,21 @@ fn openapi_spec_documents_security_contract() {
     assert!(value["paths"]["/v1/health"]["get"]["responses"]["401"].is_object());
 }
 
+/// Ensures retaining volume data remains the documented delete default.
+#[test]
+fn openapi_spec_makes_volume_data_deletion_optional() {
+    let value = openapi::json_value(&server::openapi());
+    let parameters = value["paths"]["/v1/volumes/{selector}"]["delete"]["parameters"]
+        .as_array()
+        .expect("volume delete parameters should be an array");
+    let delete_data = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "delete_data")
+        .expect("volume delete should document delete_data");
+
+    assert_eq!(delete_data["required"], false);
+}
+
 /// Ensures workload submission schemas keep CPU and memory resources mandatory.
 #[test]
 fn openapi_spec_requires_workload_resource_bounds() {
@@ -254,6 +269,7 @@ fn expected_operations() -> BTreeSet<(String, String)> {
         ("POST", "/v1/tasks/{selector}/stop"),
         ("POST", "/v1/volumes"),
         ("POST", "/v1/volumes/import"),
+        ("POST", "/v1/volumes/{selector}/restore"),
         ("PUT", "/v1/ingress"),
         ("PUT", "/v1/nodes/{node_id}/labels"),
         ("PUT", "/v1/secrets/{name}"),

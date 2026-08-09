@@ -1096,6 +1096,34 @@
         ],
         "type": "object"
       },
+      "FilesystemOwnership": {
+        "description": "REST-facing ownership policy for one managed filesystem.",
+        "properties": {
+          "gid": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "uid": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
       "HealthResponse": {
         "description": "Full health response returned after pinging the local daemon session.",
         "properties": {
@@ -1961,34 +1989,6 @@
         ],
         "type": "object"
       },
-      "LocalVolumeOwnership": {
-        "description": "REST-facing ownership policy for local volume materialization.",
-        "properties": {
-          "gid": {
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "kind": {
-            "type": "string"
-          },
-          "uid": {
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "kind"
-        ],
-        "type": "object"
-      },
       "LocalVolumeSource": {
         "oneOf": [
           {
@@ -2013,7 +2013,7 @@
       "LocalVolumeSpec": {
         "properties": {
           "ownership": {
-            "$ref": "#/components/schemas/LocalVolumeOwnership"
+            "$ref": "#/components/schemas/FilesystemOwnership"
           },
           "source": {
             "$ref": "#/components/schemas/LocalVolumeSource"
@@ -2885,6 +2885,200 @@
         ],
         "type": "object"
       },
+      "ReplicatedVolumeGroupStatus": {
+        "description": "REST-facing status copied from the replicated volume's Raft state.",
+        "properties": {
+          "attached_node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "control_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed_index": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "copy_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "degraded": {
+            "type": "boolean"
+          },
+          "fence": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "group_id": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "leader_node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replacement_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replacement_new_node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replacement_old_node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reporter_node_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "volume_epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "volume_id": {
+            "type": "string"
+          },
+          "voter_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "volume_id",
+          "volume_epoch",
+          "group_id",
+          "reporter_node_id",
+          "status",
+          "committed_index",
+          "updated_at",
+          "control_revision",
+          "copy_node_ids",
+          "voter_node_ids",
+          "degraded"
+        ],
+        "type": "object"
+      },
+      "ReplicatedVolumePlan": {
+        "description": "REST-facing immutable genesis input for a replicated volume.",
+        "properties": {
+          "bootstrap_id": {
+            "type": "string"
+          },
+          "capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "data_block_bytes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "logical_sector_bytes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minimum_io_bytes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "physical_block_bytes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replica_node_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "volume_epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "volume_id": {
+            "type": "string"
+          },
+          "workload_node_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "volume_id",
+          "volume_epoch",
+          "bootstrap_id",
+          "workload_node_id",
+          "replica_node_ids",
+          "generation",
+          "capacity_bytes",
+          "logical_sector_bytes",
+          "physical_block_bytes",
+          "minimum_io_bytes",
+          "data_block_bytes"
+        ],
+        "type": "object"
+      },
+      "ReplicatedVolumeSpec": {
+        "description": "Mantissa-managed replicated volume settings.",
+        "properties": {
+          "ownership": {
+            "$ref": "#/components/schemas/FilesystemOwnership"
+          }
+        },
+        "type": "object"
+      },
       "RestErrorBody": {
         "description": "Stable JSON error body returned by REST handlers.",
         "properties": {
@@ -3169,7 +3363,7 @@
             ]
           },
           "ownership": {
-            "$ref": "#/components/schemas/LocalVolumeOwnership"
+            "$ref": "#/components/schemas/FilesystemOwnership"
           },
           "path": {
             "type": "string"
@@ -4387,12 +4581,23 @@
         ],
         "type": "string"
       },
+      "VolumeCreateDriver": {
+        "description": "Storage driver selected by a REST volume create request.",
+        "enum": [
+          "local",
+          "replicated"
+        ],
+        "type": "string"
+      },
       "VolumeCreateRequest": {
         "additionalProperties": false,
-        "description": "REST request body for creating one managed local volume.",
+        "description": "REST request body for creating one Mantissa-managed volume.",
         "properties": {
           "binding_mode": {
             "type": "string"
+          },
+          "driver": {
+            "$ref": "#/components/schemas/VolumeCreateDriver"
           },
           "labels": {
             "items": {
@@ -4429,11 +4634,19 @@
         ],
         "type": "object"
       },
+      "VolumeDeleteDisposition": {
+        "description": "Accepted logical result of a delete request.",
+        "enum": [
+          "deleted",
+          "retained"
+        ],
+        "type": "string"
+      },
       "VolumeDeleteResponse": {
         "description": "REST response returned after deleting one volume.",
         "properties": {
-          "deleted_data": {
-            "type": "boolean"
+          "disposition": {
+            "$ref": "#/components/schemas/VolumeDeleteDisposition"
           },
           "preserved_path": {
             "type": [
@@ -4443,7 +4656,7 @@
           }
         },
         "required": [
-          "deleted_data"
+          "disposition"
         ],
         "type": "object"
       },
@@ -4515,17 +4728,47 @@
       "VolumeInspect": {
         "description": "REST-facing volume inspection payload.",
         "properties": {
+          "group_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReplicatedVolumeGroupStatus"
+              }
+            ]
+          },
           "node_states": {
             "items": {
               "$ref": "#/components/schemas/VolumeNodeStatus"
             },
             "type": "array"
           },
+          "plan": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReplicatedVolumePlan"
+              }
+            ]
+          },
           "spec": {
             "$ref": "#/components/schemas/VolumeSpec"
+          },
+          "state": {
+            "type": "string"
+          },
+          "state_message": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
+          "state",
           "spec",
           "node_states"
         ],
@@ -4576,6 +4819,15 @@
               "integer",
               "null"
             ]
+          },
+          "group_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "health": {
+            "type": "string"
           },
           "id": {
             "type": "string"
@@ -4633,6 +4885,7 @@
           "node_id",
           "node_name",
           "state",
+          "health",
           "published_task_ids",
           "updated_at",
           "volume_epoch"
@@ -4640,7 +4893,7 @@
         "type": "object"
       },
       "VolumeOwnershipRequest": {
-        "description": "REST request ownership policy for managed local volumes.",
+        "description": "REST request ownership policy for Mantissa-managed filesystems.",
         "oneOf": [
           {
             "properties": {
@@ -4735,8 +4988,21 @@
           "created_at": {
             "type": "string"
           },
+          "desired_disposition": {
+            "type": "string"
+          },
           "driver": {
             "$ref": "#/components/schemas/VolumeDriver"
+          },
+          "filesystem_ownership": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FilesystemOwnership"
+              }
+            ]
           },
           "id": {
             "type": "string"
@@ -4747,38 +5013,22 @@
             },
             "type": "array"
           },
-          "local_ownership": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/LocalVolumeOwnership"
-              }
-            ]
-          },
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
+          "lifecycle_request_id": {
             "type": "string"
           },
-          "phase_version": {
+          "lifecycle_revision": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
-          "reason": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "name": {
+            "type": "string"
           },
           "reclaim_policy": {
             "type": "string"
+          },
+          "remove_data": {
+            "type": "boolean"
           },
           "requested_bytes": {
             "format": "int64",
@@ -4787,9 +5037,6 @@
               "integer",
               "null"
             ]
-          },
-          "status": {
-            "type": "string"
           },
           "updated_at": {
             "type": "string"
@@ -4808,9 +5055,11 @@
           "binding_mode",
           "reclaim_policy",
           "labels",
-          "status",
           "volume_epoch",
-          "phase_version",
+          "lifecycle_revision",
+          "lifecycle_request_id",
+          "desired_disposition",
+          "remove_data",
           "created_at",
           "updated_at"
         ],
@@ -4840,21 +5089,21 @@
           "driver": {
             "$ref": "#/components/schemas/VolumeDriver"
           },
-          "id": {
-            "type": "string"
-          },
-          "in_use": {
-            "type": "boolean"
-          },
-          "local_ownership": {
+          "filesystem_ownership": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/LocalVolumeOwnership"
+                "$ref": "#/components/schemas/FilesystemOwnership"
               }
             ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "in_use": {
+            "type": "boolean"
           },
           "name": {
             "type": "string"
@@ -4876,6 +5125,9 @@
               "null"
             ]
           },
+          "state": {
+            "type": "string"
+          },
           "status": {
             "type": "string"
           },
@@ -4891,6 +5143,7 @@
           "binding_mode",
           "reclaim_policy",
           "status",
+          "state",
           "in_use",
           "updated_at"
         ],
@@ -10511,7 +10764,7 @@
         ]
       },
       "post": {
-        "description": "Creates one managed local volume through the local daemon.",
+        "description": "Creates one Mantissa-managed volume through the local daemon.",
         "operationId": "create",
         "requestBody": {
           "content": {
@@ -10695,7 +10948,7 @@
     },
     "/v1/volumes/{selector}": {
       "delete": {
-        "description": "Deletes one volume by UUID text or exact volume name.",
+        "description": "Retains or permanently deletes one volume by UUID text or exact name.",
         "operationId": "delete",
         "parameters": [
           {
@@ -10705,6 +10958,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Permanently remove managed backing data. Defaults to false.",
+            "in": "query",
+            "name": "delete_data",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -10877,6 +11139,99 @@
         ]
       }
     },
+    "/v1/volumes/{selector}/restore": {
+      "post": {
+        "description": "Restores one retained replicated volume by UUID text or exact name.",
+        "operationId": "restore",
+        "parameters": [
+          {
+            "description": "Volume UUID string or exact volume name.",
+            "in": "path",
+            "name": "selector",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VolumeSpec"
+                }
+              }
+            },
+            "description": "Volume restore request accepted."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Restore volume",
+        "tags": [
+          "volumes"
+        ]
+      }
+    },
     "/v1/volumes/{selector}/status": {
       "get": {
         "description": "Fetches one volume status by UUID text or exact volume name.",
@@ -11006,7 +11361,7 @@
       "name": "ingress"
     },
     {
-      "description": "Local volume creation, import, inspection, and deletion.",
+      "description": "Managed volume creation, import, inspection, and deletion.",
       "name": "volumes"
     },
     {

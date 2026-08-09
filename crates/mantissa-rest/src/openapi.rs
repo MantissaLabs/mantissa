@@ -228,7 +228,7 @@ fn tags() -> Vec<Tag> {
         ),
         (
             "volumes",
-            "Local volume creation, import, inspection, and deletion.",
+            "Managed volume creation, import, inspection, and deletion.",
         ),
         (
             "tasks",
@@ -514,7 +514,7 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         OperationMethod::Post,
         "/v1/volumes",
         "Create volume",
-        "Creates one managed local volume through the local daemon.",
+        "Creates one Mantissa-managed volume through the local daemon.",
     ),
     (
         OperationMethod::Post,
@@ -532,7 +532,13 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         OperationMethod::Delete,
         "/v1/volumes/{selector}",
         "Delete volume",
-        "Deletes one volume by UUID text or exact volume name.",
+        "Retains or permanently deletes one volume by UUID text or exact name.",
+    ),
+    (
+        OperationMethod::Post,
+        "/v1/volumes/{selector}/restore",
+        "Restore volume",
+        "Restores one retained replicated volume by UUID text or exact name.",
     ),
     (
         OperationMethod::Get,

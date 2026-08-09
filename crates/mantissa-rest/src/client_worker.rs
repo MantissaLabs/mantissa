@@ -380,7 +380,7 @@ impl ClientWorkerHandle {
         self.send(ClientCommand::ListVolumes).await
     }
 
-    /// Creates one managed local volume.
+    /// Creates one Mantissa-managed volume.
     pub async fn create_volume(
         &self,
         request: VolumeCreateRequest,
@@ -417,8 +417,19 @@ impl ClientWorkerHandle {
     pub async fn delete_volume(
         &self,
         selector: String,
+        delete_data: bool,
     ) -> Result<VolumeDeleteResponse, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::DeleteVolume {
+            selector,
+            delete_data,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Restores one retained replicated volume by UUID text or exact name.
+    pub async fn restore_volume(&self, selector: String) -> Result<VolumeSpec, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::RestoreVolume {
             selector,
             respond_to,
         })
@@ -951,7 +962,12 @@ enum ClientCommand {
     },
     DeleteVolume {
         selector: String,
+        delete_data: bool,
         respond_to: oneshot::Sender<Result<VolumeDeleteResponse, ClientWorkerError>>,
+    },
+    RestoreVolume {
+        selector: String,
+        respond_to: oneshot::Sender<Result<VolumeSpec, ClientWorkerError>>,
     },
     ListTasks(oneshot::Sender<Result<Vec<TaskSummary>, ClientWorkerError>>),
     GetTask {
@@ -1246,9 +1262,17 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
             }
             ClientCommand::DeleteVolume {
                 selector,
+                delete_data,
                 respond_to,
             } => {
-                let _ignored = respond_to.send(delete_volume(&config, &selector).await);
+                let _ignored =
+                    respond_to.send(delete_volume(&config, &selector, delete_data).await);
+            }
+            ClientCommand::RestoreVolume {
+                selector,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(restore_volume(&config, &selector).await);
             }
             ClientCommand::ListTasks(respond_to) => {
                 let _ignored = respond_to.send(list_tasks(&config).await);
@@ -1853,13 +1877,28 @@ async fn get_volume_status(
 async fn delete_volume(
     config: &ClientConfig,
     selector: &str,
+    delete_data: bool,
 ) -> Result<VolumeDeleteResponse, ClientWorkerError> {
     volumes::inspect(config, selector)
         .await
         .map_err(not_found_error)?;
-    volumes::delete(config, selector)
+    volumes::delete(config, selector, delete_data)
         .await
         .map(VolumeDeleteResponse::from)
+        .map_err(conflict_error)
+}
+
+/// Restores one retained volume through the reusable Mantissa client API.
+async fn restore_volume(
+    config: &ClientConfig,
+    selector: &str,
+) -> Result<VolumeSpec, ClientWorkerError> {
+    volumes::inspect(config, selector)
+        .await
+        .map_err(not_found_error)?;
+    volumes::restore(config, selector)
+        .await
+        .map(VolumeSpec::from)
         .map_err(conflict_error)
 }
 
