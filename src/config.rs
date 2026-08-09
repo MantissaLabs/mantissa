@@ -1,5 +1,7 @@
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,6 +18,10 @@ use tracing::warn;
 use crate::ip_family::DefaultIpFamilyPolicy;
 use crate::network::types::NetworkRealizationPolicy;
 use crate::volumes::local::ensure_local_volume_root;
+
+mod replicated_volume;
+
+pub(crate) use replicated_volume::CheckedReplicatedVolumeConfig;
 
 /// Maximum scheduler slot count supported by the local scheduler snapshot codec.
 pub const SCHEDULER_MAX_SLOT_COUNT: u64 = 65_536;
@@ -55,7 +61,405 @@ pub struct StorageConfig {
     #[serde(default)]
     pub local_volume_enforce_capacity: bool,
     #[serde(default)]
+    pub replicated_volumes: Option<ReplicatedVolumeConfig>,
+    #[serde(default)]
     pub gc: StoreGcConfig,
+}
+
+/// Daemon settings that override the built-in replicated-volume settings.
+///
+/// A node without this section uses local paths, detects its storage address,
+/// and starts replicated volumes when the host supports them.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeConfig {
+    pub pool_path: String,
+    pub catalog_path: Option<String>,
+    pub listen_address: String,
+    pub advertise_address: String,
+    pub startup_timeout_ms: u64,
+    pub shutdown_timeout_ms: u64,
+    pub operation_timeout_ms: u64,
+    pub max_saved_replicas: usize,
+    pub heartbeat_interval_ms: u64,
+    pub election_timeout_min_ms: u64,
+    pub election_timeout_max_ms: u64,
+    pub runtime_limits: ReplicatedVolumeRuntimeLimits,
+    pub protocol_limits: ReplicatedVolumeProtocolLimits,
+    pub transport_limits: ReplicatedVolumeTransportLimits,
+    pub log_limits: ReplicatedVolumeLogLimits,
+    pub data_store_limits: ReplicatedVolumeDataStoreLimits,
+    pub state_limits: ReplicatedVolumeStateLimits,
+    pub repair_limits: ReplicatedVolumeRepairLimits,
+    pub driver_limits: ReplicatedVolumeDriverLimits,
+    pub filesystem: ReplicatedVolumeFilesystemSettings,
+}
+
+/// Limits for saved and running Raft groups on one node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeRuntimeLimits {
+    pub max_saved_groups: usize,
+    pub max_active_groups: usize,
+    pub max_parallel_starts: usize,
+    pub max_background_jobs: usize,
+}
+
+/// Limits applied while encoding and reading Raft Cap'n Proto messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeProtocolLimits {
+    pub max_message_bytes: usize,
+    pub max_entry_bytes: usize,
+    pub max_append_entries: u32,
+    pub max_membership_nodes: u32,
+    pub max_traversal_bytes: usize,
+    pub max_nesting_levels: u32,
+}
+
+/// Connection, queue, size, and time limits for the shared Raft transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeTransportLimits {
+    pub max_connections: usize,
+    pub max_queued_calls: usize,
+    pub max_queued_bytes: usize,
+    pub reserved_vote_and_heartbeat_queue_bytes: usize,
+    pub max_calls_per_peer: usize,
+    pub reserved_vote_and_heartbeat_calls_per_peer: usize,
+    pub max_snapshot_chunk_bytes: usize,
+    pub connect_timeout_ms: u64,
+    pub handshake_timeout_ms: u64,
+    pub call_timeout_ms: u64,
+    pub queue_timeout_ms: u64,
+    pub reconnect_delay_ms: u64,
+}
+
+/// Size limits for encrypted Raft log frames and files.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeLogLimits {
+    pub max_frame_bytes: usize,
+    pub max_segment_bytes: u64,
+    pub snapshot_after_entries: u64,
+}
+
+/// Worker limits for fixed replica data files.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeDataStoreLimits {
+    pub worker_threads: usize,
+    pub max_queued_operations: usize,
+}
+
+/// Defensive encoded-size limit for replicated-volume control state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeStateLimits {
+    pub max_state_bytes: usize,
+}
+
+/// Failure delay, concurrency, request, and bandwidth limits for replica repair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeRepairLimits {
+    pub failure_grace_ms: u64,
+    pub max_parallel_repairs: usize,
+    pub max_chunk_bytes: usize,
+    pub max_bytes_per_second: u64,
+}
+
+/// ublk queue and copied-request memory limits for one attached volume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeDriverLimits {
+    pub queue_count: u16,
+    pub queue_depth: u16,
+    pub max_request_bytes: u32,
+    pub max_queue_buffer_bytes: u64,
+    pub max_pending_requests: usize,
+    pub max_pending_buffer_bytes: usize,
+    pub max_batch_changes: usize,
+    pub max_batch_bytes: usize,
+    pub max_batch_delay_us: u64,
+}
+
+/// Exact ext4 tools, layout choices, and mount settings.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicatedVolumeFilesystemSettings {
+    pub mount_root: String,
+    pub wipefs_path: String,
+    pub mkfs_ext4_path: String,
+    pub features: Vec<String>,
+    pub inode_size_bytes: u16,
+    pub bytes_per_inode: u32,
+    pub reserved_space_percent: u8,
+    pub extended_options: Vec<String>,
+    pub mount_options: Vec<String>,
+}
+
+impl Default for ReplicatedVolumeRuntimeLimits {
+    /// Returns conservative limits for saved and active volume groups.
+    fn default() -> Self {
+        Self {
+            max_saved_groups: 100,
+            max_active_groups: 16,
+            max_parallel_starts: 4,
+            max_background_jobs: 2,
+        }
+    }
+}
+
+impl Default for ReplicatedVolumeProtocolLimits {
+    /// Returns message limits that keep one write well below one Raft message.
+    fn default() -> Self {
+        Self {
+            max_message_bytes: 8 << 20,
+            max_entry_bytes: 2 << 20,
+            max_append_entries: 16,
+            max_membership_nodes: 8,
+            max_traversal_bytes: 16 << 20,
+            max_nesting_levels: 32,
+        }
+    }
+}
+
+impl Default for ReplicatedVolumeTransportLimits {
+    /// Returns bounded connection, queue, and timeout settings.
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            max_queued_calls: 128,
+            max_queued_bytes: 32 << 20,
+            reserved_vote_and_heartbeat_queue_bytes: 1 << 20,
+            max_calls_per_peer: 8,
+            reserved_vote_and_heartbeat_calls_per_peer: 2,
+            max_snapshot_chunk_bytes: 1 << 20,
+            connect_timeout_ms: 3_000,
+            handshake_timeout_ms: 3_000,
+            call_timeout_ms: 30_000,
+            queue_timeout_ms: 3_000,
+            reconnect_delay_ms: 500,
+        }
+    }
+}
+
+impl Default for ReplicatedVolumeLogLimits {
+    /// Returns file and frame limits for each volume's Raft log.
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 3 << 20,
+            max_segment_bytes: 64 << 20,
+            snapshot_after_entries: 4_096,
+        }
+    }
+}
+
+impl Default for ReplicatedVolumeDataStoreLimits {
+    /// Returns bounded node-wide fixed-file worker limits.
+    fn default() -> Self {
+        Self {
+            worker_threads: 8,
+            max_queued_operations: 64,
+        }
+    }
+}
+
+impl Default for ReplicatedVolumeStateLimits {
+    /// Returns the bounded control-state snapshot limit for one volume group.
+    fn default() -> Self {
+        Self {
+            max_state_bytes: 2 << 20,
+        }
+    }
+}
+
+impl Default for ReplicatedVolumeRepairLimits {
+    /// Returns bounded repair work and a shared bandwidth limit.
+    fn default() -> Self {
+        Self {
+            failure_grace_ms: 30_000,
+            max_parallel_repairs: 2,
+            max_chunk_bytes: 1 << 20,
+            max_bytes_per_second: 64 << 20,
+        }
+    }
+}
+
+impl Default for ReplicatedVolumeDriverLimits {
+    /// Returns ublk queue settings with a bounded memory cost per volume.
+    fn default() -> Self {
+        Self {
+            queue_count: 2,
+            queue_depth: 32,
+            max_request_bytes: 128 << 10,
+            max_queue_buffer_bytes: 8 << 20,
+            max_pending_requests: 64,
+            max_pending_buffer_bytes: 1 << 20,
+            max_batch_changes: 64,
+            max_batch_bytes: 1 << 20,
+            max_batch_delay_us: 250,
+        }
+    }
+}
+
+impl ReplicatedVolumeConfig {
+    /// Builds the settings used when the operator provides no storage section.
+    pub(crate) fn automatic(advertise_override: Option<&str>) -> Result<Self> {
+        let state_dir = ensure_state_dir().context("prepare the Mantissa state directory")?;
+        let pool_path = state_dir.join("replicas");
+        fs::create_dir_all(&pool_path).with_context(|| {
+            format!(
+                "create the default replicated-volume pool {}",
+                pool_path.display()
+            )
+        })?;
+
+        let advertise_ip = automatic_replicated_volume_ip(advertise_override)?;
+        let listen_ip = match advertise_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let wipefs_path = find_replicated_volume_tool(
+            "wipefs",
+            &[
+                "/usr/sbin/wipefs",
+                "/sbin/wipefs",
+                "/usr/bin/wipefs",
+                "/bin/wipefs",
+            ],
+        )?;
+        let mkfs_ext4_path = find_replicated_volume_tool(
+            "mkfs.ext4",
+            &[
+                "/usr/sbin/mkfs.ext4",
+                "/sbin/mkfs.ext4",
+                "/usr/bin/mkfs.ext4",
+                "/bin/mkfs.ext4",
+            ],
+        )?;
+
+        Ok(Self::with_defaults(
+            pool_path,
+            state_dir.join("replicated-volumes.redb"),
+            state_dir.join("volume-mounts"),
+            SocketAddr::new(listen_ip, 7578),
+            SocketAddr::new(advertise_ip, 7578),
+            wipefs_path,
+            mkfs_ext4_path,
+        ))
+    }
+
+    /// Fills paths and addresses around the built-in limits and ext4 profile.
+    fn with_defaults(
+        pool_path: PathBuf,
+        catalog_path: PathBuf,
+        mount_root: PathBuf,
+        listen_address: SocketAddr,
+        advertise_address: SocketAddr,
+        wipefs_path: PathBuf,
+        mkfs_ext4_path: PathBuf,
+    ) -> Self {
+        Self {
+            pool_path: pool_path.display().to_string(),
+            catalog_path: Some(catalog_path.display().to_string()),
+            listen_address: listen_address.to_string(),
+            advertise_address: advertise_address.to_string(),
+            startup_timeout_ms: 30_000,
+            shutdown_timeout_ms: 60_000,
+            operation_timeout_ms: 60_000,
+            max_saved_replicas: 100,
+            heartbeat_interval_ms: 2_000,
+            election_timeout_min_ms: 8_000,
+            election_timeout_max_ms: 12_000,
+            runtime_limits: ReplicatedVolumeRuntimeLimits::default(),
+            protocol_limits: ReplicatedVolumeProtocolLimits::default(),
+            transport_limits: ReplicatedVolumeTransportLimits::default(),
+            log_limits: ReplicatedVolumeLogLimits::default(),
+            data_store_limits: ReplicatedVolumeDataStoreLimits::default(),
+            state_limits: ReplicatedVolumeStateLimits::default(),
+            repair_limits: ReplicatedVolumeRepairLimits::default(),
+            driver_limits: ReplicatedVolumeDriverLimits::default(),
+            filesystem: ReplicatedVolumeFilesystemSettings {
+                mount_root: mount_root.display().to_string(),
+                wipefs_path: wipefs_path.display().to_string(),
+                mkfs_ext4_path: mkfs_ext4_path.display().to_string(),
+                features: vec![
+                    "has_journal".to_string(),
+                    "extent".to_string(),
+                    "filetype".to_string(),
+                    "64bit".to_string(),
+                    "metadata_csum".to_string(),
+                ],
+                inode_size_bytes: 256,
+                bytes_per_inode: 16_384,
+                reserved_space_percent: 0,
+                extended_options: vec![
+                    // New replicated volumes already read as zero. Discarding
+                    // the full capacity would create needless Raft writes.
+                    "nodiscard".to_string(),
+                    // Let ext4 finish zeroing unused metadata after the first
+                    // mount instead of blocking workload startup.
+                    "lazy_itable_init=1".to_string(),
+                    "lazy_journal_init=1".to_string(),
+                ],
+                mount_options: vec!["noatime".to_string()],
+            },
+        }
+    }
+
+    /// Checks and converts every replicated-volume setting.
+    pub(crate) fn checked(&self) -> Result<CheckedReplicatedVolumeConfig> {
+        CheckedReplicatedVolumeConfig::new(self)
+    }
+
+    /// Checks every replicated-volume setting without opening local resources.
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.checked().map(drop)
+    }
+}
+
+/// Uses an explicit daemon address when possible, then checks local interfaces.
+fn automatic_replicated_volume_ip(advertise_override: Option<&str>) -> Result<IpAddr> {
+    if let Some(address) = advertise_override
+        .and_then(|address| address.parse::<SocketAddr>().ok())
+        .filter(|address| !address.ip().is_unspecified())
+    {
+        return Ok(address.ip());
+    }
+
+    let preferred_family = match default_ip_family_policy() {
+        DefaultIpFamilyPolicy::Ipv4 => Some(crate::ip_family::IpFamily::Ipv4),
+        DefaultIpFamilyPolicy::Ipv6 => Some(crate::ip_family::IpFamily::Ipv6),
+        DefaultIpFamilyPolicy::Auto => None,
+    };
+    crate::node::address::compute_advertise_ip(None, None, preferred_family)
+        .context("find a local address for replicated volumes")
+}
+
+/// Finds one required system tool at a known absolute path.
+fn find_replicated_volume_tool(name: &str, candidates: &[&str]) -> Result<PathBuf> {
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
+        return Ok(path);
+    }
+
+    anyhow::bail!(
+        "replicated volumes need {name}; checked {}",
+        candidates.join(", ")
+    )
+}
+
+/// Checks one required absolute filesystem path.
+fn validate_absolute_path(name: &str, path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        anyhow::bail!("{name} cannot be empty");
+    }
+    if !Path::new(path).is_absolute() {
+        anyhow::bail!("{name} must be an absolute path");
+    }
+    Ok(())
 }
 
 /// # Description:
@@ -967,6 +1371,11 @@ pub fn local_volume_enforce_capacity() -> bool {
     global_config().storage.local_volume_enforce_capacity
 }
 
+/// Returns the operator's replicated-volume settings, if they were supplied.
+pub fn replicated_volume_config() -> Option<ReplicatedVolumeConfig> {
+    global_config().storage.replicated_volumes
+}
+
 /// # Description:
 ///
 /// Render a config snapshot as pretty-printed RON for diagnostics.
@@ -1689,6 +2098,10 @@ impl Config {
             }
         }
 
+        if let Some(replicated_volumes) = self.storage.replicated_volumes.as_ref() {
+            replicated_volumes.validate()?;
+        }
+
         if self.storage.gc.interval_ms == 0 {
             anyhow::bail!("storage.gc.interval_ms must be greater than zero");
         }
@@ -2034,6 +2447,10 @@ fn restart_required_changes(old: &Config, new: &Config) -> Vec<String> {
         changes.push("storage.local_volume_enforce_capacity".to_string());
     }
 
+    if old.storage.replicated_volumes != new.storage.replicated_volumes {
+        changes.push("storage.replicated_volumes".to_string());
+    }
+
     if old.storage.gc != new.storage.gc {
         changes.push("storage.gc".to_string());
     }
@@ -2213,10 +2630,249 @@ mod tests {
         }
     }
 
+    /// Builds one complete valid storage config from the built-in settings.
+    fn replicated_volume_config() -> ReplicatedVolumeConfig {
+        ReplicatedVolumeConfig::with_defaults(
+            PathBuf::from("/var/lib/mantissa/replicas"),
+            PathBuf::from("/var/lib/mantissa/replicated-volumes.redb"),
+            PathBuf::from("/var/lib/mantissa/volume-mounts"),
+            "0.0.0.0:7578"
+                .parse()
+                .expect("test listen address should parse"),
+            "10.0.0.8:7578"
+                .parse()
+                .expect("test advertise address should parse"),
+            PathBuf::from("/usr/sbin/wipefs"),
+            PathBuf::from("/usr/sbin/mkfs.ext4"),
+        )
+    }
+
     #[test]
     fn defaults_validate() {
         let config = Config::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn replicated_volume_defaults_are_valid_and_use_the_storage_port() {
+        let storage = replicated_volume_config();
+        assert!(storage.validate().is_ok());
+        assert_eq!(storage.listen_address, "0.0.0.0:7578");
+        assert_eq!(storage.advertise_address, "10.0.0.8:7578");
+        assert_eq!(storage.heartbeat_interval_ms, 2_000);
+        assert_eq!(storage.election_timeout_min_ms, 8_000);
+        assert_eq!(storage.election_timeout_max_ms, 12_000);
+        assert_eq!(storage.log_limits.snapshot_after_entries, 4_096);
+        assert_eq!(storage.data_store_limits.worker_threads, 8);
+        assert_eq!(storage.data_store_limits.max_queued_operations, 64);
+    }
+
+    #[test]
+    fn replicated_volume_runtime_uses_the_checked_config() {
+        let storage = replicated_volume_config();
+        let checked = storage.checked().expect("check replicated-volume config");
+
+        assert_eq!(checked.pool_path, PathBuf::from(&storage.pool_path));
+        assert_eq!(
+            checked.catalog_path,
+            storage.catalog_path.as_deref().map(PathBuf::from)
+        );
+        assert_eq!(
+            checked.operation_timeout,
+            Duration::from_millis(storage.operation_timeout_ms)
+        );
+        assert_eq!(
+            checked.runtime_limits.max_saved_groups(),
+            storage.runtime_limits.max_saved_groups
+        );
+        assert_eq!(
+            checked.protocol_limits.max_message_bytes(),
+            storage.protocol_limits.max_message_bytes
+        );
+        assert_eq!(
+            checked.max_state_bytes,
+            storage.state_limits.max_state_bytes
+        );
+        assert_eq!(
+            checked.driver_limits.max_pending_requests(),
+            storage.driver_limits.max_pending_requests
+        );
+        assert_eq!(
+            checked.repair_failure_grace,
+            Duration::from_millis(storage.repair_limits.failure_grace_ms)
+        );
+        assert_eq!(
+            checked.raft_config.snapshot_policy,
+            openraft::SnapshotPolicy::LogsSinceLast(storage.log_limits.snapshot_after_entries)
+        );
+        assert_eq!(
+            checked.raft_config.max_in_snapshot_log_to_keep,
+            storage.log_limits.snapshot_after_entries
+        );
+        assert_eq!(
+            checked.raft_config.purge_batch_size,
+            storage.log_limits.snapshot_after_entries
+        );
+    }
+
+    #[test]
+    fn replicated_volume_address_uses_the_daemon_ip() {
+        assert_eq!(
+            automatic_replicated_volume_ip(Some("10.20.30.40:6578"))
+                .expect("explicit daemon IP should be accepted"),
+            "10.20.30.40"
+                .parse::<IpAddr>()
+                .expect("test IP should parse")
+        );
+    }
+
+    #[test]
+    fn replicated_volume_config_checks_all_required_values() {
+        let mut config = Config::default();
+        config.storage.replicated_volumes = Some(replicated_volume_config());
+        assert!(config.validate().is_ok());
+
+        let storage = config
+            .storage
+            .replicated_volumes
+            .as_mut()
+            .expect("replicated storage config should exist");
+        storage.advertise_address = "0.0.0.0:7578".to_string();
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.operation_timeout_ms = 0;
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.log_limits.snapshot_after_entries = 0;
+        config.storage.replicated_volumes = Some(storage);
+        let error = config
+            .validate()
+            .expect_err("zero snapshot entry threshold must be rejected");
+        assert!(
+            format!("{error:#}").contains("snapshot entry limit"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn replicated_volume_driver_limits_fit_the_data_path() {
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.driver_limits.max_pending_requests = 0;
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.protocol_limits.max_message_bytes = storage.driver_limits.max_batch_bytes;
+        storage.protocol_limits.max_entry_bytes = storage.driver_limits.max_batch_bytes / 2;
+        config.storage.replicated_volumes = Some(storage);
+        let error = config
+            .validate()
+            .expect_err("a data message needs room beyond its block payload");
+        assert!(
+            format!("{error:#}").contains("replica write requests need"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn replicated_volume_membership_limit_fits_joint_replacement() {
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.protocol_limits.max_membership_nodes = 3;
+        config.storage.replicated_volumes = Some(storage);
+
+        let error = config
+            .validate()
+            .expect_err("three stable voters plus a replacement must fit");
+        assert!(
+            format!("{error:#}").contains("at least 4"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn replicated_volume_fixed_file_limits_are_checked() {
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.data_store_limits.worker_threads = 0;
+        config.storage.replicated_volumes = Some(storage);
+        let error = config
+            .validate()
+            .expect_err("zero fixed-file workers must be rejected");
+        assert!(
+            format!("{error:#}").contains("file-worker thread count"),
+            "unexpected validation error: {error:#}"
+        );
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.data_store_limits.max_queued_operations = 0;
+        config.storage.replicated_volumes = Some(storage);
+        let error = config
+            .validate()
+            .expect_err("an empty fixed-file queue must be rejected");
+        assert!(
+            format!("{error:#}").contains("file-worker queue"),
+            "unexpected validation error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn replicated_volume_filesystem_requires_explicit_safe_choices() {
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.filesystem.extended_options[1] = "lazy_itable_init=0".to_string();
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_ok());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage
+            .filesystem
+            .extended_options
+            .retain(|option| option != "lazy_itable_init=1");
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage
+            .filesystem
+            .extended_options
+            .push("lazy_itable_init=1".to_string());
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage
+            .filesystem
+            .extended_options
+            .retain(|option| option != "nodiscard");
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage
+            .filesystem
+            .extended_options
+            .push("discard".to_string());
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        let mut storage = replicated_volume_config();
+        storage.filesystem.mount_options.push("ro".to_string());
+        config.storage.replicated_volumes = Some(storage);
+        assert!(config.validate().is_err());
     }
 
     #[test]
