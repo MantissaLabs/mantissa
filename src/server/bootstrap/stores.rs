@@ -31,7 +31,9 @@ use crate::store::replicated::secret_key_sync::{
 use crate::store::replicated::secrets::{SecretStore, open_secret_store};
 use crate::store::replicated::services::{ServiceStore, open_service_store};
 use crate::store::replicated::volumes::{
-    VolumeNodeStore, VolumeSpecStore, open_volume_node_store, open_volume_spec_store,
+    ReplicatedVolumeGroupStatusStore, ReplicatedVolumePlanStore, VolumeNodeStore, VolumeSpecStore,
+    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
+    open_volume_node_store, open_volume_spec_store,
 };
 use crate::store::replicated::workloads::{WorkloadStore, open_workload_store};
 use crate::token::TokenStore;
@@ -74,6 +76,8 @@ pub struct BootstrapStores {
     pub network_attachments: NetworkAttachmentStore,
     pub volumes: VolumeSpecStore,
     pub volume_nodes: VolumeNodeStore,
+    pub volume_plans: ReplicatedVolumePlanStore,
+    pub volume_group_statuses: ReplicatedVolumeGroupStatusStore,
     pub ingress_pools: IngressPoolStore,
     pub secret_keyring: Arc<RwLock<SecretKeyring>>,
 }
@@ -171,6 +175,13 @@ impl BootstrapStores {
         let volume_nodes = open_volume_node_store(ctx.db.clone(), ctx.self_id)?;
         volume_nodes.rebuild_mst_from_disk().await?;
 
+        let volume_plans = open_replicated_volume_plan_store(ctx.db.clone(), ctx.self_id)?;
+        volume_plans.rebuild_mst_from_disk().await?;
+
+        let volume_group_statuses =
+            open_replicated_volume_group_status_store(ctx.db.clone(), ctx.self_id)?;
+        volume_group_statuses.rebuild_mst_from_disk().await?;
+
         let ingress_pools = open_ingress_pool_store(ctx.db.clone(), ctx.self_id)?;
         ingress_pools.rebuild_mst_from_disk().await?;
 
@@ -197,6 +208,8 @@ impl BootstrapStores {
             network_attachments,
             volumes,
             volume_nodes,
+            volume_plans,
+            volume_group_statuses,
             ingress_pools,
             secret_keyring,
         })

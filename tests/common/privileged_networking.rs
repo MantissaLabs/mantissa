@@ -311,6 +311,7 @@ pub fn privileged_headless_config() -> HeadlessConfig {
         store_gc_config: None,
         service_timing: None,
         runtime_health: None,
+        replicated_volumes: None,
     }
 }
 

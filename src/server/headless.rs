@@ -16,7 +16,10 @@ use crate::{
     secrets::master_key::envelope::{PassphraseKdfParams, SecretPassphrase},
     server::{
         RunHandles, Server,
-        bootstrap::{BootedRuntime, BootstrapContext, BootstrapOptions, RuntimeTaskHandles, boot},
+        bootstrap::{
+            BootedRuntime, BootstrapContext, BootstrapOptions, ReplicatedVolumeStartup,
+            RuntimeTaskHandles, boot,
+        },
     },
     services::{ServiceController, ServiceControllerTiming},
     store::replicated::scheduler_digests::SchedulerDigestStore,
@@ -70,6 +73,7 @@ pub struct HeadlessConfig {
     pub store_gc_config: Option<crate::config::RuntimeStoreGcConfig>,
     pub service_timing: Option<ServiceControllerTiming>,
     pub runtime_health: Option<crate::config::RuntimeHealthConfig>,
+    pub replicated_volumes: Option<crate::config::ReplicatedVolumeConfig>,
 }
 
 impl Default for HeadlessConfig {
@@ -94,6 +98,7 @@ impl Default for HeadlessConfig {
             store_gc_config: None,
             service_timing: None,
             runtime_health: None,
+            replicated_volumes: None,
         }
     }
 }
@@ -163,6 +168,7 @@ pub struct HeadlessNode {
     // Runtime handles for TCP
     handles: Option<RunHandles>,
     runtime_tasks: Option<RuntimeTaskHandles>,
+    replicated_volumes: Option<Arc<crate::volumes::replicated::ReplicatedVolumeRuntime>>,
     _tmp_dir: Option<PathBuf>, // when using convenience constructors
 }
 
@@ -204,6 +210,7 @@ impl HeadlessNode {
             store_gc_config,
             service_timing,
             runtime_health,
+            replicated_volumes,
         } = cfg;
         // Local Node + client
         let mut node_obj = node::Node::new();
@@ -250,6 +257,10 @@ impl HeadlessNode {
             store_gc_config,
             service_timing: service_timing.unwrap_or(defaults.service_timing),
             runtime_health: runtime_health.unwrap_or(defaults.runtime_health),
+            replicated_volumes: replicated_volumes
+                .map_or(ReplicatedVolumeStartup::Disabled, |config| {
+                    ReplicatedVolumeStartup::Configured(Box::new(config))
+                }),
         };
 
         let BootedRuntime {
@@ -265,6 +276,7 @@ impl HeadlessNode {
 
         // Keep a clone to use start/stop server on.
         let stored_server = server.clone();
+        let replicated_volume_runtime = comps.replicated_volumes.clone();
 
         // Transport wiring + readiness: compute the effective transport we report back
         let (handles, effective_transport) = match transport {
@@ -335,6 +347,7 @@ impl HeadlessNode {
             transport: effective_transport,
             handles,
             runtime_tasks: Some(runtime_tasks),
+            replicated_volumes: replicated_volume_runtime,
             server: stored_server,
             _tmp_dir: None,
         })
@@ -573,6 +586,7 @@ impl HeadlessNode {
                 store_gc_config: None,
                 service_timing: None,
                 runtime_health: None,
+                replicated_volumes: None,
             },
         )
         .await
@@ -751,18 +765,96 @@ impl HeadlessNode {
         }
     }
 
+    /// Reports exact local replicated-mount readiness for headless diagnostics.
+    pub async fn replicated_volume_is_mounted(
+        &self,
+        key: mantissa_volume::catalog::ReplicaKey,
+    ) -> io::Result<bool> {
+        match self.replicated_volumes.as_ref() {
+            Some(runtime) => runtime.volume_is_mounted(key).await.map_err(to_io),
+            None => Ok(false),
+        }
+    }
+
+    /// Returns exact local attachment facts for headless lifecycle diagnostics.
+    pub async fn replicated_volume_attachment_diagnostics(
+        &self,
+        key: mantissa_volume::catalog::ReplicaKey,
+    ) -> io::Result<String> {
+        match self.replicated_volumes.as_ref() {
+            Some(runtime) => runtime.attachment_diagnostics(key).await.map_err(to_io),
+            None => Ok("replicated-volume runtime is disabled".to_string()),
+        }
+    }
+
     /// Shut down the full headless runtime before dropping the node.
     ///
     /// Restart tests use this instead of plain `stop()` when they need to
-    /// model a real daemon exit. The method stops the exported transport,
-    /// tears down discovery-owned listeners and NodePort publication, and then
-    /// aborts the long-running runtime actors spawned during bootstrap.
+    /// model a real daemon exit. The method stops peer loops, drops cached peer
+    /// sessions, stops the exported transport, tears down local networking, and
+    /// then aborts the long-running runtime actors started during boot.
     pub async fn shutdown(mut self) -> io::Result<()> {
         self.stop().await?;
-        self.network_controller.shutdown().await.map_err(to_io)?;
+        let replicated_shutdown_deadline = if let Some(storage) = self.replicated_volumes.as_ref() {
+            let deadline = tokio::time::Instant::now() + storage.shutdown_attempt_timeout();
+            tokio::time::timeout_at(deadline, async {
+                self.workload_manager.begin_shutdown().await;
+                loop {
+                    match self
+                        .workload_manager
+                        .quiesce_replicated_volume_tasks_for_shutdown()
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "headless replicated-volume task shutdown did not become safe",
+                )
+            })?;
+            let _ = self
+                .workload_manager
+                .flush_workload_updates_for_shutdown()
+                .await;
+            if let Some(runtime_tasks) = self.runtime_tasks.as_ref() {
+                let _ = runtime_tasks.flush_gossip(Duration::from_secs(5)).await;
+            }
+            storage.begin_shutdown();
+            Some(deadline)
+        } else {
+            None
+        };
+        self.topology_runtime.stop_cluster_background_tasks();
+        self.registry.clear().await;
+        self.server.release_replicated_volumes();
+        let network_result = self.network_controller.shutdown().await.map_err(to_io);
         if let Some(runtime_tasks) = self.runtime_tasks.take() {
             runtime_tasks.abort_and_wait().await;
         }
+        let storage_result = match self.replicated_volumes.take() {
+            Some(storage) => {
+                let deadline = replicated_shutdown_deadline.ok_or_else(|| {
+                    io::Error::other("headless replicated-volume shutdown lost its deadline")
+                })?;
+                storage
+                    .shutdown_with_timeout(
+                        deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    )
+                    .await
+                    .map_err(|error| io::Error::other(format!("{error:#}")))
+            }
+            None if replicated_shutdown_deadline.is_none() => Ok(()),
+            None => Err(io::Error::other(
+                "headless replicated-volume shutdown retained an unexpected deadline",
+            )),
+        };
+        storage_result?;
+        network_result?;
         Ok(())
     }
 }

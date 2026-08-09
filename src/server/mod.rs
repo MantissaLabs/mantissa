@@ -193,6 +193,7 @@ pub(crate) struct ServerDependencies {
     pub token_store: TokenStore,
     pub session_store: AuthStore,
     pub noise_keys: Arc<NoiseKeys>,
+    pub replicated_volumes: Option<Arc<crate::volumes::replicated::ReplicatedVolumeRuntime>>,
 }
 
 /// Fully wired server implementation exported over Cap'n Proto.
@@ -207,6 +208,8 @@ pub struct Server {
     transport: ServerTransport,
     sessions: SessionFactory,
     liveness: Liveness,
+    replicated_volumes:
+        Arc<parking_lot::Mutex<Option<Arc<crate::volumes::replicated::ReplicatedVolumeRuntime>>>>,
 }
 
 impl Server {
@@ -240,7 +243,13 @@ impl Server {
             },
             sessions,
             liveness,
+            replicated_volumes: Arc::new(parking_lot::Mutex::new(deps.replicated_volumes)),
         }
+    }
+
+    /// Releases the storage runtime held by every clone of this stopped server.
+    pub(crate) fn release_replicated_volumes(&self) {
+        self.replicated_volumes.lock().take();
     }
 
     /// Sets whether the server should currently accept requests.

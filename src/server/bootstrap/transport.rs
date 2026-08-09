@@ -1,4 +1,4 @@
-use super::runtime::BootstrapOptions;
+use super::runtime::{BootstrapOptions, ReplicatedVolumeStartup};
 use crate::config;
 use crate::secrets::master_key::envelope::{PassphraseKdfParams, SecretPassphrase};
 
@@ -41,6 +41,7 @@ pub(super) fn daemon_bootstrap_options(
     rest_token_enabled: bool,
 ) -> BootstrapOptions {
     let replication = config::replication_runtime_config();
+    let replicated_volumes = replicated_volume_startup(config::replicated_volume_config());
     BootstrapOptions {
         gossip_channel_capacity: replication.gossip_channel_capacity,
         gossip_fanout: replication.gossip_fanout,
@@ -54,13 +55,26 @@ pub(super) fn daemon_bootstrap_options(
         master_key_passphrase: Some(master_key_passphrase),
         rest_token_enabled,
         master_key_kdf_params: daemon_master_key_kdf_params(),
+        replicated_volumes,
         ..BootstrapOptions::default()
     }
 }
 
+/// Chooses automatic startup unless the operator supplied complete settings.
+fn replicated_volume_startup(
+    config: Option<config::ReplicatedVolumeConfig>,
+) -> ReplicatedVolumeStartup {
+    config.map_or(ReplicatedVolumeStartup::Automatic, |config| {
+        ReplicatedVolumeStartup::Configured(Box::new(config))
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PassphraseKdfParams, parse_test_master_key_kdf_profile};
+    use super::{
+        PassphraseKdfParams, ReplicatedVolumeStartup, parse_test_master_key_kdf_profile,
+        replicated_volume_startup,
+    };
 
     /// Hidden daemon KDF profile parsing should be strict and deterministic.
     #[test]
@@ -75,5 +89,14 @@ mod tests {
         );
         assert_eq!(parse_test_master_key_kdf_profile(""), None);
         assert_eq!(parse_test_master_key_kdf_profile("fastest"), None);
+    }
+
+    /// A normal daemon should try the built-in replicated-volume settings.
+    #[test]
+    fn replicated_volumes_start_automatically_without_config() {
+        assert!(matches!(
+            replicated_volume_startup(None),
+            ReplicatedVolumeStartup::Automatic
+        ));
     }
 }

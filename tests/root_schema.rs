@@ -122,6 +122,7 @@ async fn create_restartable_node_with_root_schema(
             store_gc_config: None,
             service_timing: None,
             runtime_health: None,
+            replicated_volumes: None,
         },
     )
     .await

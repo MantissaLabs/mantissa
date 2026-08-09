@@ -39,6 +39,10 @@ use crate::store::replicated::registry::{ReplicatedStoreHandles, replicated_stor
 use crate::sync::{SyncGcProgress, SyncRunner, SyncService, SyncStores};
 use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, TopologyStorage};
+use crate::volumes::replicated::{
+    ReplicatedVolumeController, ReplicatedVolumePlanner, ReplicatedVolumeRuntime,
+    ReplicatedVolumeSupport, desired_replica_generations,
+};
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::workload::WorkloadRegistry;
 use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
@@ -62,7 +66,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// How one daemon chooses whether to start replicated-volume storage.
+#[derive(Clone)]
+pub enum ReplicatedVolumeStartup {
+    /// Do not start storage. Headless tests use this unless they opt in.
+    Disabled,
+
+    /// Use built-in settings when this host passes every local check.
+    Automatic,
+
+    /// Use the complete settings supplied by the operator.
+    Configured(Box<config::ReplicatedVolumeConfig>),
+}
 
 /// Overrides applied to the shared bootstrap pipeline.
 ///
@@ -90,6 +107,7 @@ pub struct BootstrapOptions {
     pub store_gc_config: Option<config::RuntimeStoreGcConfig>,
     pub service_timing: ServiceControllerTiming,
     pub runtime_health: config::RuntimeHealthConfig,
+    pub replicated_volumes: ReplicatedVolumeStartup,
     /// KDF cost for passphrase-backed master-key envelopes.
     ///
     /// Production uses the hardened default; headless tests lower only this
@@ -120,6 +138,7 @@ impl Default for BootstrapOptions {
             store_gc_config: None,
             service_timing: ServiceControllerTiming::default(),
             runtime_health: config::health_runtime_config(),
+            replicated_volumes: ReplicatedVolumeStartup::Disabled,
             master_key_kdf_params: PassphraseKdfParams::production(),
         }
     }
@@ -158,6 +177,7 @@ pub struct RuntimeComponents {
     pub sync_gc_progress: SyncGcProgress,
     pub cluster_view: ClusterViewState,
     pub root_schema: RootSchemaState,
+    pub replicated_volumes: Option<Arc<ReplicatedVolumeRuntime>>,
 }
 
 /// Fully booted runtime shared by the daemon and headless startup paths.
@@ -177,9 +197,23 @@ pub struct BootedRuntime {
 /// controllers before restarting the same node identity from durable state.
 pub struct RuntimeTaskHandles {
     tasks: Vec<JoinHandle<()>>,
+    gossip_control: async_channel::Sender<gossip::OutboundControl>,
 }
 
 impl RuntimeTaskHandles {
+    /// Waits for the outbound worker to attempt every workload update queued before shutdown.
+    pub async fn flush_gossip(&self, timeout: Duration) -> Result<(), anyhow::Error> {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        self.gossip_control
+            .send(gossip::OutboundControl::Flush(sent))
+            .await
+            .map_err(|_| anyhow::anyhow!("outbound gossip worker is unavailable"))?;
+        tokio::time::timeout(timeout, received)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out while attempting final gossip updates"))?
+            .map_err(|_| anyhow::anyhow!("outbound gossip worker stopped before final updates"))
+    }
+
     /// Abort every runtime actor that bootstrap spawned.
     ///
     /// Headless restart tests use this after graceful subsystem cleanup so
@@ -218,6 +252,8 @@ struct RuntimeActors {
     volume_replicator: VolumeReplicator,
     scheduler_digest_replicator: SchedulerDigestReplicator,
     volume_controller: VolumeController,
+    replicated_volume_planner: ReplicatedVolumePlanner,
+    replicated_volume_controller: Option<ReplicatedVolumeController>,
     network_gossiper: NetworkGossiper,
 }
 
@@ -347,6 +383,7 @@ struct TopologyBuildInputs<'a> {
     topology_stores: TopologyStorage,
     deps: TopologyDependencies,
     runtime_support: crate::runtime::types::RuntimeSupportProfile,
+    replicated_volume_support: ReplicatedVolumeSupport,
 }
 
 /// Options consumed only while spawning long-running runtime tasks.
@@ -366,10 +403,29 @@ pub async fn boot(
     options: BootstrapOptions,
 ) -> BootstrapResult<BootedRuntime> {
     let stores = BootstrapStores::open(&ctx, &options).await?;
+    let replicated_volumes = open_replicated_volumes(
+        &ctx,
+        &stores,
+        options.replicated_volumes.clone(),
+        options.advertise_override.as_deref(),
+    )
+    .await?;
     // This async assembly path carries a large future state machine during
     // headless startup. Boxing it keeps current-thread test stacks bounded.
-    let (components, actors, gossip_rx, gossip_dedupe) =
-        Box::pin(build_runtime_components(&ctx, &stores, &options)).await?;
+    let built = Box::pin(build_runtime_components(
+        &ctx,
+        &stores,
+        &options,
+        replicated_volumes.clone(),
+    ))
+    .await;
+    let (components, actors, gossip_rx, gossip_dedupe) = match built {
+        Ok(built) => built,
+        Err(error) => {
+            shutdown_replicated_volumes(replicated_volumes.as_ref()).await;
+            return Err(error);
+        }
+    };
     apply_runtime_overrides(&components, &options);
     let server = build_server(&ctx, &stores, &components);
     let runtime_tasks = spawn_runtime_tasks(
@@ -386,7 +442,11 @@ pub async fn boot(
         },
     )
     .await;
-    finish_boot(&server, &components).await?;
+    if let Err(error) = finish_boot(&server, &components).await {
+        runtime_tasks.abort_and_wait().await;
+        shutdown_replicated_volumes(replicated_volumes.as_ref()).await;
+        return Err(error);
+    }
 
     Ok(BootedRuntime {
         stores,
@@ -394,6 +454,155 @@ pub async fn boot(
         server,
         runtime_tasks,
     })
+}
+
+/// Checks, recovers, and starts replicated storage before the daemon is ready.
+async fn open_replicated_volumes(
+    ctx: &BootstrapContext,
+    stores: &BootstrapStores,
+    startup: ReplicatedVolumeStartup,
+    advertise_override: Option<&str>,
+) -> BootstrapResult<Option<Arc<ReplicatedVolumeRuntime>>> {
+    let (config, automatic) = match startup {
+        ReplicatedVolumeStartup::Disabled => return Ok(None),
+        ReplicatedVolumeStartup::Automatic => {
+            let config = match config::ReplicatedVolumeConfig::automatic(advertise_override) {
+                Ok(config) => config,
+                Err(error) => {
+                    warn!(
+                        target: "server",
+                        "replicated volumes are unavailable on this node: {error:#}"
+                    );
+                    return Ok(None);
+                }
+            };
+            (config, true)
+        }
+        ReplicatedVolumeStartup::Configured(config) => (*config, false),
+    };
+
+    let startup_timeout = Duration::from_millis(config.startup_timeout_ms);
+    let startup_started = tokio::time::Instant::now();
+    let prepared = if automatic {
+        match tokio::time::timeout(
+            startup_timeout,
+            ReplicatedVolumeRuntime::prepare_host(&config, ctx.self_id),
+        )
+        .await
+        {
+            Ok(Ok(prepared)) => Some(prepared),
+            Ok(Err(error)) => {
+                warn!(
+                    target: "server",
+                    "replicated volumes are unavailable on this node: {error:#}"
+                );
+                return Ok(None);
+            }
+            Err(_) => {
+                warn!(
+                    target: "server",
+                    "replicated volumes are unavailable because local checks exceeded {startup_timeout:?}"
+                );
+                return Ok(None);
+            }
+        }
+    } else {
+        None
+    };
+
+    let Some(open_timeout) = startup_timeout.checked_sub(startup_started.elapsed()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("replicated-volume startup exceeded {startup_timeout:?}"),
+        )
+        .into());
+    };
+    let open = open_replicated_volume_runtime(
+        config,
+        prepared,
+        ctx.self_id,
+        Arc::clone(&ctx.noise_keys),
+        stores.peers.clone(),
+    );
+    let storage = tokio::time::timeout(open_timeout, open)
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("replicated-volume storage did not open within {startup_timeout:?}"),
+            )
+        })??;
+
+    let desired_registry = VolumeRegistry::new(
+        stores.volumes.clone(),
+        stores.volume_nodes.clone(),
+        stores.volume_plans.clone(),
+        stores.volume_group_statuses.clone(),
+    );
+    let desired_specs = desired_registry.list_reconcilable_specs_including_deleting()?;
+    storage.replace_desired_generations(desired_replica_generations(&desired_specs));
+
+    if let Err(error) = storage.start_listening() {
+        shutdown_replicated_volumes(Some(&storage)).await;
+        if automatic {
+            warn!(
+                target: "server",
+                "replicated volumes are unavailable because the storage address could not be opened: {error:#}"
+            );
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+
+    let Some(recovery_timeout) = startup_timeout.checked_sub(startup_started.elapsed()) else {
+        shutdown_replicated_volumes(Some(&storage)).await;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("replicated-volume startup exceeded {startup_timeout:?}"),
+        )
+        .into());
+    };
+    match tokio::time::timeout(recovery_timeout, storage.recover()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            shutdown_replicated_volumes(Some(&storage)).await;
+            return Err(error.into());
+        }
+        Err(_) => {
+            shutdown_replicated_volumes(Some(&storage)).await;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("replicated-volume recovery did not finish within {startup_timeout:?}"),
+            )
+            .into());
+        }
+    };
+    Ok(Some(storage))
+}
+
+/// Opens storage with either new checks or checks completed by automatic setup.
+async fn open_replicated_volume_runtime(
+    config: config::ReplicatedVolumeConfig,
+    prepared: Option<crate::volumes::replicated::PreparedStorage>,
+    node_id: uuid::Uuid,
+    noise_keys: Arc<mantissa_net::noise::NoiseKeys>,
+    peers: crate::store::replicated::peers::PeersStore,
+) -> anyhow::Result<Arc<ReplicatedVolumeRuntime>> {
+    match prepared {
+        Some(prepared) => {
+            ReplicatedVolumeRuntime::open_prepared(prepared, node_id, noise_keys, peers).await
+        }
+        None => ReplicatedVolumeRuntime::open(config, node_id, noise_keys, peers).await,
+    }
+}
+
+/// Stops recovered storage while preserving the startup error being reported.
+async fn shutdown_replicated_volumes(storage: Option<&Arc<ReplicatedVolumeRuntime>>) {
+    if let Some(storage) = storage
+        && let Err(error) = storage.shutdown().await
+    {
+        error!(target: "server", "failed to stop replicated storage: {error}");
+    }
 }
 
 /// Applies timing and advertise overrides after runtime components exist.
@@ -440,6 +649,7 @@ async fn build_runtime_components(
     ctx: &BootstrapContext,
     stores: &BootstrapStores,
     options: &BootstrapOptions,
+    replicated_volumes: Option<Arc<ReplicatedVolumeRuntime>>,
 ) -> BootstrapResult<(
     RuntimeComponents,
     RuntimeActors,
@@ -466,6 +676,13 @@ async fn build_runtime_components(
 
     let cluster_view = stores.restore_active_view()?;
     let root_schema = stores.restore_root_schema_state(&ctx.db, options.root_schema_override)?;
+    let replicated_volume_support = match replicated_volumes.as_ref() {
+        Some(storage) => storage.support(root_schema.publication_generation())?,
+        None => ReplicatedVolumeSupport::stopped(
+            root_schema.publication_generation(),
+            root_schema.info().updated_at_unix_ms,
+        ),
+    };
     let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
 
     let runtime_health = options.runtime_health;
@@ -502,7 +719,12 @@ async fn build_runtime_components(
     let workload_registry = WorkloadRegistry::new(stores.workloads.clone());
     let service_registry = services::ServiceRegistry::new(stores.services.clone());
     let service_reconcile_trigger = ServiceReconcileTrigger::new();
-    let volume_registry = VolumeRegistry::new(stores.volumes.clone(), stores.volume_nodes.clone());
+    let volume_registry = VolumeRegistry::new(
+        stores.volumes.clone(),
+        stores.volume_nodes.clone(),
+        stores.volume_plans.clone(),
+        stores.volume_group_statuses.clone(),
+    );
     let ingress_pool_registry = IngressPoolRegistry::new(stores.ingress_pools.clone());
     let registry = build_registry(ctx, stores, health_monitor.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
@@ -528,6 +750,7 @@ async fn build_runtime_components(
             runtime_health,
         },
         runtime_support,
+        replicated_volume_support,
     })?;
     restore_topology_derived_state(&topology).await?;
     let topology_client = capnp_rpc::new_client(topology.clone());
@@ -572,6 +795,22 @@ async fn build_runtime_components(
         local_volume_root.clone(),
         config::local_volume_enforce_capacity(),
     );
+    let replicated_volume_planner = ReplicatedVolumePlanner::new(
+        volume_registry.clone(),
+        stores.peers.clone(),
+        registry.health_monitor(),
+        gossip_tx.clone(),
+        ctx.self_id,
+    );
+    let replicated_volume_controller = replicated_volumes.as_ref().map(|runtime| {
+        ReplicatedVolumeController::new(
+            volume_registry.clone(),
+            stores.peers.clone(),
+            registry.health_monitor(),
+            gossip_tx.clone(),
+            Arc::clone(runtime),
+        )
+    });
 
     let job_registry = JobRegistry::new(stores.jobs.clone());
     let agent_registry = AgentRegistry::new(stores.agents.clone());
@@ -630,6 +869,7 @@ async fn build_runtime_components(
         network_registry: network_registry.clone(),
         network_controller: Some(network_controller.clone()),
         volume_registry: volume_registry.clone(),
+        replicated_volume_runtime: replicated_volumes.clone(),
         secret_registry: secret_registry.clone(),
         secret_keyring: stores.secret_keyring.clone(),
         forwarding_events: Some(forwarding_tx),
@@ -772,6 +1012,7 @@ async fn build_runtime_components(
             sync_gc_progress,
             cluster_view,
             root_schema,
+            replicated_volumes,
         },
         RuntimeActors {
             runtime_health,
@@ -782,6 +1023,8 @@ async fn build_runtime_components(
             volume_replicator,
             scheduler_digest_replicator,
             volume_controller,
+            replicated_volume_planner,
+            replicated_volume_controller,
             network_gossiper,
         },
         gossip_rx,
@@ -833,6 +1076,8 @@ fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
         cluster_operations: stores.cluster_operations.domain_store(),
         volumes: stores.volumes.clone(),
         volume_nodes: stores.volume_nodes.clone(),
+        volume_plans: stores.volume_plans.clone(),
+        volume_group_statuses: stores.volume_group_statuses.clone(),
         scheduler_digests: stores.scheduler_digests.clone(),
         ingress_pools: stores.ingress_pools.clone(),
     })
@@ -926,6 +1171,7 @@ fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> 
         crypto: keys,
         deps: inputs.deps,
         runtime_support: inputs.runtime_support,
+        replicated_volume_support: inputs.replicated_volume_support,
     })
     .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
 }
@@ -1111,6 +1357,7 @@ fn build_server(
             token_store: stores.token_store.clone(),
             session_store: stores.session_auth.clone(),
             noise_keys: ctx.noise_keys.clone(),
+            replicated_volumes: components.replicated_volumes.clone(),
         },
     )
 }
@@ -1169,6 +1416,8 @@ async fn spawn_runtime_tasks(
         volume_replicator,
         scheduler_digest_replicator,
         volume_controller,
+        replicated_volume_planner,
+        replicated_volume_controller,
         network_gossiper,
     } = actors;
 
@@ -1176,6 +1425,7 @@ async fn spawn_runtime_tasks(
     let topology_lifecycle = components.topology.clone();
     let topology_for_gossip = components.topology.clone();
     let gossip_tick = topology_for_gossip.gossip_interval();
+    let (gossip_control, gossip_controls) = async_channel::bounded(1);
     let mut tasks = Vec::new();
 
     match config::metrics_runtime_config() {
@@ -1255,6 +1505,16 @@ async fn spawn_runtime_tasks(
     }));
 
     tasks.push(tokio::task::spawn_local(async move {
+        replicated_volume_planner.run().await;
+    }));
+
+    if let Some(controller) = replicated_volume_controller {
+        tasks.push(tokio::task::spawn_local(async move {
+            controller.run().await;
+        }));
+    }
+
+    tasks.push(tokio::task::spawn_local(async move {
         network_gossiper.run().await;
     }));
 
@@ -1277,6 +1537,7 @@ async fn spawn_runtime_tasks(
     tasks.push(tokio::task::spawn_local(async move {
         gossip::start(
             gossip_rx,
+            gossip_controls,
             topology_for_gossip,
             gossip_dedupe,
             Some(gossip_fanout),
@@ -1305,5 +1566,8 @@ async fn spawn_runtime_tasks(
 
     tasks.extend(components.network_controller.spawn());
 
-    RuntimeTaskHandles { tasks }
+    RuntimeTaskHandles {
+        tasks,
+        gossip_control,
+    }
 }

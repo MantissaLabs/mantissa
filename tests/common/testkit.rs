@@ -417,6 +417,7 @@ impl TestNode {
             store_gc_config: None,
             service_timing: overrides.service_timing,
             runtime_health: overrides.runtime_health,
+            replicated_volumes: None,
         }
     }
 
