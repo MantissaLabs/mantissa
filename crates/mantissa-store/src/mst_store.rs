@@ -1078,12 +1078,24 @@ where
     where
         I: IntoIterator<Item = (C::Key, C::Value)>,
     {
+        let _ = self.upsert_many_if(entries, |_, _, _| true).await?;
+        Ok(())
+    }
+
+    /// Writes a whole batch only when every entry passes a check against its latest value.
+    ///
+    /// Returning `false` from `should_write` rejects the whole batch. No row or MST root changes.
+    pub async fn upsert_many_if<I, F>(&self, entries: I, mut should_write: F) -> crate::Result<bool>
+    where
+        I: IntoIterator<Item = (C::Key, C::Value)>,
+        F: FnMut(&C::Key, Option<&C::Snapshot>, &C::Value) -> bool,
+    {
         let mut requested: HashMap<C::Key, C::Value> = HashMap::new();
         for (key, value) in entries {
             requested.insert(key, value);
         }
         if requested.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         let _mutation = self.mutation_gate.lock().await;
@@ -1099,6 +1111,10 @@ where
                     Some(row) => Some(Self::decode_reg(row.value())?),
                     None => None,
                 };
+                let snapshot = current.as_ref().map(C::snapshot_reg);
+                if !should_write(&key, snapshot.as_ref(), &value) {
+                    return Ok(false);
+                }
                 let reg = C::upsert_reg(current, &self.actor, value);
                 values
                     .insert(kb.as_slice(), Self::encode_reg(&reg)?.as_slice())
@@ -1132,7 +1148,7 @@ where
         }
 
         self.bump_change_clock();
-        Ok(())
+        Ok(true)
     }
 
     /// Remove key and persist a tombstone with a monotonic sequence.
@@ -2683,6 +2699,48 @@ mod tests {
                 .as_slice(),
             &["first-updated"]
         );
+    }
+
+    /// A failed batch condition must leave every row and the MST root unchanged.
+    #[tokio::test]
+    async fn upsert_many_if_rejects_the_whole_batch() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let first_key = key(1);
+        let second_key = key(2);
+        store
+            .upsert(&second_key, "remove-through-4".to_string())
+            .await
+            .unwrap();
+        let initial_root = store.root_digest().await;
+
+        let mut checked = 0usize;
+        let accepted = store
+            .upsert_many_if(
+                [
+                    (first_key, "new-first".to_string()),
+                    (second_key, "epoch-4".to_string()),
+                ],
+                |_, _, _| {
+                    checked = checked.saturating_add(1);
+                    checked < 2
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!accepted);
+        assert!(!store.exists(&first_key).unwrap());
+        assert_eq!(
+            store
+                .get_snapshot(&second_key)
+                .unwrap()
+                .expect("second row")
+                .as_slice(),
+            &["remove-through-4"]
+        );
+        assert_eq!(store.root_digest().await, initial_root);
     }
 
     /// Raw register loading should preserve encoded key order for cached indexes.
