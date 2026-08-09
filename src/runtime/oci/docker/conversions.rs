@@ -5,12 +5,27 @@
 
 use bollard::container::LogOutput;
 use bollard::errors::Error as BollardError;
-use bollard::service::ContainerInspectResponse;
+use bollard::service::{ContainerInspectResponse, MountPoint};
 
 use crate::runtime::types::{
     RuntimeAttachmentTarget, RuntimeConfigInfo, RuntimeError, RuntimeInfo, RuntimeLogFrame,
-    RuntimeLogStream, RuntimeNetworkEndpoint, RuntimeStateInfo,
+    RuntimeLogStream, RuntimeMount, RuntimeNetworkEndpoint, RuntimeStateInfo,
 };
+
+/// Converts Docker mount records into the runtime-neutral host and container paths.
+fn runtime_mounts(mounts: Option<Vec<MountPoint>>) -> Vec<RuntimeMount> {
+    mounts
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|mount| {
+            let source = mount.source?;
+            Some(RuntimeMount {
+                source,
+                destination: mount.destination.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
 
 /// Converts one Docker attach or log frame into the runtime-neutral output
 /// stream used by higher layers.
@@ -48,6 +63,7 @@ pub(super) fn classify_runtime_error(runtime_id: &str, err: BollardError) -> Run
 /// Converts one inspect response into the generic runtime info shape used
 /// outside the backend.
 pub(super) fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> RuntimeInfo {
+    let mounts = runtime_mounts(inspect.mounts);
     let image = inspect
         .config
         .as_ref()
@@ -121,6 +137,7 @@ pub(super) fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> Ru
         config: RuntimeConfigInfo { tty },
         attachment_target,
         network_endpoints,
+        mounts,
     }
 }
 
@@ -129,6 +146,7 @@ pub(super) fn runtime_info_from_inspect(inspect: ContainerInspectResponse) -> Ru
 pub(super) fn runtime_info_from_list_entry(
     entry: bollard::models::ContainerSummary,
 ) -> RuntimeInfo {
+    let mounts = runtime_mounts(entry.mounts);
     let id = entry.id.unwrap_or_default();
     let name = entry
         .names
@@ -157,6 +175,29 @@ pub(super) fn runtime_info_from_list_entry(
             ..Default::default()
         },
         created,
+        mounts,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn docker_mount_paths_are_kept_in_runtime_info() {
+        let mounts = runtime_mounts(Some(vec![MountPoint {
+            source: Some("/var/lib/mantissa/volume-mounts/data".to_string()),
+            destination: Some("/data".to_string()),
+            ..Default::default()
+        }]));
+
+        assert_eq!(
+            mounts,
+            vec![RuntimeMount {
+                source: "/var/lib/mantissa/volume-mounts/data".to_string(),
+                destination: "/data".to_string(),
+            }]
+        );
     }
 }

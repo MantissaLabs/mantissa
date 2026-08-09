@@ -430,6 +430,15 @@ pub struct RuntimeNetworkEndpoint {
     pub ip_address: Option<String>,
 }
 
+/// One host path mounted into a runtime instance.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeMount {
+    /// Path on the host that provides the mounted files.
+    pub source: String,
+    /// Path where the source is visible inside the runtime instance.
+    pub destination: String,
+}
+
 /// Generic metadata returned by runtime list and inspect operations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeInfo {
@@ -443,6 +452,7 @@ pub struct RuntimeInfo {
     pub config: RuntimeConfigInfo,
     pub attachment_target: Option<RuntimeAttachmentTarget>,
     pub network_endpoints: Vec<RuntimeNetworkEndpoint>,
+    pub mounts: Vec<RuntimeMount>,
 }
 
 /// Point-in-time resource usage sample for one runtime instance.
