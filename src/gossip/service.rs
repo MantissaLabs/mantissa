@@ -481,6 +481,7 @@ pub(super) fn message_for_forwarding(message: &Message) -> Option<Message> {
                     readiness,
                     labels,
                     runtime_support,
+                    replicated_volumes,
                     root_schema,
                 } => TopologyEvent::Join {
                     id: *peer_id,
@@ -499,6 +500,7 @@ pub(super) fn message_for_forwarding(message: &Message) -> Option<Message> {
                     readiness: readiness.clone(),
                     labels: labels.clone(),
                     runtime_support: runtime_support.clone(),
+                    replicated_volumes: replicated_volumes.clone(),
                     root_schema: *root_schema,
                 },
                 other => other.clone(),

@@ -21,7 +21,7 @@ pub(super) struct PeerSnapshot {
 
 /// Maintains a reusable peer snapshot to minimise Redb scans in hot paths.
 pub(super) struct PeerSnapshotCache {
-    last_generation: u64,
+    last_generation: Option<u64>,
     entries: Arc<Vec<PeerCacheEntry>>,
     /// Reusable vectors backing snapshot extraction to avoid per-tick allocations.
     actives: Vec<(UuidKey, MvReg<PeerValue, Uuid>)>,
@@ -32,7 +32,7 @@ impl PeerSnapshotCache {
     /// Create an empty cache ready to serve snapshots.
     pub(super) fn new() -> Self {
         Self {
-            last_generation: 0,
+            last_generation: None,
             entries: Arc::new(Vec::new()),
             actives: Vec::new(),
             tombstones: Vec::new(),
@@ -42,7 +42,7 @@ impl PeerSnapshotCache {
     /// Return a cached snapshot, refreshing from the store when the change clock advanced.
     pub(super) fn snapshot(&mut self, store: &PeersStore) -> mantissa_store::Result<PeerSnapshot> {
         let current_generation = store.change_clock();
-        if current_generation == self.last_generation {
+        if self.last_generation == Some(current_generation) {
             return Ok(PeerSnapshot {
                 generation: current_generation,
                 entries: self.entries.clone(),
@@ -71,11 +71,24 @@ impl PeerSnapshotCache {
 
         let entries = Arc::new(fresh_entries);
         self.entries = entries.clone();
-        self.last_generation = current_generation;
+        self.last_generation = Some(current_generation);
 
         Ok(PeerSnapshot {
             generation: current_generation,
             entries,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PeerSnapshotCache;
+
+    /// A new cache must load the durable store even when its change clock is zero.
+    #[test]
+    fn new_cache_has_not_loaded_generation_zero() {
+        let cache = PeerSnapshotCache::new();
+
+        assert_ne!(cache.last_generation, Some(0));
     }
 }

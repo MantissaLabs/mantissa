@@ -96,6 +96,7 @@ impl JoinRequest {
             readiness: Box::new(self.peer.readiness.clone()),
             labels: Box::new(self.peer.labels.clone()),
             runtime_support: Box::new(self.peer.runtime_support.clone()),
+            replicated_volumes: Box::new(self.peer.replicated_volumes.clone()),
             root_schema: self.peer.root_schema,
         }
     }

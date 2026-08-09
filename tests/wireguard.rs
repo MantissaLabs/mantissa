@@ -55,6 +55,7 @@ fn test_peer_value(address: &str, wireguard: WireGuardPeerValue) -> PeerValue {
         signing_pub: [2u8; 32],
         identity_sig: vec![3u8; 64],
         wireguard: Some(wireguard),
+        replicated_volumes: Default::default(),
         scheduling: PeerSchedulingState::schedulable_default(Uuid::nil()),
         readiness: Default::default(),
         labels: PeerLabelState::default(),

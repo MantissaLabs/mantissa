@@ -888,6 +888,7 @@ impl Registry {
                 signing_pub: signing_key.verifying_key().to_bytes(),
                 identity_sig: Vec::new(),
                 wireguard: None,
+                replicated_volumes: Default::default(),
                 scheduling: PeerSchedulingState::schedulable_default(self.node_id),
                 readiness: NodeReadiness::ready(self.node_id, 0),
                 labels: PeerLabelState::default(),
@@ -902,6 +903,23 @@ impl Registry {
             .upsert(&UuidKey::from(self.node_id), current)
             .await
             .map_err(|e| anyhow!("failed to upsert self peer scheduling state: {e}"))?;
+        Ok(())
+    }
+
+    /// Updates the local node's replicated-volume support in tests.
+    #[cfg(test)]
+    pub async fn upsert_self_replicated_volumes(
+        &self,
+        support: crate::volumes::replicated::ReplicatedVolumeSupport,
+    ) -> AnyResult<()> {
+        let Some(mut current) = self.peer_latest_value(self.node_id) else {
+            return Err(anyhow!("self peer value not yet available"));
+        };
+        current.replicated_volumes = support;
+        self.peers
+            .upsert(&UuidKey::from(self.node_id), current)
+            .await
+            .map_err(|e| anyhow!("failed to upsert self replicated-volume support: {e}"))?;
         Ok(())
     }
 
@@ -2319,6 +2337,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             scheduling: PeerSchedulingState::schedulable_default(peer_id),
             readiness: NodeReadiness::ready(peer_id, 10),
             labels: Default::default(),

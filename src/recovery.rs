@@ -332,6 +332,7 @@ mod tests {
             signing_pub: [byte.saturating_add(1); 32],
             identity_sig: vec![byte.saturating_add(2); 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             scheduling: PeerSchedulingState::schedulable_default(node_id),
             readiness: Default::default(),
             labels: PeerLabelState::default(),

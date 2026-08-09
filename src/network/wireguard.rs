@@ -911,6 +911,7 @@ mod tests {
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard,
+            replicated_volumes: Default::default(),
             runtime_support: RuntimeSupportProfile::default(),
             scheduling: PeerSchedulingState::schedulable_default(Uuid::nil()),
             readiness: Default::default(),

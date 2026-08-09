@@ -888,6 +888,7 @@ fn privileged_remote_peer_value(peer_id: Uuid, address: &str, hostname: &str) ->
         signing_pub: [0x42; 32],
         identity_sig: vec![0x43; 64],
         wireguard: None,
+        replicated_volumes: Default::default(),
         scheduling: PeerSchedulingState::schedulable_default(peer_id),
         readiness: NodeReadiness::ready(peer_id, 1),
         labels: PeerLabelState::default(),

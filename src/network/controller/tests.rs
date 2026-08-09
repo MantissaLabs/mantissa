@@ -98,6 +98,7 @@ fn test_peer_value(
             signing_pub: [2u8; 32],
             identity_sig: vec![3u8; 64],
             wireguard: None,
+            replicated_volumes: Default::default(),
             scheduling,
             readiness: if ready {
                 NodeReadiness::ready(peer_id, 1)
