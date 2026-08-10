@@ -2,6 +2,7 @@ use crate::registry::Registry;
 use crate::topology::Topology;
 use crate::volumes::gossip::VolumeReplicator;
 use crate::volumes::registry::VolumeRegistry;
+use crate::volumes::replicated::{ReplicatedVolumeRuntime, WriterFilesystemSpace};
 use crate::volumes::types::{
     DesiredVolumeDisposition, ExternalVolumeSpec, FilesystemOwnership, LocalVolumeSpec,
     ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan, ReplicatedVolumeSpec, VolumeAccessMode,
@@ -17,8 +18,8 @@ use mantissa_protocol::health::NodeStatus as ProtocolNodeHealth;
 use mantissa_protocol::volumes::{
     VolumeDeleteDisposition as ProtocolVolumeDeleteDisposition, filesystem_ownership,
     local_volume_spec, replicated_volume_group_status, replicated_volume_plan, volume_driver_spec,
-    volume_event, volume_inspect, volume_label, volume_node_status, volume_spec, volume_summary,
-    volumes,
+    volume_event, volume_filesystem_space, volume_inspect, volume_label, volume_node_status,
+    volume_spec, volume_summary, volumes,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashMap;
@@ -26,7 +27,12 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::debug;
 use uuid::Uuid;
+
+const FILESYSTEM_SPACE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cap'n Proto RPC surface for creating, listing, inspecting, and deleting volume objects.
 pub struct VolumesRpc {
@@ -34,6 +40,7 @@ pub struct VolumesRpc {
     cluster_registry: Registry,
     topology: Topology,
     replicator: VolumeReplicator,
+    replicated_volume_runtime: Option<Arc<ReplicatedVolumeRuntime>>,
 }
 
 impl VolumesRpc {
@@ -43,12 +50,67 @@ impl VolumesRpc {
         cluster_registry: Registry,
         topology: Topology,
         replicator: VolumeReplicator,
+        replicated_volume_runtime: Option<Arc<ReplicatedVolumeRuntime>>,
     ) -> Self {
         Self {
             registry,
             cluster_registry,
             topology,
             replicator,
+            replicated_volume_runtime,
+        }
+    }
+
+    /// Reads live filesystem space from the mounted writer without affecting inspect success.
+    async fn query_writer_filesystem_space(
+        &self,
+        plan: Option<&ReplicatedVolumePlan>,
+        group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+        node_health: &HashMap<Uuid, NodeHealth>,
+    ) -> Option<WriterFilesystemSpace> {
+        let runtime = self.replicated_volume_runtime.as_ref()?;
+        let plan = plan?;
+        let writer_node_id = group_status?.attached_node_id?;
+        if matches!(node_health.get(&writer_node_id), Some(NodeHealth::Down)) {
+            return None;
+        }
+        let descriptor = match plan.descriptor.to_storage() {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                debug!(
+                    target: "volumes",
+                    volume_id = %plan.volume_id,
+                    "could not decode the volume descriptor for filesystem inspection: {error:#}"
+                );
+                return None;
+            }
+        };
+        match tokio::time::timeout(
+            FILESYSTEM_SPACE_QUERY_TIMEOUT,
+            runtime.inspect_writer_filesystem_space_on(writer_node_id, descriptor),
+        )
+        .await
+        {
+            Ok(Ok(space)) => Some(space),
+            Ok(Err(error)) => {
+                debug!(
+                    target: "volumes",
+                    volume_id = %plan.volume_id,
+                    writer_node_id = %writer_node_id,
+                    "could not inspect the writer filesystem: {error:#}"
+                );
+                None
+            }
+            Err(_) => {
+                debug!(
+                    target: "volumes",
+                    volume_id = %plan.volume_id,
+                    writer_node_id = %writer_node_id,
+                    timeout = ?FILESYSTEM_SPACE_QUERY_TIMEOUT,
+                    "writer filesystem inspection timed out"
+                );
+                None
+            }
         }
     }
 
@@ -1092,6 +1154,7 @@ fn write_volume_inspect(
     node_states: &[VolumeNodeStateValue],
     plan: Option<&ReplicatedVolumePlan>,
     group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+    filesystem_space: Option<WriterFilesystemSpace>,
     node_health: &HashMap<Uuid, NodeHealth>,
 ) -> Result<(), Error> {
     write_volume_spec(builder.reborrow().init_spec(), spec);
@@ -1114,7 +1177,21 @@ fn write_volume_inspect(
     if let Some(group_status) = group_status {
         write_replicated_volume_group_status(builder.reborrow().init_group_status(), group_status);
     }
+    if let Some(filesystem_space) = filesystem_space {
+        write_volume_filesystem_space(builder.reborrow().init_filesystem_space(), filesystem_space);
+    }
     Ok(())
+}
+
+/// Serializes one live filesystem-space measurement from its writer node.
+fn write_volume_filesystem_space(
+    mut builder: volume_filesystem_space::Builder<'_>,
+    measurement: WriterFilesystemSpace,
+) {
+    builder.set_writer_node_id(measurement.writer_node_id.as_bytes());
+    builder.set_total_bytes(measurement.space.total_bytes());
+    builder.set_used_bytes(measurement.space.used_bytes());
+    builder.set_available_bytes(measurement.space.available_bytes());
 }
 
 /// Serializes one volume gossip event into the Cap'n Proto gossip envelope.
@@ -1668,12 +1745,16 @@ impl volumes::Server for VolumesRpc {
         let plan = self.registry.get_plan(spec.id).map_err(to_capnp)?;
         let group_status = self.registry.get_group_status(spec.id).map_err(to_capnp)?;
         let node_health = self.cluster_registry.health_monitor().snapshot();
+        let filesystem_space = self
+            .query_writer_filesystem_space(plan.as_ref(), group_status.as_ref(), &node_health)
+            .await;
         write_volume_inspect(
             results.get().init_volume(),
             &spec,
             &node_states,
             plan.as_ref(),
             group_status.as_ref(),
+            filesystem_space,
             &node_health,
         )?;
         Ok(())
@@ -1700,6 +1781,7 @@ impl volumes::Server for VolumesRpc {
             &node_states,
             plan.as_ref(),
             group_status.as_ref(),
+            None,
             &node_health,
         )?;
         Ok(())
@@ -1715,6 +1797,7 @@ mod tests {
     };
     use crate::volumes::types::{SavedVolumeDescriptor, VolumeStatus};
     use mantissa_store::uuid_key::UuidKey;
+    use mantissa_volume::fs::space::FilesystemSpace;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -1785,6 +1868,60 @@ mod tests {
         });
         spec.plan_coordinator_node_id = Some(Uuid::from_u128(70));
         spec
+    }
+
+    /// Inspect includes live filesystem space only when the writer query succeeded.
+    #[test]
+    fn inspect_serializes_best_effort_writer_filesystem_space() {
+        let spec = sample_replicated_spec();
+        let writer_node_id = Uuid::from_u128(8);
+        let measurement = WriterFilesystemSpace {
+            writer_node_id,
+            space: FilesystemSpace::from_bytes(1_000, 400, 500)
+                .expect("test filesystem counters should be valid"),
+        };
+        let node_health = HashMap::new();
+        let mut message = capnp::message::Builder::new_default();
+        write_volume_inspect(
+            message.init_root::<volume_inspect::Builder<'_>>(),
+            &spec,
+            &[],
+            None,
+            None,
+            Some(measurement),
+            &node_health,
+        )
+        .expect("inspect payload should serialize");
+
+        let inspect = message
+            .get_root_as_reader::<volume_inspect::Reader<'_>>()
+            .expect("inspect payload should be readable");
+        let space = inspect
+            .get_filesystem_space()
+            .expect("successful writer query should be present");
+        assert_eq!(
+            writer_node_id.as_bytes(),
+            space.get_writer_node_id().unwrap()
+        );
+        assert_eq!(1_000, space.get_total_bytes());
+        assert_eq!(400, space.get_used_bytes());
+        assert_eq!(500, space.get_available_bytes());
+
+        let mut unavailable = capnp::message::Builder::new_default();
+        write_volume_inspect(
+            unavailable.init_root::<volume_inspect::Builder<'_>>(),
+            &spec,
+            &[],
+            None,
+            None,
+            None,
+            &node_health,
+        )
+        .expect("inspect without live space should still serialize");
+        let inspect = unavailable
+            .get_root_as_reader::<volume_inspect::Reader<'_>>()
+            .expect("inspect without live space should be readable");
+        assert!(!inspect.has_filesystem_space());
     }
 
     /// Checks public state derived from intent, committed control state, and health.

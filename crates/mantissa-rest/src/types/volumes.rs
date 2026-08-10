@@ -5,10 +5,11 @@ use mantissa_client::volumes::{
     VolumeBindingMode as ClientVolumeBindingMode, VolumeCreateDriver as ClientVolumeCreateDriver,
     VolumeCreateRequest as ClientVolumeCreateRequest,
     VolumeDeleteDisposition as ClientVolumeDeleteDisposition, VolumeDeleteResult,
-    VolumeDriver as ClientVolumeDriver, VolumeImportRequest as ClientVolumeImportRequest,
-    VolumeInspect as ClientVolumeInspect, VolumeLabel as ClientVolumeLabel,
-    VolumeNodeStatus as ClientVolumeNodeStatus, VolumeReclaimPolicy as ClientVolumeReclaimPolicy,
-    VolumeSpec as ClientVolumeSpec, VolumeSummary as ClientVolumeSummary,
+    VolumeDriver as ClientVolumeDriver, VolumeFilesystemSpace as ClientVolumeFilesystemSpace,
+    VolumeImportRequest as ClientVolumeImportRequest, VolumeInspect as ClientVolumeInspect,
+    VolumeLabel as ClientVolumeLabel, VolumeNodeStatus as ClientVolumeNodeStatus,
+    VolumeReclaimPolicy as ClientVolumeReclaimPolicy, VolumeSpec as ClientVolumeSpec,
+    VolumeSummary as ClientVolumeSummary,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -503,6 +504,28 @@ pub struct VolumeInspect {
     pub node_states: Vec<VolumeNodeStatus>,
     pub plan: Option<ReplicatedVolumePlan>,
     pub group_status: Option<ReplicatedVolumeGroupStatus>,
+    pub filesystem_space: Option<VolumeFilesystemSpace>,
+}
+
+/// Live filesystem space measured on the mounted replicated-volume writer.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VolumeFilesystemSpace {
+    pub writer_node_id: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+}
+
+impl From<ClientVolumeFilesystemSpace> for VolumeFilesystemSpace {
+    /// Converts one live client measurement into its REST representation.
+    fn from(value: ClientVolumeFilesystemSpace) -> Self {
+        Self {
+            writer_node_id: value.writer_node_id.to_string(),
+            total_bytes: value.total_bytes,
+            used_bytes: value.used_bytes,
+            available_bytes: value.available_bytes,
+        }
+    }
 }
 
 impl From<ClientVolumeInspect> for VolumeInspect {
@@ -520,6 +543,7 @@ impl From<ClientVolumeInspect> for VolumeInspect {
                 .collect(),
             plan: value.plan.map(ReplicatedVolumePlan::from),
             group_status: value.group_status.map(ReplicatedVolumeGroupStatus::from),
+            filesystem_space: value.filesystem_space.map(VolumeFilesystemSpace::from),
         }
     }
 }

@@ -6,7 +6,7 @@ use mantissa_protocol::volumes::{
     VolumeNodeState as ProtoVolumeNodeState, VolumeReclaimPolicy as ProtoVolumeReclaimPolicy,
     VolumeState as ProtoVolumeState, VolumeStatus as ProtoVolumeStatus, filesystem_ownership,
     local_volume_spec, replicated_volume_group_status, replicated_volume_plan, volume_driver_spec,
-    volume_inspect, volume_node_status, volume_spec, volume_summary,
+    volume_filesystem_space, volume_inspect, volume_node_status, volume_spec, volume_summary,
 };
 use serde::Deserialize;
 use std::fmt;
@@ -459,6 +459,34 @@ pub struct VolumeInspect {
     pub node_states: Vec<VolumeNodeStatus>,
     pub plan: Option<ReplicatedVolumePlan>,
     pub group_status: Option<ReplicatedVolumeGroupStatus>,
+    pub filesystem_space: Option<VolumeFilesystemSpace>,
+}
+
+/// Live filesystem space measured on the mounted replicated-volume writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeFilesystemSpace {
+    pub writer_node_id: Uuid,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+}
+
+impl VolumeFilesystemSpace {
+    /// Decodes one live filesystem-space measurement from its writer node.
+    fn from_reader(reader: volume_filesystem_space::Reader<'_>) -> Result<Self> {
+        let total_bytes = reader.get_total_bytes();
+        let used_bytes = reader.get_used_bytes();
+        let available_bytes = reader.get_available_bytes();
+        if total_bytes == 0 || used_bytes > total_bytes || available_bytes > total_bytes {
+            return Err(anyhow!("filesystem space contains invalid byte counters"));
+        }
+        Ok(Self {
+            writer_node_id: read_uuid(reader.get_writer_node_id()?, "filesystem writer node id")?,
+            total_bytes,
+            used_bytes,
+            available_bytes,
+        })
+    }
 }
 
 /// Client-side delete result payload.
@@ -686,6 +714,12 @@ impl VolumeInspect {
             .transpose()?
             .map(ReplicatedVolumeGroupStatus::from_reader)
             .transpose()?;
+        let filesystem_space = reader
+            .has_filesystem_space()
+            .then(|| reader.get_filesystem_space())
+            .transpose()?
+            .map(VolumeFilesystemSpace::from_reader)
+            .transpose()?;
         Ok(Self {
             state: VolumeState::from_proto(reader.get_state()?),
             state_message: empty_text(reader.get_state_message()?.to_str()?),
@@ -693,6 +727,7 @@ impl VolumeInspect {
             node_states,
             plan,
             group_status,
+            filesystem_space,
         })
     }
 }

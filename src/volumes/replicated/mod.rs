@@ -13,6 +13,7 @@ pub(crate) use controller::desired_replica_generations;
 pub use planner::ReplicatedVolumePlanner;
 pub(crate) use runtime::PreparedStorage;
 pub use runtime::ReplicatedVolumeRuntime;
+pub(crate) use runtime::WriterFilesystemSpace;
 
 use crate::topology::peers::{NodeReadinessState, PeerValue};
 use mantissa_health::Status as HealthStatus;

@@ -971,6 +971,7 @@ async fn build_runtime_components(
         registry.clone(),
         topology.clone(),
         volume_replicator.clone(),
+        replicated_volumes.clone(),
     );
     let volumes_client = capnp_rpc::new_client(volumes_service);
 

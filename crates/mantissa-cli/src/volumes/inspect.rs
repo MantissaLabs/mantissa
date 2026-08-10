@@ -49,6 +49,30 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         "  Requested capacity: {}",
         format_bytes(volume.spec.requested_bytes)
     )?;
+    if let Some(space) = volume.filesystem_space {
+        writeln!(&mut rendered, "  Filesystem:")?;
+        writeln!(&mut rendered, "    Writer node: {}", space.writer_node_id)?;
+        writeln!(
+            &mut rendered,
+            "    Total capacity: {}",
+            format_bytes(Some(space.total_bytes))
+        )?;
+        writeln!(
+            &mut rendered,
+            "    Used capacity: {}",
+            format_bytes(Some(space.used_bytes))
+        )?;
+        writeln!(
+            &mut rendered,
+            "    Available capacity: {}",
+            format_bytes(Some(space.available_bytes))
+        )?;
+    } else if matches!(
+        volume.spec.driver,
+        mantissa_client::volumes::VolumeDriver::Replicated
+    ) {
+        writeln!(&mut rendered, "  Filesystem capacity: unavailable")?;
+    }
     writeln!(&mut rendered, "  Created: {}", volume.spec.created_at)?;
     writeln!(&mut rendered, "  Updated: {}", volume.spec.updated_at)?;
     writeln!(

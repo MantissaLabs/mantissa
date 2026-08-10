@@ -27,7 +27,10 @@ use mantissa_volume::control_state::{
 use mantissa_volume::driver::{
     DriverLimits, UblkDeviceId, UblkDeviceState, UblkOwnerId, UblkSystem,
 };
-use mantissa_volume::fs::{calls, ext4};
+use mantissa_volume::fs::{
+    calls, ext4,
+    space::{self, FilesystemSpace},
+};
 use mantissa_volume::protocol::{ReplicaKeyAdapter, UuidNodeIdAdapter, VolumeCommandAdapter};
 use mantissa_volume::storage::replica_file::connection::{
     ReplicaDataConnection, ReplicaDataServer, read_connection_open,
@@ -233,6 +236,13 @@ pub(crate) enum ReplacementMembershipGoal {
 pub(crate) struct LeaderVolumeGroupState {
     pub(crate) control_state: VolumeControlState,
     pub(crate) voter_node_ids: BTreeSet<Uuid>,
+}
+
+/// Live filesystem space measured on the node serving the mounted writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WriterFilesystemSpace {
+    pub(crate) writer_node_id: Uuid,
+    pub(crate) space: FilesystemSpace,
 }
 
 /// Owns local replicas, volume Raft groups, data gates, and node-wide transport.
@@ -2205,6 +2215,30 @@ impl ReplicatedVolumeRuntime {
                 .await
                 .context("join replicated-volume mount check")??,
         )
+    }
+
+    /// Measures filesystem space only while the local mounted writer remains owned.
+    pub(crate) async fn measure_writer_filesystem_space(
+        &self,
+        key: ReplicaKey,
+    ) -> Result<WriterFilesystemSpace> {
+        let _lifecycle = self.driver_lifecycle.read().await;
+        if self.is_stopping() {
+            anyhow::bail!("the replicated-volume runtime is stopping");
+        }
+        let singleflight = self.volume_singleflight.get(key);
+        let _singleflight = singleflight.lock().await;
+        if !self.volume_is_mounted(key).await? {
+            anyhow::bail!("replicated volume is not mounted on this writer node");
+        }
+        let path = self.fs.mount_path(key);
+        let space = tokio::task::spawn_blocking(move || space::measure(&path))
+            .await
+            .context("join replicated-volume filesystem space measurement")??;
+        Ok(WriterFilesystemSpace {
+            writer_node_id: self.node_id,
+            space,
+        })
     }
 
     /// Describes applied, cataloged, and driver facts for lifecycle diagnostics.

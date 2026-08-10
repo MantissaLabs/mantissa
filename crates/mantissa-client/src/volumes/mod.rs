@@ -23,8 +23,9 @@ pub use status::status;
 pub use types::{
     DesiredVolumeDisposition, FilesystemOwnership, ReplicatedVolumeGroupStatus,
     ReplicatedVolumePlan, VolumeAccessMode, VolumeBindingMode, VolumeDeleteDisposition,
-    VolumeDeleteResult, VolumeDriver, VolumeInspect, VolumeLabel, VolumeNodeState,
-    VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec, VolumeState, VolumeStatus, VolumeSummary,
+    VolumeDeleteResult, VolumeDriver, VolumeFilesystemSpace, VolumeInspect, VolumeLabel,
+    VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec, VolumeState, VolumeStatus,
+    VolumeSummary,
 };
 
 /// Converts MiB to bytes and rejects values that are too large for `u64`.

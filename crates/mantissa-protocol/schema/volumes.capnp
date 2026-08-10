@@ -49,6 +49,10 @@ interface ReplicatedVolumeStorage {
   inspectQuorumState @5 (request :ReplicaStatusRequest)
       -> (state :VolumeControlSnapshot, voterNodeIds :List(Data));
   # Read linearizable control state and current membership from the elected leader.
+
+  inspectFilesystemSpace @6 (request :ReplicaStatusRequest)
+      -> (space :VolumeFilesystemSpace);
+  # Measure the mounted filesystem only on its current writer node.
 }
 
 struct ReplicatedVolumeStorageStatus {
@@ -945,6 +949,23 @@ struct VolumeInspect {
 
   stateMessage @5 :Text;
   # Current explanation for the calculated state, empty when the saved message is sufficient.
+
+  filesystemSpace @6 :VolumeFilesystemSpace;
+  # Best-effort live measurement from the mounted writer, absent when unavailable.
+}
+
+struct VolumeFilesystemSpace {
+  writerNodeId @0 :Data;
+  # Node that owned the mounted writer when this measurement was taken.
+
+  totalBytes @1 :UInt64;
+  # Total data-block capacity reported by the mounted filesystem.
+
+  usedBytes @2 :UInt64;
+  # Allocated filesystem data blocks. Reserved free blocks are not counted as used.
+
+  availableBytes @3 :UInt64;
+  # Bytes available to the workload according to the mounted filesystem.
 }
 
 struct VolumeCreateRequest {

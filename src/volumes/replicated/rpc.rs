@@ -8,13 +8,14 @@ use anyhow::{Context, Result};
 use mantissa_protocol::volumes::{
     LocalReplicaHealth as WireReplicaHealth, LocalReplicaState as WireReplicaState,
     ReplacementMembershipGoal as WireMembershipGoal, local_replica_status,
-    replicated_volume_storage,
+    replicated_volume_storage, volume_filesystem_space,
 };
 use mantissa_raft::transport::{
     AuthenticatedApplication, AuthenticatedStreamApplication, TransportError,
 };
 use mantissa_volume::catalog::{ReplicaHealth, ReplicaKey, ReplicaState};
 use mantissa_volume::control_state::{VolumeCommand, VolumeCommandResponse};
+use mantissa_volume::fs::space::FilesystemSpace;
 use mantissa_volume::protocol::{
     descriptor_message_bytes, read_control_state, read_descriptor, read_volume_command,
     read_volume_command_response, write_control_state, write_descriptor, write_volume_command,
@@ -25,6 +26,7 @@ use uuid::Uuid;
 
 use super::runtime::{
     LeaderVolumeGroupState, LocalReplicaStatus, ReplacementMembershipGoal, ReplicatedVolumeRuntime,
+    WriterFilesystemSpace,
 };
 
 /// Creates authenticated storage services after the runtime is fully owned.
@@ -290,6 +292,23 @@ impl replicated_volume_storage::Server for StorageServer {
         );
         Ok(())
     }
+
+    /// Measures live filesystem space only when this node owns the mounted writer.
+    async fn inspect_filesystem_space(
+        self: Rc<Self>,
+        params: replicated_volume_storage::InspectFilesystemSpaceParams,
+        mut results: replicated_volume_storage::InspectFilesystemSpaceResults,
+    ) -> Result<(), capnp::Error> {
+        let descriptor =
+            read_descriptor(params.get()?.get_request()?.get_descriptor()?).map_err(capnp_error)?;
+        let runtime = self.runtime()?;
+        let measurement = runtime
+            .measure_writer_filesystem_space(ReplicaKey::from(&descriptor))
+            .await
+            .map_err(capnp_error)?;
+        write_filesystem_space(results.get().init_space(), measurement);
+        Ok(())
+    }
 }
 
 impl ReplicatedVolumeRuntime {
@@ -504,6 +523,31 @@ impl ReplicatedVolumeRuntime {
         .context("inspect quorum state on elected leader")
     }
 
+    /// Measures live filesystem space directly on the current writer node.
+    pub(crate) async fn inspect_writer_filesystem_space_on(
+        &self,
+        writer_node_id: Uuid,
+        descriptor: VolumeDescriptor,
+    ) -> Result<WriterFilesystemSpace> {
+        if writer_node_id == self.node_id() {
+            return self
+                .measure_writer_filesystem_space(ReplicaKey::from(&descriptor))
+                .await;
+        }
+        let size = storage_request_size(&descriptor, 0);
+        self.call_storage(writer_node_id, size, move |transport| {
+            Box::pin(async move {
+                let client = storage_client(transport).await?;
+                let mut call = client.inspect_filesystem_space_request();
+                write_descriptor(call.get().init_request().init_descriptor(), &descriptor);
+                let response = call.send().promise.await?;
+                read_filesystem_space(response.get()?.get_space()?, writer_node_id)
+            })
+        })
+        .await
+        .context("inspect filesystem space on writer node")
+    }
+
     /// Runs one typed storage call through the shared authenticated transport.
     async fn call_storage<T, F>(
         &self,
@@ -560,6 +604,40 @@ fn write_status(mut builder: local_replica_status::Builder<'_>, status: &LocalRe
         &status.voter_node_ids,
     );
     builder.set_reserved_bytes(status.reserved_bytes);
+}
+
+/// Writes one live filesystem-space measurement from its writer node.
+fn write_filesystem_space(
+    mut builder: volume_filesystem_space::Builder<'_>,
+    measurement: WriterFilesystemSpace,
+) {
+    builder.set_writer_node_id(measurement.writer_node_id.as_bytes());
+    builder.set_total_bytes(measurement.space.total_bytes());
+    builder.set_used_bytes(measurement.space.used_bytes());
+    builder.set_available_bytes(measurement.space.available_bytes());
+}
+
+/// Reads one filesystem-space response and checks that it came from the requested writer.
+fn read_filesystem_space(
+    reader: volume_filesystem_space::Reader<'_>,
+    expected_writer_node_id: Uuid,
+) -> Result<WriterFilesystemSpace, capnp::Error> {
+    let writer_node_id = read_uuid(reader.get_writer_node_id()?, "filesystem writer node ID")?;
+    if writer_node_id != expected_writer_node_id {
+        return Err(capnp_error(
+            "filesystem space response came from a different writer node",
+        ));
+    }
+    let space = FilesystemSpace::from_bytes(
+        reader.get_total_bytes(),
+        reader.get_used_bytes(),
+        reader.get_available_bytes(),
+    )
+    .map_err(capnp_error)?;
+    Ok(WriterFilesystemSpace {
+        writer_node_id,
+        space,
+    })
 }
 
 /// Reads and validates all bounded local observation fields.
@@ -670,5 +748,34 @@ mod tests {
 
         assert_eq!(status.voter_node_ids, voters);
         assert_eq!(status.health, ReplicaHealth::NeedsRecovery);
+    }
+
+    /// Filesystem-space replies must identify the exact writer that was queried.
+    #[test]
+    fn filesystem_space_reader_rejects_a_different_writer() {
+        let writer_node_id = Uuid::from_u128(1);
+        let measurement = WriterFilesystemSpace {
+            writer_node_id,
+            space: FilesystemSpace::from_bytes(100, 40, 50)
+                .expect("test filesystem counters should be valid"),
+        };
+        let mut message = capnp::message::Builder::new_default();
+        write_filesystem_space(
+            message.init_root::<volume_filesystem_space::Builder<'_>>(),
+            measurement,
+        );
+        let reader = message
+            .get_root_as_reader::<volume_filesystem_space::Reader<'_>>()
+            .expect("test filesystem space should be readable");
+
+        assert_eq!(
+            measurement,
+            read_filesystem_space(reader, writer_node_id)
+                .expect("matching writer response should be accepted")
+        );
+        assert!(
+            read_filesystem_space(reader, Uuid::from_u128(2)).is_err(),
+            "a response from another writer must not be shown"
+        );
     }
 }
