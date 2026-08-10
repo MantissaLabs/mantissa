@@ -18,6 +18,7 @@ use mantissa_volume::storage::replica_file::io_admission::AppliedVolumeStateRegi
 use mantissa_volume::storage::{VolumeControlStateReader, VolumeControlStateStore};
 use openraft::{Config as RaftConfig, EmptyNode, EntryPayload, LogId};
 use thiserror::Error;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use super::{VolumeApplication, VolumeCatalog, VolumeTransport};
@@ -95,6 +96,18 @@ impl GroupStarter<ReplicaKey> for VolumeGroupStarter {
         )
         .await
         .map_err(|error| VolumeGroupError::Raft(Box::new(error)))?;
+        let metrics = node.metrics();
+        info!(
+            target: "mantissa::volumes::raft",
+            volume_id = %group_id.volume_id().as_uuid(),
+            generation = group_id.generation().get(),
+            local_node_id = %self.node_id,
+            term = metrics.term,
+            state = ?metrics.state,
+            leader_node_id = ?metrics.leader,
+            applied_log_index = ?metrics.last_applied_index,
+            "started local volume Raft member"
+        );
         Ok(RunningVolumeNode {
             group_id,
             node,
@@ -122,12 +135,25 @@ impl RunningVolumeNode {
         self.node
             .initialize(
                 voter_node_ids
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .map(|node_id| (node_id, EmptyNode {}))
                     .collect::<BTreeMap<_, _>>(),
             )
             .await
-            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))
+            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))?;
+        let metrics = self.node.metrics();
+        info!(
+            target: "mantissa::volumes::raft",
+            volume_id = %self.group_id.volume_id().as_uuid(),
+            generation = self.group_id.generation().get(),
+            local_node_id = %metrics.node_id,
+            term = metrics.term,
+            leader_node_id = ?metrics.leader,
+            voter_node_ids = ?voter_node_ids,
+            "initialized volume Raft group"
+        );
+        Ok(())
     }
 
     /// Waits until this member observes a current leader without starting an election.
@@ -135,10 +161,22 @@ impl RunningVolumeNode {
         &self,
         timeout: Duration,
     ) -> Result<Uuid, VolumeGroupError> {
-        self.node
+        let leader = self
+            .node
             .wait_for_leader(timeout)
             .await
-            .map_err(VolumeGroupError::Wait)
+            .map_err(VolumeGroupError::Wait)?;
+        let metrics = self.node.metrics();
+        debug!(
+            target: "mantissa::volumes::raft",
+            volume_id = %self.group_id.volume_id().as_uuid(),
+            generation = self.group_id.generation().get(),
+            local_node_id = %metrics.node_id,
+            term = metrics.term,
+            leader_node_id = %leader,
+            "volume Raft leader is ready"
+        );
+        Ok(leader)
     }
 
     /// Waits until this member has applied the leader's reported control entry.
@@ -186,26 +224,69 @@ impl RunningVolumeNode {
 
     /// Adds one non-voting replica and waits for it to catch up.
     pub(super) async fn add_learner(&self, node_id: Uuid) -> Result<(), VolumeGroupError> {
+        let previous_members = self.node.member_ids();
         self.node
             .add_learner(node_id)
             .await
-            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))
+            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))?;
+        if !previous_members.contains(&node_id) {
+            let metrics = self.node.metrics();
+            info!(
+                target: "mantissa::volumes::raft",
+                volume_id = %self.group_id.volume_id().as_uuid(),
+                generation = self.group_id.generation().get(),
+                local_node_id = %metrics.node_id,
+                term = metrics.term,
+                learner_node_id = %node_id,
+                "added learner to volume Raft group"
+            );
+        }
+        Ok(())
     }
 
     /// Replaces the current voters with the exact requested set.
     pub(super) async fn set_voters(&self, voters: BTreeSet<Uuid>) -> Result<(), VolumeGroupError> {
+        let previous_voters = self.node.voter_ids();
         self.node
-            .set_voters(voters)
+            .set_voters(voters.clone())
             .await
-            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))
+            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))?;
+        if previous_voters != voters {
+            let metrics = self.node.metrics();
+            info!(
+                target: "mantissa::volumes::raft",
+                volume_id = %self.group_id.volume_id().as_uuid(),
+                generation = self.group_id.generation().get(),
+                local_node_id = %metrics.node_id,
+                term = metrics.term,
+                previous_voter_node_ids = ?previous_voters,
+                voter_node_ids = ?voters,
+                "changed volume Raft voters"
+            );
+        }
+        Ok(())
     }
 
     /// Removes one cancelled replacement while it is still only a learner.
     pub(super) async fn remove_learner(&self, node_id: Uuid) -> Result<(), VolumeGroupError> {
+        let previous_members = self.node.member_ids();
         self.node
             .remove_learner(node_id)
             .await
-            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))
+            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))?;
+        if previous_members.contains(&node_id) {
+            let metrics = self.node.metrics();
+            info!(
+                target: "mantissa::volumes::raft",
+                volume_id = %self.group_id.volume_id().as_uuid(),
+                generation = self.group_id.generation().get(),
+                local_node_id = %metrics.node_id,
+                term = metrics.term,
+                learner_node_id = %node_id,
+                "removed learner from volume Raft group"
+            );
+        }
+        Ok(())
     }
 
     /// Returns the latest local Raft metrics used by health reports.
@@ -247,10 +328,21 @@ impl RunningGroup for RunningVolumeNode {
 
     /// Stops the recovered OpenRaft member and its inbound route.
     async fn shutdown(&self) -> Result<(), Self::Error> {
+        let metrics = self.node.metrics();
         self.node
             .shutdown()
             .await
-            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))
+            .map_err(|error| VolumeGroupError::Raft(Box::new(error)))?;
+        debug!(
+            target: "mantissa::volumes::raft",
+            volume_id = %self.group_id.volume_id().as_uuid(),
+            generation = self.group_id.generation().get(),
+            local_node_id = %metrics.node_id,
+            term = metrics.term,
+            leader_node_id = ?metrics.leader,
+            "stopped local volume Raft member"
+        );
+        Ok(())
     }
 }
 

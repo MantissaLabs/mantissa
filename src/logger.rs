@@ -32,6 +32,51 @@ fn add_default_directive(filter: EnvFilter, directive: &'static str) -> EnvFilte
     }
 }
 
+/// Builds the requested filter and applies quiet dependency defaults.
+///
+/// An invalid `RUST_LOG` falls back to the requested level and cannot bypass
+/// the dependency defaults merely by containing a dependency name.
+fn configured_filter(default_level: &'static str, rust_log: Option<&str>) -> EnvFilter {
+    let (mut filter, valid_rust_log) = match rust_log {
+        Some(raw) => match EnvFilter::try_new(raw) {
+            Ok(filter) => (filter, Some(raw)),
+            Err(_) => (EnvFilter::new(default_level), None),
+        },
+        None => (EnvFilter::new(default_level), None),
+    };
+
+    if !has_target_directive(valid_rust_log, "bollard", true) {
+        filter = add_default_directive(filter, "bollard::docker=warn");
+    }
+    if !has_target_directive(valid_rust_log, "openraft", false) {
+        // Keep OpenRaft's expected retries quiet by default. A specific child
+        // target remains usable because it is more specific than this rule.
+        filter = add_default_directive(filter, "openraft=off");
+    }
+    filter
+}
+
+/// Returns whether a valid filter configures one target directly.
+///
+/// Child matching is useful for Bollard's existing module-specific default.
+/// OpenRaft deliberately requires an exact top-level directive so one selected
+/// child module can be enabled without enabling every other OpenRaft target.
+fn has_target_directive(rust_log: Option<&str>, target: &str, include_children: bool) -> bool {
+    rust_log.is_some_and(|raw| {
+        raw.split(',').any(|directive| {
+            let selected = directive
+                .split_once('=')
+                .map_or(directive, |(selected, _level)| selected)
+                .trim();
+            selected == target
+                || (include_children
+                    && selected
+                        .strip_prefix(target)
+                        .is_some_and(|suffix| suffix.starts_with("::")))
+        })
+    })
+}
+
 /// Initialize pretty logs for binaries. Idempotent.
 /// Respects `RUST_LOG`, defaults to `info`.
 pub fn init() -> io::Result<()> {
@@ -42,16 +87,8 @@ pub fn init() -> io::Result<()> {
     // Route `log` crate records into `tracing` (idempotent: ignore error).
     let _ = LogTracer::init();
 
-    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if !rust_log_mentions("bollard") {
-        filter = add_default_directive(filter, "bollard::docker=warn");
-    }
-    if !rust_log_mentions("openraft") {
-        // OpenRaft logs its internal retries, including expected peer removal,
-        // as warnings and errors. Mantissa reports actionable failures from
-        // the level reconciler: opt in to OpenRaft internals with RUST_LOG.
-        filter = add_default_directive(filter, "openraft=off");
-    }
+    let rust_log = env::var("RUST_LOG").ok();
+    let filter = configured_filter("info", rust_log.as_deref());
     let ansi = std::io::stderr().is_terminal();
     let timer = local_timer();
     let layer = fmt::layer()
@@ -94,13 +131,8 @@ pub fn init_for_tests() {
     let _ = LogTracer::init(); // idempotent
 
     // Default to debug in tests unless overridden.
-    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    if !rust_log_mentions("bollard") {
-        filter = add_default_directive(filter, "bollard::docker=warn");
-    }
-    if !rust_log_mentions("openraft") {
-        filter = add_default_directive(filter, "openraft=off");
-    }
+    let rust_log = env::var("RUST_LOG").ok();
+    let filter = configured_filter("debug", rust_log.as_deref());
 
     let timer = local_timer();
     let layer = fmt::layer()
@@ -119,9 +151,100 @@ pub fn init_for_tests() {
     let _ = INIT.set(());
 }
 
-/// Return true when `RUST_LOG` explicitly references the provided target substring.
-fn rust_log_mentions(target: &str) -> bool {
-    env::var("RUST_LOG")
-        .map(|raw| raw.contains(target))
-        .unwrap_or(false)
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+    use tracing_subscriber::prelude::*;
+
+    use super::configured_filter;
+
+    /// OpenRaft stays quiet when no filter explicitly enables it.
+    #[test]
+    fn openraft_is_disabled_by_default() {
+        let subscriber = tracing_subscriber::registry().with(configured_filter("info", None));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(
+                target: "openraft::raft",
+                Level::ERROR
+            ));
+            assert!(tracing::enabled!(
+                target: "mantissa::volumes::raft",
+                Level::INFO
+            ));
+        });
+    }
+
+    /// The documented Mantissa filter includes application-level Raft events.
+    #[test]
+    fn mantissa_filter_includes_volume_raft_logs() {
+        let subscriber =
+            tracing_subscriber::registry().with(configured_filter("info", Some("mantissa=info")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(
+                target: "mantissa::volumes::raft",
+                Level::INFO
+            ));
+            assert!(!tracing::enabled!(
+                target: "mantissa::volumes::raft",
+                Level::DEBUG
+            ));
+        });
+    }
+
+    /// A top-level OpenRaft directive replaces the quiet default.
+    #[test]
+    fn openraft_can_be_enabled_explicitly() {
+        let subscriber = tracing_subscriber::registry()
+            .with(configured_filter("info", Some("info,openraft=debug")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(
+                target: "openraft::raft",
+                Level::DEBUG
+            ));
+        });
+    }
+
+    /// An explicit off directive keeps every OpenRaft target disabled.
+    #[test]
+    fn openraft_can_be_disabled_explicitly() {
+        let subscriber = tracing_subscriber::registry()
+            .with(configured_filter("info", Some("info,openraft=off")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(
+                target: "openraft::raft",
+                Level::ERROR
+            ));
+        });
+    }
+
+    /// One OpenRaft module can be inspected without enabling its siblings.
+    #[test]
+    fn one_openraft_module_can_be_enabled() {
+        let subscriber = tracing_subscriber::registry()
+            .with(configured_filter("info", Some("info,openraft::raft=debug")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(
+                target: "openraft::raft",
+                Level::DEBUG
+            ));
+            assert!(!tracing::enabled!(
+                target: "openraft::replication",
+                Level::ERROR
+            ));
+        });
+    }
+
+    /// Invalid input cannot accidentally restore noisy OpenRaft logs.
+    #[test]
+    fn invalid_filter_keeps_openraft_disabled() {
+        let subscriber = tracing_subscriber::registry()
+            .with(configured_filter("info", Some("info,openraft=not-a-level")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(
+                target: "openraft::raft",
+                Level::ERROR
+            ));
+            assert!(tracing::enabled!(target: "mantissa", Level::INFO));
+        });
+    }
 }

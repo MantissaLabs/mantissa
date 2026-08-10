@@ -20,7 +20,7 @@ use mantissa_volume::{
 };
 use parking_lot::Mutex;
 use tokio::time::interval;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::runtime::{LeaderVolumeGroupState, ReplacementMembershipGoal, ReplicatedVolumeRuntime};
@@ -645,17 +645,26 @@ impl ReplicatedVolumeController {
                 .into_iter()
                 .map(VolumeNodeId::new)
                 .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-            ensure_applied(
-                self.runtime
-                    .propose_as_leader_for_reconcile(
-                        key,
-                        VolumeCommand::Initialize(InitializeVolume {
-                            descriptor,
-                            initial_copies,
-                        }),
-                    )
-                    .await?,
-            )?;
+            let response = self
+                .runtime
+                .propose_as_leader_for_reconcile(
+                    key,
+                    VolumeCommand::Initialize(InitializeVolume {
+                        descriptor,
+                        initial_copies,
+                    }),
+                )
+                .await?;
+            let control_revision = ensure_applied(response)?;
+            info!(
+                target: "mantissa::volumes::raft",
+                volume_id = %spec.id,
+                generation = key.generation().get(),
+                leader_node_id = %self.runtime.node_id(),
+                control_revision,
+                copy_node_ids = ?plan.replica_node_ids,
+                "initialized replicated-volume control state"
+            );
             return Ok(());
         }
         let wanted = desired_disposition(spec);
@@ -1299,17 +1308,42 @@ impl ReplicatedVolumeController {
         if observation.copy_node_ids != observation.voter_node_ids {
             observation.degraded = true;
         }
-        if self
-            .registry
-            .get_group_status(spec.id)?
+        let saved_group_status = self.registry.get_group_status(spec.id)?;
+        if saved_group_status
             .as_ref()
             .is_some_and(|saved| same_group_observation(saved, &observation))
         {
             return Ok(());
         }
+        let previous_leader_node_id = saved_group_status.and_then(|status| status.leader_node_id);
         self.registry
             .upsert_group_status(observation.clone())
             .await?;
+        if let Some(leader_node_id) = observation.leader_node_id
+            && previous_leader_node_id != Some(leader_node_id)
+        {
+            match previous_leader_node_id {
+                Some(previous_leader_node_id) => info!(
+                    target: "mantissa::volumes::raft",
+                    volume_id = %spec.id,
+                    generation = plan.descriptor.generation,
+                    raft_group_id = %group_id,
+                    previous_leader_node_id = %previous_leader_node_id,
+                    leader_node_id = %leader_node_id,
+                    committed_log_index = observation.committed_index,
+                    "volume Raft leader changed"
+                ),
+                None => info!(
+                    target: "mantissa::volumes::raft",
+                    volume_id = %spec.id,
+                    generation = plan.descriptor.generation,
+                    raft_group_id = %group_id,
+                    leader_node_id = %leader_node_id,
+                    committed_log_index = observation.committed_index,
+                    "volume Raft leader elected"
+                ),
+            }
+        }
         if let Err(error) = self
             .broadcast(VolumeEvent::GroupStatusUpsert(Box::new(observation)))
             .await
@@ -1482,10 +1516,11 @@ fn local_origin_allows_bootstrap(origin: &LocalReplicaOrigin) -> bool {
     matches!(origin, LocalReplicaOrigin::Bootstrap(_))
 }
 
-/// Accepts successful idempotent command outcomes and retries stale observations later.
-fn ensure_applied(response: VolumeCommandResponse) -> Result<()> {
+/// Returns the revision from a successful idempotent command outcome.
+fn ensure_applied(response: VolumeCommandResponse) -> Result<u64> {
     match response {
-        VolumeCommandResponse::Applied { .. } | VolumeCommandResponse::Current { .. } => Ok(()),
+        VolumeCommandResponse::Applied { revision, .. }
+        | VolumeCommandResponse::Current { revision, .. } => Ok(revision),
         VolumeCommandResponse::Conflict { .. } => {
             anyhow::bail!("control-state changed while reconciliation was running")
         }

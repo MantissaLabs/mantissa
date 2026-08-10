@@ -47,7 +47,7 @@ use mantissa_volume::storage::replica_file::{
 use mantissa_volume::{FenceEpoch, ReplacementId, VolumeNodeId};
 use openraft::{EmptyNode, Membership, StoredMembership};
 use parking_lot::{Mutex, RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::rpc::StorageServiceFactory;
@@ -811,11 +811,15 @@ impl ReplicatedVolumeRuntime {
             anyhow::bail!("replicated-volume runtime is stopping");
         }
         self.ensure_generation_desired(key)?;
-        if self.replicas.replica(key)?.is_none() && self.groups.catalog().group(&key)?.is_some() {
+        let existing_replica = self.replicas.replica(key)?;
+        if existing_replica.is_none() && self.groups.catalog().group(&key)?.is_some() {
             anyhow::bail!(
                 "refusing to create an empty bootstrap replica while local Raft state survives"
             );
         }
+        let replica_was_ready = existing_replica
+            .as_ref()
+            .is_some_and(|record| record.state() == ReplicaState::Ready);
         let replicas = self.replicas.clone();
         let groups = self.groups.catalog().clone();
         let settings = self.replica_file_settings;
@@ -877,6 +881,16 @@ impl ReplicatedVolumeRuntime {
             .replicas
             .replica(key)?
             .context("ensured replica disappeared from local catalog")?;
+        if !replica_was_ready && record.state() == ReplicaState::Ready {
+            info!(
+                target: "mantissa::volumes::replicated",
+                volume_id = %key.volume_id().as_uuid(),
+                generation = key.generation().get(),
+                local_node_id = %self.node_id,
+                voter_node_ids = ?voters,
+                "prepared local replicated-volume copy"
+            );
+        }
         self.ensure_local_gate(&record).await?;
         self.local_status(key).await
     }
@@ -1298,13 +1312,22 @@ impl ReplicatedVolumeRuntime {
 
     /// Suspends process-idle groups while preserving restart replay markers.
     pub(crate) async fn suspend_idle_groups(&self) -> Result<usize> {
-        tokio::time::timeout(
+        let suspended = tokio::time::timeout(
             RECONCILE_RAFT_ATTEMPT_TIMEOUT,
             self.groups.suspend_idle(self.raft_group_idle_timeout),
         )
         .await
         .context("idle volume group suspension timed out")?
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+        if suspended > 0 {
+            debug!(
+                target: "mantissa::volumes::raft",
+                local_node_id = %self.node_id,
+                suspended_group_count = suspended,
+                "stopped idle volume Raft members"
+            );
+        }
+        Ok(suspended)
     }
 
     /// Ensures the learner or final voters for one exact replacement on this leader.
@@ -3782,16 +3805,55 @@ impl ReplicatedVolumeRuntime {
 
     /// Sends one bounded start request to every saved remote voter.
     async fn wake_voters(&self, key: ReplicaKey, voters: &BTreeSet<Uuid>) {
-        let wakeups = voters
+        let remote_voters = voters
             .iter()
             .copied()
             .filter(|node| *node != self.node_id)
-            .map(|voter| self.transport.start_group_on(key, voter));
-        let _ = tokio::time::timeout(
+            .collect::<Vec<_>>();
+        let wakeups = remote_voters
+            .iter()
+            .copied()
+            .map(|voter| async move { (voter, self.transport.start_group_on(key, voter).await) });
+        match tokio::time::timeout(
             PEER_WAKE_ATTEMPT_TIMEOUT,
             futures::future::join_all(wakeups),
         )
-        .await;
+        .await
+        {
+            Ok(results) => {
+                let mut ready_voters = 0_usize;
+                let mut failed_voter_wakeups = Vec::new();
+                for (voter, result) in results {
+                    match result {
+                        Ok(()) => ready_voters += 1,
+                        Err(error) => {
+                            failed_voter_wakeups.push((voter, error.to_string()));
+                        }
+                    }
+                }
+                debug!(
+                    target: "mantissa::volumes::raft",
+                    volume_id = %key.volume_id().as_uuid(),
+                    generation = key.generation().get(),
+                    local_node_id = %self.node_id,
+                    remote_voter_count = remote_voters.len(),
+                    ready_voter_count = ready_voters,
+                    failed_voter_wakeups = ?failed_voter_wakeups,
+                    "finished waking remote volume Raft members"
+                );
+            }
+            Err(_) => {
+                debug!(
+                    target: "mantissa::volumes::raft",
+                    volume_id = %key.volume_id().as_uuid(),
+                    generation = key.generation().get(),
+                    local_node_id = %self.node_id,
+                    remote_voter_count = remote_voters.len(),
+                    timeout_ms = PEER_WAKE_ATTEMPT_TIMEOUT.as_millis(),
+                    "timed out waking remote volume Raft members"
+                );
+            }
+        }
     }
 }
 
