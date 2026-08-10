@@ -1,4 +1,4 @@
-//! Live fixed-file data-path proof through ublk and ext4.
+//! Live fixed-file data-path proof through ublk, dm-linear, and ext4.
 
 use std::error::Error;
 use std::fs::{File, OpenOptions};
@@ -22,7 +22,8 @@ use mantissa_volume::control_state::{
     WriterGrant,
 };
 use mantissa_volume::driver::{
-    UblkDevice, UblkOwnerId, UblkQueueSettings, UblkSettings, UblkSystem,
+    MappedVolumeLayout, MappedVolumeSystem, UblkDevice, UblkOwnerId, UblkQueueSettings,
+    UblkSettings, UblkSystem,
 };
 use mantissa_volume::storage::replica_file::connection::{
     ReplicaDataConnection, ReplicaDataServer, ReplicaDataServerSettings,
@@ -124,6 +125,13 @@ impl NoisePeerVerifier for ExpectedPeer {
 struct MountCleanup {
     path: PathBuf,
     mounted: bool,
+}
+
+/// Removes the published mapping before the private backend on test failure.
+struct MappedCleanup {
+    mapped_volumes: MappedVolumeSystem,
+    key: mantissa_volume::catalog::ReplicaKey,
+    mapped: bool,
 }
 
 /// Removes one temporary PostgreSQL container after success or failure.
@@ -346,10 +354,40 @@ impl MountCleanup {
 }
 
 impl Drop for MountCleanup {
-    /// Makes a best effort to release the ublk device after a failed test.
+    /// Makes a best effort to release the filesystem after a failed test.
     fn drop(&mut self) {
         if self.mounted {
             let _ = Command::new("umount").arg(&self.path).status();
+        }
+    }
+}
+
+impl MappedCleanup {
+    /// Takes cleanup ownership of one newly created mapping.
+    fn new(mapped_volumes: MappedVolumeSystem, key: mantissa_volume::catalog::ReplicaKey) -> Self {
+        Self {
+            mapped_volumes,
+            key,
+            mapped: true,
+        }
+    }
+
+    /// Records that the test removed the mapping in the required order.
+    fn removed(&mut self) {
+        self.mapped = false;
+    }
+
+    /// Takes cleanup ownership again after backend recovery or replacement.
+    fn mapped(&mut self) {
+        self.mapped = true;
+    }
+}
+
+impl Drop for MappedCleanup {
+    /// Makes a best effort to remove a mapping left by a failed test.
+    fn drop(&mut self) {
+        if self.mapped {
+            let _ = self.mapped_volumes.remove(self.key);
         }
     }
 }
@@ -615,9 +653,11 @@ fn benchmark_postgres(path: &Path, label: &str) -> Result<Duration, Box<dyn Erro
 
 /// Formats, mounts, writes, flushes, and reads through the complete proof path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires root, Linux ublk, mkfs.ext4, mount, and umount"]
+#[ignore = "requires root, Linux ublk, dm-linear, mkfs.ext4, mount, and umount"]
 async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Error>> {
     UblkSystem::system(TEST_OWNER).require_features()?;
+    let mapped_volumes = MappedVolumeSystem::new()?;
+    mapped_volumes.require_features()?;
     let file_workers = ReplicaFileWorkerPool::start(file_worker_count(), 256)?;
     let root = test_root();
     let epoch = FenceEpoch::new(2).expect("fixed live data fence must be valid");
@@ -683,12 +723,15 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
         copies,
     )?;
     let mut device = UblkDevice::start(TEST_OWNER, ublk_settings(), path.handler())?;
+    let mapped_layout = MappedVolumeLayout::new(&descriptor(), device.block_path())?;
+    let mapped_path = mapped_volumes.ensure(&mapped_layout)?;
+    let mut mapped_cleanup = MappedCleanup::new(mapped_volumes.clone(), mapped_layout.key());
 
     let format_started = Instant::now();
     run(
         Command::new("mkfs.ext4")
             .args(["-q", "-F", "-b", "4096", "-E", "nodiscard"])
-            .arg(device.block_path()),
+            .arg(mapped_path.as_path()),
         "format fixed replica ext4",
     )?;
     let format_elapsed = format_started.elapsed();
@@ -699,7 +742,7 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
     run(
         Command::new("mount")
             .args(["-t", "ext4", "-o", "noatime"])
-            .arg(device.block_path())
+            .arg(mapped_path.as_path())
             .arg(&mount_path),
         "mount fixed replica ext4",
     )?;
@@ -717,6 +760,8 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
     let resources = resources.finish(&files);
     mount.unmount()?;
 
+    mapped_volumes.remove(mapped_layout.key())?;
+    mapped_cleanup.removed();
     device.stop()?;
     path.stop().await?;
     for connection in connections {
@@ -757,22 +802,27 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
         )?;
         let mut reopened_device =
             UblkDevice::start(TEST_OWNER, ublk_settings(), reopened_path.handler())?;
+        let reopened_layout = MappedVolumeLayout::new(&descriptor(), reopened_device.block_path())?;
+        let reopened_mapped_path = mapped_volumes.ensure(&reopened_layout)?;
+        mapped_cleanup.mapped();
         run(
             Command::new("mount")
                 .args(["-t", "ext4", "-o", "noatime"])
-                .arg(reopened_device.block_path())
+                .arg(reopened_mapped_path.as_path())
                 .arg(&mount_path),
             "mount reopened fixed replica ext4",
         )?;
         mount.mounted();
         verify_reopened_file(&mount_path)?;
         mount.unmount()?;
+        mapped_volumes.remove(reopened_layout.key())?;
+        mapped_cleanup.removed();
         reopened_device.stop()?;
         reopened_path.stop().await?;
     }
     file_workers.stop(Duration::from_secs(30)).await?;
     println!(
-        "fixed replica ublk ext4: copies={} changed_region_mib={} format={format_elapsed:?} \
+        "fixed replica mapped ext4: copies={} changed_region_mib={} format={format_elapsed:?} \
          write_and_sync_64m={write_elapsed:?} local_pgbench={local_pgbench:?} \
          replicated_pgbench={replicated_pgbench:?} cpu_ms={:.3} process_write_mib={:.3} \
          write_calls={} allocated_mib={:.3} max_rss_mib={:.3} control_max_ms={:.3}",

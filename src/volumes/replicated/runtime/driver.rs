@@ -757,7 +757,7 @@ impl DriverRebuildPause {
 pub(super) struct ReplicatedDriver {
     device: Option<DriverDevice>,
     device_id: Option<UblkDeviceId>,
-    block_path: Option<PathBuf>,
+    backend_path: Option<PathBuf>,
     path: Option<FixedReplicaPath>,
     retiring_path: Option<FixedReplicaPath>,
     handler: Arc<DriverHandler>,
@@ -806,24 +806,24 @@ impl ReplicatedDriver {
 
     /// Waits for the already-tracked owner thread to expose its block device.
     pub(super) async fn finish_start(&mut self) -> Result<(), DriverError> {
-        if self.device_id.is_some() && self.block_path.is_some() {
+        if self.device_id.is_some() && self.backend_path.is_some() {
             return Ok(());
         }
         let device = self
             .device
             .as_mut()
             .ok_or(DriverError::DeviceThreadStopped)?;
-        let (device_id, block_path) = device
+        let (device_id, backend_path) = device
             .wait_until_started(self.settings.operation_timeout)
             .await?;
         self.device_id = Some(device_id);
-        self.block_path = Some(block_path);
+        self.backend_path = Some(backend_path);
         Ok(())
     }
 
-    /// Returns the block-device path exposed by ublk.
-    pub(super) fn block_path(&self) -> Result<&Path, DriverError> {
-        self.block_path
+    /// Returns the private block-device path exposed by the ublk backend.
+    pub(super) fn backend_path(&self) -> Result<&Path, DriverError> {
+        self.backend_path
             .as_deref()
             .ok_or(DriverError::DeviceNotStarted)
     }
@@ -885,7 +885,7 @@ impl ReplicatedDriver {
     /// Returns whether the fixed-file path still accepts block requests.
     pub(super) fn is_serving(&self) -> bool {
         self.device_id.is_some()
-            && self.block_path.is_some()
+            && self.backend_path.is_some()
             && self.handler.is_serving()
             && self
                 .path
@@ -1023,7 +1023,7 @@ impl ReplicatedDriver {
         Self {
             device: Some(device),
             device_id: None,
-            block_path: None,
+            backend_path: None,
             path: Some(path),
             retiring_path: None,
             handler,

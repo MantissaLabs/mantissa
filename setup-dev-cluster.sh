@@ -248,12 +248,15 @@ provision:
         ca-certificates \
         capnproto \
         curl \
+        dmsetup \
         e2fsprogs \
         git \
         htop \
         iputils-ping \
         kmod \
         libcapnp-dev \
+        libclang-dev \
+        libdevmapper-dev \
         libssl-dev \
         linux-image-cloud-arm64 \
         linux-perf \
@@ -263,13 +266,26 @@ provision:
         wireguard \
         gpg
 
-      # Keep ublk available after reboot and fail provisioning if the image ever
-      # loses the module required by Mantissa's userspace block driver.
-      printf '%s\n' ublk_drv | sudo tee /etc/modules-load.d/mantissa-ublk.conf > /dev/null
+      # Keep the replicated-volume kernel drivers available after reboot and
+      # fail provisioning when either required block-device layer is missing.
+      printf '%s\n' dm_mod ublk_drv | sudo tee /etc/modules-load.d/mantissa-volumes.conf > /dev/null
+      sudo modprobe dm_mod
       sudo modprobe ublk_drv
       sudo udevadm settle
       if [ ! -c /dev/ublk-control ]; then
         echo "ublk_drv loaded but /dev/ublk-control was not created." >&2
+        exit 1
+      fi
+      if [ ! -c /dev/mapper/control ]; then
+        echo "dm_mod loaded but /dev/mapper/control was not created." >&2
+        exit 1
+      fi
+      if [ ! -S /run/udev/control ]; then
+        echo "udev is not available for device-mapper path creation." >&2
+        exit 1
+      fi
+      if ! sudo dmsetup targets | awk '$1 == "linear" { found = 1 } END { exit !found }'; then
+        echo "The kernel does not provide the device-mapper linear target." >&2
         exit 1
       fi
 

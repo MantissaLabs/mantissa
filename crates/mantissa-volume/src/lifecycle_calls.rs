@@ -1,4 +1,4 @@
-//! Serializes blocking local lifecycle calls for replicated volumes.
+//! Serializes local replicated-volume lifecycle calls.
 //!
 //! Dropping an async caller cannot cancel a kernel or durable storage call already
 //! running on a system thread. This module keeps that call visible until it
@@ -83,10 +83,10 @@ pub enum Error {
     },
 }
 
-/// Result returned while managing a blocking filesystem call.
+/// Result returned while managing a blocking local lifecycle call.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Result saved after one filesystem call finishes.
+/// Result saved after one local lifecycle call finishes.
 #[derive(Clone)]
 enum Outcome {
     Success,
@@ -193,7 +193,7 @@ impl Default for State {
     }
 }
 
-/// Handle for one mount or unmount call that may outlive its first caller.
+/// Handle for one local lifecycle call that may outlive its first caller.
 pub struct Call {
     entry: Arc<Entry>,
 }

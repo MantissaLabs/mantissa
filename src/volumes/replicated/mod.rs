@@ -33,6 +33,9 @@ pub struct ReplicatedVolumeSupport {
     /// Whether the required ublk kernel features passed startup checks.
     pub ublk: bool,
 
+    /// Whether the device-mapper control device and linear target passed checks.
+    pub device_mapper: bool,
+
     /// Whether current pool space allows another replica reservation.
     pub accepts_replicas: bool,
 
@@ -68,6 +71,7 @@ impl ReplicatedVolumeSupport {
             .is_ok_and(|address| !address.ip().is_unspecified() && address.port() != 0)
             && self.format_version == REPLICATED_VOLUME_FORMAT_VERSION
             && self.ublk
+            && self.device_mapper
             && self.publication_generation != 0
     }
 
@@ -116,6 +120,7 @@ mod tests {
             address: "10.0.0.8:7578".to_string(),
             format_version: REPLICATED_VOLUME_FORMAT_VERSION,
             ublk: true,
+            device_mapper: true,
             accepts_replicas: true,
             available_bytes: 8 << 30,
             managed_bytes: 10 << 30,
@@ -133,6 +138,10 @@ mod tests {
         let mut missing_ublk = support.clone();
         missing_ublk.ublk = false;
         assert!(!missing_ublk.is_running());
+
+        let mut missing_device_mapper = support.clone();
+        missing_device_mapper.device_mapper = false;
+        assert!(!missing_device_mapper.is_running());
 
         let mut invalid_address = support.clone();
         invalid_address.address = "not-an-address".to_string();

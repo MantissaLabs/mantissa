@@ -1,8 +1,10 @@
-//! Small block-device boundary used by the ublk server.
+//! Local block-device boundaries for replicated volumes.
 //!
-//! The ublk code owns kernel queues and buffers. A block handler owns the
-//! storage behavior. Neither side depends on the other's implementation.
+//! The ublk backend owns kernel queues and buffers. A block handler owns the
+//! replicated storage behavior. Device-mapper provides the stable device that
+//! the filesystem uses without taking part in replication.
 
+mod device_mapper;
 mod progress;
 mod settings;
 mod ublk;
@@ -11,6 +13,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;
 
+pub use device_mapper::{
+    BlockDeviceNumber, MappedVolumeError, MappedVolumeLayout, MappedVolumePath, MappedVolumeSystem,
+    OwnedMappedVolume,
+};
 pub use progress::RequestProgress;
 pub use settings::{
     DriverLimitSettings, DriverLimits, InvalidDriverLimits, InvalidUblkSettings, UblkQueueSettings,

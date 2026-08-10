@@ -203,6 +203,7 @@ mod tests {
                 address: format!("10.0.0.{ordinal}:7578"),
                 format_version: REPLICATED_VOLUME_FORMAT_VERSION,
                 ublk: true,
+                device_mapper: true,
                 accepts_replicas: true,
                 available_bytes: u64::MAX,
                 managed_bytes: u64::MAX,

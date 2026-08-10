@@ -25,12 +25,14 @@ use mantissa_volume::control_state::{
     VolumeCommandResponse, VolumeControlState, VolumeDisposition, WriterGrant,
 };
 use mantissa_volume::driver::{
-    DriverLimits, UblkDeviceId, UblkDeviceState, UblkOwnerId, UblkSystem,
+    DriverLimits, MappedVolumeLayout, MappedVolumeSystem, UblkDeviceId, UblkDeviceState,
+    UblkOwnerId, UblkSystem,
 };
 use mantissa_volume::fs::{
-    calls, ext4,
+    ext4,
     space::{self, FilesystemSpace},
 };
+use mantissa_volume::lifecycle_calls;
 use mantissa_volume::protocol::{ReplicaKeyAdapter, UuidNodeIdAdapter, VolumeCommandAdapter};
 use mantissa_volume::storage::replica_file::connection::{
     ReplicaDataConnection, ReplicaDataServer, read_connection_open,
@@ -207,6 +209,7 @@ struct TrackedDriver {
 pub(crate) struct PreparedStorage {
     checked: CheckedReplicatedVolumeConfig,
     pool: ReplicaPool,
+    mapped_volumes: MappedVolumeSystem,
 }
 
 /// Durable local facts returned by idempotent ensure and inspect calls.
@@ -261,7 +264,8 @@ pub struct ReplicatedVolumeRuntime {
     data_connections: DataConnections,
     maintenance: MaintenanceManager,
     fs: ext4::Manager,
-    fs_calls: calls::Tracker,
+    mapped_volumes: MappedVolumeSystem,
+    lifecycle_calls: lifecycle_calls::Tracker,
     node_id: Uuid,
     volume_node_id: mantissa_volume::VolumeNodeId,
     ublk_owner_id: UblkOwnerId,
@@ -286,27 +290,40 @@ pub struct ReplicatedVolumeRuntime {
 }
 
 impl ReplicatedVolumeRuntime {
-    /// Checks root access, local tools, ublk support, and the replica pool.
+    /// Checks root access, local tools, block devices, and the replica pool.
     pub(crate) async fn prepare_host(
         config: &ReplicatedVolumeConfig,
         node_id: Uuid,
     ) -> Result<PreparedStorage> {
         let checked = config.checked()?;
         if !mantissa_net::paths::running_as_root() {
-            anyhow::bail!("replicated volumes need root access for ublk and ext4 mounts");
+            anyhow::bail!(
+                "replicated volumes need root access for ublk, device-mapper, and ext4 mounts"
+            );
         }
         let fs_settings = checked.fs.clone();
         let pool_path = checked.pool_path.clone();
-        let pool = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (pool, mapped_volumes) = tokio::task::spawn_blocking(move || -> Result<_> {
             ext4::Manager::check_tools(&fs_settings)?;
             UblkSystem::system(UblkOwnerId::for_node(node_id.as_bytes()))
                 .require_features()
                 .context("required ublk kernel features are unavailable")?;
-            ReplicaPool::check(&pool_path).context("replicated-volume pool check failed")
+            let mapped_volumes =
+                MappedVolumeSystem::new().context("open the device-mapper control device")?;
+            mapped_volumes
+                .require_features()
+                .context("required device-mapper features are unavailable")?;
+            let pool =
+                ReplicaPool::check(&pool_path).context("replicated-volume pool check failed")?;
+            Ok((pool, mapped_volumes))
         })
         .await
         .context("join replicated-volume host checks")??;
-        Ok(PreparedStorage { checked, pool })
+        Ok(PreparedStorage {
+            checked,
+            pool,
+            mapped_volumes,
+        })
     }
 
     /// Checks the host and opens durable local storage without listening.
@@ -327,7 +344,11 @@ impl ReplicatedVolumeRuntime {
         noise_keys: Arc<mantissa_net::noise::NoiseKeys>,
         peers: PeersStore,
     ) -> Result<Arc<Self>> {
-        let PreparedStorage { checked, pool } = prepared;
+        let PreparedStorage {
+            checked,
+            pool,
+            mapped_volumes,
+        } = prepared;
         let fs = tokio::task::spawn_blocking({
             let settings = checked.fs.clone();
             let timeout = checked.operation_timeout;
@@ -443,7 +464,8 @@ impl ReplicatedVolumeRuntime {
                 checked.max_repair_bytes_per_second,
             ),
             fs,
-            fs_calls: calls::Tracker::default(),
+            mapped_volumes,
+            lifecycle_calls: lifecycle_calls::Tracker::default(),
             node_id,
             volume_node_id,
             ublk_owner_id: UblkOwnerId::for_node(node_id.as_bytes()),
@@ -581,6 +603,7 @@ impl ReplicatedVolumeRuntime {
             address: self.advertise_address.to_string(),
             format_version: REPLICATED_VOLUME_FORMAT_VERSION,
             ublk: true,
+            device_mapper: true,
             accepts_replicas: pool.state() == PoolSpaceState::Ready
                 && below_replica_limit
                 && below_group_limit,
@@ -739,7 +762,7 @@ impl ReplicatedVolumeRuntime {
         let singleflight = self.volume_singleflight.get(key);
         let _singleflight = singleflight.lock().await;
         self.ensure_generation_desired(key)?;
-        self.fs_calls
+        self.lifecycle_calls
             .wait_for_idle(key, self.stop_io_timeout)
             .await
             .context("wait for earlier local work before replica retirement")?;
@@ -837,7 +860,7 @@ impl ReplicatedVolumeRuntime {
         let max_saved_groups = self.max_saved_groups;
         let saved_voters = voters.clone();
         let ready_file_is_open = self.replica_files.lock().contains_key(&key);
-        self.fs_calls
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-bootstrap-replica",
@@ -996,7 +1019,7 @@ impl ReplicatedVolumeRuntime {
         let max_saved_groups = self.max_saved_groups;
         let saved_voters = voters.clone();
         let ready_file_is_open = self.replica_files.lock().contains_key(&key);
-        self.fs_calls
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-replacement-replica",
@@ -1090,7 +1113,7 @@ impl ReplicatedVolumeRuntime {
             .replicas
             .replica(key)?
             .context("unhealthy replacement replica disappeared before reset")?;
-        self.fs_calls
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-reset-unhealthy-replica",
@@ -1644,6 +1667,25 @@ impl ReplicatedVolumeRuntime {
                 saved.ublk_device().is_none()
             };
             if serving {
+                if let Some(volume_mount) = saved.volume_mount()
+                    && volume_mount.state() != SavedMountState::Mounted
+                {
+                    let record = self
+                        .replicas
+                        .replica(key)?
+                        .context("saved attachment has no local replica")?;
+                    let backend_path = {
+                        let driver = self
+                            .tracked_driver(key)
+                            .context("serving attachment lost its tracked ublk backend")?;
+                        driver.lock().await.backend_path()?.to_path_buf()
+                    };
+                    let mapped_path = self
+                        .ensure_mapped_volume_device(&record, backend_path)
+                        .await?;
+                    self.recover_saved_mount(&record, &saved, &state, volume_mount, mapped_path)
+                        .await?;
+                }
                 return Ok(());
             }
             if saved.volume_mount().is_none() {
@@ -1734,7 +1776,7 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Converges one adopted fence behind the same local ublk device and mount.
+    /// Converges one adopted fence behind the same backend, mapping, and mount.
     async fn advance_local_driver_fence(
         &self,
         record: &ReplicaRecord,
@@ -1983,7 +2025,7 @@ impl ReplicatedVolumeRuntime {
         self.ensure_generation_desired(key)?;
         let singleflight = self.volume_singleflight.get(key);
         let _singleflight = singleflight.lock().await;
-        self.fs_calls
+        self.lifecycle_calls
             .wait_for_idle(key, self.stop_io_timeout)
             .await
             .context("wait for earlier local work before disposition reconciliation")?;
@@ -2048,7 +2090,7 @@ impl ReplicatedVolumeRuntime {
     ) -> Result<()> {
         let singleflight = self.volume_singleflight.get(key);
         let _singleflight = singleflight.lock().await;
-        self.fs_calls
+        self.lifecycle_calls
             .wait_for_idle(key, self.stop_io_timeout)
             .await
             .context("wait for earlier local work before terminal cleanup")?;
@@ -2207,7 +2249,28 @@ impl ReplicatedVolumeRuntime {
         if driver.attachment() != expected || !driver.is_available() {
             return Ok(false);
         }
+        let backend_path = driver.backend_path()?.to_path_buf();
         drop(driver);
+        let record = self
+            .replicas
+            .replica(key)?
+            .context("mounted attachment has no local replica")?;
+        let layout = MappedVolumeLayout::new(record.descriptor(), backend_path)?;
+        let mapped_volumes = self.mapped_volumes.clone();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-map-check",
+                self.operation_timeout,
+                move || -> Result<()> {
+                    if mapped_volumes.inspect(&layout)?.is_none() {
+                        anyhow::bail!("mapped volume device is absent");
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .context("check mounted replicated-volume mapping")?;
         let fs = self.fs.clone();
         let path = volume_mount.path().to_path_buf();
         Ok(
@@ -2272,7 +2335,7 @@ impl ReplicatedVolumeRuntime {
         ))
     }
 
-    /// Converges one local writer grant, tracked ublk device, and ext4 mount.
+    /// Converges one writer grant, private ublk backend, mapping, and ext4 mount.
     pub async fn mount_volume(
         &self,
         key: ReplicaKey,
@@ -2370,8 +2433,8 @@ impl ReplicatedVolumeRuntime {
             .replicas
             .attachment(key)?
             .context("saved attachment disappeared after its writer grant")?;
-        let device = match self.ensure_driver(&record, &attachment, &state).await {
-            Ok(device) => device,
+        let backend_path = match self.ensure_ublk_backend(&record, &attachment, &state).await {
+            Ok(backend_path) => backend_path,
             Err(driver_error) if writer_path_failure_requires_recovery(&driver_error) => {
                 let recovery = self
                     .begin_recovery_for_failed_writer(key, &state, writer)
@@ -2388,7 +2451,10 @@ impl ReplicatedVolumeRuntime {
             }
             Err(driver_error) => return Err(driver_error),
         };
-        self.ensure_mounted_filesystem(key, &record, &attachment, &state, device, ownership)
+        let mapped_path = self
+            .ensure_mapped_volume_device(&record, backend_path)
+            .await?;
+        self.ensure_mounted_filesystem(key, &record, &attachment, &state, mapped_path, ownership)
             .await
     }
 
@@ -2454,7 +2520,7 @@ impl ReplicatedVolumeRuntime {
         match self.attempt_attachment_detach(key).await? {
             AttachmentDetachProgress::Complete => {}
             AttachmentDetachProgress::FencePending(error) => {
-                // Local admission, the mount, and the device are already gone. Keep the durable
+                // Local admission, mount, mapping, and backend are already gone. Keep the durable
                 // detaching record as the attachment reconciler's retry cursor, but do not make
                 // workload deletion depend on quorum returning for an old writer that cannot
                 // serve I/O.
@@ -2510,7 +2576,7 @@ impl ReplicatedVolumeRuntime {
         }
     }
 
-    /// Stops and drains one path while retaining its ublk device for cleanup.
+    /// Stops and drains one path while retaining its ublk backend for cleanup.
     async fn quiesce_driver_requests(&self, key: ReplicaKey) -> Result<()> {
         let Some(driver) = self.tracked_driver(key) else {
             return Ok(());
@@ -2767,8 +2833,8 @@ impl ReplicatedVolumeRuntime {
         .context("start fixed-file replicated data path")
     }
 
-    /// Creates and registers a driver before waiting for its owner thread.
-    async fn ensure_driver(
+    /// Creates or recovers the private ublk backend for one writer attachment.
+    async fn ensure_ublk_backend(
         &self,
         record: &ReplicaRecord,
         saved: &LocalAttachmentRecord,
@@ -2792,12 +2858,12 @@ impl ReplicatedVolumeRuntime {
                 );
             }
             let saved_device = driver.saved_device()?;
-            let block_path = driver.block_path()?.to_path_buf();
+            let backend_path = driver.backend_path()?.to_path_buf();
             drop(driver);
             self.replicas.save_ublk_device(record.key(), saved_device)?;
             let current = self.read_quorum_state(record.key()).await?;
             validate_saved_writer(&current, self.volume_node_id, saved.session_id(), fence)?;
-            return Ok(block_path);
+            return Ok(backend_path);
         }
         if saved.ublk_device().is_some() {
             anyhow::bail!("saved ublk device was not recovered before attachment retry");
@@ -2835,9 +2901,9 @@ impl ReplicatedVolumeRuntime {
                 )),
             };
         }
-        let (device, block_path) = {
+        let (device, backend_path) = {
             let driver = driver.lock().await;
-            (driver.saved_device()?, driver.block_path()?.to_path_buf())
+            (driver.saved_device()?, driver.backend_path()?.to_path_buf())
         };
         self.replicas.save_ublk_device(record.key(), device)?;
         let current = self.read_quorum_state(record.key()).await?;
@@ -2852,7 +2918,35 @@ impl ReplicatedVolumeRuntime {
             self.stop_tracked_driver(record.key()).await?;
             anyhow::bail!("writer grant changed while ublk was starting");
         }
-        Ok(block_path)
+        Ok(backend_path)
+    }
+
+    /// Ensures the deterministic dm-linear device used by the filesystem.
+    async fn ensure_mapped_volume_device(
+        &self,
+        record: &ReplicaRecord,
+        backend_path: PathBuf,
+    ) -> Result<PathBuf> {
+        let key = record.key();
+        let layout = MappedVolumeLayout::new(record.descriptor(), backend_path)?;
+        let expected_path = layout.expected_path().to_path_buf();
+        let mapped_volumes = self.mapped_volumes.clone();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-map",
+                self.operation_timeout,
+                move || mapped_volumes.ensure(&layout).map(drop),
+            )
+            .await
+            .context("ensure mapped replicated-volume device")?;
+        info!(
+            target: "volumes",
+            ?key,
+            mapped_device = %expected_path.display(),
+            "replicated-volume mapped device is ready"
+        );
+        Ok(expected_path)
     }
 
     /// Registers an inert driver before starting its kernel owner thread.
@@ -2905,7 +2999,7 @@ impl ReplicatedVolumeRuntime {
         record: &ReplicaRecord,
         attachment: &LocalAttachmentRecord,
         state: &VolumeControlState,
-        device: PathBuf,
+        mapped_path: PathBuf,
         ownership: crate::volumes::types::FilesystemOwnership,
     ) -> Result<PathBuf> {
         let fence = attachment
@@ -2936,11 +3030,11 @@ impl ReplicatedVolumeRuntime {
                 requested
             }
         };
-        self.ensure_filesystem(record, &device).await?;
+        self.ensure_filesystem(record, &mapped_path).await?;
         let fs = self.fs.clone();
         let mount_path = path.clone();
-        let mount_device = device;
-        self.fs_calls
+        let mount_device = mapped_path;
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-mount",
@@ -2984,7 +3078,7 @@ impl ReplicatedVolumeRuntime {
     async fn ensure_filesystem(
         &self,
         record: &ReplicaRecord,
-        device: &std::path::Path,
+        mapped_path: &std::path::Path,
     ) -> Result<()> {
         let key = record.key();
         let filesystem_id = deterministic_filesystem_id(key)?;
@@ -2999,7 +3093,7 @@ impl ReplicatedVolumeRuntime {
         {
             anyhow::bail!("saved filesystem format conflicts with deterministic settings");
         }
-        let signatures = self.fs.probe(device).await?;
+        let signatures = self.fs.probe(mapped_path).await?;
         if is_exact_ext4(&signatures, filesystem_id) {
             if let Some(saved) = prior {
                 self.replicas.clear_filesystem_format(key, saved)?;
@@ -3019,8 +3113,8 @@ impl ReplicatedVolumeRuntime {
             driver.lock().await.progress()
         };
         let fs = self.fs.clone();
-        let format_device = device.to_path_buf();
-        self.fs_calls
+        let format_device = mapped_path.to_path_buf();
+        self.lifecycle_calls
             .run_async(
                 key,
                 "mantissa-volume-format",
@@ -3039,7 +3133,7 @@ impl ReplicatedVolumeRuntime {
             driver.lock().await.flush_handle()?
         };
         flush.run().await?;
-        let signatures = self.fs.probe(device).await?;
+        let signatures = self.fs.probe(mapped_path).await?;
         if !is_exact_ext4(&signatures, filesystem_id) {
             anyhow::bail!("ext4 format did not create the deterministic filesystem UUID");
         }
@@ -3053,7 +3147,7 @@ impl ReplicatedVolumeRuntime {
         self.finish_quiesced_attachment(key).await
     }
 
-    /// Clears retry markers only after their physical mount and device are absent.
+    /// Clears retry markers only after mount, mapping, and backend are absent.
     async fn finish_quiesced_attachment(&self, key: ReplicaKey) -> Result<()> {
         if let Some(saved) = self.replicas.attachment(key)?
             && let Some(mount) = saved.volume_mount().cloned()
@@ -3150,7 +3244,7 @@ impl ReplicatedVolumeRuntime {
         let key = record.key();
         let root = record.path(self.replicas.pool_root());
         let starter = self.groups.starter().clone();
-        self.fs_calls
+        self.lifecycle_calls
             .run(
                 key,
                 call_name,
@@ -3239,7 +3333,7 @@ impl ReplicatedVolumeRuntime {
         }
         let fs = self.fs.clone();
         let path = unmounting.path().to_path_buf();
-        self.fs_calls
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-unmount",
@@ -3256,6 +3350,26 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
+    /// Removes every owned mapped device before its ublk backend can stop.
+    async fn remove_mapped_volume_device(&self, key: ReplicaKey) -> Result<()> {
+        let mapped_volumes = self.mapped_volumes.clone();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-unmap",
+                self.stop_io_timeout,
+                move || mapped_volumes.remove(key),
+            )
+            .await
+            .context("remove mapped replicated-volume device")?;
+        debug!(
+            target: "volumes",
+            ?key,
+            "replicated-volume mapped device is absent"
+        );
+        Ok(())
+    }
+
     /// Lazily detaches a mount only after local driver admission is quarantined.
     async fn detach_quarantined_mount(
         &self,
@@ -3269,7 +3383,7 @@ impl ReplicatedVolumeRuntime {
         }
         let fs = self.fs.clone();
         let path = unmounting.path().to_path_buf();
-        self.fs_calls
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-detach",
@@ -3310,7 +3424,8 @@ impl ReplicatedVolumeRuntime {
     /// Removes a saved device that has no live owner thread in this process.
     async fn remove_untracked_device(&self, key: ReplicaKey, saved: SavedUblkDevice) -> Result<()> {
         let owner = self.ublk_owner_id;
-        self.fs_calls
+        let mapped_volumes = self.mapped_volumes.clone();
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-ublk-cleanup",
@@ -3319,6 +3434,14 @@ impl ReplicatedVolumeRuntime {
                     let system = UblkSystem::system(owner);
                     match system.device(saved.id())? {
                         None => Ok(()),
+                        Some(device)
+                            if mapped_volumes.backend_is_referenced(device.block_path())? =>
+                        {
+                            anyhow::bail!(
+                                "ublk backend {} is still referenced by device-mapper",
+                                saved.id()
+                            )
+                        }
                         Some(device) if device.state() == UblkDeviceState::Running => {
                             anyhow::bail!("untracked ublk device {} is still running", saved.id())
                         }
@@ -3335,6 +3458,20 @@ impl ReplicatedVolumeRuntime {
         let attachments = self
             .replicas
             .discover_attachments(self.max_saved_replicas)?;
+        let expected_mappings = attachments
+            .iter()
+            .filter(|saved| saved.ublk_device().is_some())
+            .map(LocalAttachmentRecord::key)
+            .collect::<BTreeSet<_>>();
+        let mapped_volumes = self.mapped_volumes.clone();
+        self.lifecycle_calls
+            .run_global(
+                "mantissa-volume-unexpected-mapping-cleanup",
+                self.stop_io_timeout,
+                move || mapped_volumes.remove_unexpected(&expected_mappings),
+            )
+            .await
+            .context("remove unexpected mapped volume devices")?;
         let saved_ids = attachments
             .iter()
             .filter_map(LocalAttachmentRecord::ublk_device)
@@ -3354,11 +3491,21 @@ impl ReplicatedVolumeRuntime {
             }
             let owner = self.ublk_owner_id;
             let id = unexpected.id();
-            self.fs_calls
+            let path = unexpected.block_path().to_path_buf();
+            let mapped_volumes = self.mapped_volumes.clone();
+            self.lifecycle_calls
                 .run_global(
                     "mantissa-volume-unexpected-ublk-cleanup",
                     self.stop_io_timeout,
-                    move || UblkSystem::system(owner).remove(id),
+                    move || -> Result<()> {
+                        if mapped_volumes.backend_is_referenced(&path)? {
+                            anyhow::bail!(
+                                "unexpected ublk backend {id} is still referenced by device-mapper"
+                            );
+                        }
+                        UblkSystem::system(owner).remove(id)?;
+                        Ok(())
+                    },
                 )
                 .await
                 .context("remove unexpected ublk device")?;
@@ -3540,8 +3687,12 @@ impl ReplicatedVolumeRuntime {
             self.replicas
                 .replace_ublk_device(key, saved_device, replacement)?;
         }
+        let backend_path = driver.lock().await.backend_path()?.to_path_buf();
+        let mapped_path = self
+            .ensure_mapped_volume_device(&record, backend_path)
+            .await?;
         if let Some(volume_mount) = saved.volume_mount().cloned() {
-            self.recover_saved_mount(&record, &saved, &state, &volume_mount)
+            self.recover_saved_mount(&record, &saved, &state, &volume_mount, mapped_path)
                 .await?;
         }
         Ok(())
@@ -3554,6 +3705,7 @@ impl ReplicatedVolumeRuntime {
         attachment: &LocalAttachmentRecord,
         state: &VolumeControlState,
         saved: &SavedVolumeMount,
+        mapped_path: PathBuf,
     ) -> Result<()> {
         let key = record.key();
         if saved.state() == SavedMountState::Unmounting {
@@ -3571,25 +3723,19 @@ impl ReplicatedVolumeRuntime {
         if saved.path() != self.fs.mount_path(key) {
             anyhow::bail!("saved mount path differs from the configured deterministic path");
         }
-        let device = {
-            let driver = self
-                .tracked_driver(key)
-                .context("saved mount has no recovered driver")?;
-            driver.lock().await.block_path()?.to_path_buf()
-        };
-        self.ensure_filesystem(record, &device).await?;
+        self.ensure_filesystem(record, &mapped_path).await?;
         let fs = self.fs.clone();
         let path = saved.path().to_path_buf();
         let owner_uid = saved.owner_uid();
         let owner_gid = saved.owner_gid();
         let mode = saved.mode();
-        self.fs_calls
+        self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-mount",
                 self.operation_timeout,
                 move || -> Result<()> {
-                    fs.mount(&device, &path)?;
+                    fs.mount(&mapped_path, &path)?;
                     crate::volumes::permissions::apply_filesystem_ownership(
                         &path, owner_uid, owner_gid, mode,
                     )
@@ -3622,30 +3768,15 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Quarantines and drops local resources while retaining the durable writer session.
+    /// Removes mount, mapping, and backend while retaining the writer session.
     async fn quiesce_attachment_resources(&self, key: ReplicaKey) -> Result<()> {
         self.quiesce_driver_requests(key).await?;
-        let has_tracked_driver = self.drivers.lock().contains_key(&key);
-        if !has_tracked_driver
-            && let Some(device) = self
-                .replicas
-                .attachment(key)?
-                .and_then(|saved| saved.ublk_device())
-        {
-            // After process loss a saved device can remain in the kernel's
-            // recovery state without a userspace server. Remove that inert
-            // device first so a lazy detach cannot wait for dead userspace I/O.
-            self.remove_untracked_device(key, device).await?;
-            // Keep the saved identity until the mount record is gone. The
-            // catalog intentionally forbids unlinking a mount from its device;
-            // terminal cleanup below observes the absent kernel device and
-            // clears both facts in dependency order.
-        }
         if let Some(saved) = self.replicas.attachment(key)?
             && let Some(volume_mount) = saved.volume_mount().cloned()
         {
             self.detach_quarantined_mount(key, &volume_mount).await?;
         }
+        self.remove_mapped_volume_device(key).await?;
         self.stop_tracked_driver(key).await?;
         if let Some(saved) = self.replicas.attachment(key)?
             && let Some(device) = saved.ublk_device()
@@ -3719,7 +3850,7 @@ impl ReplicatedVolumeRuntime {
         )
         .await
         .context("replica data connection shutdown timed out")?;
-        self.fs_calls.stop(self.shutdown_timeout).await?;
+        self.lifecycle_calls.stop(self.shutdown_timeout).await?;
         self.replica_file_workers
             .stop(self.shutdown_timeout)
             .await?;

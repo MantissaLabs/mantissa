@@ -26,7 +26,14 @@ jobs:
       - name: Install eBPF toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm pkg-config libelf-dev zlib1g-dev
+          sudo apt-get install -y \
+            clang \
+            libclang-dev \
+            libdevmapper-dev \
+            libelf-dev \
+            llvm \
+            pkg-config \
+            zlib1g-dev
           rustup toolchain install nightly --component rust-src --component llvm-tools-preview
           cargo install bpf-linker --locked
       - name: Install Cap'n Proto

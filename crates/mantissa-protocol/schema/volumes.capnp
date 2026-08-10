@@ -79,6 +79,9 @@ struct ReplicatedVolumeStorageStatus {
 
   publicationGeneration @7 :UInt64;
   # Node startup generation used to reject an older status.
+
+  deviceMapper @8 :Bool;
+  # True when the host provides the device-mapper linear target.
 }
 
 # One request sent over a dedicated replicated-volume data connection.
@@ -1547,7 +1550,7 @@ enum LocalVolumeMountState {
   # The mount was found and its ownership was applied.
 
   unmounting @2;
-  # The mount must be removed before the ublk device can stop.
+  # The mount must be removed before its mapped device and ublk backend.
 }
 
 # Complete node-local catalog row for one replica generation.

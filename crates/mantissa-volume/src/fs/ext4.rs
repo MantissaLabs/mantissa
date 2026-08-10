@@ -971,9 +971,9 @@ struct KernelMount {
 
 /// Finds whether the requested device owns the exact ext4 mount path.
 fn find_mount(device: &Path, target: &Path) -> Result<MountCheck> {
-    let metadata = fs::metadata(device).context("read ublk block-device metadata")?;
+    let metadata = fs::metadata(device).context("read block-device metadata")?;
     if !metadata.file_type().is_block_device() {
-        return Err(Error::invalid("ublk path is not a block device"));
+        return Err(Error::invalid("block-device path is not a block device"));
     }
     let device_major = major(metadata.rdev());
     let device_minor = minor(metadata.rdev());
@@ -1250,7 +1250,7 @@ mod tests {
     #[test]
     fn parses_linux_mount_table_rows() {
         let mounts = parse_mounts(
-            b"36 25 0:32 / /var/lib/mantissa/volume\\040mount rw - ext4 /dev/ublkb0 rw\n",
+            b"36 25 0:32 / /var/lib/mantissa/volume\\040mount rw - ext4 /dev/mapper/mantissa-rv-test rw\n",
         )
         .expect("parse mountinfo");
         assert_eq!(
@@ -1269,7 +1269,7 @@ mod tests {
     #[test]
     fn parses_read_only_mount_state() {
         let mounts = parse_mounts(
-            b"36 25 0:32 / /var/lib/mantissa/volume ro - ext4 /dev/ublkb0 ro,errors=remount-ro\n",
+            b"36 25 0:32 / /var/lib/mantissa/volume ro - ext4 /dev/mapper/mantissa-rv-test ro,errors=remount-ro\n",
         )
         .expect("parse read-only mountinfo");
         assert_eq!(mounts.len(), 1);

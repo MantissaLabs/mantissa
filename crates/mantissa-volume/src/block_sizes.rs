@@ -7,13 +7,13 @@ const REQUIRED_BLOCK_BYTES: u32 = 4 * 1024;
 /// Identifies one block-size setting in validation errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockSizeSetting {
-    /// Logical sector reported by ublk.
+    /// Logical sector reported by the published block device.
     LogicalSector,
 
-    /// Physical block reported by ublk.
+    /// Physical block reported by the published block device.
     PhysicalBlock,
 
-    /// Minimum I/O size reported by ublk.
+    /// Minimum I/O size reported by the published block device.
     MinimumIo,
 
     /// Data block allocated and tracked by the storage engine.
@@ -33,7 +33,7 @@ impl fmt::Display for BlockSizeSetting {
     }
 }
 
-/// Logical sector size reported by the ublk driver.
+/// Logical sector size reported by the published block device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalSectorSize(u32);
 
@@ -50,7 +50,7 @@ impl LogicalSectorSize {
     }
 }
 
-/// Physical block size reported by the ublk driver.
+/// Physical block size reported by the published block device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalBlockSize(u32);
 
@@ -67,7 +67,7 @@ impl PhysicalBlockSize {
     }
 }
 
-/// Minimum I/O size reported by the ublk driver.
+/// Minimum I/O size reported by the published block device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MinimumIoSize(u32);
 

@@ -10,6 +10,7 @@ mod descriptor;
 pub mod driver;
 pub mod fs;
 mod identity;
+pub mod lifecycle_calls;
 pub mod protocol;
 pub mod state_machine;
 pub mod storage;

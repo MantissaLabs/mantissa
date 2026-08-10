@@ -11,6 +11,8 @@
       curl \
       git \
       libcapnp-dev \
+      libclang-dev \
+      libdevmapper-dev \
       lld \
       llvm \
       pkg-config \

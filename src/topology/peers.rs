@@ -669,6 +669,7 @@ pub(crate) fn write_peer(mut builder: peer_capnp::Builder<'_>, value: &PeerValue
     volume_storage.set_address(&value.replicated_volumes.address);
     volume_storage.set_format_version(value.replicated_volumes.format_version);
     volume_storage.set_ublk(value.replicated_volumes.ublk);
+    volume_storage.set_device_mapper(value.replicated_volumes.device_mapper);
     volume_storage.set_accepts_replicas(value.replicated_volumes.accepts_replicas);
     volume_storage.set_available_bytes(value.replicated_volumes.available_bytes);
     volume_storage.set_managed_bytes(value.replicated_volumes.managed_bytes);
@@ -765,6 +766,7 @@ pub(crate) fn read_peer(reader: peer_capnp::Reader<'_>) -> Result<PeerValue, Cap
         address: volume_storage.get_address()?.to_str()?.to_owned(),
         format_version: volume_storage.get_format_version(),
         ublk: volume_storage.get_ublk(),
+        device_mapper: volume_storage.get_device_mapper(),
         accepts_replicas: volume_storage.get_accepts_replicas(),
         available_bytes: volume_storage.get_available_bytes(),
         managed_bytes: volume_storage.get_managed_bytes(),
@@ -1683,6 +1685,7 @@ mod tests {
                 address: "10.0.0.8:7578".to_string(),
                 format_version: 1,
                 ublk: true,
+                device_mapper: true,
                 accepts_replicas: true,
                 available_bytes: 8 << 30,
                 managed_bytes: 2 << 30,

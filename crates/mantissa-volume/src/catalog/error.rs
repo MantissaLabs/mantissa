@@ -144,8 +144,8 @@ pub enum CatalogError {
     #[error("local replica already has a different volume mount")]
     VolumeMountChanged,
 
-    /// A mount must use the ublk device saved for the same attachment.
-    #[error("local volume mount does not match the saved ublk device")]
+    /// A mount must use the same writer session as its saved backend.
+    #[error("local volume mount does not match the saved backend session")]
     VolumeMountDeviceMismatch,
 
     /// Another unfinished ext4 format is already saved for this replica.
@@ -238,7 +238,7 @@ pub enum CatalogError {
     #[error("local replica still has an active ublk device or filesystem operation")]
     ReplicaStillAttached,
 
-    /// An attachment row remains until its mount and ublk device are gone.
+    /// An attachment row remains until its mount and saved backend are gone.
     #[error("local volume attachment still owns kernel resources")]
     AttachmentStillActive,
 }

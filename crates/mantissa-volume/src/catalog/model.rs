@@ -329,7 +329,7 @@ pub enum SavedMountState {
     /// The mount was found and its ownership was applied.
     Mounted,
 
-    /// The mount must be removed before the ublk device can stop.
+    /// The mount must be removed before its mapped device and ublk backend.
     Unmounting,
 }
 
