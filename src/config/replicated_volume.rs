@@ -294,11 +294,8 @@ fn validate_repair_limits(
 
 /// Checks batching limits that span the driver and fixed-file data path.
 fn validate_batch_limits(config: &ReplicatedVolumeConfig) -> Result<()> {
-    if config.driver_limits.max_batch_changes == 0
-        || config.driver_limits.max_batch_bytes == 0
-        || config.driver_limits.max_batch_delay_us == 0
-    {
-        anyhow::bail!("replicated-volume block batch limits must be greater than zero");
+    if config.driver_limits.max_batch_changes == 0 || config.driver_limits.max_batch_bytes == 0 {
+        anyhow::bail!("replicated-volume block batch count and bytes must be greater than zero");
     }
     if config.driver_limits.max_batch_changes > config.driver_limits.max_pending_requests {
         anyhow::bail!("replicated-volume block batch count must fit the pending request limit");

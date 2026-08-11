@@ -30,8 +30,8 @@
             ],
             replicas: 1,
             resources: (
-                cpu_millis: 500,
-                memory_mb: 512,
+                cpu_millis: 2000,
+                memory_mb: 1024,
             ),
             restart_policy: Some((
                 name: unless_stopped,

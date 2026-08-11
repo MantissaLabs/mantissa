@@ -238,9 +238,9 @@ struct QueuedWrite {
 /// One accepted flush waiting for all earlier file writes.
 struct QueuedFlush {
     flush: ReplicaFlush,
-    fence: Option<FencePermit>,
-    pending: PendingRequest,
-    reply: oneshot::Sender<Result<(), BlockIoError>>,
+    fences: Vec<FencePermit>,
+    pending: Vec<PendingRequest>,
+    replies: Vec<oneshot::Sender<Result<(), BlockIoError>>>,
 }
 
 /// Ordered work waiting behind current file operations.
@@ -260,9 +260,9 @@ enum Completion {
         barrier: bool,
     },
     Flush {
-        pending: PendingRequest,
-        reply: oneshot::Sender<Result<(), BlockIoError>>,
-        _fence: Option<FencePermit>,
+        pending: Vec<PendingRequest>,
+        replies: Vec<oneshot::Sender<Result<(), BlockIoError>>>,
+        _fences: Vec<FencePermit>,
     },
 }
 
@@ -1270,6 +1270,10 @@ impl PathActor {
                     previous.ready_at = Instant::now();
                 }
                 let through_write_number = self.next_write_number.saturating_sub(1);
+                let request = match append_matching_flush(queued, through_write_number, request) {
+                    Ok(()) => return Ok(()),
+                    Err(request) => request,
+                };
                 let flush = ReplicaFlush::new(
                     self.data_fence,
                     self.next_flush_number,
@@ -1281,14 +1285,32 @@ impl PathActor {
                     .ok_or(FixedReplicaPathError::FlushNumberExhausted)?;
                 queued.push_back(QueuedWork::Flush(QueuedFlush {
                     flush,
-                    fence: request.fence,
-                    pending: request.pending,
-                    reply: request.reply,
+                    fences: request.fence.into_iter().collect(),
+                    pending: vec![request.pending],
+                    replies: vec![request.reply],
                 }));
             }
         }
         Ok(())
     }
+}
+
+/// Adds one waiter to the queued flush that covers the same write prefix.
+fn append_matching_flush(
+    queued: &mut VecDeque<QueuedWork>,
+    through_write_number: u64,
+    request: FlushRequest,
+) -> Result<(), FlushRequest> {
+    let Some(QueuedWork::Flush(previous)) = queued.back_mut() else {
+        return Err(request);
+    };
+    if previous.flush.through_write_number() != through_write_number {
+        return Err(request);
+    }
+    previous.fences.extend(request.fence);
+    previous.pending.push(request.pending);
+    previous.replies.push(request.reply);
+    Ok(())
 }
 
 /// Builds one cancellation-safe watcher for the first remote connection loss.
@@ -1360,13 +1382,18 @@ async fn start_work(
         QueuedWork::Flush(flush) => {
             let copy_handles = copies.to_vec();
             let future = async move {
-                let result =
-                    sync_copies(&copy_handles, flush.flush, flush.fence.clone(), timeout).await;
+                let result = sync_copies(
+                    &copy_handles,
+                    flush.flush,
+                    flush.fences.first().cloned(),
+                    timeout,
+                )
+                .await;
                 FinishedWork {
                     completion: Completion::Flush {
                         pending: flush.pending,
-                        reply: flush.reply,
-                        _fence: flush.fence,
+                        replies: flush.replies,
+                        _fences: flush.fences,
                     },
                     result: result.map_err(Into::into),
                 }
@@ -1486,11 +1513,13 @@ fn finish_work(finished: FinishedWork, cache: &SharedCache) -> (bool, Option<Str
         }
         Completion::Flush {
             pending,
-            reply,
-            _fence: _,
+            replies,
+            _fences: _,
         } => {
             drop(pending);
-            let _ = reply.send(result);
+            for reply in replies {
+                let _ = reply.send(result.clone());
+            }
             (true, failure)
         }
     }
@@ -1570,7 +1599,9 @@ fn reject_queued(work: QueuedWork) {
             }
         }
         QueuedWork::Flush(flush) => {
-            let _ = flush.reply.send(Err(BlockIoError::NotServing));
+            for reply in flush.replies {
+                let _ = reply.send(Err(BlockIoError::NotServing));
+            }
         }
     }
 }
@@ -1747,5 +1778,169 @@ impl From<ReplicaFileWorkerError> for FixedReplicaPathError {
         Self::Worker {
             message: error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod coalescing_tests {
+    use super::*;
+
+    /// Flush callers covering the same queued prefix share one completion.
+    #[tokio::test]
+    async fn matching_queued_flushes_share_one_sync() {
+        let pending = PendingRequests::new(2, 1);
+        let first_pending = pending
+            .reserve(0)
+            .await
+            .expect("first flush must reserve a request");
+        let second_pending = pending
+            .reserve(0)
+            .await
+            .expect("second flush must reserve a request");
+        let fence = FenceEpoch::new(1).expect("test fence must be valid");
+        let flush = ReplicaFlush::new(fence, 3, 7).expect("test flush must be valid");
+        let (first_reply, first_result) = oneshot::channel();
+        let (second_reply, second_result) = oneshot::channel();
+        let mut queued = VecDeque::from([QueuedWork::Flush(QueuedFlush {
+            flush,
+            fences: Vec::new(),
+            pending: vec![first_pending],
+            replies: vec![first_reply],
+        })]);
+
+        let combined = append_matching_flush(
+            &mut queued,
+            7,
+            FlushRequest {
+                fence: None,
+                pending: second_pending,
+                reply: second_reply,
+            },
+        );
+        assert!(
+            combined.is_ok(),
+            "matching flush must join the queued durability boundary"
+        );
+
+        let QueuedWork::Flush(combined) = queued
+            .pop_front()
+            .expect("one combined flush must remain queued")
+        else {
+            panic!("queued work must remain a flush");
+        };
+        assert!(queued.is_empty());
+        assert_eq!(combined.flush, flush);
+        assert_eq!(combined.pending.len(), 2);
+        assert_eq!(combined.replies.len(), 2);
+
+        let cache = Arc::new(RwLock::new(BTreeMap::new()));
+        let (barrier, failure) = finish_work(
+            FinishedWork {
+                completion: Completion::Flush {
+                    pending: combined.pending,
+                    replies: combined.replies,
+                    _fences: combined.fences,
+                },
+                result: Ok(()),
+            },
+            &cache,
+        );
+        assert!(barrier);
+        assert!(failure.is_none());
+        assert!(
+            first_result
+                .await
+                .expect("first flush must receive a result")
+                .is_ok()
+        );
+        assert!(
+            second_result
+                .await
+                .expect("second flush must receive a result")
+                .is_ok()
+        );
+        assert_eq!(pending.test_counts(), (0, 0));
+    }
+
+    /// A queued write keeps later flushes on a distinct durability boundary.
+    #[tokio::test]
+    async fn flushes_do_not_coalesce_across_a_write() {
+        let pending = PendingRequests::new(3, 4 << 10);
+        let first_flush_pending = pending
+            .reserve(0)
+            .await
+            .expect("first flush must reserve a request");
+        let write_pending = pending
+            .reserve(4 << 10)
+            .await
+            .expect("write must reserve one block");
+        let second_flush_pending = pending
+            .reserve(0)
+            .await
+            .expect("second flush must reserve a request");
+        let fence = FenceEpoch::new(1).expect("test fence must be valid");
+        let descriptor = VolumeDescriptor::new(
+            crate::VolumeId::new(uuid::Uuid::from_u128(
+                0x018f_89ad_6bc8_7b3d_a8ef_50b1_3cda_14c2,
+            ))
+            .expect("test volume ID must be valid"),
+            crate::VolumeGeneration::new(1).expect("test generation must be valid"),
+            8 << 12,
+            crate::VolumeBlockSizes::supported(),
+        )
+        .expect("test descriptor must be valid");
+        let file_settings = ReplicaFileSettings::new(4 << 10, 8, 4 << 10, 8)
+            .expect("test file settings must be valid");
+        let write = Arc::new(
+            ReplicaWrite::new(
+                descriptor,
+                fence,
+                8,
+                vec![ReplicaBlockChange::Write {
+                    block: 0,
+                    data: Bytes::from(vec![0x41; 4 << 10]),
+                }],
+                file_settings,
+            )
+            .expect("test write must be valid"),
+        );
+        let (first_flush_reply, _first_flush_result) = oneshot::channel();
+        let (write_reply, _write_result) = oneshot::channel();
+        let (second_flush_reply, _second_flush_result) = oneshot::channel();
+        let mut queued = VecDeque::from([
+            QueuedWork::Flush(QueuedFlush {
+                flush: ReplicaFlush::new(fence, 3, 7).expect("first flush must be valid"),
+                fences: Vec::new(),
+                pending: vec![first_flush_pending],
+                replies: vec![first_flush_reply],
+            }),
+            QueuedWork::Write(QueuedWrite {
+                request: 8,
+                write,
+                blocks: vec![0],
+                flush: None,
+                fences: Vec::new(),
+                pending: vec![write_pending],
+                replies: vec![write_reply],
+                ready_at: Instant::now(),
+            }),
+        ]);
+
+        let second = append_matching_flush(
+            &mut queued,
+            8,
+            FlushRequest {
+                fence: None,
+                pending: second_flush_pending,
+                reply: second_flush_reply,
+            },
+        )
+        .expect_err("a write must separate the two flushes");
+        assert_eq!(queued.len(), 2);
+        assert!(matches!(queued.back(), Some(QueuedWork::Write(_))));
+
+        drop(second);
+        drop(queued);
+        assert_eq!(pending.test_counts(), (0, 0));
     }
 }

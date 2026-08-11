@@ -261,6 +261,31 @@ pub(crate) struct ReplicatedVolumeTestStorageLimits {
     pub(crate) repair_chunk_bytes: usize,
 }
 
+/// Exact driver and file-worker limits used by one real volume benchmark.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplicatedVolumeTestDriverLimits {
+    pub(crate) queue_count: u16,
+    pub(crate) queue_depth: u16,
+    pub(crate) queue_buffer_bytes: u64,
+    pub(crate) file_workers: usize,
+    pub(crate) batch_delay_us: u64,
+    pub(crate) max_batch_changes: usize,
+}
+
+impl ReplicatedVolumeTestDriverLimits {
+    /// Returns the same write-path limits used by the product defaults.
+    pub(crate) const fn current() -> Self {
+        Self {
+            queue_count: 2,
+            queue_depth: 32,
+            queue_buffer_bytes: 8 << 20,
+            file_workers: 8,
+            batch_delay_us: 0,
+            max_batch_changes: 64,
+        }
+    }
+}
+
 impl ReplicatedVolumeTestStorageLimits {
     /// Returns the same storage limits used by the product defaults.
     pub(crate) const fn current() -> Self {
@@ -278,8 +303,7 @@ pub(crate) struct ReplicatedVolumeTestNodeState {
     signing_key: ed25519_dalek::SigningKey,
     pub(crate) node_root: PathBuf,
     storage_address: String,
-    batch_delay_us: u64,
-    max_batch_changes: usize,
+    driver_limits: ReplicatedVolumeTestDriverLimits,
     storage_limits: ReplicatedVolumeTestStorageLimits,
     runtime: Arc<RecordingRuntimeBackend>,
 }
@@ -305,11 +329,10 @@ impl ReplicatedVolumeTestNodeState {
                 global_metadata_sync_tick: Some(Duration::from_millis(300)),
                 gossip_tick: Some(Duration::from_millis(200)),
                 local_volume_root: Some(self.node_root.join("local-volumes")),
-                replicated_volumes: Some(replicated_volume_test_config(
+                replicated_volumes: Some(replicated_volume_test_config_with_driver_limits(
                     &self.node_root,
                     self.storage_address.clone(),
-                    self.batch_delay_us,
-                    self.max_batch_changes,
+                    self.driver_limits,
                     self.storage_limits,
                 )),
                 ..HeadlessConfig::default()
@@ -452,12 +475,15 @@ impl PostgresBenchmarkContainer {
             let args = vec![
                 "exec".to_string(),
                 self.name.clone(),
-                "pg_isready".to_string(),
+                "psql".to_string(),
+                "--no-psqlrc".to_string(),
                 "--quiet".to_string(),
                 "--username".to_string(),
                 "mantissa".to_string(),
                 "--dbname".to_string(),
                 "app".to_string(),
+                "--command".to_string(),
+                "SELECT 1".to_string(),
             ];
             if docker_output(&args, Duration::from_secs(5))
                 .await
@@ -550,6 +576,21 @@ pub(crate) fn postgres_benchmark_number(name: &str, default: u64) -> anyhow::Res
         anyhow::bail!("{name} must be greater than zero");
     }
     Ok(value)
+}
+
+/// Reads one benchmark setting that may explicitly be zero.
+pub(crate) fn postgres_benchmark_nonnegative_number(
+    name: &str,
+    default: u64,
+) -> anyhow::Result<u64> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    value
+        .to_str()
+        .with_context(|| format!("{name} is not UTF-8"))?
+        .parse::<u64>()
+        .with_context(|| format!("{name} is not a non-negative integer"))
 }
 
 /// Parsed throughput and latency from one pgbench run.
@@ -652,12 +693,11 @@ pub(crate) fn unused_storage_address() -> anyhow::Result<String> {
     Ok(listener.local_addr()?.to_string())
 }
 
-/// Builds complete replicated-volume settings under one test node directory.
-pub(crate) fn replicated_volume_test_config(
+/// Builds settings with exact driver limits for one measured comparison.
+pub(crate) fn replicated_volume_test_config_with_driver_limits(
     node_root: &Path,
     storage_address: String,
-    batch_delay_us: u64,
-    max_batch_changes: usize,
+    driver_limits: ReplicatedVolumeTestDriverLimits,
     storage_limits: ReplicatedVolumeTestStorageLimits,
 ) -> config::ReplicatedVolumeConfig {
     config::ReplicatedVolumeConfig {
@@ -711,7 +751,7 @@ pub(crate) fn replicated_volume_test_config(
             snapshot_after_entries: 4_096,
         },
         data_store_limits: config::ReplicatedVolumeDataStoreLimits {
-            worker_threads: 8,
+            worker_threads: driver_limits.file_workers,
             max_queued_operations: 64,
         },
         state_limits: config::ReplicatedVolumeStateLimits {
@@ -724,15 +764,15 @@ pub(crate) fn replicated_volume_test_config(
             max_bytes_per_second: 64 << 20,
         },
         driver_limits: config::ReplicatedVolumeDriverLimits {
-            queue_count: 2,
-            queue_depth: 32,
+            queue_count: driver_limits.queue_count,
+            queue_depth: driver_limits.queue_depth,
             max_request_bytes: 128 << 10,
-            max_queue_buffer_bytes: 8 << 20,
-            max_pending_requests: max_batch_changes.max(64),
+            max_queue_buffer_bytes: driver_limits.queue_buffer_bytes,
+            max_pending_requests: driver_limits.max_batch_changes.max(64),
             max_pending_buffer_bytes: 1 << 20,
-            max_batch_changes,
+            max_batch_changes: driver_limits.max_batch_changes,
             max_batch_bytes: 1 << 20,
-            max_batch_delay_us: batch_delay_us,
+            max_batch_delay_us: driver_limits.batch_delay_us,
         },
         filesystem: config::ReplicatedVolumeFilesystemSettings {
             mount_root: node_root.join("mounts").display().to_string(),
@@ -762,29 +802,18 @@ pub(crate) fn replicated_volume_test_config(
 pub(crate) async fn start_replicated_volume_test_cluster(
     root: &Path,
 ) -> anyhow::Result<(Vec<TestNode>, Vec<ReplicatedVolumeTestNodeState>)> {
-    start_replicated_volume_test_cluster_with_driver_settings(root, 250, 64).await
-}
-
-/// Starts the real storage cluster with measured write-grouping settings.
-pub(crate) async fn start_replicated_volume_test_cluster_with_driver_settings(
-    root: &Path,
-    batch_delay_us: u64,
-    max_batch_changes: usize,
-) -> anyhow::Result<(Vec<TestNode>, Vec<ReplicatedVolumeTestNodeState>)> {
-    start_replicated_volume_test_cluster_with_settings(
+    start_replicated_volume_test_cluster_with_driver_limits(
         root,
-        batch_delay_us,
-        max_batch_changes,
+        ReplicatedVolumeTestDriverLimits::current(),
         ReplicatedVolumeTestStorageLimits::current(),
     )
     .await
 }
 
-/// Starts the real storage cluster with caller-selected measured limits.
-pub(crate) async fn start_replicated_volume_test_cluster_with_settings(
+/// Starts five storage runtimes with exact driver and file-worker limits.
+pub(crate) async fn start_replicated_volume_test_cluster_with_driver_limits(
     root: &Path,
-    batch_delay_us: u64,
-    max_batch_changes: usize,
+    driver_limits: ReplicatedVolumeTestDriverLimits,
     storage_limits: ReplicatedVolumeTestStorageLimits,
 ) -> anyhow::Result<(Vec<TestNode>, Vec<ReplicatedVolumeTestNodeState>)> {
     let mut cluster = Vec::with_capacity(REPLICATED_VOLUME_TEST_NODE_COUNT);
@@ -816,8 +845,7 @@ pub(crate) async fn start_replicated_volume_test_cluster_with_settings(
             signing_key,
             node_root,
             storage_address: unused_storage_address()?,
-            batch_delay_us,
-            max_batch_changes,
+            driver_limits,
             storage_limits,
             runtime,
         };
@@ -1017,6 +1045,19 @@ pub(crate) async fn restart_volume_copies_with_delayed_peers(
                 .context("saved test state does not contain a volume copy")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    for state in std::iter::once(writer_state).chain(peer_states.iter().copied()) {
+        wait_for_test_volume_database_release(
+            &state.node_root.join("replicated-volumes.redb"),
+            Duration::from_secs(5),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "wait for stopped volume copy {} to release its database",
+                state.node_id
+            )
+        })?;
+    }
 
     let start_writer = writer_state.start();
     let start_peers = async move {
@@ -2325,13 +2366,16 @@ pub(crate) async fn run_postgres_path_comparison(
         postgres_benchmark_number("MANTISSA_POSTGRES_BENCHMARK_SINGLE_SECONDS", 30)?;
     let loaded_seconds =
         postgres_benchmark_number("MANTISSA_POSTGRES_BENCHMARK_LOADED_SECONDS", 60)?;
+    let replicated_only = std::env::var_os("MANTISSA_POSTGRES_BENCHMARK_REPLICATED_ONLY").is_some();
 
     let mut results = Vec::new();
     for run in 1..=runs {
-        let order = if run % 2 == 1 {
-            [("local", &local), ("replicated", &replicated)]
+        let order = if replicated_only {
+            vec![("replicated", &replicated)]
+        } else if run % 2 == 1 {
+            vec![("local", &local), ("replicated", &replicated)]
         } else {
-            [("replicated", &replicated), ("local", &local)]
+            vec![("replicated", &replicated), ("local", &local)]
         };
         for (storage, container) in order {
             eprintln!("starting PostgreSQL benchmark run {run} for {storage} storage");

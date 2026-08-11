@@ -16,7 +16,7 @@ use crate::services::types::{
     compute_service_id,
 };
 use crate::task::types::TaskStateFilter;
-use crate::volumes::types::VolumeDriver;
+use crate::volumes::types::{VolumeAccessMode, VolumeDriver};
 use crate::volumes::{VolumeAccessError, VolumeRegistry};
 use crate::workload::manager::WorkloadManager;
 use crate::workload::manager::{

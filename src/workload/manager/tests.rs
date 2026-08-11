@@ -199,6 +199,7 @@ struct MockRuntimeBackend {
     stop_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     stop_errors: Arc<AsyncMutex<HashMap<String, String>>>,
     removed: Arc<AsyncMutex<Vec<String>>>,
+    remove_calls: Arc<AsyncMutex<Vec<(String, bool, bool)>>>,
     remove_delay: Arc<AsyncMutex<Option<std::time::Duration>>>,
     open_stdin: Arc<AsyncMutex<Vec<bool>>>,
     limits: Arc<AsyncMutex<Vec<ResourceLimits>>>,
@@ -394,14 +395,18 @@ impl RuntimeBackend for MockRuntimeBackend {
     async fn remove_instance(
         &self,
         instance_id: &str,
-        _force: bool,
-        _remove_volumes: bool,
+        force: bool,
+        remove_volumes: bool,
     ) -> RuntimeResult<()> {
         let delay = *self.remove_delay.lock().await;
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
         self.removed.lock().await.push(instance_id.to_string());
+        self.remove_calls
+            .lock()
+            .await
+            .push((instance_id.to_string(), force, remove_volumes));
         let mut inspect = self.inspect.lock().await;
         inspect.retain(|key, response| key != instance_id && response.id != instance_id);
         Ok(())
@@ -11197,6 +11202,46 @@ async fn setup_replicated_shutdown_test(
     let volume = create_ready_replicated_volume(&manager, volume_name).await;
 
     (manager, mock_runtime, replicated, mount_root, volume)
+}
+
+/// A running container must be killed before a failed replicated mount can expose its bare path.
+#[tokio::test]
+async fn inventory_volume_loss_force_removes_runtime_before_unpublishing_mount() {
+    let (manager, mock_runtime, replicated, _mount_root, volume) =
+        setup_replicated_shutdown_test(1, "failed-inventory-mount").await;
+    let started = manager
+        .start_workloads_batch(vec![standalone_volume_task_request(&volume, "/data")])
+        .await
+        .expect("start replicated-volume task");
+    let task = started.first().expect("started task");
+    mock_runtime.listed.lock().await.push(running_runtime_info(
+        "container-0",
+        &format!("mantissa-{}", task.id),
+        "img",
+    ));
+
+    replicated.mounted.store(false, Ordering::Release);
+    replicated.fail_mount.store(true, Ordering::Release);
+    manager
+        .reconcile_local_runtime_inventory()
+        .await
+        .expect("reconcile failed replicated mount");
+
+    assert!(
+        mock_runtime.stopped.lock().await.is_empty(),
+        "volume loss must not wait for a graceful stop timeout"
+    );
+    assert_eq!(
+        mock_runtime.remove_calls.lock().await.as_slice(),
+        &[("container-0".to_string(), true, true)],
+        "the runtime must be force-removed before the failed mount is unpublished"
+    );
+    assert_eq!(replicated.unmount_calls.load(Ordering::Acquire), 1);
+    let blocked = manager
+        .load_spec(task.id)
+        .await
+        .expect("load volume-unavailable task");
+    assert!(matches!(blocked.state, WorkloadPhase::VolumeUnavailable));
 }
 
 #[tokio::test]

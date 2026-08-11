@@ -151,8 +151,8 @@ impl ReplacementChunk<'_> {
     }
 }
 
-/// Returns true when a start-first replacement would contend with the previous replica's ports.
-fn replacement_chunk_requires_stop_first(
+/// Returns true when old and new tasks in one chunk bind the same host port.
+fn replacement_chunk_has_host_port_conflict(
     chunk: &ReplacementChunk<'_>,
     old_templates_by_name: &HashMap<String, TaskTemplateSpecValue>,
 ) -> bool {
@@ -167,6 +167,45 @@ fn replacement_chunk_requires_stop_first(
                     )
                 })
     })
+}
+
+/// Returns true when old and new tasks in one chunk mount the same read-write-once volume.
+fn replacement_chunk_reuses_read_write_once_volume(
+    chunk: &ReplacementChunk<'_>,
+    old_templates_by_name: &HashMap<String, TaskTemplateSpecValue>,
+    volume_registry: &VolumeRegistry,
+) -> anyhow::Result<bool> {
+    for replacement in &chunk.replacements {
+        if replacement.previous.is_none() {
+            continue;
+        }
+        let Some(old_template) = old_templates_by_name.get(&replacement.template.name) else {
+            continue;
+        };
+        for new_mount in &replacement.template.execution.volumes {
+            if !old_template
+                .execution
+                .volumes
+                .iter()
+                .any(|old_mount| old_mount.volume_id == new_mount.volume_id)
+            {
+                continue;
+            }
+            let volume = volume_registry
+                .get_spec(new_mount.volume_id)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "unknown volume '{}' ({}) during service rollout",
+                        new_mount.volume_name,
+                        new_mount.volume_id
+                    )
+                })?;
+            if matches!(volume.access_mode, VolumeAccessMode::ReadWriteOnce) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Outcome of one rollout chunk attempt.
@@ -799,7 +838,7 @@ impl ServiceController {
         )
     }
 
-    /// Stops the previous task incarnations for one replacement chunk and records rollback state.
+    /// Stops every previous task and waits for cleanup before its replacement can start.
     async fn stop_replacement_chunk_previous_tasks(
         &self,
         service_name: &str,
@@ -817,6 +856,13 @@ impl ServiceController {
                 &mut artifacts.rollback_old_tasks,
             )
             .await?;
+        }
+        for replacement in replacements {
+            let Some(previous) = replacement.previous.as_ref() else {
+                continue;
+            };
+            self.wait_rollout_task_stopped(service_name, previous.task_id)
+                .await?;
         }
         Ok(())
     }
@@ -939,22 +985,33 @@ impl ServiceController {
         progress: &mut RolloutProgress,
         artifacts: &mut RolloutArtifacts,
     ) -> Result<ChunkProgress, anyhow::Error> {
-        let requires_stop_first =
-            replacement_chunk_requires_stop_first(chunk, &artifacts.old_templates_by_name);
+        let host_port_conflict =
+            replacement_chunk_has_host_port_conflict(chunk, &artifacts.old_templates_by_name);
+        let shared_read_write_once_volume = replacement_chunk_reuses_read_write_once_volume(
+            chunk,
+            &artifacts.old_templates_by_name,
+            &self.volume_registry,
+        )?;
+        let must_stop_old_task_first = host_port_conflict || shared_read_write_once_volume;
         let effective_stop_first =
             matches!(phase.rollout.settings.order, ServiceRolloutOrder::StopFirst)
-                || requires_stop_first;
+                || must_stop_old_task_first;
 
-        if requires_stop_first
+        if must_stop_old_task_first
             && matches!(
                 phase.rollout.settings.order,
                 ServiceRolloutOrder::StartFirst
             )
         {
+            let reason = if shared_read_write_once_volume {
+                "old and new tasks mount the same read_write_once volume"
+            } else {
+                "old and new tasks bind the same host port"
+            };
             tracing::info!(
                 target: "services",
-                "service '{}' rollout chunk is using stop-first order because replacement host ports overlap previous replicas",
-                phase.rollout.service_name
+                "service '{}' rollout chunk is using stop-first order because {reason}",
+                phase.rollout.service_name,
             );
         }
 
@@ -1817,7 +1874,7 @@ mod tests {
         };
         let old_templates_by_name = HashMap::from([("api".to_string(), old_template)]);
 
-        assert!(replacement_chunk_requires_stop_first(
+        assert!(replacement_chunk_has_host_port_conflict(
             &chunk,
             &old_templates_by_name
         ));
@@ -1846,7 +1903,7 @@ mod tests {
         };
         let old_templates_by_name = HashMap::from([("api".to_string(), old_template)]);
 
-        assert!(!replacement_chunk_requires_stop_first(
+        assert!(!replacement_chunk_has_host_port_conflict(
             &chunk,
             &old_templates_by_name
         ));

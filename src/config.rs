@@ -289,7 +289,7 @@ impl Default for ReplicatedVolumeDriverLimits {
             max_pending_buffer_bytes: 1 << 20,
             max_batch_changes: 64,
             max_batch_bytes: 1 << 20,
-            max_batch_delay_us: 250,
+            max_batch_delay_us: 50,
         }
     }
 }

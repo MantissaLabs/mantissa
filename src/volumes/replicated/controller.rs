@@ -1028,16 +1028,14 @@ impl ReplicatedVolumeController {
         {
             anyhow::bail!("a draining writer must move before its replica can be replaced");
         }
-        let coordinator = data
-            .writer
-            .map(|writer| writer.node_id)
-            .or_else(|| {
-                data.copies
-                    .iter()
-                    .copied()
-                    .find(|node_id| Some(*node_id) != old_node_id)
-            })
-            .context("replacement has no active source copy")?;
+        let coordinator = select_replacement_source(
+            &data.copies,
+            old_node_id,
+            data.writer.map(|writer| writer.node_id),
+            bound,
+            |node_id| replica_copy_is_available(node_id, peers, health, reported_replica_errors),
+        )
+        .context("replacement has no active source copy")?;
         let replacement = ReplacementGrant {
             id: ReplacementId::new(Uuid::new_v4())?,
             coordinator_node_id: coordinator,
@@ -1571,6 +1569,27 @@ fn select_recovery_coordinator(
         })
 }
 
+/// Selects the current writer or the recovered bound copy as a replacement source.
+fn select_replacement_source(
+    copies: &BTreeSet<VolumeNodeId>,
+    old_node_id: Option<VolumeNodeId>,
+    writer: Option<VolumeNodeId>,
+    bound: Option<VolumeNodeId>,
+    mut is_available: impl FnMut(VolumeNodeId) -> bool,
+) -> Option<VolumeNodeId> {
+    let can_copy =
+        |node_id: VolumeNodeId| Some(node_id) != old_node_id && copies.contains(&node_id);
+    writer
+        .filter(|node_id| can_copy(*node_id) && is_available(*node_id))
+        .or_else(|| bound.filter(|node_id| can_copy(*node_id) && is_available(*node_id)))
+        .or_else(|| {
+            copies
+                .iter()
+                .copied()
+                .find(|node_id| can_copy(*node_id) && is_available(*node_id))
+        })
+}
+
 /// Detects a safe two-copy membership that needs a new third learner.
 fn degraded_group_needs_new_member(
     copies: &BTreeSet<VolumeNodeId>,
@@ -1977,6 +1996,38 @@ mod tests {
         );
         assert_eq!(
             select_recovery_coordinator(&survivors, None, None, |_| false),
+            None
+        );
+    }
+
+    /// Replacement keeps using the recovered bound copy after writer access is revoked.
+    #[test]
+    fn replacement_prefers_writer_then_bound_copy() {
+        let first = VolumeNodeId::new(Uuid::from_u128(1)).expect("non-zero node ID");
+        let second = VolumeNodeId::new(Uuid::from_u128(2)).expect("non-zero node ID");
+        let third = VolumeNodeId::new(Uuid::from_u128(3)).expect("non-zero node ID");
+        let copies = BTreeSet::from([first, second, third]);
+
+        assert_eq!(
+            select_replacement_source(&copies, None, Some(first), Some(second), |_| true),
+            Some(first)
+        );
+        assert_eq!(
+            select_replacement_source(&copies, None, None, Some(second), |_| true),
+            Some(second)
+        );
+        assert_eq!(
+            select_replacement_source(&copies, Some(first), Some(first), Some(second), |_| true),
+            Some(second)
+        );
+        assert_eq!(
+            select_replacement_source(&copies, None, None, Some(second), |node_id| {
+                node_id != second
+            }),
+            Some(first)
+        );
+        assert_eq!(
+            select_replacement_source(&copies, None, None, Some(second), |_| false),
             None
         );
     }

@@ -156,6 +156,7 @@ struct VolumeBlockRequest {
 
     ensureRepair @12 :VolumeMaintenanceIdentity;
     # Make the current grant own repair state, superseding stale work.
+
   }
 }
 

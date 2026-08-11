@@ -2535,8 +2535,20 @@ impl WorkloadManager {
             guard.remove(&task_id)
         };
         if let Some(instance_id) = instance_id {
-            self.rollback_instance_launch(&instance_id, "volume unavailable")
-                .await;
+            // The storage path is already unsafe or unavailable here. A graceful stop can leave
+            // the runtime restart policy active until its timeout expires, allowing an entrypoint
+            // to restart against the bare directory below a detached mount. Force removal stops
+            // that restart loop before local volume cleanup proceeds.
+            if let Err(remove_err) = self
+                .remove_instance_bounded(&instance_id, true, true, Duration::from_secs(10))
+                .await
+            {
+                warn!(
+                    target: "task",
+                    instance = %instance_id.handle,
+                    "failed to remove runtime instance after volume loss: {remove_err}"
+                );
+            }
         }
 
         self.cleanup_secret_artifacts(task_id).await;
@@ -3738,13 +3750,14 @@ impl WorkloadManager {
                 continue;
             }
 
-            if value.admission_group_id.is_some() {
-                let spec = value_to_spec(task_id, value.clone());
-                if !self.admission_group_allows_adoption(&spec).await? {
-                    self.stop_unowned_instance(task_id, &instance, false, Some(&value))
-                        .await;
-                    continue;
-                }
+            let spec = value_to_spec(task_id, value.clone());
+
+            if value.admission_group_id.is_some()
+                && !self.admission_group_allows_adoption(&spec).await?
+            {
+                self.stop_unowned_instance(task_id, &instance, false, Some(&value))
+                    .await;
+                continue;
             }
 
             let instance_id = canonicalize_runtime_ref(&instance.runtime, &instance.info);
@@ -3759,11 +3772,8 @@ impl WorkloadManager {
                     .publish_task_volume_mounts_for_task(task_id, &value.volumes)
                     .await
             {
-                warn!(
-                    target: "task",
-                    task = %task_id,
-                    "failed to republish local volume mounts while adopting runtime instance: {err:#}"
-                );
+                self.mark_task_volume_unavailable(spec, err).await;
+                continue;
             }
 
             if matches!(value.state, WorkloadPhase::Running)

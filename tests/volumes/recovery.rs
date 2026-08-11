@@ -90,10 +90,13 @@ async fn run_benchmark() -> anyhow::Result<()> {
     let (profile, storage_limits) = selected_profile()?;
     let root = tempfile::tempdir_in("/var/tmp")
         .context("create replicated-volume recovery benchmark root on ext4")?;
-    let (mut cluster, states) =
-        start_replicated_volume_test_cluster_with_settings(root.path(), 250, 64, storage_limits)
-            .await
-            .context("start replicated-volume recovery benchmark cluster")?;
+    let (mut cluster, states) = start_replicated_volume_test_cluster_with_driver_limits(
+        root.path(),
+        ReplicatedVolumeTestDriverLimits::current(),
+        storage_limits,
+    )
+    .await
+    .context("start replicated-volume recovery benchmark cluster")?;
     let result = run_recovery_benchmark(&mut cluster, &states, profile, storage_limits).await;
     let shutdown_result = shutdown_replicated_volume_test_cluster(cluster).await;
     result?;

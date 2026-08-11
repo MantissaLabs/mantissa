@@ -8,18 +8,50 @@ local_test!(replicated_volume_postgresql_benchmark, {
 
     let root =
         tempfile::tempdir_in("/var/tmp").expect("create PostgreSQL volume benchmark root on ext4");
-    let batch_delay_us =
-        postgres_benchmark_number("MANTISSA_POSTGRES_BENCHMARK_BATCH_DELAY_US", 250)
+    let mut driver_limits = ReplicatedVolumeTestDriverLimits::current();
+    driver_limits.batch_delay_us =
+        postgres_benchmark_nonnegative_number("MANTISSA_POSTGRES_BENCHMARK_BATCH_DELAY_US", 0)
             .expect("read PostgreSQL benchmark batch delay");
-    let max_batch_changes = usize::try_from(
+    driver_limits.max_batch_changes = usize::try_from(
         postgres_benchmark_number("MANTISSA_POSTGRES_BENCHMARK_MAX_BATCH_CHANGES", 64)
             .expect("read PostgreSQL benchmark batch change limit"),
     )
     .expect("PostgreSQL benchmark batch change limit must fit usize");
-    let (cluster, _states) = start_replicated_volume_test_cluster_with_settings(
+    driver_limits.queue_count = u16::try_from(
+        postgres_benchmark_number("MANTISSA_POSTGRES_BENCHMARK_QUEUE_COUNT", 2)
+            .expect("read PostgreSQL benchmark queue count"),
+    )
+    .expect("PostgreSQL benchmark queue count must fit u16");
+    driver_limits.queue_depth = u16::try_from(
+        postgres_benchmark_number("MANTISSA_POSTGRES_BENCHMARK_QUEUE_DEPTH", 32)
+            .expect("read PostgreSQL benchmark queue depth"),
+    )
+    .expect("PostgreSQL benchmark queue depth must fit u16");
+    // Queue memory is an existing hard bound. Larger measured queue shapes need
+    // enough space for every slot without changing the maximum request size.
+    let required_queue_buffer_bytes =
+        u64::from(driver_limits.queue_count) * u64::from(driver_limits.queue_depth) * (128 << 10);
+    driver_limits.queue_buffer_bytes = driver_limits
+        .queue_buffer_bytes
+        .max(required_queue_buffer_bytes);
+    driver_limits.file_workers = usize::try_from(
+        postgres_benchmark_number("MANTISSA_POSTGRES_BENCHMARK_FILE_WORKERS", 8)
+            .expect("read PostgreSQL benchmark file-worker count"),
+    )
+    .expect("PostgreSQL benchmark file-worker count must fit usize");
+    eprintln!(
+        "PostgreSQL replicated-volume limits: queues={}, depth={}, queue_buffer_bytes={}, \
+         file_workers={}, batch_delay_us={}, max_batch_changes={}",
+        driver_limits.queue_count,
+        driver_limits.queue_depth,
+        driver_limits.queue_buffer_bytes,
+        driver_limits.file_workers,
+        driver_limits.batch_delay_us,
+        driver_limits.max_batch_changes,
+    );
+    let (cluster, _states) = start_replicated_volume_test_cluster_with_driver_limits(
         root.path(),
-        batch_delay_us,
-        max_batch_changes,
+        driver_limits,
         ReplicatedVolumeTestStorageLimits::current(),
     )
     .await

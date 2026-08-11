@@ -27,7 +27,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tracing::debug;
 use uuid::Uuid;
@@ -40,7 +40,7 @@ pub struct VolumesRpc {
     cluster_registry: Registry,
     topology: Topology,
     replicator: VolumeReplicator,
-    replicated_volume_runtime: Option<Arc<ReplicatedVolumeRuntime>>,
+    replicated_volume_runtime: Option<Weak<ReplicatedVolumeRuntime>>,
 }
 
 impl VolumesRpc {
@@ -57,7 +57,7 @@ impl VolumesRpc {
             cluster_registry,
             topology,
             replicator,
-            replicated_volume_runtime,
+            replicated_volume_runtime: replicated_volume_runtime.as_ref().map(Arc::downgrade),
         }
     }
 
@@ -68,7 +68,7 @@ impl VolumesRpc {
         group_status: Option<&ReplicatedVolumeGroupStatusValue>,
         node_health: &HashMap<Uuid, NodeHealth>,
     ) -> Option<WriterFilesystemSpace> {
-        let runtime = self.replicated_volume_runtime.as_ref()?;
+        let runtime = self.replicated_volume_runtime.as_ref()?.upgrade()?;
         let plan = plan?;
         let writer_node_id = group_status?.attached_node_id?;
         if matches!(node_health.get(&writer_node_id), Some(NodeHealth::Down)) {

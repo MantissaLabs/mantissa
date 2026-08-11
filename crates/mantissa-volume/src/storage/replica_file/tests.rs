@@ -7,6 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use mantissa_raft::ApplyContext;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use uuid::Uuid;
 
 use super::connection::{
@@ -294,6 +295,36 @@ fn start_recovery_connection(
     let client = ReplicaDataConnection::start(client_stream, data_limits(), 16)
         .expect("test recovery connection must start");
     (client, server)
+}
+
+/// Reads one complete test frame using the production length prefix.
+async fn read_test_frame(stream: &mut DuplexStream) -> Vec<u8> {
+    let mut length = [0_u8; 4];
+    stream
+        .read_exact(&mut length)
+        .await
+        .expect("test frame length must arrive");
+    let length = u32::from_be_bytes(length) as usize;
+    let mut bytes = vec![0_u8; length];
+    stream
+        .read_exact(&mut bytes)
+        .await
+        .expect("complete test frame must arrive");
+    bytes
+}
+
+/// Writes one complete test frame using the production length prefix.
+async fn write_test_frame(stream: &mut DuplexStream, bytes: &[u8]) {
+    let length = u32::try_from(bytes.len()).expect("test frame must fit its length prefix");
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .expect("test frame length must write");
+    stream
+        .write_all(bytes)
+        .await
+        .expect("complete test frame must write");
+    stream.flush().await.expect("test frame must flush");
 }
 
 /// Uses explicit small bounds suitable for focused file tests.
@@ -1959,6 +1990,225 @@ async fn fixed_path_reports_a_failed_remote_copy() {
     assert!(handler.failure().is_some());
     assert!(handler.write(0, block(0x62), true).await.is_err());
 
+    let _ = path.stop().await;
+}
+
+/// Losing one copy fails an FUA request that is waiting for its remote sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_path_fails_when_a_copy_is_lost_during_fua() {
+    let current_fence = later_data_fence(2);
+    let local_directory = TempDir::new().expect("local temporary directory");
+    let remote_directory = TempDir::new().expect("remote temporary directory");
+    let local = Arc::new(
+        ReplicaFile::create(
+            local_directory.path(),
+            descriptor(),
+            current_fence,
+            settings(),
+        )
+        .expect("local replica file must be created"),
+    );
+    let remote = Arc::new(
+        ReplicaFile::create(
+            remote_directory.path(),
+            descriptor(),
+            current_fence,
+            settings(),
+        )
+        .expect("remote replica file must be created"),
+    );
+    let remote_progress = ReplicaDataProgress::from_file(remote.progress());
+    let limits = data_limits();
+    let (client_stream, mut peer_stream) = tokio::io::duplex(1 << 20);
+    let (fua_seen, fua_received) = tokio::sync::oneshot::channel();
+    let (close_peer, close_requested) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let progress_request = decode_request(&read_test_frame(&mut peer_stream).await, limits)
+            .expect("startup progress request must decode");
+        assert!(matches!(
+            progress_request.action(),
+            ReplicaDataAction::GetProgress { .. }
+        ));
+        let progress_response = ReplicaDataResponse::new(
+            progress_request.request_id(),
+            ReplicaDataResult::Progress(remote_progress),
+        )
+        .expect("startup progress response must be valid");
+        let bytes = encode_response(&progress_response, limits)
+            .expect("startup progress response must encode");
+        write_test_frame(&mut peer_stream, &bytes).await;
+
+        let write_request = decode_request(&read_test_frame(&mut peer_stream).await, limits)
+            .expect("pending FUA write must decode");
+        assert!(matches!(
+            write_request.action(),
+            ReplicaDataAction::Write(_)
+        ));
+        let _ = fua_seen.send(());
+        let _ = close_requested.await;
+    });
+    let connection = Arc::new(
+        ReplicaDataConnection::start(client_stream, limits, 4)
+            .expect("test remote connection must start"),
+    );
+    let remote_copy = FixedReplicaCopy::remote(descriptor(), current_fence, connection)
+        .await
+        .expect("mock remote copy must report matching progress");
+    let mut path = FixedReplicaPath::start_copies(
+        descriptor(),
+        current_fence,
+        path_settings(),
+        worker_pool(),
+        vec![FixedReplicaCopy::local(Arc::clone(&local)), remote_copy],
+    )
+    .expect("fixed replica path must start");
+    let handler = path.handler();
+    let writer = Arc::clone(&handler);
+    let fua = tokio::spawn(async move { writer.write(0, block(0x63), true).await });
+    tokio::time::timeout(Duration::from_secs(1), fua_received)
+        .await
+        .expect("remote copy must receive the pending FUA")
+        .expect("remote copy must publish the pending FUA");
+    close_peer
+        .send(())
+        .expect("mock remote copy must still be waiting");
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), fua)
+            .await
+            .expect("FUA must finish after remote loss")
+            .expect("FUA task must join")
+            .is_err(),
+        "FUA must not succeed after one active copy is lost"
+    );
+    tokio::time::timeout(Duration::from_secs(1), handler.wait_until_stopped())
+        .await
+        .expect("remote loss must stop the fixed path");
+    assert!(handler.failure().is_some());
+    assert_eq!(
+        local.progress().flush_number(),
+        0,
+        "a failed all-copy FUA must not advance one copy's durable point"
+    );
+
+    peer.await.expect("mock remote copy task must join");
+    let _ = path.stop().await;
+}
+
+/// Losing one copy fails a flush that is waiting for its remote sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_path_fails_when_a_copy_is_lost_during_flush() {
+    let current_fence = later_data_fence(2);
+    let local_directory = TempDir::new().expect("local temporary directory");
+    let remote_directory = TempDir::new().expect("remote temporary directory");
+    let local = Arc::new(
+        ReplicaFile::create(
+            local_directory.path(),
+            descriptor(),
+            current_fence,
+            settings(),
+        )
+        .expect("local replica file must be created"),
+    );
+    let remote = Arc::new(
+        ReplicaFile::create(
+            remote_directory.path(),
+            descriptor(),
+            current_fence,
+            settings(),
+        )
+        .expect("remote replica file must be created"),
+    );
+    let limits = data_limits();
+    let (client_stream, mut peer_stream) = tokio::io::duplex(1 << 20);
+    let (sync_seen, sync_received) = tokio::sync::oneshot::channel();
+    let (close_peer, close_requested) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let progress_request = decode_request(&read_test_frame(&mut peer_stream).await, limits)
+            .expect("startup progress request must decode");
+        assert!(matches!(
+            progress_request.action(),
+            ReplicaDataAction::GetProgress { .. }
+        ));
+        let progress_response = ReplicaDataResponse::new(
+            progress_request.request_id(),
+            ReplicaDataResult::Progress(ReplicaDataProgress::from_file(remote.progress())),
+        )
+        .expect("startup progress response must be valid");
+        let bytes = encode_response(&progress_response, limits)
+            .expect("startup progress response must encode");
+        write_test_frame(&mut peer_stream, &bytes).await;
+
+        let write_request = decode_request(&read_test_frame(&mut peer_stream).await, limits)
+            .expect("ordinary write request must decode");
+        let ReplicaDataAction::Write(write) = write_request.action() else {
+            panic!("first data request must be an ordinary write");
+        };
+        let stored = remote
+            .write(write)
+            .expect("mock remote copy must store the ordinary write");
+        let write_response = ReplicaDataResponse::new(
+            write_request.request_id(),
+            ReplicaDataResult::Stored(ReplicaDataProgress::from_file(stored)),
+        )
+        .expect("ordinary write response must be valid");
+        let bytes =
+            encode_response(&write_response, limits).expect("ordinary write response must encode");
+        write_test_frame(&mut peer_stream, &bytes).await;
+
+        let sync_request = decode_request(&read_test_frame(&mut peer_stream).await, limits)
+            .expect("pending sync request must decode");
+        assert!(matches!(
+            sync_request.action(),
+            ReplicaDataAction::Sync { .. }
+        ));
+        let _ = sync_seen.send(());
+        let _ = close_requested.await;
+    });
+    let connection = Arc::new(
+        ReplicaDataConnection::start(client_stream, limits, 4)
+            .expect("test remote connection must start"),
+    );
+    let remote_copy = FixedReplicaCopy::remote(descriptor(), current_fence, connection)
+        .await
+        .expect("mock remote copy must report matching progress");
+    let mut path = FixedReplicaPath::start_copies(
+        descriptor(),
+        current_fence,
+        path_settings(),
+        worker_pool(),
+        vec![FixedReplicaCopy::local(local), remote_copy],
+    )
+    .expect("fixed replica path must start");
+    let handler = path.handler();
+    handler
+        .write(0, block(0x64), false)
+        .await
+        .expect("ordinary write must reach both copies");
+    let flusher = Arc::clone(&handler);
+    let flush = tokio::spawn(async move { flusher.flush().await });
+    tokio::time::timeout(Duration::from_secs(1), sync_received)
+        .await
+        .expect("remote copy must receive the pending sync")
+        .expect("remote copy must publish the pending sync");
+    close_peer
+        .send(())
+        .expect("mock remote copy must still be waiting");
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), flush)
+            .await
+            .expect("flush must finish after remote loss")
+            .expect("flush task must join")
+            .is_err(),
+        "flush must not succeed after one active copy is lost"
+    );
+    tokio::time::timeout(Duration::from_secs(1), handler.wait_until_stopped())
+        .await
+        .expect("remote loss must stop the fixed path");
+    assert!(handler.failure().is_some());
+
+    peer.await.expect("mock remote copy task must join");
     let _ = path.stop().await;
 }
 
