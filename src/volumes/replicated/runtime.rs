@@ -29,8 +29,8 @@ use mantissa_volume::driver::{
     UblkDeviceState, UblkOwnerId, UblkSystem,
 };
 use mantissa_volume::fs::{
-    ext4,
     space::{self, FilesystemSpace},
+    volume::{self, ReplicatedVolumeFilesystem as VolumeFilesystem},
 };
 use mantissa_volume::lifecycle_calls;
 use mantissa_volume::protocol::{ReplicaKeyAdapter, UuidNodeIdAdapter, VolumeCommandAdapter};
@@ -277,7 +277,7 @@ pub struct ReplicatedVolumeRuntime {
     replica_data_server: ReplicaDataServer,
     data_connections: DataConnections,
     maintenance: MaintenanceManager,
-    fs: ext4::Manager,
+    fs: volume::Manager,
     mapped_volumes: MappedVolumeSystem,
     lifecycle_calls: lifecycle_calls::Tracker,
     node_id: Uuid,
@@ -312,13 +312,13 @@ impl ReplicatedVolumeRuntime {
         let checked = config.checked()?;
         if !mantissa_net::paths::running_as_root() {
             anyhow::bail!(
-                "replicated volumes need root access for ublk, device-mapper, and ext4 mounts"
+                "replicated volumes need root access for ublk, device-mapper, and filesystem mounts"
             );
         }
         let fs_settings = checked.fs.clone();
         let pool_path = checked.pool_path.clone();
         let (pool, mapped_volumes) = tokio::task::spawn_blocking(move || -> Result<_> {
-            ext4::Manager::check_tools(&fs_settings)?;
+            volume::Manager::check_tools(&fs_settings)?;
             UblkSystem::system(UblkOwnerId::for_node(node_id.as_bytes()))
                 .require_features()
                 .context("required ublk kernel features are unavailable")?;
@@ -366,7 +366,7 @@ impl ReplicatedVolumeRuntime {
         let fs = tokio::task::spawn_blocking({
             let settings = checked.fs.clone();
             let timeout = checked.operation_timeout;
-            move || ext4::Manager::prepare(&settings, timeout)
+            move || volume::Manager::prepare(&settings, timeout)
         })
         .await
         .context("join replicated-volume filesystem setup")??;
@@ -2353,7 +2353,7 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Runs and records idempotent online ext4 expansion for one saved mount.
+    /// Runs and records idempotent online filesystem expansion for one saved mount.
     async fn reconcile_mounted_filesystem_capacity(
         &self,
         key: ReplicaKey,
@@ -2384,15 +2384,20 @@ impl ReplicatedVolumeRuntime {
             .to_path_buf();
         let fs = self.fs.clone();
         let resize_path = mapped_path.clone();
+        let mount_path = mount.path().to_path_buf();
+        let filesystem = mount.filesystem();
         self.lifecycle_calls
             .run_async(
                 key,
                 "mantissa-volume-expand-filesystem",
                 self.operation_timeout,
-                async move { fs.expand(&resize_path, progress).await },
+                async move {
+                    fs.expand(filesystem, &resize_path, &mount_path, progress)
+                        .await
+                },
             )
             .await
-            .context("expand mounted replicated ext4 filesystem")?;
+            .context("expand mounted replicated-volume filesystem")?;
         let current = self
             .replicas
             .attachment(key)?
@@ -2965,8 +2970,9 @@ impl ReplicatedVolumeRuntime {
             .context("check mounted replicated-volume mapping")?;
         let fs = self.fs.clone();
         let path = volume_mount.path().to_path_buf();
+        let filesystem = volume_mount.filesystem();
         Ok(
-            tokio::task::spawn_blocking(move || fs.volume_path_is_writable(&path))
+            tokio::task::spawn_blocking(move || fs.volume_path_is_writable(&path, filesystem))
                 .await
                 .context("join replicated-volume mount check")??,
         )
@@ -3027,11 +3033,12 @@ impl ReplicatedVolumeRuntime {
         ))
     }
 
-    /// Converges one writer grant, private ublk backend, mapping, and ext4 mount.
+    /// Converges one writer grant, private ublk backend, mapping, and filesystem mount.
     pub async fn mount_volume(
         &self,
         key: ReplicaKey,
         ownership: crate::volumes::types::FilesystemOwnership,
+        filesystem: crate::volumes::types::ReplicatedVolumeFilesystem,
     ) -> Result<PathBuf> {
         self.ensure_generation_desired(key)?;
         let _lifecycle = self.driver_lifecycle.read().await;
@@ -3146,8 +3153,15 @@ impl ReplicatedVolumeRuntime {
         let mapped_path = self
             .ensure_mapped_volume_device(record.descriptor(), backend_path)
             .await?;
-        self.ensure_mounted_filesystem(key, &record, &attachment, &state, mapped_path, ownership)
-            .await
+        self.ensure_mounted_filesystem(
+            &record,
+            &attachment,
+            &state,
+            mapped_path,
+            ownership,
+            volume_filesystem(filesystem),
+        )
+        .await
     }
 
     /// Removes a fenced stale attachment before allocating or reusing one mount session.
@@ -3684,16 +3698,17 @@ impl ReplicatedVolumeRuntime {
         Ok(driver)
     }
 
-    /// Formats the deterministic ext4 image and saves each mount level locally.
+    /// Formats the selected filesystem and saves each mount level locally.
     async fn ensure_mounted_filesystem(
         &self,
-        key: ReplicaKey,
         record: &ReplicaRecord,
         attachment: &LocalAttachmentRecord,
         state: &VolumeControlState,
         mapped_path: PathBuf,
         ownership: crate::volumes::types::FilesystemOwnership,
+        filesystem: VolumeFilesystem,
     ) -> Result<PathBuf> {
+        let key = record.key();
         let fence = attachment
             .granted_fence()
             .context("local attachment has no committed writer fence")?;
@@ -3708,6 +3723,7 @@ impl ReplicatedVolumeRuntime {
             owner_uid,
             owner_gid,
             mode,
+            filesystem,
         )?;
         let saved = match attachment.volume_mount() {
             Some(current) if same_mount(current, &requested) => {
@@ -3722,7 +3738,8 @@ impl ReplicatedVolumeRuntime {
                 requested
             }
         };
-        self.ensure_filesystem(record, &mapped_path).await?;
+        self.ensure_filesystem(record, &mapped_path, filesystem)
+            .await?;
         let fs = self.fs.clone();
         let mount_path = path.clone();
         let mount_device = mapped_path;
@@ -3732,7 +3749,7 @@ impl ReplicatedVolumeRuntime {
                 "mantissa-volume-mount",
                 self.operation_timeout,
                 move || -> Result<()> {
-                    fs.mount(&mount_device, &mount_path)?;
+                    fs.mount(filesystem, &mount_device, &mount_path)?;
                     crate::volumes::permissions::apply_filesystem_ownership(
                         &mount_path,
                         owner_uid,
@@ -3742,7 +3759,7 @@ impl ReplicatedVolumeRuntime {
                 },
             )
             .await
-            .context("mount replicated ext4 filesystem")?;
+            .context("mount replicated-volume filesystem")?;
         if let Err(error) = self.ensure_generation_desired(key) {
             self.remove_saved_mount(key, &saved).await?;
             return Err(error);
@@ -3757,7 +3774,7 @@ impl ReplicatedVolumeRuntime {
         .is_err()
         {
             self.remove_saved_mount(key, &saved).await?;
-            anyhow::bail!("writer grant changed while ext4 was mounting");
+            anyhow::bail!("writer grant changed while the filesystem was mounting");
         }
         if saved.state() == SavedMountState::Mounting {
             let mounted = saved.with_state(SavedMountState::Mounted)?;
@@ -3768,37 +3785,40 @@ impl ReplicatedVolumeRuntime {
         Ok(path)
     }
 
-    /// Creates or verifies the one deterministic ext4 filesystem per generation.
+    /// Creates or verifies the selected deterministic filesystem per generation.
     async fn ensure_filesystem(
         &self,
         record: &ReplicaRecord,
         mapped_path: &std::path::Path,
+        filesystem: VolumeFilesystem,
     ) -> Result<()> {
         let key = record.key();
         let filesystem_id = deterministic_filesystem_id(key)?;
-        let profile_hash = self.fs.format_profile_hash();
+        let profile_hash = self.fs.format_profile_hash(filesystem);
         let prior = self
             .replicas
             .replica(key)?
             .context("local replica disappeared before filesystem format")?
             .filesystem_format();
         if let Some(saved) = prior
-            && (saved.filesystem_id() != filesystem_id || saved.profile_hash() != profile_hash)
+            && (saved.filesystem() != filesystem
+                || saved.filesystem_id() != filesystem_id
+                || saved.profile_hash() != profile_hash)
         {
             anyhow::bail!("saved filesystem format conflicts with deterministic settings");
         }
         let signatures = self.fs.probe(mapped_path).await?;
-        if is_exact_ext4(&signatures, filesystem_id) {
-            if let Some(saved) = prior {
-                self.replicas.clear_filesystem_format(key, saved)?;
-            }
+        if prior.is_none() && is_exact_filesystem(&signatures, filesystem, filesystem_id) {
             return Ok(());
         }
         if prior.is_none() && !signatures.is_empty() {
             anyhow::bail!("unformatted volume contains a foreign filesystem signature");
         }
-        let saved =
-            prior.unwrap_or_else(|| SavedFilesystemFormat::new(filesystem_id, profile_hash));
+        // A saved format receipt means mkfs may have stopped after writing a
+        // recognizable superblock. Reformat the still-unmounted device rather
+        // than accepting a filesystem whose initialization did not finish.
+        let saved = prior
+            .unwrap_or_else(|| SavedFilesystemFormat::new(filesystem, filesystem_id, profile_hash));
         self.replicas.save_filesystem_format(key, saved)?;
         let progress = {
             let driver = self
@@ -3814,12 +3834,18 @@ impl ReplicatedVolumeRuntime {
                 "mantissa-volume-format",
                 self.operation_timeout,
                 async move {
-                    fs.format(&format_device, filesystem_id, prior.is_some(), progress)
-                        .await
+                    fs.format(
+                        filesystem,
+                        &format_device,
+                        filesystem_id,
+                        prior.is_some(),
+                        progress,
+                    )
+                    .await
                 },
             )
             .await
-            .context("format deterministic replicated ext4 filesystem")?;
+            .context("format deterministic replicated-volume filesystem")?;
         let flush = {
             let driver = self
                 .tracked_driver(key)
@@ -3828,8 +3854,11 @@ impl ReplicatedVolumeRuntime {
         };
         flush.run().await?;
         let signatures = self.fs.probe(mapped_path).await?;
-        if !is_exact_ext4(&signatures, filesystem_id) {
-            anyhow::bail!("ext4 format did not create the deterministic filesystem UUID");
+        if !is_exact_filesystem(&signatures, filesystem, filesystem_id) {
+            anyhow::bail!(
+                "{} format did not create the deterministic filesystem UUID",
+                filesystem.name()
+            );
         }
         self.replicas.clear_filesystem_format(key, saved)?;
         Ok(())
@@ -4027,19 +4056,20 @@ impl ReplicatedVolumeRuntime {
         }
         let fs = self.fs.clone();
         let path = unmounting.path().to_path_buf();
+        let filesystem = unmounting.filesystem();
         self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-unmount",
                 self.stop_io_timeout,
                 move || -> Result<()> {
-                    fs.unmount_saved(&path)?;
+                    fs.unmount_saved(filesystem, &path)?;
                     fs.remove_mount_path(&path)?;
                     Ok(())
                 },
             )
             .await
-            .context("unmount replicated ext4 filesystem")?;
+            .context("unmount replicated-volume filesystem")?;
         self.replicas.clear_volume_mount(key, &unmounting)?;
         Ok(())
     }
@@ -4078,19 +4108,20 @@ impl ReplicatedVolumeRuntime {
         }
         let fs = self.fs.clone();
         let path = unmounting.path().to_path_buf();
+        let filesystem = unmounting.filesystem();
         self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-detach",
                 self.stop_io_timeout,
                 move || -> Result<()> {
-                    fs.detach_saved(&path)?;
+                    fs.detach_saved(filesystem, &path)?;
                     fs.remove_mount_path(&path)?;
                     Ok(())
                 },
             )
             .await
-            .context("detach fenced replicated ext4 filesystem")?;
+            .context("detach fenced replicated-volume filesystem")?;
         Ok(())
     }
 
@@ -4553,7 +4584,9 @@ impl ReplicatedVolumeRuntime {
         if saved.path() != self.fs.mount_path(key) {
             anyhow::bail!("saved mount path differs from the configured deterministic path");
         }
-        self.ensure_filesystem(record, &mapped_path).await?;
+        let filesystem = saved.filesystem();
+        self.ensure_filesystem(record, &mapped_path, filesystem)
+            .await?;
         let fs = self.fs.clone();
         let path = saved.path().to_path_buf();
         let owner_uid = saved.owner_uid();
@@ -4565,14 +4598,14 @@ impl ReplicatedVolumeRuntime {
                 "mantissa-volume-mount",
                 self.operation_timeout,
                 move || -> Result<()> {
-                    fs.mount(&mapped_path, &path)?;
+                    fs.mount(filesystem, &mapped_path, &path)?;
                     crate::volumes::permissions::apply_filesystem_ownership(
                         &path, owner_uid, owner_gid, mode,
                     )
                 },
             )
             .await
-            .context("recover saved ext4 mount")?;
+            .context("recover saved replicated-volume mount")?;
         if saved.state() == SavedMountState::Mounting {
             self.replicas.replace_volume_mount(
                 key,
@@ -4645,7 +4678,7 @@ impl ReplicatedVolumeRuntime {
                         },
                     )
                     .await
-                    .context("make dead mapped backend fail before detaching ext4")?;
+                    .context("make dead mapped backend fail before detaching filesystem")?;
             }
             self.detach_quarantined_mount(key, &volume_mount).await?;
         }
@@ -5120,10 +5153,10 @@ fn saved_writer_fence(
     Ok(data.fence)
 }
 
-/// Derives the ext4 UUID solely from the immutable volume generation.
+/// Derives the filesystem UUID solely from the immutable volume generation.
 fn deterministic_filesystem_id(key: ReplicaKey) -> Result<mantissa_volume::FilesystemId> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"mantissa replicated volume ext4 filesystem v1");
+    hasher.update(b"mantissa replicated volume filesystem v1");
     hasher.update(key.volume_id().as_bytes());
     hasher.update(&key.generation().get().to_be_bytes());
     let digest = hasher.finalize();
@@ -5140,6 +5173,7 @@ fn same_mount(left: &SavedVolumeMount, right: &SavedVolumeMount) -> bool {
         && left.owner_uid() == right.owner_uid()
         && left.owner_gid() == right.owner_gid()
         && left.mode() == right.mode()
+        && left.filesystem() == right.filesystem()
 }
 
 /// Requires every current copy to have published the committed served bound.
@@ -5166,12 +5200,23 @@ fn replacement_capacity_can_converge(
     saved.has_same_storage_identity(committed) && saved.capacity() <= committed.capacity()
 }
 
-/// Returns true only for the one exact deterministic ext4 signature.
-fn is_exact_ext4(
-    signatures: &[ext4::Signature],
+/// Returns true only for the selected deterministic filesystem signature.
+fn is_exact_filesystem(
+    signatures: &[volume::Signature],
+    filesystem: VolumeFilesystem,
     filesystem_id: mantissa_volume::FilesystemId,
 ) -> bool {
-    signatures.len() == 1 && signatures[0].is_ext4(filesystem_id)
+    signatures.len() == 1 && signatures[0].matches(filesystem, filesystem_id)
+}
+
+/// Converts the desired-volume value into the filesystem manager value.
+const fn volume_filesystem(
+    filesystem: crate::volumes::types::ReplicatedVolumeFilesystem,
+) -> VolumeFilesystem {
+    match filesystem {
+        crate::volumes::types::ReplicatedVolumeFilesystem::Ext4 => VolumeFilesystem::Ext4,
+        crate::volumes::types::ReplicatedVolumeFilesystem::Xfs => VolumeFilesystem::Xfs,
+    }
 }
 
 /// Accepts safe degraded, stable, or joint membership seen during replacement.

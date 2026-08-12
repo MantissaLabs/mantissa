@@ -189,6 +189,8 @@ pub struct ExternalVolumeSpec {
 pub struct ReplicatedVolumeSpec {
     #[serde(default)]
     pub ownership: crate::volumes::FilesystemOwnership,
+    #[serde(default)]
+    pub filesystem: crate::volumes::ReplicatedVolumeFilesystem,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -509,6 +511,14 @@ impl ServiceManifest {
                         "replicated volume '{}' must set capacity_mb",
                         volume.name
                     ));
+                }
+                if let (VolumeDriver::Replicated(replicated), Some(capacity_mb)) =
+                    (&volume.driver, volume.capacity_mb)
+                {
+                    crate::volumes::validate_replicated_filesystem_capacity(
+                        replicated.filesystem,
+                        crate::volumes::capacity_mb_to_bytes(capacity_mb)?,
+                    )?;
                 }
             }
             if matches!(volume.binding_mode, VolumeBindingMode::Immediate)
@@ -1216,8 +1226,9 @@ mod tests {
                         name: "data",
                         driver: replicated((
                             ownership: fs_group(gid: 2000),
+                            filesystem: xfs,
                         )),
-                        capacity_mb: Some(64),
+                        capacity_mb: Some(300),
                     ),
                 ],
                 tasks: [
@@ -1248,7 +1259,8 @@ mod tests {
         assert!(matches!(
             &manifest.volumes[0].driver,
             VolumeDriver::Replicated(ReplicatedVolumeSpec {
-                ownership: crate::volumes::FilesystemOwnership::FsGroup { gid: 2_000 }
+                ownership: crate::volumes::FilesystemOwnership::FsGroup { gid: 2_000 },
+                filesystem: crate::volumes::ReplicatedVolumeFilesystem::Xfs,
             })
         ));
     }
@@ -1958,7 +1970,8 @@ mod tests {
         assert!(matches!(
             manifest.volumes[0].driver,
             VolumeDriver::Replicated(ReplicatedVolumeSpec {
-                ownership: crate::volumes::FilesystemOwnership::User { uid: 70, gid: 70 }
+                ownership: crate::volumes::FilesystemOwnership::User { uid: 70, gid: 70 },
+                filesystem: crate::volumes::ReplicatedVolumeFilesystem::Xfs,
             })
         ));
     }

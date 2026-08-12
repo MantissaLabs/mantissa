@@ -14,6 +14,7 @@ use anyhow::{Result, anyhow};
 use mantissa_protocol::topology::node_info;
 use uuid::Uuid;
 
+pub(crate) use create::validate_replicated_filesystem_capacity;
 pub use create::{VolumeCreateDriver, VolumeCreateRequest, create, create_with_request};
 pub use delete::delete;
 pub use expand::expand;
@@ -23,11 +24,11 @@ pub use list::list;
 pub use restore::restore;
 pub use status::status;
 pub use types::{
-    DesiredVolumeDisposition, FilesystemOwnership, ReplicatedVolumeGroupStatus,
-    ReplicatedVolumePlan, VolumeAccessMode, VolumeBindingMode, VolumeDeleteDisposition,
-    VolumeDeleteResult, VolumeDriver, VolumeExpandResult, VolumeFilesystemSpace, VolumeInspect,
-    VolumeLabel, VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec, VolumeState,
-    VolumeStatus, VolumeSummary,
+    DesiredVolumeDisposition, FilesystemOwnership, ReplicatedVolumeFilesystem,
+    ReplicatedVolumeGroupStatus, ReplicatedVolumePlan, VolumeAccessMode, VolumeBindingMode,
+    VolumeDeleteDisposition, VolumeDeleteResult, VolumeDriver, VolumeExpandResult,
+    VolumeFilesystemSpace, VolumeInspect, VolumeLabel, VolumeNodeState, VolumeNodeStatus,
+    VolumeReclaimPolicy, VolumeSpec, VolumeState, VolumeStatus, VolumeSummary,
 };
 
 /// Converts MiB to bytes and rejects values that are too large for `u64`.

@@ -773,6 +773,14 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                             name: args.name,
                             driver,
                             ownership,
+                            filesystem: match args.filesystem {
+                                ReplicatedVolumeFilesystemOpt::Ext4 => {
+                                    mantissa_client::volumes::ReplicatedVolumeFilesystem::Ext4
+                                }
+                                ReplicatedVolumeFilesystemOpt::Xfs => {
+                                    mantissa_client::volumes::ReplicatedVolumeFilesystem::Xfs
+                                }
+                            },
                             binding_mode: binding,
                             reclaim_policy: reclaim,
                             initial_capacity_bytes: args

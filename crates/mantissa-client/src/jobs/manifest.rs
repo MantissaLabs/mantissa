@@ -186,6 +186,8 @@ pub struct ExternalVolumeSpec {
 pub struct ReplicatedVolumeSpec {
     #[serde(default)]
     pub ownership: crate::volumes::FilesystemOwnership,
+    #[serde(default)]
+    pub filesystem: crate::volumes::ReplicatedVolumeFilesystem,
 }
 
 /// Driver backing for one declared manifest volume.
@@ -353,6 +355,10 @@ impl JobManifest {
                     VolumeDriver::External(_) => None,
                     VolumeDriver::Replicated(replicated) => Some(replicated.ownership.clone()),
                 },
+                replicated_filesystem: match &volume.driver {
+                    VolumeDriver::Replicated(replicated) => Some(replicated.filesystem),
+                    VolumeDriver::Local(_) | VolumeDriver::External(_) => None,
+                },
                 access_mode: match volume.access_mode {
                     VolumeAccessMode::ReadWriteOnce => {
                         crate::volumes::VolumeAccessMode::ReadWriteOnce
@@ -437,6 +443,14 @@ fn validate_declared_volumes(volumes: &[JobVolumeSpec]) -> Result<HashSet<String
                     "replicated volume '{}' must set capacity_mb",
                     volume.name
                 ));
+            }
+            if let (VolumeDriver::Replicated(replicated), Some(capacity_mb)) =
+                (&volume.driver, volume.capacity_mb)
+            {
+                crate::volumes::validate_replicated_filesystem_capacity(
+                    replicated.filesystem,
+                    crate::volumes::capacity_mb_to_bytes(capacity_mb)?,
+                )?;
             }
         }
         if matches!(volume.binding_mode, VolumeBindingMode::Immediate)
@@ -785,6 +799,7 @@ mod tests {
         let mut manifest = base_manifest();
         manifest.volumes[0].driver = VolumeDriver::Replicated(ReplicatedVolumeSpec {
             ownership: crate::volumes::FilesystemOwnership::FsGroup { gid: 2_000 },
+            filesystem: crate::volumes::ReplicatedVolumeFilesystem::Ext4,
         });
         manifest.volumes[0].capacity_mb = Some(64);
 
@@ -807,6 +822,7 @@ mod tests {
         let mut manifest = base_manifest();
         manifest.volumes[0].driver = VolumeDriver::Replicated(ReplicatedVolumeSpec {
             ownership: crate::volumes::FilesystemOwnership::Daemon,
+            filesystem: crate::volumes::ReplicatedVolumeFilesystem::Ext4,
         });
         manifest.volumes[0].capacity_mb = None;
 

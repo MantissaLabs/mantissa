@@ -1,10 +1,25 @@
 use super::{
-    FilesystemOwnership, VolumeBindingMode, VolumeLabel, VolumeSpec, parse_volume_labels,
-    resolve_node_selector,
+    FilesystemOwnership, ReplicatedVolumeFilesystem, VolumeBindingMode, VolumeLabel, VolumeSpec,
+    parse_volume_labels, resolve_node_selector,
 };
 use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::{Context, Result, anyhow};
+
+const XFS_MIN_VOLUME_BYTES: u64 = 300 * 1024 * 1024;
+
+/// Checks the minimum capacity imposed by the selected filesystem profile.
+pub(crate) fn validate_replicated_filesystem_capacity(
+    filesystem: ReplicatedVolumeFilesystem,
+    capacity_bytes: u64,
+) -> Result<()> {
+    if filesystem == ReplicatedVolumeFilesystem::Xfs && capacity_bytes < XFS_MIN_VOLUME_BYTES {
+        return Err(anyhow!(
+            "XFS replicated volumes require at least 300 MiB of capacity"
+        ));
+    }
+    Ok(())
+}
 
 /// Storage driver selected for a newly created managed volume.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -20,6 +35,7 @@ pub struct VolumeCreateRequest {
     pub name: String,
     pub driver: VolumeCreateDriver,
     pub ownership: FilesystemOwnership,
+    pub filesystem: ReplicatedVolumeFilesystem,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: super::VolumeReclaimPolicy,
     pub initial_capacity_bytes: Option<u64>,
@@ -30,12 +46,20 @@ pub struct VolumeCreateRequest {
 impl VolumeCreateRequest {
     /// Checks driver, binding, node, and capacity rules before sending the request.
     pub fn validate(&self) -> Result<()> {
+        if matches!(self.driver, VolumeCreateDriver::Replicated)
+            && let Some(capacity_bytes) = self.initial_capacity_bytes
+        {
+            validate_replicated_filesystem_capacity(self.filesystem, capacity_bytes)?;
+        }
         match self.driver {
             VolumeCreateDriver::Local
                 if matches!(self.binding_mode, VolumeBindingMode::Immediate)
                     && self.node_selector.is_none() =>
             {
                 Err(anyhow!("immediate local volumes require --node"))
+            }
+            VolumeCreateDriver::Local if self.filesystem != ReplicatedVolumeFilesystem::Ext4 => {
+                Err(anyhow!("--filesystem applies only to replicated volumes"))
             }
             VolumeCreateDriver::Replicated
                 if !matches!(self.binding_mode, VolumeBindingMode::WaitForFirstConsumer) =>
@@ -101,10 +125,25 @@ pub async fn create_with_request(
     {
         let mut inner = create.get().init_request();
         inner.set_name(&request.name);
-        let driver = inner.reborrow().init_driver();
+        let mut driver = inner.reborrow().init_driver();
         let mut ownership = match request.driver {
-            VolumeCreateDriver::Local => driver.init_local().init_managed().init_ownership(),
-            VolumeCreateDriver::Replicated => driver.init_replicated().init_ownership(),
+            VolumeCreateDriver::Local => driver
+                .reborrow()
+                .init_local()
+                .init_managed()
+                .init_ownership(),
+            VolumeCreateDriver::Replicated => {
+                let mut replicated = driver.reborrow().init_replicated();
+                replicated.set_filesystem(match request.filesystem {
+                    ReplicatedVolumeFilesystem::Ext4 => {
+                        mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Ext4
+                    }
+                    ReplicatedVolumeFilesystem::Xfs => {
+                        mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Xfs
+                    }
+                });
+                replicated.init_ownership()
+            }
         };
         match &request.ownership {
             FilesystemOwnership::Daemon => ownership.set_daemon(()),
@@ -167,6 +206,7 @@ mod tests {
             name: "data".to_string(),
             driver: VolumeCreateDriver::Replicated,
             ownership: FilesystemOwnership::Daemon,
+            filesystem: ReplicatedVolumeFilesystem::Ext4,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: super::super::VolumeReclaimPolicy::Retain,
             initial_capacity_bytes: Some(64 * 1024 * 1024),
@@ -223,6 +263,24 @@ mod tests {
                 .expect_err("fixed replicated node")
                 .to_string()
                 .contains("choose their nodes")
+        );
+    }
+
+    /// XFS uses a larger minimum volume because mkfs.xfs rejects tiny devices.
+    #[test]
+    fn replicated_create_checks_xfs_minimum_capacity() {
+        let mut request = replicated_request();
+        request.filesystem = ReplicatedVolumeFilesystem::Xfs;
+        request.initial_capacity_bytes = Some(XFS_MIN_VOLUME_BYTES);
+        assert!(request.validate().is_ok());
+
+        request.initial_capacity_bytes = Some(XFS_MIN_VOLUME_BYTES - 4096);
+        assert!(
+            request
+                .validate()
+                .expect_err("XFS volume below minimum")
+                .to_string()
+                .contains("at least 300 MiB")
         );
     }
 }

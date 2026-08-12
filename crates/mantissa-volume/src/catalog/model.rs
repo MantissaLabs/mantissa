@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::driver::{InvalidUblkSettings, UblkDeviceId, UblkQueueSettings, UblkSettings};
+use crate::fs::volume::ReplicatedVolumeFilesystem;
 use crate::{
     DriverSessionId, FenceEpoch, FilesystemId, OperationId, ReplacementId, VolumeDescriptor,
     VolumeGeneration, VolumeId,
@@ -333,7 +334,7 @@ impl SavedUblkDevice {
     }
 }
 
-/// Last saved step for one local ext4 mount.
+/// Last saved step for one local filesystem mount.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SavedMountState {
     /// The mount is required but may not yet exist in the kernel.
@@ -346,7 +347,7 @@ pub enum SavedMountState {
     Unmounting,
 }
 
-/// One ext4 mount saved so it can be restored or removed after a restart.
+/// One filesystem mount saved so it can be restored or removed after a restart.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavedVolumeMount {
     state: SavedMountState,
@@ -357,6 +358,7 @@ pub struct SavedVolumeMount {
     owner_gid: u32,
     mode: u32,
     filesystem_expanded_to_bytes: u64,
+    filesystem: ReplicatedVolumeFilesystem,
 }
 
 impl SavedVolumeMount {
@@ -368,6 +370,7 @@ impl SavedVolumeMount {
         owner_uid: u32,
         owner_gid: u32,
         mode: u32,
+        filesystem: ReplicatedVolumeFilesystem,
     ) -> Result<Self, InvalidSavedVolumeMount> {
         Self::from_stored_parts(
             SavedMountState::Mounting,
@@ -378,6 +381,7 @@ impl SavedVolumeMount {
             owner_gid,
             mode,
             0,
+            filesystem,
         )
     }
 
@@ -392,6 +396,7 @@ impl SavedVolumeMount {
         owner_gid: u32,
         mode: u32,
         filesystem_expanded_to_bytes: u64,
+        filesystem: ReplicatedVolumeFilesystem,
     ) -> Result<Self, InvalidSavedVolumeMount> {
         if !path.is_absolute() {
             return Err(InvalidSavedVolumeMount::PathNotAbsolute);
@@ -408,6 +413,7 @@ impl SavedVolumeMount {
             owner_gid,
             mode,
             filesystem_expanded_to_bytes,
+            filesystem,
         })
     }
 
@@ -453,10 +459,16 @@ impl SavedVolumeMount {
         self.mode
     }
 
-    /// Returns the largest mapped capacity to which ext4 was successfully expanded.
+    /// Returns the largest mapped capacity successfully passed to the grow tool.
     #[must_use]
     pub const fn filesystem_expanded_to_bytes(&self) -> u64 {
         self.filesystem_expanded_to_bytes
+    }
+
+    /// Returns the exact filesystem expected at the saved mount.
+    #[must_use]
+    pub const fn filesystem(&self) -> ReplicatedVolumeFilesystem {
+        self.filesystem
     }
 
     /// Returns the same mounted filesystem owned by a later session fence.
@@ -506,6 +518,7 @@ impl SavedVolumeMount {
             && self.owner_uid == next.owner_uid
             && self.owner_gid == next.owner_gid
             && self.mode == next.mode
+            && self.filesystem == next.filesystem
             && self
                 .with_state(next.state)
                 .is_ok_and(|state| state.state == next.state)
@@ -536,21 +549,33 @@ pub enum InvalidSavedVolumeMount {
     FilesystemCapacityMovedBackwards,
 }
 
-/// One unfinished ext4 format saved across a daemon restart.
+/// One unfinished filesystem format saved across a daemon restart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SavedFilesystemFormat {
     filesystem_id: FilesystemId,
     profile_hash: [u8; 32],
+    filesystem: ReplicatedVolumeFilesystem,
 }
 
 impl SavedFilesystemFormat {
-    /// Saves the attachment, UUID, and ext4 profile before mkfs starts.
+    /// Saves the filesystem, UUID, and profile before mkfs starts.
     #[must_use]
-    pub const fn new(filesystem_id: FilesystemId, profile_hash: [u8; 32]) -> Self {
+    pub const fn new(
+        filesystem: ReplicatedVolumeFilesystem,
+        filesystem_id: FilesystemId,
+        profile_hash: [u8; 32],
+    ) -> Self {
         Self {
             filesystem_id,
             profile_hash,
+            filesystem,
         }
+    }
+
+    /// Returns the exact filesystem whose format is in progress.
+    #[must_use]
+    pub const fn filesystem(self) -> ReplicatedVolumeFilesystem {
+        self.filesystem
     }
 
     /// Returns the UUID that mkfs must write.
@@ -559,7 +584,7 @@ impl SavedFilesystemFormat {
         self.filesystem_id
     }
 
-    /// Returns the hash of the exact ext4 format profile.
+    /// Returns the hash of the exact filesystem format profile.
     #[must_use]
     pub const fn profile_hash(self) -> [u8; 32] {
         self.profile_hash
@@ -639,7 +664,7 @@ impl ReplicaRecord {
         self.reserved
     }
 
-    /// Returns one unfinished ext4 format saved on this node.
+    /// Returns one unfinished filesystem format saved on this node.
     #[must_use]
     pub const fn filesystem_format(&self) -> Option<SavedFilesystemFormat> {
         self.filesystem_format
@@ -670,12 +695,12 @@ impl ReplicaRecord {
         self.reserved = reserved;
     }
 
-    /// Saves one unfinished ext4 format before tool writes begin.
+    /// Saves one unfinished filesystem format before tool writes begin.
     pub(super) fn set_filesystem_format(&mut self, format: SavedFilesystemFormat) {
         self.filesystem_format = Some(format);
     }
 
-    /// Clears an ext4 format after the committed state says it finished.
+    /// Clears a filesystem format after the committed state says it finished.
     pub(super) fn clear_filesystem_format(&mut self) {
         self.filesystem_format = None;
     }

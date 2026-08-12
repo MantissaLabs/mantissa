@@ -13,13 +13,14 @@ host path. Scheduling keeps workloads that use either form on that node.
 The `replicated` driver stores three copies on three different nodes. Raft
 elects the writer and commits its writer fence with a quorum. The separate
 block data path sends each change to the current copies in order. The node
-running the workload exposes the volume through ublk and mounts its ext4
-filesystem. Losing quorum fences writes until the volume can make a safe
-control decision again.
+running the workload exposes the volume through ublk and mounts the selected
+ext4 or XFS filesystem. Losing quorum fences writes until the volume can make
+a safe control decision again.
 
 Replicated volumes require a capacity and `wait_for_first_consumer` binding.
 The scheduler chooses the workload node and the storage controller selects the
-three nodes that hold the copies.
+three nodes that hold the copies. ext4 is the default. XFS volumes require at
+least 300 MiB and use the same online expansion path as ext4.
 
 External drivers, read-write-many mounts, snapshots, and live migration are
 not supported yet.
@@ -51,6 +52,7 @@ Create a replicated volume:
 mantissa volumes create \
   --name dbdata \
   --driver replicated \
+  --filesystem xfs \
   --capacity-mb 10240
 ```
 

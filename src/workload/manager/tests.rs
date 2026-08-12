@@ -262,6 +262,7 @@ impl super::volumes::ReplicatedVolumeAccess for FakeReplicatedVolumeAccess {
         &self,
         _key: mantissa_volume::catalog::ReplicaKey,
         _ownership: FilesystemOwnership,
+        _filesystem: crate::volumes::types::ReplicatedVolumeFilesystem,
     ) -> Result<std::path::PathBuf> {
         self.mount_calls.fetch_add(1, Ordering::AcqRel);
         if self.fail_mount.load(Ordering::Acquire) {
@@ -1410,6 +1411,7 @@ async fn create_ready_replicated_volume(manager: &WorkloadManager, name: &str) -
         name: name.to_string(),
         driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
             ownership: FilesystemOwnership::Daemon,
+            filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Ext4,
         }),
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::WaitForFirstConsumer,

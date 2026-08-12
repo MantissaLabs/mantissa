@@ -250,6 +250,7 @@ provision:
         curl \
         dmsetup \
         e2fsprogs \
+        xfsprogs \
         git \
         htop \
         iputils-ping \

@@ -2885,6 +2885,14 @@
         ],
         "type": "object"
       },
+      "ReplicatedVolumeFilesystem": {
+        "description": "Filesystem created inside one replicated block volume.",
+        "enum": [
+          "ext4",
+          "xfs"
+        ],
+        "type": "string"
+      },
       "ReplicatedVolumeGroupStatus": {
         "description": "REST-facing status copied from the replicated volume's Raft state.",
         "properties": {
@@ -3079,6 +3087,9 @@
       "ReplicatedVolumeSpec": {
         "description": "Mantissa-managed replicated volume settings.",
         "properties": {
+          "filesystem": {
+            "$ref": "#/components/schemas/ReplicatedVolumeFilesystem"
+          },
           "ownership": {
             "$ref": "#/components/schemas/FilesystemOwnership"
           }
@@ -4605,6 +4616,9 @@
           "driver": {
             "$ref": "#/components/schemas/VolumeCreateDriver"
           },
+          "filesystem": {
+            "$ref": "#/components/schemas/ReplicatedVolumeFilesystem"
+          },
           "initial_capacity_bytes": {
             "format": "int64",
             "minimum": 0,
@@ -4673,6 +4687,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "filesystem": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReplicatedVolumeFilesystem"
+              }
             ]
           },
           "handle": {

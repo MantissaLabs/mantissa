@@ -22,6 +22,9 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
     writeln!(&mut rendered, "  Volume: {}", volume.spec.name)?;
     writeln!(&mut rendered, "  ID: {}", volume.spec.id)?;
     writeln!(&mut rendered, "  State: {}", volume.state)?;
+    if let mantissa_client::volumes::VolumeDriver::Replicated(filesystem) = &volume.spec.driver {
+        writeln!(&mut rendered, "  Filesystem type: {filesystem}")?;
+    }
     writeln!(
         &mut rendered,
         "  Desired disposition: {}",
@@ -30,7 +33,7 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
     writeln!(&mut rendered, "  Bound node: {}", format_bound_node(volume))?;
     if matches!(
         volume.spec.driver,
-        mantissa_client::volumes::VolumeDriver::Replicated
+        mantissa_client::volumes::VolumeDriver::Replicated(_)
     ) {
         writeln!(
             &mut rendered,

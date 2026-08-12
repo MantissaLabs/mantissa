@@ -1142,6 +1142,7 @@ mod tests {
             name: name.to_string(),
             driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
                 ownership: FilesystemOwnership::Daemon,
+                filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Ext4,
             }),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode,

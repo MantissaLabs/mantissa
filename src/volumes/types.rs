@@ -7,6 +7,9 @@ use uuid::Uuid;
 /// Logical block size supported by the first replicated-volume profile.
 pub const REPLICATED_VOLUME_BLOCK_SIZE: u64 = 4096;
 
+/// Smallest device on which the supported XFS profile can be created.
+const XFS_MIN_VOLUME_BYTES: u64 = 300 * 1024 * 1024;
+
 /// One user-defined key/value pair attached to a volume object.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VolumeLabel {
@@ -322,6 +325,23 @@ pub struct ExternalVolumeSpec {
 pub struct ReplicatedVolumeSpec {
     /// Ownership and permissions applied after the filesystem is mounted.
     pub ownership: FilesystemOwnership,
+
+    /// Filesystem created inside the replicated block device.
+    pub filesystem: ReplicatedVolumeFilesystem,
+}
+
+/// Filesystem created inside one replicated block volume.
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicatedVolumeFilesystem {
+    /// Linux ext4 expanded online with resize2fs.
+    #[default]
+    Ext4,
+
+    /// Linux XFS expanded online with xfs_growfs.
+    Xfs,
 }
 
 /// Driver configuration stored on one volume object.
@@ -360,6 +380,8 @@ pub enum VolumeRequestError {
     },
     #[error("replicated volume capacity cannot fit in 64-bit replica accounting")]
     CapacityOverflow,
+    #[error("XFS replicated volumes require at least 300 MiB of capacity")]
+    XfsCapacityTooSmall,
     #[error("replicated volumes require a non-zero bootstrap-plan coordinator")]
     MissingPlanCoordinator,
     #[error("only replicated volumes may name a bootstrap-plan coordinator")]
@@ -444,6 +466,16 @@ impl VolumeSpecValue {
                 initial_capacity_bytes,
                 block_size: REPLICATED_VOLUME_BLOCK_SIZE,
             });
+        }
+        if matches!(
+            &self.driver,
+            VolumeDriver::Replicated(ReplicatedVolumeSpec {
+                filesystem: ReplicatedVolumeFilesystem::Xfs,
+                ..
+            })
+        ) && initial_capacity_bytes < XFS_MIN_VOLUME_BYTES
+        {
+            return Err(VolumeRequestError::XfsCapacityTooSmall);
         }
         let replica_space =
             mantissa_volume::storage_format::ReplicaSpace::for_capacity(initial_capacity_bytes)
@@ -1103,6 +1135,7 @@ mod tests {
             name: "data".to_string(),
             driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
                 ownership: FilesystemOwnership::Daemon,
+                filesystem: ReplicatedVolumeFilesystem::Ext4,
             }),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
@@ -1148,6 +1181,23 @@ mod tests {
         assert_eq!(
             local.validate_request(),
             Err(VolumeRequestError::UnexpectedPlanCoordinator)
+        );
+    }
+
+    /// XFS requests are rejected before planning if mkfs.xfs cannot create them.
+    #[test]
+    fn xfs_request_requires_minimum_capacity() {
+        let mut request = replicated_request(XFS_MIN_VOLUME_BYTES);
+        request.driver = VolumeDriver::Replicated(ReplicatedVolumeSpec {
+            ownership: FilesystemOwnership::Daemon,
+            filesystem: ReplicatedVolumeFilesystem::Xfs,
+        });
+        assert_eq!(request.validate_request(), Ok(()));
+
+        request.initial_capacity_bytes = Some(XFS_MIN_VOLUME_BYTES - 4096);
+        assert_eq!(
+            request.validate_request(),
+            Err(VolumeRequestError::XfsCapacityTooSmall)
         );
     }
 

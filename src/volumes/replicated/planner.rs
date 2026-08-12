@@ -275,6 +275,7 @@ mod tests {
             name: "coordinator-window".to_string(),
             driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
                 ownership: FilesystemOwnership::Daemon,
+                filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Ext4,
             }),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,

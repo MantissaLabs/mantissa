@@ -8,7 +8,7 @@ use mantissa_raft::protocol::{ProtocolLimitSettings, ProtocolLimits};
 use mantissa_raft::runtime::{RuntimeLimitSettings, RuntimeLimits};
 use mantissa_raft::transport::{TransportLimitSettings, TransportLimits};
 use mantissa_volume::driver::{DriverLimitSettings, DriverLimits, UblkQueueSettings};
-use mantissa_volume::fs::ext4;
+use mantissa_volume::fs::volume;
 use mantissa_volume::storage::replica_file::ReplicaFileSettings;
 use mantissa_volume::storage::replica_file::connection::ReplicaDataServerSettings;
 use mantissa_volume::storage::replica_file::data_path::FixedReplicaPathSettings;
@@ -24,7 +24,7 @@ const MIN_REPLACEMENT_MEMBERSHIP_NODES: u32 = 4;
 pub(crate) struct CheckedReplicatedVolumeConfig {
     pub(crate) pool_path: PathBuf,
     pub(crate) catalog_path: Option<PathBuf>,
-    pub(crate) fs: ext4::Settings,
+    pub(crate) fs: volume::Settings,
     pub(crate) listen_address: SocketAddr,
     pub(crate) advertise_address: SocketAddr,
     pub(crate) operation_timeout: Duration,
@@ -54,19 +54,22 @@ impl CheckedReplicatedVolumeConfig {
     /// Checks and converts every setting before any storage resource opens.
     pub(super) fn new(config: &ReplicatedVolumeConfig) -> Result<Self> {
         validate_paths(config)?;
-        let fs = ext4::Settings::new(ext4::Options {
+        let fs = volume::Settings::new(volume::Options {
             mount_root: PathBuf::from(&config.filesystem.mount_root),
             wipefs_path: PathBuf::from(&config.filesystem.wipefs_path),
             mkfs_ext4_path: PathBuf::from(&config.filesystem.mkfs_ext4_path),
             resize2fs_path: PathBuf::from(&config.filesystem.resize2fs_path),
+            mkfs_xfs_path: PathBuf::from(&config.filesystem.mkfs_xfs_path),
+            xfs_growfs_path: PathBuf::from(&config.filesystem.xfs_growfs_path),
             features: config.filesystem.features.clone(),
             inode_size_bytes: config.filesystem.inode_size_bytes,
             bytes_per_inode: config.filesystem.bytes_per_inode,
             reserved_space_percent: config.filesystem.reserved_space_percent,
             extended_options: config.filesystem.extended_options.clone(),
-            mount_options: config.filesystem.mount_options.clone(),
+            ext4_mount_options: config.filesystem.ext4_mount_options.clone(),
+            xfs_mount_options: config.filesystem.xfs_mount_options.clone(),
         })
-        .context("invalid replicated-volume ext4 settings")?;
+        .context("invalid replicated-volume filesystem settings")?;
 
         let listen_address = config
             .listen_address

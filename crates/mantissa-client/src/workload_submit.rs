@@ -31,6 +31,7 @@ pub struct DeclaredVolumeSpec {
     pub name: String,
     pub driver_kind: DeclaredVolumeDriverKind,
     pub filesystem_ownership: Option<volumes::FilesystemOwnership>,
+    pub replicated_filesystem: Option<volumes::ReplicatedVolumeFilesystem>,
     pub access_mode: volumes::VolumeAccessMode,
     pub binding_mode: volumes::VolumeBindingMode,
     pub reclaim_policy: volumes::VolumeReclaimPolicy,
@@ -615,6 +616,7 @@ pub async fn ensure_declared_volumes(
                     }
                 },
                 ownership: volume.filesystem_ownership.clone().unwrap_or_default(),
+                filesystem: volume.replicated_filesystem.unwrap_or_default(),
                 binding_mode: volume.binding_mode,
                 reclaim_policy: volume.reclaim_policy,
                 initial_capacity_bytes,
@@ -676,7 +678,8 @@ fn validate_declared_volume_compatibility(
             DeclaredVolumeDriverKind::LocalImportedPath,
         ) => {}
         (volumes::VolumeDriver::External { .. }, DeclaredVolumeDriverKind::External) => {}
-        (volumes::VolumeDriver::Replicated, DeclaredVolumeDriverKind::Replicated) => {}
+        (volumes::VolumeDriver::Replicated(filesystem), DeclaredVolumeDriverKind::Replicated)
+            if Some(*filesystem) == declared.replicated_filesystem => {}
         _ => {
             return Err(anyhow!(
                 "existing volume '{}' does not match the manifest driver/source kind",
@@ -711,7 +714,7 @@ fn validate_declared_volume_compatibility(
             declared.name
         ));
     }
-    if !matches!(existing.driver, volumes::VolumeDriver::Replicated)
+    if !matches!(existing.driver, volumes::VolumeDriver::Replicated(_))
         && existing.initial_capacity_bytes != initial_capacity_bytes
     {
         return Err(anyhow!(
@@ -749,7 +752,7 @@ async fn reconcile_declared_replicated_capacity(
     declared: &DeclaredVolumeSpec,
     target_capacity_bytes: Option<u64>,
 ) -> Result<()> {
-    if !matches!(existing.spec.driver, volumes::VolumeDriver::Replicated) {
+    if !matches!(existing.spec.driver, volumes::VolumeDriver::Replicated(_)) {
         return Ok(());
     }
     let target = target_capacity_bytes.context("replicated manifest volume has no capacity_mb")?;
@@ -785,6 +788,7 @@ mod volume_tests {
             name: "data".to_string(),
             driver_kind: DeclaredVolumeDriverKind::Replicated,
             filesystem_ownership: Some(volumes::FilesystemOwnership::FsGroup { gid: 2_000 }),
+            replicated_filesystem: Some(volumes::ReplicatedVolumeFilesystem::Ext4),
             access_mode: volumes::VolumeAccessMode::ReadWriteOnce,
             binding_mode: volumes::VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: volumes::VolumeReclaimPolicy::Retain,
@@ -797,7 +801,7 @@ mod volume_tests {
         let spec = volumes::VolumeSpec {
             id: Uuid::new_v4(),
             name: declared.name.clone(),
-            driver: volumes::VolumeDriver::Replicated,
+            driver: volumes::VolumeDriver::Replicated(volumes::ReplicatedVolumeFilesystem::Ext4),
             filesystem_ownership: declared.filesystem_ownership.clone(),
             access_mode: declared.access_mode,
             binding_mode: declared.binding_mode,

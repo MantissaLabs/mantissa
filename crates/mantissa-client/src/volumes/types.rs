@@ -9,7 +9,7 @@ use mantissa_protocol::volumes::{
     volume_expand_result, volume_filesystem_space, volume_inspect, volume_node_status, volume_spec,
     volume_summary,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
@@ -53,7 +53,7 @@ pub enum VolumeDriver {
     LocalManaged,
     LocalImportedPath(String),
     External { driver_name: String, handle: String },
-    Replicated,
+    Replicated(ReplicatedVolumeFilesystem),
 }
 
 impl fmt::Display for VolumeDriver {
@@ -63,7 +63,30 @@ impl fmt::Display for VolumeDriver {
             Self::LocalManaged => f.write_str("local(managed)"),
             Self::LocalImportedPath(path) => write!(f, "local(imported:{path})"),
             Self::External { driver_name, .. } => write!(f, "external({driver_name})"),
-            Self::Replicated => f.write_str("replicated"),
+            Self::Replicated(_) => f.write_str("replicated"),
+        }
+    }
+}
+
+/// Filesystem created inside one replicated block volume.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicatedVolumeFilesystem {
+    /// Linux ext4 expanded online with resize2fs.
+    #[default]
+    Ext4,
+
+    /// Linux XFS expanded online with xfs_growfs.
+    Xfs,
+}
+
+impl fmt::Display for ReplicatedVolumeFilesystem {
+    /// Renders the filesystem name accepted by manifests and the CLI.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ext4 => f.write_str("ext4"),
+            Self::Xfs => f.write_str("xfs"),
         }
     }
 }
@@ -833,7 +856,14 @@ fn parse_driver(
         )),
         volume_driver_spec::Which::External(Err(err)) => Err(anyhow!(err.to_string())),
         volume_driver_spec::Which::Replicated(Ok(replicated_reader)) => Ok((
-            VolumeDriver::Replicated,
+            VolumeDriver::Replicated(match replicated_reader.get_filesystem()? {
+                mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Ext4 => {
+                    ReplicatedVolumeFilesystem::Ext4
+                }
+                mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Xfs => {
+                    ReplicatedVolumeFilesystem::Xfs
+                }
+            }),
             Some(parse_filesystem_ownership(
                 replicated_reader.get_ownership()?,
             )?),

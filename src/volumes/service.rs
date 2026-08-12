@@ -5,10 +5,11 @@ use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::replicated::{ReplicatedVolumeRuntime, WriterFilesystemSpace};
 use crate::volumes::types::{
     DesiredVolumeDisposition, ExternalVolumeSpec, FilesystemOwnership, LocalVolumeSpec,
-    ReplicatedVolumeCapacityRequest, ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan,
-    ReplicatedVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver, VolumeEvent,
-    VolumeLabel, VolumeLifecycleIntent, VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy,
-    VolumeSpecDraft, VolumeSpecValue, VolumeStatus, compute_replicated_volume_node_score,
+    ReplicatedVolumeCapacityRequest, ReplicatedVolumeFilesystem, ReplicatedVolumeGroupStatusValue,
+    ReplicatedVolumePlan, ReplicatedVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
+    VolumeEvent, VolumeLabel, VolumeLifecycleIntent, VolumeNodeState, VolumeNodeStateValue,
+    VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue, VolumeStatus,
+    compute_replicated_volume_node_score,
 };
 use anyhow::Result;
 use capnp::Error;
@@ -326,6 +327,14 @@ fn write_volume_driver(mut builder: volume_driver_spec::Builder<'_>, driver: &Vo
         VolumeDriver::Replicated(spec) => {
             let mut replicated = builder.reborrow().init_replicated();
             write_filesystem_ownership(replicated.reborrow().init_ownership(), spec.ownership);
+            replicated.set_filesystem(match spec.filesystem {
+                ReplicatedVolumeFilesystem::Ext4 => {
+                    mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Ext4
+                }
+                ReplicatedVolumeFilesystem::Xfs => {
+                    mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Xfs
+                }
+            });
         }
     }
 }
@@ -386,6 +395,14 @@ fn read_volume_driver(reader: volume_driver_spec::Reader<'_>) -> Result<VolumeDr
         volume_driver_spec::Which::Replicated(Ok(replicated_reader)) => {
             Ok(VolumeDriver::Replicated(ReplicatedVolumeSpec {
                 ownership: read_filesystem_ownership(replicated_reader.get_ownership()?)?,
+                filesystem: match replicated_reader.get_filesystem()? {
+                    mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Ext4 => {
+                        ReplicatedVolumeFilesystem::Ext4
+                    }
+                    mantissa_protocol::volumes::ReplicatedVolumeFilesystem::Xfs => {
+                        ReplicatedVolumeFilesystem::Xfs
+                    }
+                },
             }))
         }
         volume_driver_spec::Which::Replicated(Err(err)) => Err(err),
@@ -2161,6 +2178,7 @@ mod tests {
             name: "replicated-cache".to_string(),
             driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
                 ownership: FilesystemOwnership::Daemon,
+                filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Ext4,
             }),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
@@ -2633,11 +2651,12 @@ mod tests {
                     uid: 1_000,
                     gid: 1_001,
                 },
+                filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Xfs,
             }),
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Delete,
-            initial_capacity_bytes: Some(16 * 4096),
+            initial_capacity_bytes: Some(300 * 1024 * 1024),
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,

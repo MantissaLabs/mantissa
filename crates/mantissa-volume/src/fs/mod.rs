@@ -3,5 +3,5 @@
 //! The volume runtime decides when these operations are allowed. This module
 //! owns the local filesystem details.
 
-pub mod ext4;
 pub mod space;
+pub mod volume;

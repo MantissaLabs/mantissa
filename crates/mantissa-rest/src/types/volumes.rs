@@ -1,5 +1,6 @@
 use mantissa_client::volumes::{
     FilesystemOwnership as ClientFilesystemOwnership,
+    ReplicatedVolumeFilesystem as ClientReplicatedVolumeFilesystem,
     ReplicatedVolumeGroupStatus as ClientReplicatedVolumeGroupStatus,
     ReplicatedVolumePlan as ClientReplicatedVolumePlan,
     VolumeBindingMode as ClientVolumeBindingMode, VolumeCreateDriver as ClientVolumeCreateDriver,
@@ -24,6 +25,8 @@ pub struct VolumeCreateRequest {
     pub driver: VolumeCreateDriver,
     #[serde(default)]
     pub ownership: VolumeOwnershipRequest,
+    #[serde(default)]
+    pub filesystem: ClientReplicatedVolumeFilesystem,
     #[serde(default = "default_binding_mode")]
     pub binding_mode: String,
     #[serde(default = "default_reclaim_policy")]
@@ -47,6 +50,7 @@ impl VolumeCreateRequest {
                 VolumeCreateDriver::Replicated => ClientVolumeCreateDriver::Replicated,
             },
             ownership: self.ownership.into_client(),
+            filesystem: self.filesystem,
             binding_mode,
             reclaim_policy: parse_reclaim_policy(&self.reclaim_policy)?,
             initial_capacity_bytes: self.initial_capacity_bytes,
@@ -203,6 +207,7 @@ impl From<ClientVolumeSummary> for VolumeSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 pub struct VolumeDriver {
     pub kind: String,
+    pub filesystem: Option<ClientReplicatedVolumeFilesystem>,
     pub path: Option<String>,
     pub driver_name: Option<String>,
     pub handle: Option<String>,
@@ -214,12 +219,14 @@ impl From<ClientVolumeDriver> for VolumeDriver {
         match value {
             ClientVolumeDriver::LocalManaged => Self {
                 kind: "local_managed".to_string(),
+                filesystem: None,
                 path: None,
                 driver_name: None,
                 handle: None,
             },
             ClientVolumeDriver::LocalImportedPath(path) => Self {
                 kind: "local_imported_path".to_string(),
+                filesystem: None,
                 path: Some(path),
                 driver_name: None,
                 handle: None,
@@ -229,12 +236,14 @@ impl From<ClientVolumeDriver> for VolumeDriver {
                 handle,
             } => Self {
                 kind: "external".to_string(),
+                filesystem: None,
                 path: None,
                 driver_name: Some(driver_name),
                 handle: Some(handle),
             },
-            ClientVolumeDriver::Replicated => Self {
+            ClientVolumeDriver::Replicated(filesystem) => Self {
                 kind: "replicated".to_string(),
+                filesystem: Some(filesystem),
                 path: None,
                 driver_name: None,
                 handle: None,

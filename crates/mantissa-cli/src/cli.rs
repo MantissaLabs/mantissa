@@ -1429,6 +1429,13 @@ pub enum VolumeDriverOpt {
     Replicated,
 }
 
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+pub enum ReplicatedVolumeFilesystemOpt {
+    #[default]
+    Ext4,
+    Xfs,
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum VolumeReclaimOpt {
     Retain,
@@ -1627,6 +1634,10 @@ pub struct VolumesCreateArgs {
     /// Storage driver to use
     #[arg(long = "driver", value_enum, default_value = "local")]
     pub driver: VolumeDriverOpt,
+
+    /// Filesystem to create inside a replicated volume
+    #[arg(long = "filesystem", value_enum, default_value = "ext4")]
+    pub filesystem: ReplicatedVolumeFilesystemOpt,
 
     /// Explicit uid ownership for managed volumes; requires --gid
     #[arg(long = "uid", value_name = "UID")]
@@ -2241,7 +2252,9 @@ mod tests {
             "--driver",
             "replicated",
             "--capacity-mb",
-            "64",
+            "300",
+            "--filesystem",
+            "xfs",
         ])
         .unwrap();
         assert!(matches!(
@@ -2249,7 +2262,8 @@ mod tests {
             Command::Volumes {
                 cmd: VolumesCommand::Create(VolumesCreateArgs {
                     driver: VolumeDriverOpt::Replicated,
-                    capacity_mb: Some(64),
+                    filesystem: ReplicatedVolumeFilesystemOpt::Xfs,
+                    capacity_mb: Some(300),
                     ..
                 })
             }

@@ -12,8 +12,9 @@ use crate::gossip::Message;
 use crate::volumes::VolumeAccessError;
 use crate::volumes::local::ensure_local_volume_path;
 use crate::volumes::types::{
-    FilesystemOwnership, VolumeBindingMode, VolumeDriver, VolumeEvent, VolumeNodeState,
-    VolumeNodeStateValue, VolumeSpecValue, VolumeStatus, compute_replicated_volume_group_id,
+    FilesystemOwnership, ReplicatedVolumeFilesystem, VolumeBindingMode, VolumeDriver, VolumeEvent,
+    VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue, VolumeStatus,
+    compute_replicated_volume_group_id,
 };
 use crate::workload::model::{WorkloadSpec, WorkloadVolumeMount as TaskVolumeMount};
 
@@ -46,7 +47,12 @@ pub(super) trait ReplicatedVolumeAccess: Send + Sync {
     async fn is_mounted(&self, key: ReplicaKey) -> Result<bool>;
 
     /// Attaches and mounts the volume, returning the host path used by the container runtime.
-    async fn mount(&self, key: ReplicaKey, ownership: FilesystemOwnership) -> Result<PathBuf>;
+    async fn mount(
+        &self,
+        key: ReplicaKey,
+        ownership: FilesystemOwnership,
+        filesystem: ReplicatedVolumeFilesystem,
+    ) -> Result<PathBuf>;
 
     /// Unmounts the volume and clears its local attachment.
     async fn unmount(&self, key: ReplicaKey) -> Result<()>;
@@ -70,12 +76,17 @@ impl ReplicatedVolumeAccess for crate::volumes::replicated::ReplicatedVolumeRunt
         self.volume_is_mounted(key).await
     }
 
-    /// Attaches ublk and mounts ext4 for a local workload.
-    async fn mount(&self, key: ReplicaKey, ownership: FilesystemOwnership) -> Result<PathBuf> {
-        self.mount_volume(key, ownership).await
+    /// Attaches ublk and mounts the selected filesystem for a local workload.
+    async fn mount(
+        &self,
+        key: ReplicaKey,
+        ownership: FilesystemOwnership,
+        filesystem: ReplicatedVolumeFilesystem,
+    ) -> Result<PathBuf> {
+        self.mount_volume(key, ownership, filesystem).await
     }
 
-    /// Unmounts ext4 and detaches ublk after the last local workload stops.
+    /// Unmounts the filesystem and detaches ublk after the last workload stops.
     async fn unmount(&self, key: ReplicaKey) -> Result<()> {
         self.unmount_volume(key).await
     }
@@ -1023,8 +1034,8 @@ impl WorkloadManager {
         }
 
         if published {
-            let ownership = match volume.driver {
-                VolumeDriver::Replicated(ref spec) => spec.ownership,
+            let (ownership, filesystem) = match volume.driver {
+                VolumeDriver::Replicated(ref spec) => (spec.ownership, spec.filesystem),
                 _ => return Err(anyhow!("volume '{}' is not replicated", volume.name)),
             };
             let already_mounted = state.state == VolumeNodeState::Published
@@ -1047,12 +1058,15 @@ impl WorkloadManager {
                     .await?;
                 return Ok(());
             }
-            let path = runtime.mount(key, ownership).await.map_err(|error| {
-                VolumeAccessError::unavailable(format!(
-                    "failed to mount replicated volume '{}': {error:#}",
-                    volume.name
-                ))
-            })?;
+            let path = runtime
+                .mount(key, ownership, filesystem)
+                .await
+                .map_err(|error| {
+                    VolumeAccessError::unavailable(format!(
+                        "failed to mount replicated volume '{}': {error:#}",
+                        volume.name
+                    ))
+                })?;
             state.local_path = Some(path.to_string_lossy().to_string());
             state.state = VolumeNodeState::Published;
             state.last_error = None;

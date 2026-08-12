@@ -20,6 +20,9 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
     writeln!(&mut rendered, "  ID: {}", volume.spec.id)?;
     writeln!(&mut rendered, "  Name: {}", volume.spec.name)?;
     writeln!(&mut rendered, "  Driver: {}", volume.spec.driver)?;
+    if let mantissa_client::volumes::VolumeDriver::Replicated(filesystem) = &volume.spec.driver {
+        writeln!(&mut rendered, "  Filesystem type: {filesystem}")?;
+    }
     writeln!(
         &mut rendered,
         "  Ownership: {}",
@@ -42,7 +45,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
     writeln!(&mut rendered, "  Bound node: {}", format_bound_node(volume))?;
     if matches!(
         volume.spec.driver,
-        mantissa_client::volumes::VolumeDriver::Replicated
+        mantissa_client::volumes::VolumeDriver::Replicated(_)
     ) {
         writeln!(&mut rendered, "  Capacity:")?;
         writeln!(
@@ -105,7 +108,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         )?;
     } else if matches!(
         volume.spec.driver,
-        mantissa_client::volumes::VolumeDriver::Replicated
+        mantissa_client::volumes::VolumeDriver::Replicated(_)
     ) {
         writeln!(&mut rendered, "  Filesystem: -")?;
     }
@@ -158,7 +161,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
 pub(super) fn format_bound_node(volume: &VolumeInspect) -> String {
     if !matches!(
         volume.spec.driver,
-        mantissa_client::volumes::VolumeDriver::Replicated
+        mantissa_client::volumes::VolumeDriver::Replicated(_)
     ) {
         return volume
             .spec
@@ -187,7 +190,7 @@ pub(super) fn render_replication(rendered: &mut String, volume: &VolumeInspect) 
     let Some(plan) = &volume.plan else {
         if matches!(
             volume.spec.driver,
-            mantissa_client::volumes::VolumeDriver::Replicated
+            mantissa_client::volumes::VolumeDriver::Replicated(_)
         ) {
             writeln!(rendered, "  Replica plan: waiting for a consumer")?;
         }

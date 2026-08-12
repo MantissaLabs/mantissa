@@ -1,4 +1,4 @@
-//! Creates, checks, mounts, and unmounts ext4 filesystems for local replicas.
+//! Creates, checks, mounts, and expands filesystems on replicated volumes.
 
 use std::collections::BTreeSet;
 use std::error::Error as StdError;
@@ -21,7 +21,28 @@ use crate::FilesystemId;
 use crate::catalog::ReplicaKey;
 use crate::driver::RequestProgress;
 
-/// Caller-selected paths and ext4 options.
+/// Filesystem stored inside one replicated block volume.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ReplicatedVolumeFilesystem {
+    /// Linux ext4 with online expansion through resize2fs.
+    #[default]
+    Ext4,
+
+    /// Linux XFS with online expansion through xfs_growfs.
+    Xfs,
+}
+
+impl ReplicatedVolumeFilesystem {
+    /// Returns the filesystem name used by Linux tools and the mount table.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ext4 => "ext4",
+            Self::Xfs => "xfs",
+        }
+    }
+}
+
+/// Caller-selected paths and filesystem options.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Options {
     /// Private directory containing volume mount points.
@@ -35,6 +56,12 @@ pub struct Options {
 
     /// Absolute path to the resize2fs executable.
     pub resize2fs_path: PathBuf,
+
+    /// Absolute path to the mkfs.xfs executable.
+    pub mkfs_xfs_path: PathBuf,
+
+    /// Absolute path to the xfs_growfs executable.
+    pub xfs_growfs_path: PathBuf,
 
     /// Exact ext4 features enabled on newly created filesystems.
     pub features: Vec<String>,
@@ -52,10 +79,13 @@ pub struct Options {
     pub extended_options: Vec<String>,
 
     /// Exact options applied when mounting ext4.
-    pub mount_options: Vec<String>,
+    pub ext4_mount_options: Vec<String>,
+
+    /// Exact options applied when mounting XFS.
+    pub xfs_mount_options: Vec<String>,
 }
 
-/// Checked paths and ext4 options used by the local filesystem manager.
+/// Checked paths and options used by the local filesystem manager.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Settings {
     options: Options,
@@ -69,7 +99,7 @@ impl Settings {
     }
 }
 
-/// Explains why caller-selected ext4 settings cannot be used.
+/// Explains why caller-selected filesystem settings cannot be used.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct InvalidSettings {
@@ -85,11 +115,11 @@ impl InvalidSettings {
     }
 }
 
-/// Failure while preparing or operating one local ext4 filesystem.
+/// Failure while preparing or operating one replicated-volume filesystem.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The host does not provide the Linux block and mount APIs this needs.
-    #[error("ext4-backed replicated volumes are supported only on Linux")]
+    #[error("replicated-volume filesystems are supported only on Linux")]
     UnsupportedPlatform,
 
     /// A local check found unsafe or conflicting state.
@@ -137,7 +167,7 @@ impl Error {
     }
 }
 
-/// Result returned by local ext4 operations.
+/// Result returned by local filesystem operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Adds local operation context without exposing untyped errors to callers.
@@ -274,6 +304,63 @@ impl Ext4FormatProfile {
     }
 }
 
+/// Every choice passed to mkfs.xfs when Mantissa creates XFS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct XfsFormatProfile {
+    block_size_bytes: u16,
+    sector_size_bytes: u16,
+    directory_block_size_bytes: u16,
+    metadata_options: &'static str,
+    inode_options: &'static str,
+}
+
+impl XfsFormatProfile {
+    /// Returns the complete XFS profile without consulting host defaults.
+    const fn new() -> Self {
+        Self {
+            block_size_bytes: 4096,
+            sector_size_bytes: 4096,
+            directory_block_size_bytes: 4096,
+            metadata_options: "crc=1,finobt=1,rmapbt=0,reflink=0,bigtime=1,inobtcount=1",
+            inode_options: "sparse=1",
+        }
+    }
+
+    /// Builds the complete mkfs.xfs arguments for one deterministic UUID.
+    fn mkfs_arguments(&self, filesystem_id: FilesystemId) -> Vec<String> {
+        vec![
+            "-q".to_string(),
+            "-K".to_string(),
+            "-b".to_string(),
+            format!("size={}", self.block_size_bytes),
+            "-s".to_string(),
+            format!("size={}", self.sector_size_bytes),
+            "-n".to_string(),
+            format!("size={}", self.directory_block_size_bytes),
+            "-m".to_string(),
+            format!("{},uuid={}", self.metadata_options, filesystem_id.as_uuid()),
+            "-i".to_string(),
+            self.inode_options.to_string(),
+        ]
+    }
+
+    /// Hashes every XFS layout choice except the per-volume UUID.
+    fn hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"mantissa replicated XFS format profile v1");
+        for value in [
+            self.block_size_bytes.to_string(),
+            self.sector_size_bytes.to_string(),
+            self.directory_block_size_bytes.to_string(),
+            self.metadata_options.to_string(),
+            self.inode_options.to_string(),
+        ] {
+            hash_profile_value(&mut hasher, value.as_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    }
+}
+
 /// One filesystem signature reported by wipefs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Signature {
@@ -283,31 +370,45 @@ pub struct Signature {
 }
 
 impl Signature {
-    /// Returns whether this is the only accepted ext4 signature and UUID.
-    pub fn is_ext4(&self, filesystem_id: FilesystemId) -> bool {
-        self.kind == "ext4"
+    /// Returns whether this signature has the expected type, UUID, and offset.
+    pub fn matches(
+        &self,
+        filesystem: ReplicatedVolumeFilesystem,
+        filesystem_id: FilesystemId,
+    ) -> bool {
+        let expected_offset = match filesystem {
+            ReplicatedVolumeFilesystem::Ext4 => "0x438",
+            ReplicatedVolumeFilesystem::Xfs => "0x0",
+        };
+        self.kind == filesystem.name()
             && self.filesystem_id == Some(*filesystem_id.as_uuid())
-            && self.offset == "0x438"
+            && self.offset == expected_offset
     }
 }
 
-/// Creates, checks, mounts, and unmounts ext4 filesystems for local replicas.
+/// Creates, checks, mounts, and expands replicated-volume filesystems.
 #[derive(Clone)]
 pub struct Manager {
     mount_root: PathBuf,
     wipefs_path: PathBuf,
     mkfs_ext4_path: PathBuf,
     resize2fs_path: PathBuf,
+    mkfs_xfs_path: PathBuf,
+    xfs_growfs_path: PathBuf,
     mke2fs_config_path: PathBuf,
-    format_profile: Ext4FormatProfile,
-    mount_flags: MsFlags,
-    mount_data: String,
+    ext4_format_profile: Ext4FormatProfile,
+    xfs_format_profile: XfsFormatProfile,
+    ext4_mount_flags: MsFlags,
+    ext4_mount_data: String,
+    xfs_mount_flags: MsFlags,
+    xfs_mount_data: String,
     command_timeout: Duration,
-    format_profile_hash: [u8; 32],
+    ext4_format_profile_hash: [u8; 32],
+    xfs_format_profile_hash: [u8; 32],
 }
 
 impl Manager {
-    /// Checks that both required filesystem tools can be executed.
+    /// Checks that every configured filesystem tool can be executed.
     pub fn check_tools(settings: &Settings) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -318,7 +419,9 @@ impl Manager {
         {
             check_tool(&settings.options.wipefs_path, "wipefs")?;
             check_tool(&settings.options.mkfs_ext4_path, "mkfs.ext4")?;
-            check_tool(&settings.options.resize2fs_path, "resize2fs")
+            check_tool(&settings.options.resize2fs_path, "resize2fs")?;
+            check_tool(&settings.options.mkfs_xfs_path, "mkfs.xfs")?;
+            check_tool(&settings.options.xfs_growfs_path, "xfs_growfs")
         }
     }
 
@@ -328,34 +431,50 @@ impl Manager {
         let wipefs_path = settings.options.wipefs_path.clone();
         let mkfs_ext4_path = settings.options.mkfs_ext4_path.clone();
         let resize2fs_path = settings.options.resize2fs_path.clone();
+        let mkfs_xfs_path = settings.options.mkfs_xfs_path.clone();
+        let xfs_growfs_path = settings.options.xfs_growfs_path.clone();
         Self::check_tools(settings)?;
         prepare_mount_root(&mount_root)?;
 
-        let format_profile = Ext4FormatProfile::new(settings);
+        let ext4_format_profile = Ext4FormatProfile::new(settings);
+        let xfs_format_profile = XfsFormatProfile::new();
         let mke2fs_config_path = mount_root.join(".mke2fs.conf");
         save_exact_mke2fs_config(
             &mke2fs_config_path,
-            format_profile.mke2fs_config().as_bytes(),
+            ext4_format_profile.mke2fs_config().as_bytes(),
         )?;
-        let (mount_flags, mount_data) = split_mount_options(&settings.options.mount_options);
-        let format_profile_hash = format_profile.hash();
+        let (ext4_mount_flags, ext4_mount_data) =
+            split_mount_options(&settings.options.ext4_mount_options);
+        let (xfs_mount_flags, xfs_mount_data) =
+            split_mount_options(&settings.options.xfs_mount_options);
+        let ext4_format_profile_hash = ext4_format_profile.hash();
+        let xfs_format_profile_hash = xfs_format_profile.hash();
         Ok(Self {
             mount_root,
             wipefs_path,
             mkfs_ext4_path,
             resize2fs_path,
+            mkfs_xfs_path,
+            xfs_growfs_path,
             mke2fs_config_path,
-            format_profile,
-            mount_flags,
-            mount_data,
+            ext4_format_profile,
+            xfs_format_profile,
+            ext4_mount_flags,
+            ext4_mount_data,
+            xfs_mount_flags,
+            xfs_mount_data,
             command_timeout,
-            format_profile_hash,
+            ext4_format_profile_hash,
+            xfs_format_profile_hash,
         })
     }
 
     /// Returns the hash used to reject a changed profile during a format retry.
-    pub const fn format_profile_hash(&self) -> [u8; 32] {
-        self.format_profile_hash
+    pub const fn format_profile_hash(&self, filesystem: ReplicatedVolumeFilesystem) -> [u8; 32] {
+        match filesystem {
+            ReplicatedVolumeFilesystem::Ext4 => self.ext4_format_profile_hash,
+            ReplicatedVolumeFilesystem::Xfs => self.xfs_format_profile_hash,
+        }
     }
 
     /// Returns the deterministic mount path for one volume generation.
@@ -376,14 +495,18 @@ impl Manager {
             .collect())
     }
 
-    /// Reports whether one private volume path is mounted read-write in the kernel.
-    pub fn volume_path_is_writable(&self, path: &Path) -> Result<bool> {
+    /// Reports whether one private path has the expected writable filesystem.
+    pub fn volume_path_is_writable(
+        &self,
+        path: &Path,
+        filesystem: ReplicatedVolumeFilesystem,
+    ) -> Result<bool> {
         if path.parent() != Some(self.mount_root.as_path()) {
             return Ok(false);
         }
-        Ok(read_mounts()?
-            .into_iter()
-            .any(|mount| mount.target == path && !mount.read_only))
+        Ok(read_mounts()?.into_iter().any(|mount| {
+            mount.target == path && mount.filesystem == filesystem.name() && !mount.read_only
+        }))
     }
 
     /// Returns all signatures without treating a failed probe as an empty disk.
@@ -398,36 +521,67 @@ impl Manager {
         parse_signatures(&output)
     }
 
-    /// Creates ext4 with only the settings selected in daemon configuration.
+    /// Creates the selected filesystem with one deterministic UUID and profile.
     pub async fn format(
         &self,
+        filesystem: ReplicatedVolumeFilesystem,
         device: &Path,
         filesystem_id: FilesystemId,
         replace_incomplete: bool,
         progress: RequestProgress,
     ) -> Result<()> {
-        let mut command = Command::new(&self.mkfs_ext4_path);
-        command
-            .env_clear()
-            .env("MKE2FS_CONFIG", &self.mke2fs_config_path)
-            .args(self.format_profile.mkfs_arguments())
-            .arg(filesystem_id.as_uuid().to_string());
-        if replace_incomplete {
-            // This is allowed only after Raft saved the same UUID in the
-            // Formatting state. It never bypasses the first empty-disk check.
-            command.arg("-F");
-        }
+        let (mut command, action) = match filesystem {
+            ReplicatedVolumeFilesystem::Ext4 => {
+                let mut command = Command::new(&self.mkfs_ext4_path);
+                command
+                    .env_clear()
+                    .env("MKE2FS_CONFIG", &self.mke2fs_config_path)
+                    .args(self.ext4_format_profile.mkfs_arguments())
+                    .arg(filesystem_id.as_uuid().to_string());
+                if replace_incomplete {
+                    command.arg("-F");
+                }
+                (command, "format ext4")
+            }
+            ReplicatedVolumeFilesystem::Xfs => {
+                let mut command = Command::new(&self.mkfs_xfs_path);
+                command
+                    .env_clear()
+                    .args(self.xfs_format_profile.mkfs_arguments(filesystem_id));
+                if replace_incomplete {
+                    command.arg("-f");
+                }
+                (command, "format XFS")
+            }
+        };
+        // Force is allowed only after the catalog saved the same filesystem,
+        // UUID, and profile. It never bypasses the first empty-disk check.
         command.arg(device);
-        run_command_while_io_progresses(command, self.command_timeout, "format ext4", progress)
-            .await?;
+        run_command_while_io_progresses(command, self.command_timeout, action, progress).await?;
         Ok(())
     }
 
-    /// Expands mounted ext4 to the full current mapped-device capacity.
-    pub async fn expand(&self, device: &Path, progress: RequestProgress) -> Result<()> {
-        let mut command = Command::new(&self.resize2fs_path);
-        command.env_clear().arg(device);
-        run_command_while_io_progresses(command, self.command_timeout, "expand ext4", progress)
+    /// Expands the mounted filesystem to the current mapped-device capacity.
+    pub async fn expand(
+        &self,
+        filesystem: ReplicatedVolumeFilesystem,
+        device: &Path,
+        mount_path: &Path,
+        progress: RequestProgress,
+    ) -> Result<()> {
+        let (command, action) = match filesystem {
+            ReplicatedVolumeFilesystem::Ext4 => {
+                let mut command = Command::new(&self.resize2fs_path);
+                command.env_clear().arg(device);
+                (command, "expand ext4")
+            }
+            ReplicatedVolumeFilesystem::Xfs => {
+                let mut command = Command::new(&self.xfs_growfs_path);
+                command.env_clear().arg("-d").arg(mount_path);
+                (command, "expand XFS")
+            }
+        };
+        run_command_while_io_progresses(command, self.command_timeout, action, progress)
             .await
             .map(drop)
     }
@@ -461,13 +615,18 @@ impl Manager {
         Ok(())
     }
 
-    /// Mounts ext4 unless the exact device is already mounted at this path.
-    pub fn mount(&self, device: &Path, path: &Path) -> Result<()> {
-        match find_mount(device, path)? {
+    /// Mounts the selected filesystem unless that exact mount already exists.
+    pub fn mount(
+        &self,
+        filesystem: ReplicatedVolumeFilesystem,
+        device: &Path,
+        path: &Path,
+    ) -> Result<()> {
+        match find_mount(device, path, filesystem)? {
             MountCheck::Exact => return Ok(()),
             MountCheck::ReadOnly => {
                 return Err(Error::invalid(
-                    "replicated ext4 filesystem is mounted read-only",
+                    "replicated-volume filesystem is mounted read-only",
                 ));
             }
             MountCheck::Conflict => {
@@ -477,19 +636,28 @@ impl Manager {
             }
             MountCheck::Absent => self.prepare_mount_path(path)?,
         }
-        let data = (!self.mount_data.is_empty()).then_some(self.mount_data.as_str());
-        mount_ext4(device, path, self.mount_flags, data)?;
-        if find_mount(device, path)? != MountCheck::Exact {
+        let (flags, data) = match filesystem {
+            ReplicatedVolumeFilesystem::Ext4 => (self.ext4_mount_flags, &self.ext4_mount_data),
+            ReplicatedVolumeFilesystem::Xfs => (self.xfs_mount_flags, &self.xfs_mount_data),
+        };
+        let data = (!data.is_empty()).then_some(data.as_str());
+        mount_filesystem(filesystem, device, path, flags, data)?;
+        if find_mount(device, path, filesystem)? != MountCheck::Exact {
             return Err(Error::invalid(
-                "ext4 mount did not appear in the kernel mount table",
+                "replicated-volume mount did not appear in the kernel mount table",
             ));
         }
         Ok(())
     }
 
     /// Removes one exact mount and rejects a conflicting filesystem.
-    pub fn unmount(&self, device: &Path, path: &Path) -> Result<()> {
-        match find_mount(device, path)? {
+    pub fn unmount(
+        &self,
+        filesystem: ReplicatedVolumeFilesystem,
+        device: &Path,
+        path: &Path,
+    ) -> Result<()> {
+        match find_mount(device, path, filesystem)? {
             MountCheck::Absent => return Ok(()),
             MountCheck::Conflict => {
                 return Err(Error::invalid(
@@ -499,12 +667,12 @@ impl Manager {
             MountCheck::Exact | MountCheck::ReadOnly => {}
         }
         umount2(path, MntFlags::UMOUNT_NOFOLLOW)
-            .with_context(|| format!("unmount ext4 from {}", path.display()))?;
+            .with_context(|| format!("unmount {} from {}", filesystem.name(), path.display()))?;
         Ok(())
     }
 
     /// Removes a catalog-owned mount when its old device path has disappeared.
-    pub fn unmount_saved(&self, path: &Path) -> Result<()> {
+    pub fn unmount_saved(&self, filesystem: ReplicatedVolumeFilesystem, path: &Path) -> Result<()> {
         if path.parent() != Some(self.mount_root.as_path()) {
             return Err(Error::invalid(
                 "saved volume mount path is outside the configured mount root",
@@ -516,21 +684,26 @@ impl Manager {
         else {
             return Ok(());
         };
-        if found.filesystem != "ext4" {
+        if found.filesystem != filesystem.name() {
             return Err(Error::invalid(
-                "saved volume mount path contains a non-ext4 filesystem",
+                "saved volume mount path contains another filesystem type",
             ));
         }
-        umount2(path, MntFlags::UMOUNT_NOFOLLOW)
-            .with_context(|| format!("unmount saved ext4 from {}", path.display()))?;
+        umount2(path, MntFlags::UMOUNT_NOFOLLOW).with_context(|| {
+            format!(
+                "unmount saved {} from {}",
+                filesystem.name(),
+                path.display()
+            )
+        })?;
         Ok(())
     }
 
-    /// Detaches a catalog-owned ext4 mount after local I/O admission is quarantined.
+    /// Detaches a catalog-owned mount after local I/O admission is quarantined.
     ///
     /// The durable unmount marker independently retains any pending distributed writer fence, so
     /// process-local mount cleanup never needs to wait for quorum before becoming safe.
-    pub fn detach_saved(&self, path: &Path) -> Result<()> {
+    pub fn detach_saved(&self, filesystem: ReplicatedVolumeFilesystem, path: &Path) -> Result<()> {
         if path.parent() != Some(self.mount_root.as_path()) {
             return Err(Error::invalid(
                 "saved volume mount path is outside the configured mount root",
@@ -542,13 +715,14 @@ impl Manager {
         else {
             return Ok(());
         };
-        if found.filesystem != "ext4" {
+        if found.filesystem != filesystem.name() {
             return Err(Error::invalid(
-                "saved volume mount path contains a non-ext4 filesystem",
+                "saved volume mount path contains another filesystem type",
             ));
         }
-        umount2(path, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW)
-            .with_context(|| format!("detach saved ext4 from {}", path.display()))?;
+        umount2(path, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW).with_context(|| {
+            format!("detach saved {} from {}", filesystem.name(), path.display())
+        })?;
         Ok(())
     }
 
@@ -601,16 +775,28 @@ impl Manager {
     }
 }
 
-/// Calls the Linux mount API with an explicit ext4 filesystem type.
+/// Calls the Linux mount API with the selected filesystem type.
 #[cfg(target_os = "linux")]
-fn mount_ext4(device: &Path, path: &Path, flags: MsFlags, data: Option<&str>) -> Result<()> {
-    mount(Some(device), path, Some("ext4"), flags, data)
-        .with_context(|| format!("mount ext4 at {}", path.display()))
+fn mount_filesystem(
+    filesystem: ReplicatedVolumeFilesystem,
+    device: &Path,
+    path: &Path,
+    flags: MsFlags,
+    data: Option<&str>,
+) -> Result<()> {
+    mount(Some(device), path, Some(filesystem.name()), flags, data)
+        .with_context(|| format!("mount {} at {}", filesystem.name(), path.display()))
 }
 
 /// Keeps the crate buildable while reporting that replicated volumes need Linux.
 #[cfg(not(target_os = "linux"))]
-fn mount_ext4(_device: &Path, _path: &Path, _flags: MsFlags, _data: Option<&str>) -> Result<()> {
+fn mount_filesystem(
+    _filesystem: ReplicatedVolumeFilesystem,
+    _device: &Path,
+    _path: &Path,
+    _flags: MsFlags,
+    _data: Option<&str>,
+) -> Result<()> {
     Err(Error::UnsupportedPlatform)
 }
 
@@ -621,6 +807,8 @@ fn check_settings(options: &Options) -> std::result::Result<(), InvalidSettings>
         ("wipefs executable", &options.wipefs_path),
         ("mkfs.ext4 executable", &options.mkfs_ext4_path),
         ("resize2fs executable", &options.resize2fs_path),
+        ("mkfs.xfs executable", &options.mkfs_xfs_path),
+        ("xfs_growfs executable", &options.xfs_growfs_path),
     ] {
         if path.as_os_str().is_empty() {
             return Err(InvalidSettings::new(format!(
@@ -704,11 +892,19 @@ fn check_settings(options: &Options) -> std::result::Result<(), InvalidSettings>
             )));
         }
     }
-    for option in &options.mount_options {
+    for option in &options.ext4_mount_options {
         check_tool_value("replicated-volume ext4 mount option", option, true)?;
         if option == "ro" {
             return Err(InvalidSettings::new(
                 "replicated-volume ext4 must be mounted read-write",
+            ));
+        }
+    }
+    for option in &options.xfs_mount_options {
+        check_tool_value("replicated-volume XFS mount option", option, true)?;
+        if option == "ro" {
+            return Err(InvalidSettings::new(
+                "replicated-volume XFS must be mounted read-write",
             ));
         }
     }
@@ -791,7 +987,7 @@ fn save_exact_mke2fs_config(path: &Path, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Adds one length-delimited value to the ext4 profile hash.
+/// Adds one length-delimited value to a filesystem profile hash.
 fn hash_profile_value(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
@@ -939,7 +1135,7 @@ fn parse_signatures(output: &[u8]) -> Result<Vec<Signature>> {
     Ok(signatures)
 }
 
-/// Separates generic mount flags from ext4-specific option text.
+/// Separates generic mount flags from filesystem-specific option text.
 fn split_mount_options(options: &[String]) -> (MsFlags, String) {
     let mut flags = MsFlags::empty();
     let mut data = Vec::new();
@@ -986,8 +1182,12 @@ struct KernelMount {
     read_only: bool,
 }
 
-/// Finds whether the requested device owns the exact ext4 mount path.
-fn find_mount(device: &Path, target: &Path) -> Result<MountCheck> {
+/// Finds whether the requested device owns the exact filesystem mount path.
+fn find_mount(
+    device: &Path,
+    target: &Path,
+    filesystem: ReplicatedVolumeFilesystem,
+) -> Result<MountCheck> {
     let metadata = fs::metadata(device).context("read block-device metadata")?;
     if !metadata.file_type().is_block_device() {
         return Err(Error::invalid("block-device path is not a block device"));
@@ -1000,7 +1200,7 @@ fn find_mount(device: &Path, target: &Path) -> Result<MountCheck> {
     else {
         return Ok(MountCheck::Absent);
     };
-    if found.filesystem == "ext4"
+    if found.filesystem == filesystem.name()
         && found.device_major == device_major
         && found.device_minor == device_minor
     {
@@ -1102,6 +1302,8 @@ mod tests {
             wipefs_path: PathBuf::from("/bin/false"),
             mkfs_ext4_path: PathBuf::from("/bin/true"),
             resize2fs_path: PathBuf::from("/bin/true"),
+            mkfs_xfs_path: PathBuf::from("/bin/true"),
+            xfs_growfs_path: PathBuf::from("/bin/true"),
             features: vec![
                 "has_journal".to_string(),
                 "extent".to_string(),
@@ -1117,7 +1319,8 @@ mod tests {
                 "lazy_itable_init=1".to_string(),
                 "lazy_journal_init=1".to_string(),
             ],
-            mount_options: Vec::new(),
+            ext4_mount_options: Vec::new(),
+            xfs_mount_options: Vec::new(),
         }
     }
 
@@ -1211,6 +1414,51 @@ mod tests {
         assert_ne!(Ext4FormatProfile::new(&settings).hash(), original);
     }
 
+    /// Builds every mkfs.xfs argument from the fixed replicated-volume profile.
+    #[test]
+    fn xfs_profile_builds_mkfs_arguments() {
+        let profile = XfsFormatProfile::new();
+        let filesystem_id = FilesystemId::new(
+            "6c8a53ed-ea48-4917-bc9d-e0ac87d27167"
+                .parse()
+                .expect("valid filesystem UUID"),
+        )
+        .expect("non-zero filesystem UUID");
+
+        assert_eq!(
+            profile.mkfs_arguments(filesystem_id),
+            vec![
+                "-q",
+                "-K",
+                "-b",
+                "size=4096",
+                "-s",
+                "size=4096",
+                "-n",
+                "size=4096",
+                "-m",
+                "crc=1,finobt=1,rmapbt=0,reflink=0,bigtime=1,inobtcount=1,\
+                 uuid=6c8a53ed-ea48-4917-bc9d-e0ac87d27167",
+                "-i",
+                "sparse=1",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    /// Gives ext4 and XFS distinct hashes so format retries cannot switch types.
+    #[test]
+    fn filesystem_profiles_have_distinct_hashes() {
+        let settings = filesystem_settings(Path::new("/unused"));
+
+        assert_ne!(
+            Ext4FormatProfile::new(&settings).hash(),
+            XfsFormatProfile::new().hash()
+        );
+    }
+
     /// Reads empty, ext4, and non-ext4 wipefs rows without losing signatures.
     #[test]
     fn parses_all_filesystem_signatures() {
@@ -1227,7 +1475,8 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].kind, "ext4");
         assert!(
-            parsed[0].is_ext4(
+            parsed[0].matches(
+                ReplicatedVolumeFilesystem::Ext4,
                 FilesystemId::new(
                     "6c8a53ed-ea48-4917-bc9d-e0ac87d27167"
                         .parse()
@@ -1238,6 +1487,23 @@ mod tests {
         );
         assert_eq!(parsed[1].kind, "LVM2_member");
         assert_eq!(parsed[1].filesystem_id, None);
+    }
+
+    /// Recognizes the XFS superblock only at its expected offset.
+    #[test]
+    fn recognizes_xfs_signature() {
+        let filesystem_id = FilesystemId::new(
+            "6c8a53ed-ea48-4917-bc9d-e0ac87d27167"
+                .parse()
+                .expect("valid filesystem UUID"),
+        )
+        .expect("non-zero filesystem UUID");
+        let parsed = parse_signatures(b"xfs,6c8a53ed-ea48-4917-bc9d-e0ac87d27167,0x0\n")
+            .expect("parse XFS signature");
+
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].matches(ReplicatedVolumeFilesystem::Xfs, filesystem_id));
+        assert!(!parsed[0].matches(ReplicatedVolumeFilesystem::Ext4, filesystem_id));
     }
 
     /// An ext4 UUID found at another byte offset is not the expected signature.
@@ -1254,7 +1520,7 @@ mod tests {
             filesystem_id: Some(*filesystem_id.as_uuid()),
             offset: "0x1234".to_string(),
         };
-        assert!(!signature.is_ext4(filesystem_id));
+        assert!(!signature.matches(ReplicatedVolumeFilesystem::Ext4, filesystem_id));
     }
 
     /// Refuses malformed probe output instead of treating it as an empty device.
@@ -1325,7 +1591,7 @@ mod tests {
         fs::create_dir(&path).expect("create saved mount path");
 
         manager
-            .unmount_saved(&path)
+            .unmount_saved(ReplicatedVolumeFilesystem::Ext4, &path)
             .expect("an already absent saved mount must be accepted");
     }
 
@@ -1360,7 +1626,9 @@ mod tests {
 
         manager
             .expand(
+                ReplicatedVolumeFilesystem::Ext4,
                 Path::new("/dev/mapper/test-volume"),
+                Path::new("/unused/mount"),
                 RequestProgress::default(),
             )
             .await
@@ -1369,6 +1637,39 @@ mod tests {
         let arguments = fs::read_to_string(format!("{}.args", resize2fs.display()))
             .expect("read resize2fs arguments");
         assert_eq!(arguments, "/dev/mapper/test-volume\n");
+    }
+
+    /// XFS expansion targets the live mount because xfs_growfs requires it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn xfs_expansion_uses_the_saved_mount_path() {
+        let temp = tempfile::tempdir().expect("create mount root");
+        let xfs_growfs = temp.path().join("xfs-growfs-test");
+        fs::write(
+            &xfs_growfs,
+            b"#!/bin/sh\n/bin/printf '%s\\n' \"$@\" > \"$0.args\"\n",
+        )
+        .expect("write xfs_growfs test command");
+        fs::set_permissions(&xfs_growfs, fs::Permissions::from_mode(0o700))
+            .expect("make xfs_growfs test command executable");
+        let mut options = filesystem_options(&temp.path().join("mounts"));
+        options.xfs_growfs_path = xfs_growfs.clone();
+        let settings = Settings::new(options).expect("valid XFS test settings");
+        let manager = Manager::prepare(&settings, Duration::from_secs(1)).expect("prepare manager");
+
+        manager
+            .expand(
+                ReplicatedVolumeFilesystem::Xfs,
+                Path::new("/dev/mapper/test-volume"),
+                Path::new("/var/lib/mantissa/volumes/test"),
+                RequestProgress::default(),
+            )
+            .await
+            .expect("expand test XFS filesystem");
+
+        let arguments = fs::read_to_string(format!("{}.args", xfs_growfs.display()))
+            .expect("read xfs_growfs arguments");
+        assert_eq!(arguments, "-d\n/var/lib/mantissa/volumes/test\n");
     }
 
     /// A failed expansion remains retryable and never produces a receipt.
@@ -1384,7 +1685,9 @@ mod tests {
         assert!(matches!(
             manager
                 .expand(
+                    ReplicatedVolumeFilesystem::Ext4,
                     Path::new("/dev/mapper/test-volume"),
+                    Path::new("/unused/mount"),
                     RequestProgress::default()
                 )
                 .await,

@@ -783,6 +783,8 @@ pub(crate) fn replicated_volume_test_config_with_driver_limits(
             wipefs_path: "/usr/sbin/wipefs".to_string(),
             mkfs_ext4_path: "/usr/sbin/mkfs.ext4".to_string(),
             resize2fs_path: "/usr/sbin/resize2fs".to_string(),
+            mkfs_xfs_path: "/usr/sbin/mkfs.xfs".to_string(),
+            xfs_growfs_path: "/usr/sbin/xfs_growfs".to_string(),
             features: vec![
                 "has_journal".to_string(),
                 "extent".to_string(),
@@ -798,7 +800,8 @@ pub(crate) fn replicated_volume_test_config_with_driver_limits(
                 "lazy_itable_init=1".to_string(),
                 "lazy_journal_init=1".to_string(),
             ],
-            mount_options: vec!["noatime".to_string()],
+            ext4_mount_options: vec!["noatime".to_string()],
+            xfs_mount_options: vec!["noatime".to_string()],
         },
     }
 }

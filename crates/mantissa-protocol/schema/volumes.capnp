@@ -588,6 +588,17 @@ struct FilesystemOwnership {
 struct ReplicatedVolumeSpec {
   ownership @0 :FilesystemOwnership;
   # Ownership and permissions applied after the filesystem is mounted.
+
+  filesystem @1 :ReplicatedVolumeFilesystem;
+  # Filesystem created inside the replicated block device.
+}
+
+enum ReplicatedVolumeFilesystem {
+  ext4 @0;
+  # Linux ext4 expanded online with resize2fs.
+
+  xfs @1;
+  # Linux XFS expanded online with xfs_growfs.
 }
 
 struct ExternalVolumeSpec {
@@ -1622,7 +1633,7 @@ struct LocalUblkDevice {
   # Logical capacity fixed when this private device was started.
 }
 
-# One ext4 mount saved so it can be restored or removed after a restart.
+# One filesystem mount saved so it can be restored or removed after a restart.
 struct LocalVolumeMount {
   state @0 :LocalVolumeMountState;
   # Last mount or unmount step made durable in the local catalog.
@@ -1646,16 +1657,22 @@ struct LocalVolumeMount {
   # Unix permission bits applied to the root of the mounted filesystem.
 
   filesystemExpandedToBytes @7 :UInt64;
-  # Largest mapped-device capacity successfully passed to resize2fs.
+  # Largest mapped-device capacity successfully passed to the filesystem grow tool.
+
+  filesystem @8 :ReplicatedVolumeFilesystem;
+  # Exact filesystem expected at this mount.
 }
 
-# One unfinished ext4 format saved so the same profile is used after restart.
+# One unfinished filesystem format saved so the same profile is used after restart.
 struct LocalFilesystemFormat {
   filesystemId @0 :Data;
   # Exact non-zero 16-byte UUID selected before formatting.
 
   profileHash @1 :Data;
-  # Blake3 hash of the exact ext4 format profile.
+  # Blake3 hash of the exact filesystem format profile.
+
+  filesystem @2 :ReplicatedVolumeFilesystem;
+  # Exact filesystem being formatted.
 }
 
 struct LocalReplicaOrigin {
@@ -1672,7 +1689,7 @@ struct LocalReplicaOrigin {
   # Empty for bootstrap, whose immutable desired plan already retains voters.
 }
 
-# Last saved step for one local ext4 mount.
+# Last saved step for one local filesystem mount.
 enum LocalVolumeMountState {
   mounting @0;
   # The mount is required but may not yet exist in the kernel.

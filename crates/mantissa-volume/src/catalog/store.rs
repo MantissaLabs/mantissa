@@ -1424,6 +1424,7 @@ mod tests {
         ReplicaState, SavedFilesystemFormat, SavedMountState, SavedUblkDevice, SavedVolumeMount,
     };
     use crate::driver::{UblkDeviceId, UblkQueueSettings, UblkSettings};
+    use crate::fs::volume::ReplicatedVolumeFilesystem;
     use crate::storage_format::ReplicaSpace;
     use crate::{
         DriverSessionId, FenceEpoch, FilesystemId, OperationId, VolumeBlockSizes, VolumeCapacity,
@@ -1666,9 +1667,16 @@ mod tests {
                 .ublk_devices(),
             &[old, larger]
         );
-        let mounting =
-            SavedVolumeMount::mounting(fence, session, directory.path().join("mount"), 0, 0, 0o700)
-                .expect("valid saved mount");
+        let mounting = SavedVolumeMount::mounting(
+            fence,
+            session,
+            directory.path().join("mount"),
+            0,
+            0,
+            0o700,
+            ReplicatedVolumeFilesystem::Xfs,
+        )
+        .expect("valid saved mount");
         catalog
             .save_volume_mount(key, mounting)
             .expect("save mount");
@@ -1925,6 +1933,7 @@ mod tests {
             1000,
             1001,
             0o2770,
+            ReplicatedVolumeFilesystem::Xfs,
         )
         .expect("valid saved mount");
 
@@ -1946,6 +1955,7 @@ mod tests {
             .save_volume_mount(key, mounting.clone())
             .expect("save mounting step");
         let format = SavedFilesystemFormat::new(
+            ReplicatedVolumeFilesystem::Xfs,
             FilesystemId::new(Uuid::from_u128(702)).expect("non-zero filesystem ID"),
             [0x5a; 32],
         );
@@ -2102,6 +2112,7 @@ mod tests {
             1000,
             1001,
             0o2770,
+            ReplicatedVolumeFilesystem::Ext4,
         )
         .expect("valid saved mount");
         let mounted = mounting

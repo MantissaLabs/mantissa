@@ -6,9 +6,9 @@ use capnp::message::{Builder, ReaderOptions};
 use mantissa_protocol::volumes::{
     LocalReplicaHealth as StoredReplicaHealth, LocalReplicaPoolFilesystem as StoredPoolFilesystem,
     LocalReplicaState as StoredReplicaState, LocalVolumeMountState as StoredMountState,
-    local_attachment_record, local_filesystem_format, local_replica_origin,
-    local_replica_pool_record, local_replica_record, local_replica_retirement, local_ublk_device,
-    local_volume_mount,
+    ReplicatedVolumeFilesystem as StoredVolumeFilesystem, local_attachment_record,
+    local_filesystem_format, local_replica_origin, local_replica_pool_record, local_replica_record,
+    local_replica_retirement, local_ublk_device, local_volume_mount,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -19,6 +19,7 @@ use super::model::{
     SavedMountState, SavedUblkDevice, SavedVolumeMount,
 };
 use super::pool::{PoolFilesystem, ReplicaPool};
+use crate::fs::volume::ReplicatedVolumeFilesystem;
 use crate::protocol::{ProtocolError, read_descriptor, write_descriptor};
 use crate::{IdentityError, OperationId, ReplacementId, VolumeGeneration, VolumeId};
 
@@ -105,20 +106,22 @@ pub(super) fn decode_replica(bytes: &[u8]) -> Result<ReplicaRecord, CatalogProto
     Ok(record)
 }
 
-/// Writes one unfinished ext4 format.
+/// Writes one unfinished filesystem format.
 fn write_filesystem_format(
     mut builder: local_filesystem_format::Builder<'_>,
     format: SavedFilesystemFormat,
 ) {
     builder.set_filesystem_id(format.filesystem_id().as_bytes());
     builder.set_profile_hash(&format.profile_hash());
+    builder.set_filesystem(write_replicated_filesystem(format.filesystem()));
 }
 
-/// Reads and checks one unfinished ext4 format.
+/// Reads and checks one unfinished filesystem format.
 fn read_filesystem_format(
     reader: local_filesystem_format::Reader<'_>,
 ) -> Result<SavedFilesystemFormat, CatalogProtocolError> {
     Ok(SavedFilesystemFormat::new(
+        read_replicated_filesystem(reader.get_filesystem())?,
         crate::FilesystemId::new(read_uuid(reader.get_filesystem_id()?, "filesystem ID")?)?,
         read_fixed(reader.get_profile_hash()?, "filesystem profile hash")?,
     ))
@@ -192,7 +195,7 @@ fn read_origin_voters(
     Ok(voter_node_ids)
 }
 
-/// Writes one restart-safe ext4 mount record.
+/// Writes one restart-safe filesystem mount record.
 fn write_volume_mount(
     mut builder: local_volume_mount::Builder<'_>,
     volume_mount: &SavedVolumeMount,
@@ -209,9 +212,10 @@ fn write_volume_mount(
     builder.set_owner_gid(volume_mount.owner_gid());
     builder.set_mode(volume_mount.mode());
     builder.set_filesystem_expanded_to_bytes(volume_mount.filesystem_expanded_to_bytes());
+    builder.set_filesystem(write_replicated_filesystem(volume_mount.filesystem()));
 }
 
-/// Reads and checks one restart-safe ext4 mount record.
+/// Reads and checks one restart-safe filesystem mount record.
 fn read_volume_mount(
     reader: local_volume_mount::Reader<'_>,
 ) -> Result<SavedVolumeMount, CatalogProtocolError> {
@@ -235,7 +239,30 @@ fn read_volume_mount(
         reader.get_owner_gid(),
         reader.get_mode(),
         reader.get_filesystem_expanded_to_bytes(),
+        read_replicated_filesystem(reader.get_filesystem())?,
     )?)
+}
+
+/// Encodes one replicated-volume filesystem in the local catalog.
+fn write_replicated_filesystem(filesystem: ReplicatedVolumeFilesystem) -> StoredVolumeFilesystem {
+    match filesystem {
+        ReplicatedVolumeFilesystem::Ext4 => StoredVolumeFilesystem::Ext4,
+        ReplicatedVolumeFilesystem::Xfs => StoredVolumeFilesystem::Xfs,
+    }
+}
+
+/// Decodes one replicated-volume filesystem from the local catalog.
+fn read_replicated_filesystem(
+    filesystem: std::result::Result<StoredVolumeFilesystem, capnp::NotInSchema>,
+) -> Result<ReplicatedVolumeFilesystem, CatalogProtocolError> {
+    match filesystem {
+        Ok(StoredVolumeFilesystem::Ext4) => Ok(ReplicatedVolumeFilesystem::Ext4),
+        Ok(StoredVolumeFilesystem::Xfs) => Ok(ReplicatedVolumeFilesystem::Xfs),
+        Err(capnp::NotInSchema(value)) => Err(CatalogProtocolError::UnknownEnum {
+            name: "replicated volume filesystem",
+            value,
+        }),
+    }
 }
 
 /// Writes one saved ublk device and the attachment it serves.

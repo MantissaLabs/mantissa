@@ -6,6 +6,7 @@
             driver: replicated((
                 // postgres:16-alpine runs the database as UID and GID 70.
                 ownership: user(uid: 70, gid: 70),
+                filesystem: xfs,
             )),
             access_mode: read_write_once,
             binding_mode: wait_for_first_consumer,

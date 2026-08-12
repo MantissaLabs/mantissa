@@ -163,6 +163,13 @@ pub async fn deploy_manifest(
                         Some(replicated.ownership.clone())
                     }
                 },
+                replicated_filesystem: match &volume.driver {
+                    super::manifest::VolumeDriver::Replicated(replicated) => {
+                        Some(replicated.filesystem)
+                    }
+                    super::manifest::VolumeDriver::Local(_)
+                    | super::manifest::VolumeDriver::External(_) => None,
+                },
                 access_mode: match volume.access_mode {
                     super::manifest::VolumeAccessMode::ReadWriteOnce => {
                         volumes::VolumeAccessMode::ReadWriteOnce

@@ -175,19 +175,22 @@ pub struct ReplicatedVolumeDriverLimits {
     pub max_batch_delay_us: u64,
 }
 
-/// Exact ext4 tools, layout choices, and mount settings.
+/// Exact filesystem tools, layout choices, and mount settings.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ReplicatedVolumeFilesystemSettings {
     pub mount_root: String,
     pub wipefs_path: String,
     pub mkfs_ext4_path: String,
     pub resize2fs_path: String,
+    pub mkfs_xfs_path: String,
+    pub xfs_growfs_path: String,
     pub features: Vec<String>,
     pub inode_size_bytes: u16,
     pub bytes_per_inode: u32,
     pub reserved_space_percent: u8,
     pub extended_options: Vec<String>,
-    pub mount_options: Vec<String>,
+    pub ext4_mount_options: Vec<String>,
+    pub xfs_mount_options: Vec<String>,
 }
 
 impl Default for ReplicatedVolumeRuntimeLimits {
@@ -339,6 +342,24 @@ impl ReplicatedVolumeConfig {
                 "/bin/resize2fs",
             ],
         )?;
+        let mkfs_xfs_path = find_replicated_volume_tool(
+            "mkfs.xfs",
+            &[
+                "/usr/sbin/mkfs.xfs",
+                "/sbin/mkfs.xfs",
+                "/usr/bin/mkfs.xfs",
+                "/bin/mkfs.xfs",
+            ],
+        )?;
+        let xfs_growfs_path = find_replicated_volume_tool(
+            "xfs_growfs",
+            &[
+                "/usr/sbin/xfs_growfs",
+                "/sbin/xfs_growfs",
+                "/usr/bin/xfs_growfs",
+                "/bin/xfs_growfs",
+            ],
+        )?;
 
         Ok(Self::with_defaults(
             pool_path,
@@ -349,10 +370,12 @@ impl ReplicatedVolumeConfig {
             wipefs_path,
             mkfs_ext4_path,
             resize2fs_path,
+            mkfs_xfs_path,
+            xfs_growfs_path,
         ))
     }
 
-    /// Fills paths and addresses around the built-in limits and ext4 profile.
+    /// Fills paths and addresses around the built-in filesystem profiles.
     #[allow(clippy::too_many_arguments)]
     fn with_defaults(
         pool_path: PathBuf,
@@ -363,6 +386,8 @@ impl ReplicatedVolumeConfig {
         wipefs_path: PathBuf,
         mkfs_ext4_path: PathBuf,
         resize2fs_path: PathBuf,
+        mkfs_xfs_path: PathBuf,
+        xfs_growfs_path: PathBuf,
     ) -> Self {
         Self {
             pool_path: pool_path.display().to_string(),
@@ -389,6 +414,8 @@ impl ReplicatedVolumeConfig {
                 wipefs_path: wipefs_path.display().to_string(),
                 mkfs_ext4_path: mkfs_ext4_path.display().to_string(),
                 resize2fs_path: resize2fs_path.display().to_string(),
+                mkfs_xfs_path: mkfs_xfs_path.display().to_string(),
+                xfs_growfs_path: xfs_growfs_path.display().to_string(),
                 features: vec![
                     "has_journal".to_string(),
                     "extent".to_string(),
@@ -408,7 +435,8 @@ impl ReplicatedVolumeConfig {
                     "lazy_itable_init=1".to_string(),
                     "lazy_journal_init=1".to_string(),
                 ],
-                mount_options: vec!["noatime".to_string()],
+                ext4_mount_options: vec!["noatime".to_string()],
+                xfs_mount_options: vec!["noatime".to_string()],
             },
         }
     }
@@ -2659,6 +2687,8 @@ mod tests {
             PathBuf::from("/usr/sbin/wipefs"),
             PathBuf::from("/usr/sbin/mkfs.ext4"),
             PathBuf::from("/usr/sbin/resize2fs"),
+            PathBuf::from("/usr/sbin/mkfs.xfs"),
+            PathBuf::from("/usr/sbin/xfs_growfs"),
         )
     }
 
@@ -2885,7 +2915,7 @@ mod tests {
 
         let mut config = Config::default();
         let mut storage = replicated_volume_config();
-        storage.filesystem.mount_options.push("ro".to_string());
+        storage.filesystem.ext4_mount_options.push("ro".to_string());
         config.storage.replicated_volumes = Some(storage);
         assert!(config.validate().is_err());
     }
