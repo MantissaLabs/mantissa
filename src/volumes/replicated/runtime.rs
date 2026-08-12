@@ -219,7 +219,6 @@ pub(crate) struct LocalReplicaStatus {
     pub(crate) state: ReplicaState,
     pub(crate) health: ReplicaHealth,
     pub(crate) group_saved: bool,
-    pub(crate) group_running: bool,
     pub(crate) control_state_initialized: bool,
     pub(crate) applied_log_index: Option<u64>,
     pub(crate) leader_node_id: Option<Uuid>,
@@ -616,13 +615,10 @@ impl ReplicatedVolumeRuntime {
         Ok(ReplicatedVolumeSupport {
             address: self.advertise_address.to_string(),
             format_version: REPLICATED_VOLUME_FORMAT_VERSION,
-            ublk: true,
-            device_mapper: true,
             accepts_replicas: pool.state() == PoolSpaceState::Ready
                 && below_replica_limit
                 && below_group_limit,
             available_bytes: pool.available_bytes(),
-            managed_bytes: pool.managed_bytes(),
             updated_at_unix_ms: unix_time_ms(),
             publication_generation,
         })
@@ -1654,7 +1650,6 @@ impl ReplicatedVolumeRuntime {
                 .as_ref()
                 .map_or(ReplicaHealth::Healthy, ReplicaRecord::health),
             group_saved: saved.is_some(),
-            group_running: running.is_some(),
             control_state_initialized: applied_state.is_some(),
             applied_log_index: applied_state
                 .as_ref()

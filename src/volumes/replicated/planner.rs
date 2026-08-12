@@ -202,11 +202,8 @@ mod tests {
             replicated_volumes: ReplicatedVolumeSupport {
                 address: format!("10.0.0.{ordinal}:7578"),
                 format_version: REPLICATED_VOLUME_FORMAT_VERSION,
-                ublk: true,
-                device_mapper: true,
                 accepts_replicas: true,
                 available_bytes: u64::MAX,
-                managed_bytes: u64::MAX,
                 updated_at_unix_ms: 1,
                 publication_generation: 1,
             },

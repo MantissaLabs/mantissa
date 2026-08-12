@@ -1109,7 +1109,6 @@ impl ReplicaCatalog {
         };
         Ok(PoolStatus::new(
             state,
-            pool.managed_bytes,
             available_bytes,
             pool.data_bytes,
             pool.metadata_bytes,

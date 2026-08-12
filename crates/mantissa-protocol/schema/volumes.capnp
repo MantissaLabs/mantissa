@@ -2,6 +2,7 @@
 
 using import "health.capnp".NodeStatus;
 
+# Cluster API for creating, inspecting, retaining, and deleting volumes.
 interface Volumes {
   create @0 (request :VolumeCreateRequest) -> (volume :VolumeSpec);
   # Create a new volume object.
@@ -29,6 +30,7 @@ interface Volumes {
   # Save a larger desired total capacity and reconcile it asynchronously.
 }
 
+# Node API for replicated-volume setup, control, and inspection.
 interface ReplicatedVolumeStorage {
   ensureReplica @0 (request :EnsureReplicaRequest)
       -> (status :LocalReplicaStatus);
@@ -63,33 +65,25 @@ interface ReplicatedVolumeStorage {
   # Read local reservation, file coverage, and served bounds without changing them.
 }
 
+# Replicated-volume availability advertised by one cluster node.
 struct ReplicatedVolumeStorageStatus {
   address @0 :Text;
   # Private address used for authenticated storage traffic.
 
   formatVersion @1 :UInt16;
-  # Disk and network format served by this node.
+  # Complete replicated-volume format served by this node.
 
-  ublk @2 :Bool;
-  # True when the kernel provides every required ublk feature.
-
-  acceptsReplicas @3 :Bool;
+  acceptsReplicas @2 :Bool;
   # True when the pool can accept another replica.
 
-  availableBytes @4 :UInt64;
+  availableBytes @3 :UInt64;
   # Space currently available in the pool filesystem.
 
-  managedBytes @5 :UInt64;
-  # Pool capacity tracked by the local replica database.
-
-  updatedAtUnixMs @6 :UInt64;
+  updatedAtUnixMs @4 :UInt64;
   # Time when this status was measured.
 
-  publicationGeneration @7 :UInt64;
+  publicationGeneration @5 :UInt64;
   # Node startup generation used to reject an older status.
-
-  deviceMapper @8 :Bool;
-  # True when the host provides the device-mapper linear target.
 }
 
 # One request sent over a dedicated replicated-volume data connection.
@@ -110,6 +104,7 @@ struct VolumeBlockConnection {
   # Non-zero driver or maintenance session fixed for this connection.
 }
 
+# Work permitted on one authenticated replica-data connection.
 enum VolumeBlockConnectionPurpose {
   invalid @0;
   # Default value. Decoders always reject it.
@@ -124,6 +119,7 @@ enum VolumeBlockConnectionPurpose {
   # Copy current data into one replacement copy.
 }
 
+# One numbered operation sent over a replica-data connection.
 struct VolumeBlockRequest {
   requestId @0 :UInt64;
   # Non-zero caller number matched with one response on each connection.
@@ -425,11 +421,13 @@ struct VolumeFinishRepair {
   # Greatest write covered by that durable flush.
 }
 
+# Number and placement of workloads allowed to write one volume.
 enum VolumeAccessMode {
   readWriteOnce @0;
   # One writer on one node at a time.
 }
 
+# Point at which a volume is assigned to a workload node.
 enum VolumeBindingMode {
   immediate @0;
   # Volume must already be bound to one node when created.
@@ -438,6 +436,7 @@ enum VolumeBindingMode {
   # Volume binds when the first consumer is scheduled.
 }
 
+# Data action requested when a volume object is deleted.
 enum VolumeReclaimPolicy {
   retain @0;
   # Preserve the backing data path when deleting the control-plane object.
@@ -446,6 +445,7 @@ enum VolumeReclaimPolicy {
   # Delete Mantissa-managed backing data after the last consumer disappears.
 }
 
+# Compact lifecycle state returned in volume lists.
 enum VolumeStatus {
   pending @0;
   # Desired object exists but is not bound or ready yet.
@@ -475,6 +475,7 @@ enum VolumeStatus {
   # A retained volume is returning to service.
 }
 
+# Detailed lifecycle state derived for one volume.
 enum VolumeState {
   pending @0;
   # A local volume exists but is not ready yet.
@@ -513,6 +514,7 @@ enum VolumeState {
   # The preserved volume is returning to service.
 }
 
+# Node-local realization state for one volume.
 enum VolumeNodeState {
   pending @0;
   # Node-local realization has not started yet.
@@ -536,6 +538,7 @@ enum VolumeNodeState {
   # The local replica is stopped and preserved.
 }
 
+# One operator-supplied label attached to a volume.
 struct VolumeLabel {
   key @0 :Text;
   # Metadata key.
@@ -544,6 +547,7 @@ struct VolumeLabel {
   # Metadata value.
 }
 
+# Backing directory selected for one node-local volume.
 struct LocalVolumeSpec {
   union {
     managed @0 :ManagedLocalVolumeSpec;
@@ -554,11 +558,13 @@ struct LocalVolumeSpec {
   }
 }
 
+# Directory settings for a volume managed by Mantissa.
 struct ManagedLocalVolumeSpec {
   ownership @0 :FilesystemOwnership;
   # Ownership and permissions applied to the managed filesystem.
 }
 
+# User and group ownership applied to a mounted filesystem.
 struct UserFilesystemOwnership {
   uid @0 :UInt32;
   # User ID applied to the managed filesystem.
@@ -567,11 +573,13 @@ struct UserFilesystemOwnership {
   # Group ID applied to the managed filesystem.
 }
 
+# Writable group ownership applied to a mounted filesystem.
 struct GroupFilesystemOwnership {
   gid @0 :UInt32;
   # Writable group ID applied to the managed filesystem.
 }
 
+# Ownership policy applied to a volume filesystem.
 struct FilesystemOwnership {
   union {
     daemon @0 :Void;
@@ -585,6 +593,7 @@ struct FilesystemOwnership {
   }
 }
 
+# Filesystem settings for one Mantissa-replicated block volume.
 struct ReplicatedVolumeSpec {
   ownership @0 :FilesystemOwnership;
   # Ownership and permissions applied after the filesystem is mounted.
@@ -593,6 +602,7 @@ struct ReplicatedVolumeSpec {
   # Filesystem created inside the replicated block device.
 }
 
+# Filesystem that Mantissa creates and expands on a replicated block volume.
 enum ReplicatedVolumeFilesystem {
   ext4 @0;
   # Linux ext4 expanded online with resize2fs.
@@ -601,6 +611,7 @@ enum ReplicatedVolumeFilesystem {
   # Linux XFS expanded online with xfs_growfs.
 }
 
+# Identity of storage managed by an external volume driver.
 struct ExternalVolumeSpec {
   driverName @0 :Text;
   # External driver identifier.
@@ -609,22 +620,34 @@ struct ExternalVolumeSpec {
   # Driver-specific volume handle.
 }
 
+# Backing storage implementation selected for one volume.
 struct VolumeDriverSpec {
   union {
     local @0 :LocalVolumeSpec;
+    # Directory-backed storage on the volume's bound node.
+
     external @1 :ExternalVolumeSpec;
+    # Storage whose lifecycle belongs to an external driver.
+
     replicated @2 :ReplicatedVolumeSpec;
     # Mantissa stores three block-replicated copies and uses Raft only for
     # bounded writer, membership, recovery, and replacement grant.
   }
 }
 
+# Requested long-term outcome for one volume generation.
 enum DesiredVolumeDisposition {
   live @0;
+  # Keep the volume available for workloads.
+
   retained @1;
+  # Stop the volume while preserving its Mantissa-owned data.
+
   deleted @2;
+  # Permanently remove the volume generation.
 }
 
+# Convergent lifecycle request saved with one volume generation.
 struct VolumeLifecycleIntent {
   revision @0 :UInt64;
   # Monotonic desired-state revision within one public generation.
@@ -639,6 +662,7 @@ struct VolumeLifecycleIntent {
   # True only when terminal deletion may remove Mantissa-owned backing data.
 }
 
+# Canonical desired state for one volume generation.
 struct VolumeSpec {
   id @0 :Data;
   # 16-byte UUID for the volume.
@@ -693,6 +717,7 @@ struct VolumeSpec {
 
 }
 
+# Latest local realization facts published by one volume node.
 struct VolumeNodeStatus {
   id @0 :Data;
   # 16-byte UUID for the node-status row.
@@ -749,9 +774,10 @@ struct VolumeNodeStatus {
   # Capacity exposed by the writer's active mapped device, zero on other nodes.
 
   filesystemExpansionPending @18 :Bool;
-  # True while the writer's ext4 receipt is behind its mapped-device capacity.
+  # True while the selected filesystem is behind its mapped-device capacity.
 }
 
+# Immutable replica placement and bootstrap identity for one volume generation.
 struct ReplicatedVolumePlan {
   id @0 :Data;
   # Stable 16-byte key for this immutable plan.
@@ -775,6 +801,7 @@ struct ReplicatedVolumePlan {
   # Exact volume identity, capacity, and block sizes used by all three replicas.
 }
 
+# Idempotent request to create or inspect one planned replica.
 struct EnsureReplicaRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact immutable volume generation to realize.
@@ -786,11 +813,13 @@ struct EnsureReplicaRequest {
   # Exact common three-voter bootstrap set.
 }
 
+# Exact volume generation requested by a read-only replica inspection.
 struct ReplicaStatusRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact volume generation whose local state is requested.
 }
 
+# Exact volume and target size requested by a local capacity inspection.
 struct InspectReplicaCapacityRequest {
   volumeId @0 :Data;
   # Exact stable volume UUID.
@@ -802,6 +831,7 @@ struct InspectReplicaCapacityRequest {
   # Desired capacity whose local preparation is being checked.
 }
 
+# Local reservation, file, and served bounds for one expansion target.
 struct ReplicaCapacityStatus {
   reservedCapacityBytes @0 :UInt64;
   # Logical capacity covered by the durable local pool reservation.
@@ -819,6 +849,7 @@ struct ReplicaCapacityStatus {
   # Concrete local blocker, empty when no blocker was observed.
 }
 
+# Idempotent request to prepare one granted replacement copy.
 struct EnsureReplacementReplicaRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact volume generation being rebuilt on this node.
@@ -830,6 +861,7 @@ struct EnsureReplacementReplicaRequest {
   # Current voters allowed to start this replacement member.
 }
 
+# One control command addressed to the elected leader of a volume group.
 struct ProposeVolumeCommandRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact generation whose current leader must evaluate the command.
@@ -838,6 +870,7 @@ struct ProposeVolumeCommandRequest {
   # One bounded semantic compare-and-set control-state transition.
 }
 
+# Idempotent request for one granted replacement membership state.
 struct EnsureReplacementMembershipRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact generation whose elected leader owns membership changes.
@@ -853,12 +886,19 @@ struct EnsureReplacementMembershipRequest {
   # Empty for learner and finalVoters goals.
 }
 
+# Membership state requested while replacing one replica.
 enum ReplacementMembershipGoal {
   learner @0;
+  # Keep the replacement in the group without a vote.
+
   finalVoters @1;
+  # Adopt the replacement into the final voter set.
+
   absent @2;
+  # Remove the replacement and restore the surviving voter set.
 }
 
+# Durable local replica and Raft facts returned by setup and inspection RPCs.
 struct LocalReplicaStatus {
   exists @0 :Bool;
   # True when the local replica catalog contains this volume generation.
@@ -869,37 +909,35 @@ struct LocalReplicaStatus {
   groupSaved @2 :Bool;
   # True when the local Raft catalog contains this volume generation.
 
-  groupRunning @3 :Bool;
-  # True when the local Raft member is currently running.
-
-  volumeStateCommitted @4 :Bool;
+  controlStateInitialized @3 :Bool;
   # True after the first volume command has been saved locally.
 
-  appliedLogIndex @5 :UInt64;
+  appliedLogIndex @4 :UInt64;
   # Highest locally applied Raft log index, or zero when none is known.
 
-  hasAppliedLog @6 :Bool;
+  hasAppliedLog @5 :Bool;
   # Distinguishes no applied entry from an applied entry at index zero.
 
-  leaderNodeId @7 :Data;
+  leaderNodeId @6 :Data;
   # Current leader UUID, empty when no leader is known.
 
-  voterNodeIds @8 :List(Data);
+  voterNodeIds @7 :List(Data);
   # Current committed voter UUIDs in sorted order.
 
-  reservedCapacityBytes @9 :UInt64;
+  reservedCapacityBytes @8 :UInt64;
   # Logical capacity covered by this replica's local pool reservation.
 
-  health @10 :LocalReplicaHealth;
+  health @9 :LocalReplicaHealth;
   # Durable health of the local data copy. Ignored when exists is false.
 
-  preparedCapacityBytes @11 :UInt64;
+  preparedCapacityBytes @10 :UInt64;
   # Largest capacity covered by durable file length and reservation.
 
-  servedCapacityBytes @12 :UInt64;
+  servedCapacityBytes @11 :UInt64;
   # Largest capacity currently accepted by this replica's data path.
 }
 
+# Latest committed control and membership facts for one volume Raft group.
 struct ReplicatedVolumeGroupStatus {
   id @0 :Data;
   # 16-byte UUID for this group-status record.
@@ -962,6 +1000,7 @@ struct ReplicatedVolumeGroupStatus {
   # Logical capacity committed by the volume Raft group.
 }
 
+# Compact operator-facing view returned by the volume list API.
 struct VolumeSummary {
   id @0 :Data;
   # 16-byte UUID for the volume.
@@ -1000,12 +1039,13 @@ struct VolumeSummary {
   # Short operator-facing reason.
 
   updatedAt @12 :Text;
-  # RFC3339 timestamp of the latest control-plane update.
+  # RFC3339 timestamp when the canonical volume object last changed.
 
   state @13 :VolumeState;
   # Current state derived from the immutable plan, Raft observation, and node reports.
 }
 
+# Canonical volume state and the observations used to derive its current state.
 struct VolumeInspect {
   spec @0 :VolumeSpec;
   # Canonical volume object.
@@ -1032,6 +1072,7 @@ struct VolumeInspect {
   # Effective requested replicated capacity, zero for other volume drivers.
 }
 
+# Best-effort space measurement from the currently mounted writer filesystem.
 struct VolumeFilesystemSpace {
   writerNodeId @0 :Data;
   # Node that owned the mounted writer when this measurement was taken.
@@ -1046,6 +1087,7 @@ struct VolumeFilesystemSpace {
   # Bytes available to the workload according to the mounted filesystem.
 }
 
+# Desired settings for a newly managed volume.
 struct VolumeCreateRequest {
   name @0 :Text;
   # Human-readable volume name.
@@ -1072,6 +1114,7 @@ struct VolumeCreateRequest {
   # Required when bindingMode=immediate.
 }
 
+# Existing host directory to register as a node-local volume.
 struct VolumeImportRequest {
   name @0 :Text;
   # Human-readable volume name.
@@ -1089,6 +1132,7 @@ struct VolumeImportRequest {
   # Operator metadata labels.
 }
 
+# Accepted deletion outcome returned before physical cleanup finishes.
 struct VolumeDeleteResult {
   preservedPath @0 :Text;
   # Backing path preserved after delete, empty when none.
@@ -1097,6 +1141,7 @@ struct VolumeDeleteResult {
   # Accepted logical outcome. Physical cleanup converges independently.
 }
 
+# Desired and committed sizes observed after an expansion request.
 struct VolumeExpandResult {
   volumeId @0 :Data;
   # Stable UUID of the replicated volume.
@@ -1114,6 +1159,7 @@ struct VolumeExpandResult {
   # Whether this call changed the durable desired-capacity request.
 }
 
+# Data outcome accepted for one volume deletion.
 enum VolumeDeleteDisposition {
   deleted @0;
   # The generation is terminal and owned backing data may be removed.
@@ -1122,6 +1168,7 @@ enum VolumeDeleteDisposition {
   # Backing data remains available for restore or operator handling.
 }
 
+# One convergent volume row update sent through cluster gossip.
 struct VolumeEvent {
   event @0 :EventType;
   # Event type.
@@ -1150,6 +1197,7 @@ struct VolumeEvent {
   capacityRequest @8 :ReplicatedVolumeCapacityRequest;
   # Desired replicated-volume capacity for upserts.
 
+  # Exact row operation carried by one volume event.
   enum EventType {
     upsert @0;
     # Volume object upsert.
@@ -1428,26 +1476,67 @@ enum VolumeControlCommandRejection {
   # Default value. Decoders always reject it.
 
   notInitialized @1;
+  # The group has no committed descriptor or data control state.
+
   alreadyInitialized @2;
+  # Initialization already committed different or subsequently changed state.
+
   wrongGeneration @3;
+  # The command targets another destructive generation.
+
   volumeNotLive @4;
+  # Only a live generation can receive operational grants.
+
   writerOutsideCopySet @5;
+  # A writer is outside the active data-copy set.
+
   wrongWriter @6;
+  # The named writer is not current.
+
   invalidCopySet @7;
+  # The selected active-copy set is not two or three valid nodes.
+
   invalidRecovery @8;
+  # The recovery selection violates current data control state.
+
   recoveryInProgress @9;
+  # Another recovery remains authorized.
+
   noRecovery @10;
+  # No recovery exists to complete or replace.
+
   wrongRecovery @11;
+  # The named recovery is not current.
+
   recoveryIdConflict @12;
+  # A recovery ID was reused with different immutable fields.
+
   invalidReplacement @13;
+  # The replacement selection violates current data control state.
+
   replacementInProgress @14;
+  # Another replacement remains authorized.
+
   noReplacement @15;
+  # No replacement exists to cancel or adopt.
+
   wrongReplacement @16;
+  # The named replacement is not current.
+
   replacementIdConflict @17;
+  # A replacement ID was reused with different immutable fields.
+
   revisionExhausted @18;
+  # No larger control revision can be represented.
+
   fenceExhausted @19;
+  # No larger data-plane fence can be represented.
+
   capacityCannotShrink @20;
+  # A committed volume capacity can never decrease.
+
   capacityNotAligned @21;
+  # The requested capacity is not aligned to the volume block sizes.
 }
 
 # Complete bounded control state stored in one volume Raft snapshot.
@@ -1675,6 +1764,7 @@ struct LocalFilesystemFormat {
   # Exact filesystem being formatted.
 }
 
+# Durable bootstrap or replacement grant that created one local replica.
 struct LocalReplicaOrigin {
   union {
     bootstrapId @0 :Data;
@@ -1704,7 +1794,7 @@ enum LocalVolumeMountState {
 # Complete node-local catalog row for one replica generation.
 struct LocalReplicaRecord {
   formatVersion @0 :UInt16;
-  # Non-zero version of this durable catalog record.
+  # Exact local replica catalog format understood by this build.
 
   descriptor @1 :VolumeDescriptor;
   # Identity, applied Raft capacity, and fixed block sizes of this replica.
@@ -1725,29 +1815,46 @@ struct LocalReplicaRecord {
   # Durable reason this node owns the copy.
 
   filesystemFormat @7 :LocalFilesystemFormat;
-  # Unfinished ext4 format, or a null pointer when none is running.
+  # Unfinished selected-filesystem format, or null when none is running.
 
   health @8 :LocalReplicaHealth;
   # Durable fail-closed health independent from local lifecycle state.
 }
 
+# Restart-safe ownership of one local writer device and filesystem mount.
 struct LocalAttachmentRecord {
   formatVersion @0 :UInt16;
+  # Exact local attachment catalog format understood by this build.
+
   descriptor @1 :VolumeDescriptor;
+  # Exact volume generation and capacity owned by this attachment.
+
   sessionId @2 :Data;
+  # Non-zero driver session shared by the device and mount.
+
   grantedFence @3 :UInt64;
   # Zero before a writer grant commits.
+
   ublkDevices @4 :List(LocalUblkDevice);
   # One active device, or active plus retiring device during an online switch.
+
   volumeMount @5 :LocalVolumeMount;
+  # Saved mount state, or null before a mount is needed.
+
   detaching @6 :Bool;
   # Monotonic local cleanup intent retained even when no device or mount was created.
 }
 
+# Restart-safe instruction to remove one obsolete local replica generation.
 struct LocalReplicaRetirement {
   formatVersion @0 :UInt16;
+  # Exact local retirement catalog format understood by this build.
+
   volumeId @1 :Data;
+  # Stable 16-byte UUID of the volume whose copy must be removed.
+
   generation @2 :UInt64;
+  # Exact destructive-rebuild generation that must be removed.
 }
 
 # Small control state saved after each applied Raft command.

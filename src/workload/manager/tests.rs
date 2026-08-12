@@ -11232,11 +11232,8 @@ async fn setup_replicated_shutdown_test(
         .upsert_self_replicated_volumes(ReplicatedVolumeSupport {
             address: "127.0.0.1:7578".to_string(),
             format_version: REPLICATED_VOLUME_FORMAT_VERSION,
-            ublk: true,
-            device_mapper: true,
             accepts_replicas: true,
             available_bytes: u64::MAX,
-            managed_bytes: u64::MAX,
             updated_at_unix_ms: 1,
             publication_generation: 1,
         })
@@ -11745,11 +11742,8 @@ async fn replicated_mount_failure_returns_one_blocked_task_and_keeps_its_slots_f
         .upsert_self_replicated_volumes(ReplicatedVolumeSupport {
             address: "127.0.0.1:7578".to_string(),
             format_version: REPLICATED_VOLUME_FORMAT_VERSION,
-            ublk: true,
-            device_mapper: true,
             accepts_replicas: true,
             available_bytes: u64::MAX,
-            managed_bytes: u64::MAX,
             updated_at_unix_ms: 1,
             publication_generation: 1,
         })

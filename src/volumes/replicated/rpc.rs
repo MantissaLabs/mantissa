@@ -653,8 +653,7 @@ fn write_status(mut builder: local_replica_status::Builder<'_>, status: &LocalRe
         ReplicaHealth::NeedsRecovery => WireReplicaHealth::NeedsRecovery,
     });
     builder.set_group_saved(status.group_saved);
-    builder.set_group_running(status.group_running);
-    builder.set_volume_state_committed(status.control_state_initialized);
+    builder.set_control_state_initialized(status.control_state_initialized);
     builder.set_has_applied_log(status.applied_log_index.is_some());
     builder.set_applied_log_index(status.applied_log_index.unwrap_or_default());
     if let Some(leader) = status.leader_node_id {
@@ -763,8 +762,7 @@ fn read_status(
         state,
         health,
         group_saved: reader.get_group_saved(),
-        group_running: reader.get_group_running(),
-        control_state_initialized: reader.get_volume_state_committed(),
+        control_state_initialized: reader.get_control_state_initialized(),
         applied_log_index: reader
             .get_has_applied_log()
             .then(|| reader.get_applied_log_index()),

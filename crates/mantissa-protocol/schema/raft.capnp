@@ -2,6 +2,7 @@
 
 using Volumes = import "volumes.capnp";
 
+# Entry point for Raft and application RPCs on one authenticated connection.
 interface RaftTransport {
   getRaft @0 () -> (service :Raft);
   # Return the generic Raft service for this authenticated connection.
@@ -10,6 +11,7 @@ interface RaftTransport {
   # Return the application service registered by the crate using Raft.
 }
 
+# Raft RPCs addressed to one application-defined group.
 interface Raft {
   requestVote @0 (groupId :RaftGroupId, request :VoteRequest)
       -> (response :VoteResponse);

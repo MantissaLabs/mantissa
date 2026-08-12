@@ -867,7 +867,6 @@ pub enum PoolSpaceState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolStatus {
     state: PoolSpaceState,
-    managed_bytes: u64,
     available_bytes: u64,
     data_bytes: u64,
     metadata_bytes: u64,
@@ -877,14 +876,12 @@ impl PoolStatus {
     /// Builds one current view from durable totals and filesystem free space.
     pub(super) const fn new(
         state: PoolSpaceState,
-        managed_bytes: u64,
         available_bytes: u64,
         data_bytes: u64,
         metadata_bytes: u64,
     ) -> Self {
         Self {
             state,
-            managed_bytes,
             available_bytes,
             data_bytes,
             metadata_bytes,
@@ -895,12 +892,6 @@ impl PoolStatus {
     #[must_use]
     pub const fn state(self) -> PoolSpaceState {
         self.state
-    }
-
-    /// Returns the durable pool capacity used for reservations.
-    #[must_use]
-    pub const fn managed_bytes(self) -> u64 {
-        self.managed_bytes
     }
 
     /// Returns space currently available from the filesystem.
