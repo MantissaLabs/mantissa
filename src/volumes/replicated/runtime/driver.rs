@@ -52,17 +52,24 @@ impl ReplicatedDriverSettings {
     }
 }
 
-/// Selects whether the device thread creates or recovers one kernel device.
-enum DriverDeviceMode {
+/// Selects whether the ublk owner creates or recovers one kernel device.
+enum UblkDeviceMode {
     Start,
     Recover(UblkDeviceId),
 }
 
-/// Keeps all potentially blocking ublk cleanup off Tokio worker threads.
-struct DriverDevice {
-    pending_start: Option<DriverDeviceStart>,
-    ready: Option<oneshot::Receiver<Result<(UblkDeviceId, PathBuf), UblkError>>>,
-    started: Option<(UblkDeviceId, PathBuf)>,
+/// Kernel identity published after one ublk device finishes starting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StartedUblkDevice {
+    id: UblkDeviceId,
+    path: PathBuf,
+}
+
+/// Keeps all potentially blocking ublk startup and cleanup off Tokio workers.
+struct UblkDeviceOwner {
+    pending_start: Option<UblkDeviceStart>,
+    ready: Option<oneshot::Receiver<Result<StartedUblkDevice, UblkError>>>,
+    started: Option<StartedUblkDevice>,
     start_failed: bool,
     stop_requests: Option<std::sync::mpsc::Sender<DeviceStopRequest>>,
     stop_attempt: Option<oneshot::Receiver<UblkError>>,
@@ -70,12 +77,12 @@ struct DriverDevice {
 }
 
 /// Complete owner-thread inputs retained until the runtime registers the driver.
-struct DriverDeviceStart {
+struct UblkDeviceStart {
     owner_id: UblkOwnerId,
-    mode: DriverDeviceMode,
+    mode: UblkDeviceMode,
     settings: mantissa_volume::driver::UblkSettings,
     handler: Arc<dyn BlockHandler>,
-    ready: oneshot::Sender<Result<(UblkDeviceId, PathBuf), UblkError>>,
+    ready: oneshot::Sender<Result<StartedUblkDevice, UblkError>>,
     stop_requests: std::sync::mpsc::Receiver<DeviceStopRequest>,
     finished: oneshot::Sender<Result<(), UblkError>>,
 }
@@ -85,11 +92,11 @@ struct DeviceStopRequest {
     failed: oneshot::Sender<UblkError>,
 }
 
-impl DriverDevice {
+impl UblkDeviceOwner {
     /// Prepares owner-thread channels without creating any kernel resource.
     fn prepare_start(
         owner_id: UblkOwnerId,
-        mode: DriverDeviceMode,
+        mode: UblkDeviceMode,
         settings: mantissa_volume::driver::UblkSettings,
         handler: Arc<dyn BlockHandler>,
     ) -> Self {
@@ -97,7 +104,7 @@ impl DriverDevice {
         let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
         let (finished_sender, finished_receiver) = oneshot::channel();
         Self {
-            pending_start: Some(DriverDeviceStart {
+            pending_start: Some(UblkDeviceStart {
                 owner_id,
                 mode,
                 settings,
@@ -145,7 +152,7 @@ impl DriverDevice {
     async fn wait_until_started(
         &mut self,
         timeout: Duration,
-    ) -> Result<(UblkDeviceId, PathBuf), DriverError> {
+    ) -> Result<StartedUblkDevice, DriverError> {
         if let Some(started) = self.started.as_ref() {
             return Ok(started.clone());
         }
@@ -256,15 +263,15 @@ enum DeviceStopEvent {
 /// Owns the concrete ublk handle and retries failed cleanup only when requested.
 fn run_device_owner(
     owner_id: UblkOwnerId,
-    mode: DriverDeviceMode,
+    mode: UblkDeviceMode,
     settings: mantissa_volume::driver::UblkSettings,
     handler: Arc<dyn BlockHandler>,
-    ready: oneshot::Sender<Result<(UblkDeviceId, PathBuf), UblkError>>,
+    ready: oneshot::Sender<Result<StartedUblkDevice, UblkError>>,
     stop_requests: std::sync::mpsc::Receiver<DeviceStopRequest>,
 ) -> Result<(), UblkError> {
     let device = match mode {
-        DriverDeviceMode::Start => UblkDevice::start(owner_id, settings, handler),
-        DriverDeviceMode::Recover(id) => UblkDevice::recover(owner_id, id, settings, handler),
+        UblkDeviceMode::Start => UblkDevice::start(owner_id, settings, handler),
+        UblkDeviceMode::Recover(id) => UblkDevice::recover(owner_id, id, settings, handler),
     };
     let mut device = match device {
         Ok(device) => device,
@@ -273,9 +280,10 @@ fn run_device_owner(
             return Ok(());
         }
     };
-    let id = device.id();
-    let path = device.block_path().to_path_buf();
-    let _ = ready.send(Ok((id, path)));
+    let _ = ready.send(Ok(StartedUblkDevice {
+        id: device.id(),
+        path: device.block_path().to_path_buf(),
+    }));
 
     while let Ok(request) = stop_requests.recv() {
         match device.stop() {
@@ -288,10 +296,111 @@ fn run_device_owner(
     device.stop()
 }
 
-impl Drop for DriverDevice {
+impl Drop for UblkDeviceOwner {
     /// Asks the owner thread to clean up without blocking the dropping thread.
     fn drop(&mut self) {
         self.request_stop();
+    }
+}
+
+/// Complete private ublk device owned by one replicated-volume driver.
+struct DriverDevice {
+    owner: UblkDeviceOwner,
+    gate: Arc<DriverDeviceGate>,
+    settings: ReplicatedDriverSettings,
+}
+
+impl DriverDevice {
+    /// Prepares one gated ublk device without starting its owner thread.
+    fn prepare(
+        mode: UblkDeviceMode,
+        settings: ReplicatedDriverSettings,
+        handler: Arc<DriverHandler>,
+        enabled: bool,
+    ) -> Self {
+        let gate = Arc::new(DriverDeviceGate::new(handler, enabled));
+        let block_handler: Arc<dyn BlockHandler> = gate.clone();
+        let owner =
+            UblkDeviceOwner::prepare_start(settings.owner_id, mode, settings.ublk, block_handler);
+        Self {
+            owner,
+            gate,
+            settings,
+        }
+    }
+
+    /// Starts this device only after its enclosing driver has durable ownership.
+    fn start_owner(&mut self) -> Result<(), DriverError> {
+        self.owner.start_owner()
+    }
+
+    /// Waits for startup while retaining the result for cancellation-safe retries.
+    async fn finish_start(&mut self) -> Result<(), DriverError> {
+        self.owner
+            .wait_until_started(self.settings.operation_timeout)
+            .await
+            .map(drop)
+    }
+
+    /// Returns the kernel identity after this device has finished starting.
+    fn started(&self) -> Result<&StartedUblkDevice, DriverError> {
+        self.owner
+            .started
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)
+    }
+
+    /// Returns the kernel identifier when this device has finished starting.
+    fn id(&self) -> Option<UblkDeviceId> {
+        self.owner.started.as_ref().map(|started| started.id)
+    }
+
+    /// Returns the private block path exposed by this ublk device.
+    fn path(&self) -> Result<&Path, DriverError> {
+        Ok(self.started()?.path.as_path())
+    }
+
+    /// Returns this device in the durable catalog representation.
+    fn saved(
+        &self,
+        attachment: DriverAttachment,
+    ) -> Result<mantissa_volume::catalog::SavedUblkDevice, DriverError> {
+        Ok(mantissa_volume::catalog::SavedUblkDevice::new(
+            self.started()?.id,
+            attachment.fence,
+            attachment.session_id,
+            self.settings.ublk,
+        ))
+    }
+
+    /// Returns the capacity presented by this private ublk device.
+    fn capacity_bytes(&self) -> u64 {
+        self.settings.ublk.capacity_bytes()
+    }
+
+    /// Allows requests to enter the shared replicated data path through this device.
+    fn enable(&self) {
+        self.gate.enable();
+    }
+
+    /// Rejects requests that still reach this device after a mapping switch.
+    fn disable(&self) {
+        self.gate.disable();
+    }
+
+    /// Returns whether this device currently accepts requests through its gate.
+    fn is_enabled(&self) -> bool {
+        self.gate.is_enabled()
+    }
+
+    /// Stops this device while retaining unfinished cleanup for a later retry.
+    async fn stop(&mut self) -> Result<(), DriverError> {
+        self.owner.stop(self.settings.operation_timeout).await
+    }
+
+    /// Returns whether the owner thread has reached terminal cleanup.
+    fn is_stopped(&self) -> bool {
+        self.owner.is_stopped()
     }
 }
 
@@ -844,20 +953,13 @@ impl DriverIoPause {
 /// One ublk device backed by the bounded fixed-file replica path.
 #[must_use = "a replicated driver must be stopped before it is dropped"]
 pub(super) struct ReplicatedDriver {
-    device: Option<DriverDevice>,
-    device_id: Option<UblkDeviceId>,
-    backend_path: Option<PathBuf>,
-    device_gate: Arc<DriverDeviceGate>,
-    next_device: Option<DriverDevice>,
-    next_device_id: Option<UblkDeviceId>,
-    next_backend_path: Option<PathBuf>,
-    next_device_gate: Option<Arc<DriverDeviceGate>>,
-    next_settings: Option<ReplicatedDriverSettings>,
+    active_device: Option<DriverDevice>,
+    larger_device: Option<DriverDevice>,
     retiring_device: Option<DriverDevice>,
     path: Option<FixedReplicaPath>,
     retiring_path: Option<FixedReplicaPath>,
     handler: Arc<DriverHandler>,
-    settings: ReplicatedDriverSettings,
+    operation_timeout: Duration,
     progress: RequestProgress,
 }
 
@@ -894,7 +996,7 @@ impl ReplicatedDriver {
 
     /// Starts the prepared owner after this driver enters the runtime map.
     pub(super) fn start_device_owner(&mut self) -> Result<(), DriverError> {
-        self.device
+        self.active_device
             .as_mut()
             .ok_or(DriverError::DeviceThreadStopped)?
             .start_owner()
@@ -902,26 +1004,19 @@ impl ReplicatedDriver {
 
     /// Waits for the already-tracked owner thread to expose its block device.
     pub(super) async fn finish_start(&mut self) -> Result<(), DriverError> {
-        if self.device_id.is_some() && self.backend_path.is_some() {
-            return Ok(());
-        }
-        let device = self
-            .device
+        self.active_device
             .as_mut()
-            .ok_or(DriverError::DeviceThreadStopped)?;
-        let (device_id, backend_path) = device
-            .wait_until_started(self.settings.operation_timeout)
-            .await?;
-        self.device_id = Some(device_id);
-        self.backend_path = Some(backend_path);
-        Ok(())
+            .ok_or(DriverError::DeviceThreadStopped)?
+            .finish_start()
+            .await
     }
 
     /// Returns the private block-device path exposed by the ublk backend.
     pub(super) fn backend_path(&self) -> Result<&Path, DriverError> {
-        self.backend_path
-            .as_deref()
-            .ok_or(DriverError::DeviceNotStarted)
+        self.active_device
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?
+            .path()
     }
 
     /// Returns the attachment identity served by this device.
@@ -933,19 +1028,17 @@ impl ReplicatedDriver {
     pub(super) fn saved_device(
         &self,
     ) -> Result<mantissa_volume::catalog::SavedUblkDevice, DriverError> {
-        let device_id = self.device_id.ok_or(DriverError::DeviceNotStarted)?;
-        let attachment = self.attachment();
-        Ok(mantissa_volume::catalog::SavedUblkDevice::new(
-            device_id,
-            attachment.fence,
-            attachment.session_id,
-            self.settings.ublk,
-        ))
+        self.active_device
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?
+            .saved(self.attachment())
     }
 
     /// Returns the capacity of the private device currently selected by dm-linear.
     pub(super) fn device_capacity_bytes(&self) -> u64 {
-        self.settings.ublk.capacity_bytes()
+        self.active_device
+            .as_ref()
+            .map_or(0, DriverDevice::capacity_bytes)
     }
 
     /// Returns the capacity installed in the shared replicated data path.
@@ -958,7 +1051,7 @@ impl ReplicatedDriver {
         &mut self,
         settings: ReplicatedDriverSettings,
     ) -> Result<(), DriverError> {
-        self.start_next_device(DriverDeviceMode::Start, settings)
+        self.start_larger_device_with_mode(UblkDeviceMode::Start, settings)
     }
 
     /// Recovers one saved larger inactive device behind the shared I/O gate.
@@ -967,87 +1060,69 @@ impl ReplicatedDriver {
         device_id: UblkDeviceId,
         settings: ReplicatedDriverSettings,
     ) -> Result<(), DriverError> {
-        self.start_next_device(DriverDeviceMode::Recover(device_id), settings)
+        self.start_larger_device_with_mode(UblkDeviceMode::Recover(device_id), settings)
     }
 
-    /// Starts or recovers one disabled next device with exact capacity.
-    fn start_next_device(
+    /// Starts or recovers one disabled larger device with exact capacity.
+    fn start_larger_device_with_mode(
         &mut self,
-        mode: DriverDeviceMode,
+        mode: UblkDeviceMode,
         settings: ReplicatedDriverSettings,
     ) -> Result<(), DriverError> {
-        if self.next_device.is_some() {
-            if self
-                .next_settings
-                .is_some_and(|saved| saved.ublk.capacity_bytes() == settings.ublk.capacity_bytes())
-            {
+        if let Some(larger) = self.larger_device.as_ref() {
+            if larger.capacity_bytes() == settings.ublk.capacity_bytes() {
                 return Ok(());
             }
             return Err(DriverError::AnotherCapacityDevicePending);
         }
-        if settings.ublk.capacity_bytes() <= self.settings.ublk.capacity_bytes()
-            || self.retiring_device.is_some()
-        {
+        let active_capacity = self
+            .active_device
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?
+            .capacity_bytes();
+        if settings.ublk.capacity_bytes() <= active_capacity || self.retiring_device.is_some() {
             return Err(DriverError::AnotherCapacityDevicePending);
         }
-        let gate = Arc::new(DriverDeviceGate::new(Arc::clone(&self.handler), false));
-        let ublk_handler: Arc<dyn BlockHandler> = gate.clone();
-        let mut device =
-            DriverDevice::prepare_start(settings.owner_id, mode, settings.ublk, ublk_handler);
+        let mut device = DriverDevice::prepare(mode, settings, Arc::clone(&self.handler), false);
         device.start_owner()?;
-        self.next_device = Some(device);
-        self.next_device_gate = Some(gate);
-        self.next_settings = Some(settings);
+        self.larger_device = Some(device);
         Ok(())
     }
 
     /// Waits for the tracked larger device to expose its private backend path.
     pub(super) async fn finish_larger_device_start(&mut self) -> Result<(), DriverError> {
-        if self.next_device_id.is_some() && self.next_backend_path.is_some() {
-            return Ok(());
-        }
-        let settings = self.next_settings.ok_or(DriverError::DeviceNotStarted)?;
         let started = {
             let device = self
-                .next_device
+                .larger_device
                 .as_mut()
                 .ok_or(DriverError::DeviceNotStarted)?;
-            device.wait_until_started(settings.operation_timeout).await
+            device.finish_start().await
         };
-        let (device_id, backend_path) = match started {
-            Ok(started) => started,
-            Err(start_error) => {
-                return match self.stop_larger_device().await {
-                    Ok(()) => Err(start_error),
-                    Err(cleanup_error) => Err(cleanup_error),
-                };
-            }
-        };
-        self.next_device_id = Some(device_id);
-        self.next_backend_path = Some(backend_path);
-        Ok(())
+        match started {
+            Ok(()) => Ok(()),
+            Err(start_error) => match self.stop_larger_device().await {
+                Ok(()) => Err(start_error),
+                Err(cleanup_error) => Err(cleanup_error),
+            },
+        }
     }
 
     /// Returns the durable record for the tracked larger private device.
     pub(super) fn saved_larger_device(
         &self,
     ) -> Result<mantissa_volume::catalog::SavedUblkDevice, DriverError> {
-        let device_id = self.next_device_id.ok_or(DriverError::DeviceNotStarted)?;
-        let settings = self.next_settings.ok_or(DriverError::DeviceNotStarted)?;
-        let attachment = self.attachment();
-        Ok(mantissa_volume::catalog::SavedUblkDevice::new(
-            device_id,
-            attachment.fence,
-            attachment.session_id,
-            settings.ublk,
-        ))
+        self.larger_device
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?
+            .saved(self.attachment())
     }
 
     /// Returns the private path for the tracked larger device.
     pub(super) fn larger_backend_path(&self) -> Result<&Path, DriverError> {
-        self.next_backend_path
-            .as_deref()
-            .ok_or(DriverError::DeviceNotStarted)
+        self.larger_device
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?
+            .path()
     }
 
     /// Arms the larger private device without rejecting old requests still leaving dm-linear.
@@ -1055,61 +1130,47 @@ impl ReplicatedDriver {
         if !self.is_io_paused() {
             return Err(DriverError::Block(BlockIoError::NotServing));
         }
-        let gate = self
-            .next_device_gate
+        let larger = self
+            .larger_device
             .as_ref()
             .ok_or(DriverError::DeviceNotStarted)?;
-        gate.enable();
+        larger.enable();
         Ok(())
     }
 
     /// Makes the larger device active after device-mapper proves its table is active.
     pub(super) fn promote_larger_device(&mut self) -> Result<(), DriverError> {
-        if self.next_device.is_none()
-            || self.next_device_id.is_none()
-            || self.next_backend_path.is_none()
-            || self.next_settings.is_none()
-        {
+        let larger = self
+            .larger_device
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?;
+        larger.started()?;
+        if !larger.is_enabled() {
             return Err(DriverError::DeviceNotStarted);
         }
-        let next_gate = self
-            .next_device_gate
-            .take()
-            .ok_or(DriverError::DeviceNotStarted)?;
-        if !next_gate.is_enabled() {
-            self.next_device_gate = Some(next_gate);
-            return Err(DriverError::DeviceNotStarted);
+        if self.active_device.is_none() || self.retiring_device.is_some() {
+            return Err(DriverError::AnotherCapacityDevicePending);
         }
-        let next_device = self
-            .next_device
+        self.active_device
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?
+            .disable();
+        let larger = self
+            .larger_device
             .take()
             .ok_or(DriverError::DeviceNotStarted)?;
-        let next_id = self
-            .next_device_id
-            .take()
+        let active = self
+            .active_device
+            .replace(larger)
             .ok_or(DriverError::DeviceNotStarted)?;
-        let next_path = self
-            .next_backend_path
-            .take()
-            .ok_or(DriverError::DeviceNotStarted)?;
-        let next_settings = self
-            .next_settings
-            .take()
-            .ok_or(DriverError::DeviceNotStarted)?;
-        self.device_gate.disable();
-        self.retiring_device = self.device.take();
-        self.device = Some(next_device);
-        self.device_id = Some(next_id);
-        self.backend_path = Some(next_path);
-        self.device_gate = next_gate;
-        self.settings = next_settings;
+        self.retiring_device = Some(active);
         Ok(())
     }
 
     /// Stops the unreferenced old private device while retaining an unfinished wait.
     pub(super) async fn stop_retiring_device(&mut self) -> Result<(), DriverError> {
         let result = match self.retiring_device.as_mut() {
-            Some(device) => device.stop(self.settings.operation_timeout).await,
+            Some(device) => device.stop().await,
             None => Ok(()),
         };
         if self
@@ -1124,20 +1185,16 @@ impl ReplicatedDriver {
 
     /// Stops an unactivated larger device after the old mapping remains active.
     pub(super) async fn stop_larger_device(&mut self) -> Result<(), DriverError> {
-        let result = match self.next_device.as_mut() {
-            Some(device) => device.stop(self.settings.operation_timeout).await,
+        let result = match self.larger_device.as_mut() {
+            Some(device) => device.stop().await,
             None => Ok(()),
         };
         if self
-            .next_device
+            .larger_device
             .as_ref()
             .is_none_or(DriverDevice::is_stopped)
         {
-            self.next_device.take();
-            self.next_device_id = None;
-            self.next_backend_path = None;
-            self.next_device_gate = None;
-            self.next_settings = None;
+            self.larger_device.take();
         }
         result
     }
@@ -1179,8 +1236,9 @@ impl ReplicatedDriver {
 
     /// Returns whether the fixed-file path still accepts block requests.
     pub(super) fn is_serving(&self) -> bool {
-        self.device_id.is_some()
-            && self.backend_path.is_some()
+        self.active_device
+            .as_ref()
+            .is_some_and(|device| device.started().is_ok())
             && self.handler.is_serving()
             && self
                 .path
@@ -1219,12 +1277,13 @@ impl ReplicatedDriver {
             (handler.is_serving(), handler.failure())
         });
         format!(
-            "attachment={:?}, mode={mode}, in_flight={}, device={:?}, next_device={:?}, \
+            "attachment={:?}, mode={mode}, in_flight={}, active_device={:?}, \
+             larger_device={:?}, \
              active={active:?}, retiring_path={retiring:?}, retiring_device={}",
             self.attachment(),
             self.handler.in_flight.load(Ordering::Acquire),
-            self.device_id,
-            self.next_device_id,
+            self.active_device.as_ref().and_then(DriverDevice::id),
+            self.larger_device.as_ref().and_then(DriverDevice::id),
             self.retiring_device.is_some(),
         )
     }
@@ -1266,25 +1325,29 @@ impl ReplicatedDriver {
     /// Stops new I/O and retains unfinished device cleanup for a later retry.
     pub(super) async fn stop(&mut self) -> Result<(), DriverError> {
         let data_result = self.stop_requests().await;
-        let active_result = match self.device.as_mut() {
-            Some(device) => device.stop(self.settings.operation_timeout).await,
+        let active_result = match self.active_device.as_mut() {
+            Some(device) => device.stop().await,
             None => Ok(()),
         };
-        if self.device.as_ref().is_some_and(DriverDevice::is_stopped) {
-            self.device.take();
+        if self
+            .active_device
+            .as_ref()
+            .is_some_and(DriverDevice::is_stopped)
+        {
+            self.active_device.take();
         }
-        let next_result = self.stop_larger_device().await;
+        let larger_result = self.stop_larger_device().await;
         let retiring_result = self.stop_retiring_device().await;
         data_result
             .and(active_result)
-            .and(next_result)
+            .and(larger_result)
             .and(retiring_result)
     }
 
     /// Returns whether both the kernel device and data path reached terminal cleanup.
     pub(super) fn is_stopped(&self) -> bool {
-        self.device.is_none()
-            && self.next_device.is_none()
+        self.active_device.is_none()
+            && self.larger_device.is_none()
             && self.retiring_device.is_none()
             && self.path.is_none()
             && self.retiring_path.is_none()
@@ -1295,14 +1358,12 @@ impl ReplicatedDriver {
         self.quarantine();
         let path_result = stop_data_path(&mut self.path).await;
         let retiring_result = stop_data_path(&mut self.retiring_path).await;
-        let drain_result = tokio::time::timeout(
-            self.settings.operation_timeout,
-            self.handler.wait_for_drained(),
-        )
-        .await
-        .map_err(|_| DriverError::RequestDrainTimedOut {
-            timeout: self.settings.operation_timeout,
-        });
+        let drain_result =
+            tokio::time::timeout(self.operation_timeout, self.handler.wait_for_drained())
+                .await
+                .map_err(|_| DriverError::RequestDrainTimedOut {
+                    timeout: self.operation_timeout,
+                });
         path_result.and(retiring_result).and(drain_result)
     }
 
@@ -1324,26 +1385,16 @@ impl ReplicatedDriver {
             attachment,
         ));
         let progress = handler.progress.clone();
-        let device_gate = Arc::new(DriverDeviceGate::new(Arc::clone(&handler), true));
-        let ublk_handler: Arc<dyn BlockHandler> = device_gate.clone();
-        let mode = recover_id.map_or(DriverDeviceMode::Start, DriverDeviceMode::Recover);
-        let device =
-            DriverDevice::prepare_start(settings.owner_id, mode, settings.ublk, ublk_handler);
+        let mode = recover_id.map_or(UblkDeviceMode::Start, UblkDeviceMode::Recover);
+        let device = DriverDevice::prepare(mode, settings, Arc::clone(&handler), true);
         Self {
-            device: Some(device),
-            device_id: None,
-            backend_path: None,
-            device_gate,
-            next_device: None,
-            next_device_id: None,
-            next_backend_path: None,
-            next_device_gate: None,
-            next_settings: None,
+            active_device: Some(device),
+            larger_device: None,
             retiring_device: None,
             path: Some(path),
             retiring_path: None,
             handler,
-            settings,
+            operation_timeout: settings.operation_timeout,
             progress,
         }
     }
@@ -1450,8 +1501,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        DriverAttachment, DriverDevice, DriverDeviceGate, DriverDeviceMode, DriverError,
-        DriverHandler, DriverPath, DriverQuarantine, ReplicatedDriver, ReplicatedDriverSettings,
+        DriverAttachment, DriverDevice, DriverDeviceGate, DriverError, DriverHandler, DriverPath,
+        DriverQuarantine, ReplicatedDriver, ReplicatedDriverSettings, StartedUblkDevice,
+        UblkDeviceMode, UblkDeviceOwner,
     };
 
     /// Small handler used to exercise admission and planned rebuild pauses.
@@ -1552,11 +1604,11 @@ mod tests {
     }
 
     /// Creates a device state whose owner is already waiting for cleanup.
-    fn stopping_device(
+    fn stopping_device_owner(
         stop_requests: std::sync::mpsc::Sender<super::DeviceStopRequest>,
         finished: tokio::sync::oneshot::Receiver<Result<(), mantissa_volume::driver::UblkError>>,
-    ) -> DriverDevice {
-        DriverDevice {
+    ) -> UblkDeviceOwner {
+        UblkDeviceOwner {
             pending_start: None,
             ready: None,
             started: None,
@@ -1628,7 +1680,7 @@ mod tests {
 
     /// Prepared devices have no owner or kernel work and stop synchronously.
     #[tokio::test]
-    async fn prepared_device_is_inert_until_its_registered_owner_starts() {
+    async fn prepared_device_owner_is_inert_until_registered_driver_starts_it() {
         let descriptor = descriptor();
         let settings = UblkSettings::new(
             &descriptor,
@@ -1643,19 +1695,19 @@ mod tests {
         let path: Arc<dyn DriverPath> = Arc::new(TestHandler(0, false, None));
         let (handler, _applied_state) = authorized_handler(path);
         let handler: Arc<dyn BlockHandler> = Arc::new(handler);
-        let mut device = DriverDevice::prepare_start(
+        let mut owner = UblkDeviceOwner::prepare_start(
             UblkOwnerId::new(1),
-            DriverDeviceMode::Start,
+            UblkDeviceMode::Start,
             settings,
             handler,
         );
 
-        assert!(device.pending_start.is_some());
-        device
+        assert!(owner.pending_start.is_some());
+        owner
             .stop(Duration::from_millis(10))
             .await
             .expect("inert device cleanup must not wait for a thread");
-        assert!(device.is_stopped());
+        assert!(owner.is_stopped());
     }
 
     /// Old requests remain valid until device mapper confirms the larger backend is active.
@@ -1946,7 +1998,7 @@ mod tests {
         let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
         let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
-        let owner = std::thread::spawn(move || {
+        let owner_thread = std::thread::spawn(move || {
             stop_receiver
                 .recv()
                 .expect("test owner must receive its stop request");
@@ -1955,17 +2007,17 @@ mod tests {
                 .expect("test owner must be released after the timeout");
             let _ = finished_sender.send(Ok(()));
         });
-        let mut device = stopping_device(stop_sender, finished_receiver);
+        let mut owner = stopping_device_owner(stop_sender, finished_receiver);
 
         assert!(matches!(
-            device.stop(Duration::from_millis(10)).await,
+            owner.stop(Duration::from_millis(10)).await,
             Err(DriverError::DeviceStopTimedOut { .. })
         ));
         release_sender
             .send(())
             .expect("test owner release must be delivered");
-        owner.join().expect("test owner thread must finish");
-        device
+        owner_thread.join().expect("test owner thread must finish");
+        owner
             .stop(Duration::from_millis(10))
             .await
             .expect("retry must observe completed device cleanup");
@@ -1977,7 +2029,7 @@ mod tests {
         let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
         let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
-        let owner = std::thread::spawn(move || {
+        let owner_thread = std::thread::spawn(move || {
             stop_receiver
                 .recv()
                 .expect("test owner must receive its stop request");
@@ -1986,9 +2038,9 @@ mod tests {
                 .expect("test owner must be released after cancellation");
             let _ = finished_sender.send(Ok(()));
         });
-        let mut device = stopping_device(stop_sender, finished_receiver);
+        let mut owner = stopping_device_owner(stop_sender, finished_receiver);
 
-        let mut first = Box::pin(device.stop(Duration::from_secs(1)));
+        let mut first = Box::pin(owner.stop(Duration::from_secs(1)));
         poll_fn(|context| {
             assert!(matches!(first.as_mut().poll(context), Poll::Pending));
             Poll::Ready(())
@@ -1998,8 +2050,8 @@ mod tests {
         release_sender
             .send(())
             .expect("test owner release must be delivered");
-        owner.join().expect("test owner thread must finish");
-        device
+        owner_thread.join().expect("test owner thread must finish");
+        owner
             .stop(Duration::from_millis(10))
             .await
             .expect("retry must observe completed device cleanup");
@@ -2010,7 +2062,7 @@ mod tests {
     async fn device_stop_retries_a_reported_cleanup_error() {
         let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
         let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
-        let owner = std::thread::spawn(move || {
+        let owner_thread = std::thread::spawn(move || {
             let first: super::DeviceStopRequest = stop_receiver
                 .recv()
                 .expect("test owner must receive the first attempt");
@@ -2025,18 +2077,18 @@ mod tests {
             drop(second);
             let _ = finished_sender.send(Ok(()));
         });
-        let mut device = stopping_device(stop_sender, finished_receiver);
+        let mut owner = stopping_device_owner(stop_sender, finished_receiver);
 
         assert!(matches!(
-            device.stop(Duration::from_secs(1)).await,
+            owner.stop(Duration::from_secs(1)).await,
             Err(DriverError::Ublk(_))
         ));
-        device
+        owner
             .stop(Duration::from_secs(1))
             .await
             .expect("second attempt must observe terminal cleanup");
-        assert!(device.is_stopped());
-        owner.join().expect("test owner thread must finish");
+        assert!(owner.is_stopped());
+        owner_thread.join().expect("test owner thread must finish");
     }
 
     /// A terminal owner failure is reported once and remains known as stopped.
@@ -2045,14 +2097,14 @@ mod tests {
         let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
         let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
         drop(finished_sender);
-        let mut device = stopping_device(stop_sender, finished_receiver);
+        let mut owner = stopping_device_owner(stop_sender, finished_receiver);
 
         assert!(matches!(
-            device.stop(Duration::from_millis(10)).await,
+            owner.stop(Duration::from_millis(10)).await,
             Err(DriverError::DeviceThreadStopped)
         ));
-        assert!(device.is_stopped());
-        device
+        assert!(owner.is_stopped());
+        owner
             .stop(Duration::from_millis(10))
             .await
             .expect("retry after a terminal result has no remaining work");
@@ -2065,7 +2117,7 @@ mod tests {
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let (stop_sender, _stop_receiver) = std::sync::mpsc::channel();
         let (_finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
-        let mut device = DriverDevice {
+        let mut owner = UblkDeviceOwner {
             pending_start: None,
             ready: Some(ready_receiver),
             started: None,
@@ -2075,7 +2127,7 @@ mod tests {
             finished: Some(finished_receiver),
         };
 
-        let mut first = Box::pin(device.wait_until_started(Duration::from_secs(1)));
+        let mut first = Box::pin(owner.wait_until_started(Duration::from_secs(1)));
         poll_fn(|context| {
             assert!(matches!(first.as_mut().poll(context), Poll::Pending));
             Poll::Ready(())
@@ -2083,12 +2135,15 @@ mod tests {
         .await;
         drop(first);
 
-        let expected = (UblkDeviceId::new(17), PathBuf::from("/dev/ublkb17"));
+        let expected = StartedUblkDevice {
+            id: UblkDeviceId::new(17),
+            path: PathBuf::from("/dev/ublkb17"),
+        };
         ready_sender
             .send(Ok(expected.clone()))
             .expect("test device readiness must send");
         assert_eq!(
-            device
+            owner
                 .wait_until_started(Duration::from_millis(10))
                 .await
                 .expect("retry must observe ready device"),
@@ -2112,28 +2167,24 @@ mod tests {
         let larger = current
             .with_capacity(VolumeCapacity::new(128 << 20).expect("larger test capacity"))
             .expect("compatible larger descriptor");
-        let current_settings = ReplicatedDriverSettings::new(
-            UblkOwnerId::new(1),
-            UblkSettings::new(&current, queues).expect("current ublk settings"),
-            Duration::from_secs(1),
-        );
+        let operation_timeout = Duration::from_secs(1);
         let larger_settings = ReplicatedDriverSettings::new(
             UblkOwnerId::new(1),
             UblkSettings::new(&larger, queues).expect("larger ublk settings"),
-            Duration::from_secs(1),
+            operation_timeout,
         );
 
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
         let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
-        let owner = std::thread::spawn(move || {
+        let owner_thread = std::thread::spawn(move || {
             let request: super::DeviceStopRequest = stop_receiver
                 .recv()
-                .expect("failed successor must request cleanup");
+                .expect("failed larger device must request cleanup");
             drop(request);
             let _ = finished_sender.send(Ok(()));
         });
-        let next_device = DriverDevice {
+        let larger_owner = UblkDeviceOwner {
             pending_start: None,
             ready: Some(ready_receiver),
             started: None,
@@ -2141,6 +2192,11 @@ mod tests {
             stop_requests: Some(stop_sender),
             stop_attempt: None,
             finished: Some(finished_receiver),
+        };
+        let larger_device = DriverDevice {
+            owner: larger_owner,
+            gate: Arc::new(DriverDeviceGate::new(Arc::clone(&handler), false)),
+            settings: larger_settings,
         };
         ready_sender
             .send(Err(mantissa_volume::driver::UblkError::Unavailable {
@@ -2150,20 +2206,13 @@ mod tests {
 
         let progress = handler.progress.clone();
         let mut driver = ReplicatedDriver {
-            device: None,
-            device_id: None,
-            backend_path: None,
-            device_gate: Arc::new(DriverDeviceGate::new(Arc::clone(&handler), true)),
-            next_device: Some(next_device),
-            next_device_id: None,
-            next_backend_path: None,
-            next_device_gate: Some(Arc::new(DriverDeviceGate::new(Arc::clone(&handler), false))),
-            next_settings: Some(larger_settings),
+            active_device: None,
+            larger_device: Some(larger_device),
             retiring_device: None,
             path: None,
             retiring_path: None,
             handler,
-            settings: current_settings,
+            operation_timeout,
             progress,
         };
 
@@ -2171,9 +2220,7 @@ mod tests {
             driver.finish_larger_device_start().await,
             Err(DriverError::Ublk(_))
         ));
-        assert!(driver.next_device.is_none());
-        assert!(driver.next_device_gate.is_none());
-        assert!(driver.next_settings.is_none());
-        owner.join().expect("cleanup owner must finish");
+        assert!(driver.larger_device.is_none());
+        owner_thread.join().expect("cleanup owner must finish");
     }
 }
