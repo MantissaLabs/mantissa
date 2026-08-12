@@ -130,6 +130,7 @@ struct MountCleanup {
 /// Removes the published mapping before the private backend on test failure.
 struct MappedCleanup {
     mapped_volumes: MappedVolumeSystem,
+    node_id: VolumeNodeId,
     key: mantissa_volume::catalog::ReplicaKey,
     mapped: bool,
 }
@@ -364,9 +365,14 @@ impl Drop for MountCleanup {
 
 impl MappedCleanup {
     /// Takes cleanup ownership of one newly created mapping.
-    fn new(mapped_volumes: MappedVolumeSystem, key: mantissa_volume::catalog::ReplicaKey) -> Self {
+    fn new(
+        mapped_volumes: MappedVolumeSystem,
+        node_id: VolumeNodeId,
+        key: mantissa_volume::catalog::ReplicaKey,
+    ) -> Self {
         Self {
             mapped_volumes,
+            node_id,
             key,
             mapped: true,
         }
@@ -387,7 +393,7 @@ impl Drop for MappedCleanup {
     /// Makes a best effort to remove a mapping left by a failed test.
     fn drop(&mut self) {
         if self.mapped {
-            let _ = self.mapped_volumes.remove(self.key);
+            let _ = self.mapped_volumes.remove(self.node_id, self.key);
         }
     }
 }
@@ -723,9 +729,13 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
         copies,
     )?;
     let mut device = UblkDevice::start(TEST_OWNER, ublk_settings(), path.handler())?;
-    let mapped_layout = MappedVolumeLayout::new(&descriptor(), device.block_path())?;
+    let mapped_layout = MappedVolumeLayout::new(node(1), &descriptor(), device.block_path())?;
     let mapped_path = mapped_volumes.ensure(&mapped_layout)?;
-    let mut mapped_cleanup = MappedCleanup::new(mapped_volumes.clone(), mapped_layout.key());
+    let mut mapped_cleanup = MappedCleanup::new(
+        mapped_volumes.clone(),
+        mapped_layout.node_id(),
+        mapped_layout.key(),
+    );
 
     let format_started = Instant::now();
     run(
@@ -760,7 +770,7 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
     let resources = resources.finish(&files);
     mount.unmount()?;
 
-    mapped_volumes.remove(mapped_layout.key())?;
+    mapped_volumes.remove(mapped_layout.node_id(), mapped_layout.key())?;
     mapped_cleanup.removed();
     device.stop()?;
     path.stop().await?;
@@ -802,7 +812,8 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
         )?;
         let mut reopened_device =
             UblkDevice::start(TEST_OWNER, ublk_settings(), reopened_path.handler())?;
-        let reopened_layout = MappedVolumeLayout::new(&descriptor(), reopened_device.block_path())?;
+        let reopened_layout =
+            MappedVolumeLayout::new(node(1), &descriptor(), reopened_device.block_path())?;
         let reopened_mapped_path = mapped_volumes.ensure(&reopened_layout)?;
         mapped_cleanup.mapped();
         run(
@@ -815,7 +826,7 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
         mount.mounted();
         verify_reopened_file(&mount_path)?;
         mount.unmount()?;
-        mapped_volumes.remove(reopened_layout.key())?;
+        mapped_volumes.remove(reopened_layout.node_id(), reopened_layout.key())?;
         mapped_cleanup.removed();
         reopened_device.stop()?;
         reopened_path.stop().await?;

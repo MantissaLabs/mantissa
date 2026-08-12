@@ -67,7 +67,7 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::WaitForFirstConsumer,
         reclaim_policy: VolumeReclaimPolicy::Delete,
-        requested_bytes: Some(64 * 4096),
+        initial_capacity_bytes: Some(64 * 4096),
         labels: Vec::new(),
         bound_node_id: None,
         bound_node_name: None,
@@ -91,7 +91,7 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
         SavedVolumeDescriptor::for_volume(
             request.id,
             request.volume_epoch,
-            request.requested_bytes.expect("replicated capacity"),
+            request.initial_capacity_bytes.expect("replicated capacity"),
         )
         .expect("replicated descriptor"),
     );
@@ -163,7 +163,7 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
         "node-a",
         None,
         VolumeNodeState::Ready,
-        request.requested_bytes,
+        request.initial_capacity_bytes,
         request.volume_epoch,
     )
     .with_group_id(

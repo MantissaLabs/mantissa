@@ -5,7 +5,8 @@ use mantissa_client::volumes::{
     VolumeBindingMode as ClientVolumeBindingMode, VolumeCreateDriver as ClientVolumeCreateDriver,
     VolumeCreateRequest as ClientVolumeCreateRequest,
     VolumeDeleteDisposition as ClientVolumeDeleteDisposition, VolumeDeleteResult,
-    VolumeDriver as ClientVolumeDriver, VolumeFilesystemSpace as ClientVolumeFilesystemSpace,
+    VolumeDriver as ClientVolumeDriver, VolumeExpandResult as ClientVolumeExpandResult,
+    VolumeFilesystemSpace as ClientVolumeFilesystemSpace,
     VolumeImportRequest as ClientVolumeImportRequest, VolumeInspect as ClientVolumeInspect,
     VolumeLabel as ClientVolumeLabel, VolumeNodeStatus as ClientVolumeNodeStatus,
     VolumeReclaimPolicy as ClientVolumeReclaimPolicy, VolumeSpec as ClientVolumeSpec,
@@ -28,7 +29,7 @@ pub struct VolumeCreateRequest {
     #[serde(default = "default_reclaim_policy")]
     pub reclaim_policy: String,
     #[serde(default)]
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     #[serde(default)]
     pub labels: Vec<VolumeLabel>,
     #[serde(default)]
@@ -48,7 +49,7 @@ impl VolumeCreateRequest {
             ownership: self.ownership.into_client(),
             binding_mode,
             reclaim_policy: parse_reclaim_policy(&self.reclaim_policy)?,
-            requested_bytes: self.requested_bytes,
+            initial_capacity_bytes: self.initial_capacity_bytes,
             labels: self
                 .labels
                 .into_iter()
@@ -78,7 +79,7 @@ pub struct VolumeImportRequest {
     pub node_selector: String,
     pub path: String,
     #[serde(default)]
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     #[serde(default)]
     pub labels: Vec<VolumeLabel>,
 }
@@ -90,7 +91,7 @@ impl From<VolumeImportRequest> for ClientVolumeImportRequest {
             name: value.name,
             node_selector: value.node_selector,
             path: value.path,
-            requested_bytes: value.requested_bytes,
+            initial_capacity_bytes: value.initial_capacity_bytes,
             labels: value
                 .labels
                 .into_iter()
@@ -168,7 +169,7 @@ pub struct VolumeSummary {
     pub state: String,
     pub bound_node_id: Option<String>,
     pub bound_node_name: Option<String>,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub in_use: bool,
     pub reason: Option<String>,
     pub updated_at: String,
@@ -190,7 +191,7 @@ impl From<ClientVolumeSummary> for VolumeSummary {
             state,
             bound_node_id: value.bound_node_id.map(|id| id.to_string()),
             bound_node_name: value.bound_node_name,
-            requested_bytes: value.requested_bytes,
+            initial_capacity_bytes: value.initial_capacity_bytes,
             in_use: value.in_use,
             reason: value.reason,
             updated_at: value.updated_at,
@@ -283,7 +284,7 @@ pub struct VolumeSpec {
     pub access_mode: String,
     pub binding_mode: String,
     pub reclaim_policy: String,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub labels: Vec<VolumeLabel>,
     pub bound_node_id: Option<String>,
     pub bound_node_name: Option<String>,
@@ -307,7 +308,7 @@ impl From<ClientVolumeSpec> for VolumeSpec {
             access_mode: value.access_mode.to_string(),
             binding_mode: value.binding_mode.to_string(),
             reclaim_policy: value.reclaim_policy.to_string(),
-            requested_bytes: value.requested_bytes,
+            initial_capacity_bytes: value.initial_capacity_bytes,
             labels: value.labels.into_iter().map(VolumeLabel::from).collect(),
             bound_node_id: value.bound_node_id.map(|id| id.to_string()),
             bound_node_name: value.bound_node_name,
@@ -361,6 +362,11 @@ pub struct VolumeNodeStatus {
     pub state: String,
     pub health: String,
     pub capacity_bytes: Option<u64>,
+    pub reserved_capacity_bytes: Option<u64>,
+    pub prepared_capacity_bytes: Option<u64>,
+    pub served_capacity_bytes: Option<u64>,
+    pub device_capacity_bytes: Option<u64>,
+    pub filesystem_expansion_pending: bool,
     pub used_bytes: Option<u64>,
     pub published_task_ids: Vec<String>,
     pub updated_at: String,
@@ -381,6 +387,11 @@ impl From<ClientVolumeNodeStatus> for VolumeNodeStatus {
             state: value.state.to_string(),
             health: value.health.to_string(),
             capacity_bytes: value.capacity_bytes,
+            reserved_capacity_bytes: value.reserved_capacity_bytes,
+            prepared_capacity_bytes: value.prepared_capacity_bytes,
+            served_capacity_bytes: value.served_capacity_bytes,
+            device_capacity_bytes: value.device_capacity_bytes,
+            filesystem_expansion_pending: value.filesystem_expansion_pending,
             used_bytes: value.used_bytes,
             published_task_ids: value
                 .published_task_ids
@@ -405,7 +416,7 @@ pub struct ReplicatedVolumePlan {
     pub workload_node_id: String,
     pub replica_node_ids: Vec<String>,
     pub generation: u64,
-    pub capacity_bytes: u64,
+    pub initial_capacity_bytes: u64,
     pub logical_sector_bytes: u32,
     pub physical_block_bytes: u32,
     pub minimum_io_bytes: u32,
@@ -427,7 +438,7 @@ impl From<ClientReplicatedVolumePlan> for ReplicatedVolumePlan {
                 .map(|id| id.to_string())
                 .collect(),
             generation: value.generation,
-            capacity_bytes: value.capacity_bytes,
+            initial_capacity_bytes: value.initial_capacity_bytes,
             logical_sector_bytes: value.logical_sector_bytes,
             physical_block_bytes: value.physical_block_bytes,
             minimum_io_bytes: value.minimum_io_bytes,
@@ -451,6 +462,7 @@ pub struct ReplicatedVolumeGroupStatus {
     pub updated_at: String,
     pub message: Option<String>,
     pub control_revision: u64,
+    pub replicated_capacity_bytes: u64,
     pub fence: Option<u64>,
     pub copy_node_ids: Vec<String>,
     pub voter_node_ids: Vec<String>,
@@ -476,6 +488,7 @@ impl From<ClientReplicatedVolumeGroupStatus> for ReplicatedVolumeGroupStatus {
             updated_at: value.updated_at,
             message: value.message,
             control_revision: value.control_revision,
+            replicated_capacity_bytes: value.replicated_capacity_bytes,
             fence: value.fence,
             copy_node_ids: value
                 .copy_node_ids
@@ -500,6 +513,7 @@ impl From<ClientReplicatedVolumeGroupStatus> for ReplicatedVolumeGroupStatus {
 pub struct VolumeInspect {
     pub state: String,
     pub state_message: Option<String>,
+    pub desired_capacity_bytes: Option<u64>,
     pub spec: VolumeSpec,
     pub node_states: Vec<VolumeNodeStatus>,
     pub plan: Option<ReplicatedVolumePlan>,
@@ -535,6 +549,7 @@ impl From<ClientVolumeInspect> for VolumeInspect {
         Self {
             state,
             state_message: value.state_message,
+            desired_capacity_bytes: value.desired_capacity_bytes,
             spec: value.spec.into(),
             node_states: value
                 .node_states
@@ -570,6 +585,37 @@ pub struct VolumeDeleteQuery {
     /// Permanently removes managed backing data instead of applying retain policy.
     #[serde(default)]
     pub delete_data: bool,
+}
+
+/// REST request body for expanding a replicated volume.
+#[derive(Clone, Copy, Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeExpandRequest {
+    /// New total capacity in bytes rather than bytes to add.
+    pub capacity_bytes: u64,
+}
+
+/// REST response after a desired capacity is saved locally.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct VolumeExpandResponse {
+    pub volume_id: String,
+    pub initial_capacity_bytes: u64,
+    pub desired_capacity_bytes: u64,
+    pub replicated_capacity_bytes: u64,
+    pub desired_capacity_changed: bool,
+}
+
+impl From<ClientVolumeExpandResult> for VolumeExpandResponse {
+    /// Converts the reusable client result into the public JSON response.
+    fn from(value: ClientVolumeExpandResult) -> Self {
+        Self {
+            volume_id: value.volume_id.to_string(),
+            initial_capacity_bytes: value.initial_capacity_bytes,
+            desired_capacity_bytes: value.desired_capacity_bytes,
+            replicated_capacity_bytes: value.replicated_capacity_bytes,
+            desired_capacity_changed: value.desired_capacity_changed,
+        }
+    }
 }
 
 impl From<VolumeDeleteResult> for VolumeDeleteResponse {

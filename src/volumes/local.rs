@@ -181,7 +181,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes: None,
+            initial_capacity_bytes: None,
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,

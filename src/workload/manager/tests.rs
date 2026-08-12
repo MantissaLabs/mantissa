@@ -48,8 +48,8 @@ use crate::store::replicated::scheduler_digests::open_scheduler_digest_store;
 use crate::store::replicated::secrets::open_secret_store;
 use crate::store::replicated::services::open_service_store;
 use crate::store::replicated::volumes::{
-    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
-    open_volume_node_store, open_volume_spec_store,
+    open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
+    open_replicated_volume_plan_store, open_volume_node_store, open_volume_spec_store,
 };
 use crate::store::replicated::workloads::open_workload_store;
 use crate::task::types::{TaskStateFilter, TaskStateKind};
@@ -243,7 +243,11 @@ impl super::volumes::ReplicatedVolumeAccess for FakeReplicatedVolumeAccess {
     }
 
     /// Returns the readiness selected by the test.
-    async fn is_ready(&self, _key: mantissa_volume::catalog::ReplicaKey) -> Result<bool> {
+    async fn is_ready(
+        &self,
+        _key: mantissa_volume::catalog::ReplicaKey,
+        _required_capacity_bytes: u64,
+    ) -> Result<bool> {
         self.ready_calls.fetch_add(1, Ordering::AcqRel);
         Ok(self.ready.load(Ordering::Acquire))
     }
@@ -1068,11 +1072,18 @@ async fn setup_manager_with_forwarding(
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume group status store");
+    let volume_capacity_store = open_replicated_volume_capacity_request_store(volume_db, actor)
+        .expect("open volume capacity store");
+    volume_capacity_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume capacity store");
     let volume_registry = VolumeRegistry::new(
         volume_spec_store,
         volume_node_store,
         volume_plan_store,
         volume_group_status_store,
+        volume_capacity_store,
     );
     let (master_db, _master_dir) = temp_db("master");
     let master_envelope_provider = Arc::new(
@@ -1379,7 +1390,7 @@ async fn create_managed_local_volume(
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode,
         reclaim_policy: VolumeReclaimPolicy::Retain,
-        requested_bytes: None,
+        initial_capacity_bytes: None,
         labels: Vec::new(),
         bound_node_id,
         bound_node_name: bound_node_name.map(str::to_string),
@@ -1403,7 +1414,7 @@ async fn create_ready_replicated_volume(manager: &WorkloadManager, name: &str) -
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::WaitForFirstConsumer,
         reclaim_policy: VolumeReclaimPolicy::Retain,
-        requested_bytes: Some(64 * 1_024 * 1_024),
+        initial_capacity_bytes: Some(64 * 1_024 * 1_024),
         labels: Vec::new(),
         bound_node_id: Some(manager.local_node_id),
         bound_node_name: Some(manager.local_node_name.clone()),
@@ -1421,7 +1432,7 @@ async fn create_ready_replicated_volume(manager: &WorkloadManager, name: &str) -
     let descriptor = SavedVolumeDescriptor::for_volume(
         spec.id,
         spec.volume_epoch,
-        spec.requested_bytes.expect("replicated capacity"),
+        spec.initial_capacity_bytes.expect("replicated capacity"),
     )
     .expect("build replicated descriptor");
     let replicas = [manager.local_node_id, Uuid::new_v4(), Uuid::new_v4()];
@@ -1449,7 +1460,7 @@ async fn create_ready_replicated_volume(manager: &WorkloadManager, name: &str) -
         manager.local_node_name.clone(),
         None,
         VolumeNodeState::Ready,
-        spec.requested_bytes,
+        spec.initial_capacity_bytes,
         spec.volume_epoch,
     )
     .with_group_id(group_id);
@@ -1468,6 +1479,9 @@ async fn create_ready_replicated_volume(manager: &WorkloadManager, name: &str) -
         VolumeStatus::Ready,
         12,
     );
+    group.replicated_capacity_bytes = spec
+        .initial_capacity_bytes
+        .expect("replicated volume has initial capacity");
     group.copy_node_ids = replicas.to_vec();
     group.voter_node_ids = replicas.to_vec();
     manager
@@ -5243,6 +5257,47 @@ async fn request_task_stop_is_idempotent_while_stopping() {
     assert!(
         mock_cm.stopped.lock().await.is_empty(),
         "stop should not invoke runtime stop again when task is already stopping"
+    );
+}
+
+#[tokio::test]
+async fn volume_failure_does_not_overwrite_concurrent_stop() {
+    let (manager, scheduler, _mock_runtime, _network_registry) = setup_manager().await;
+
+    scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 128 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("init slots");
+
+    let running = manager
+        .start_workload("svc", "img", vec![], 200, 64 * 1_024 * 1_024, None)
+        .await
+        .expect("start container");
+    let stopping = manager
+        .request_workload_stop(running.id)
+        .await
+        .expect("record concurrent stop");
+
+    let _error = manager
+        .mark_task_volume_unavailable(running.clone(), anyhow!("replica quorum was lost"))
+        .await;
+    let saved = manager
+        .load_spec(running.id)
+        .await
+        .expect("load task after stale volume failure");
+    assert_eq!(saved.state, WorkloadPhase::Stopping);
+    assert_eq!(saved.phase_version, stopping.phase_version);
+
+    manager
+        .reconcile_requested_stop(running.id)
+        .await
+        .expect("finish the preserved stop request");
+    assert!(
+        manager.load_spec(running.id).await.is_err(),
+        "the preserved stop request must remove the task row"
     );
 }
 

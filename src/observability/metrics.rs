@@ -1102,6 +1102,7 @@ fn metrics_domain_label(domain: Domain) -> &'static str {
         Domain::VolumeNodes => "volume_nodes",
         Domain::VolumePlans => "volume_plans",
         Domain::VolumeGroupStatuses => "volume_group_statuses",
+        Domain::VolumeCapacityRequests => "volume_capacity_requests",
         Domain::SchedulerDigests => "scheduler_digests",
         Domain::SecretMasterKeys => "secret_master_keys",
         Domain::IngressPools => "ingress_pools",

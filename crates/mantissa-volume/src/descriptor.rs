@@ -7,10 +7,23 @@ use crate::{BlockSizeSetting, VolumeBlockSizes, VolumeGeneration, VolumeId};
 pub struct VolumeCapacity(u64);
 
 impl VolumeCapacity {
+    /// Creates one non-zero logical capacity before descriptor alignment checks.
+    pub fn new(capacity_bytes: u64) -> Result<Self, DescriptorError> {
+        if capacity_bytes == 0 {
+            return Err(DescriptorError::ZeroCapacity);
+        }
+        Ok(Self(capacity_bytes))
+    }
+
     /// Returns the logical capacity in bytes.
     #[must_use]
     pub const fn bytes(self) -> u64 {
         self.0
+    }
+
+    /// Rebuilds a capacity that was already validated before durable or atomic storage.
+    pub(crate) const fn from_validated(capacity_bytes: u64) -> Self {
+        Self(capacity_bytes)
     }
 }
 
@@ -44,7 +57,7 @@ impl ByteOffset {
     }
 }
 
-/// Immutable identity, capacity, and block sizes for one volume generation.
+/// Current identity, logical capacity, and fixed block sizes for one generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VolumeDescriptor {
     volume_id: VolumeId,
@@ -54,16 +67,14 @@ pub struct VolumeDescriptor {
 }
 
 impl VolumeDescriptor {
-    /// Creates an immutable descriptor without imposing a product capacity cap.
+    /// Creates a descriptor without imposing a product capacity cap.
     pub fn new(
         volume_id: VolumeId,
         generation: VolumeGeneration,
         capacity_bytes: u64,
         block_sizes: VolumeBlockSizes,
     ) -> Result<Self, DescriptorError> {
-        if capacity_bytes == 0 {
-            return Err(DescriptorError::ZeroCapacity);
-        }
+        let capacity = VolumeCapacity::new(capacity_bytes)?;
 
         let alignments = [
             (
@@ -96,7 +107,7 @@ impl VolumeDescriptor {
         Ok(Self {
             volume_id,
             generation,
-            capacity: VolumeCapacity(capacity_bytes),
+            capacity,
             block_sizes,
         })
     }
@@ -123,6 +134,34 @@ impl VolumeDescriptor {
     #[must_use]
     pub const fn block_sizes(&self) -> VolumeBlockSizes {
         self.block_sizes
+    }
+
+    /// Returns this generation and its block sizes with a checked new capacity.
+    pub fn with_capacity(&self, capacity: VolumeCapacity) -> Result<Self, DescriptorError> {
+        Self::new(
+            self.volume_id,
+            self.generation,
+            capacity.bytes(),
+            self.block_sizes,
+        )
+    }
+
+    /// Checks the stable generation and block layout while allowing capacity to differ.
+    #[must_use]
+    pub fn has_same_storage_identity(&self, other: &Self) -> bool {
+        self.volume_id == other.volume_id
+            && self.generation == other.generation
+            && self.block_sizes == other.block_sizes
+    }
+
+    /// Rebuilds this descriptor from a capacity checked before atomic publication.
+    pub(crate) fn with_prevalidated_capacity(&self, capacity_bytes: u64) -> Self {
+        Self {
+            volume_id: self.volume_id,
+            generation: self.generation,
+            capacity: VolumeCapacity::from_validated(capacity_bytes),
+            block_sizes: self.block_sizes,
+        }
     }
 
     /// Returns the number of addressable logical sectors.

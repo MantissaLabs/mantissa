@@ -6,22 +6,56 @@ use crate::common;
 
 const RECOVERY_BENCHMARK_ENV: &str = "MANTISSA_RUN_REPLICATED_VOLUME_RECOVERY_BENCHMARK";
 const RECOVERY_PROFILE_ENV: &str = "MANTISSA_REPLICATED_VOLUME_RECOVERY_PROFILE";
+const REPLICATED_VOLUME_LIFECYCLE_TEST_STACK_BYTES: usize = 16 << 20;
+
+#[test]
+fn replicated_volume_public_api_survives_restart_repair_and_lost_quorum() {
+    let test = std::thread::Builder::new()
+        .name("replicated-volume-lifecycle".to_string())
+        .stack_size(REPLICATED_VOLUME_LIFECYCLE_TEST_STACK_BYTES)
+        .spawn(|| {
+            mantissa::logger::init_for_tests();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build replicated-volume lifecycle test runtime");
+            runtime.block_on(common::testkit::run_local(Box::pin(async {
+                if !replicated_volume_tests_enabled() {
+                    return;
+                }
+                let root = tempfile::tempdir_in("/var/tmp")
+                    .expect("create replicated-volume test root on ext4");
+                let (mut cluster, states) = start_replicated_volume_test_cluster(root.path())
+                    .await
+                    .expect("start real replicated-volume cluster");
+                let flow = run_replicated_volume_public_flow(&mut cluster, &states);
+                let result = Box::pin(flow).await;
+                let shutdown_result = shutdown_replicated_volume_test_cluster(cluster).await;
+                result.expect("run real replicated-volume public API flow");
+                shutdown_result.expect("shut down real replicated-volume test cluster");
+            })));
+        })
+        .expect("start replicated-volume lifecycle test thread");
+    test.join()
+        .expect("replicated-volume lifecycle test thread panicked");
+}
 
 local_test!(
-    replicated_volume_public_api_survives_restart_repair_and_lost_quorum,
+    replicated_volume_insufficient_space_keeps_current_capacity,
     {
         if !replicated_volume_tests_enabled() {
             return;
         }
-        let root =
-            tempfile::tempdir_in("/var/tmp").expect("create replicated-volume test root on ext4");
-        let (mut cluster, states) = start_replicated_volume_test_cluster(root.path())
+        let root = tempfile::tempdir_in("/var/tmp")
+            .expect("create insufficient-space expansion root on ext4");
+        let (cluster, _states) = start_replicated_volume_test_cluster(root.path())
             .await
-            .expect("start real replicated-volume cluster");
-        let result = run_replicated_volume_public_flow(&mut cluster, &states).await;
+            .expect("start insufficient-space expansion cluster");
+        let flow = run_insufficient_space_expansion_flow(&cluster);
+        let result = Box::pin(flow).await;
         let shutdown_result = shutdown_replicated_volume_test_cluster(cluster).await;
-        result.expect("run real replicated-volume public API flow");
-        shutdown_result.expect("shut down real replicated-volume test cluster");
+        result.expect("keep current capacity after insufficient-space expansion");
+        shutdown_result.expect("shut down insufficient-space expansion cluster");
     }
 );
 

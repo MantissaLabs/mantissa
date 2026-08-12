@@ -1,11 +1,13 @@
 use crate::store::replicated::volumes::{
-    ReplicatedVolumeGroupStatusStore, ReplicatedVolumePlanStore, VolumeNodeStore, VolumeSpecStore,
+    ReplicatedVolumeCapacityRequestStore, ReplicatedVolumeGroupStatusStore,
+    ReplicatedVolumePlanStore, VolumeNodeStore, VolumeSpecStore,
 };
 use crate::volumes::types::{
+    REPLICATED_VOLUME_BLOCK_SIZE, ReplicatedVolumeCapacityRequest,
     ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan, VolumeDriver, VolumeNodeStateValue,
-    VolumeSpecValue, compare_volume_timestamps, compute_replicated_volume_group_id,
-    compute_replicated_volume_group_status_id, compute_replicated_volume_plan_id,
-    compute_volume_id, compute_volume_node_state_id,
+    VolumeSpecValue, compare_volume_timestamps, compute_replicated_volume_capacity_request_id,
+    compute_replicated_volume_group_id, compute_replicated_volume_group_status_id,
+    compute_replicated_volume_plan_id, compute_volume_id, compute_volume_node_state_id,
 };
 use anyhow::{Result, anyhow};
 use mantissa_store::uuid_key::UuidKey;
@@ -22,23 +24,26 @@ pub struct VolumeRegistry {
     nodes: VolumeNodeStore,
     plans: ReplicatedVolumePlanStore,
     group_statuses: ReplicatedVolumeGroupStatusStore,
+    capacity_requests: ReplicatedVolumeCapacityRequestStore,
     change_version: Arc<AtomicU64>,
     changed: Arc<Notify>,
 }
 
 impl VolumeRegistry {
-    /// Builds the registry from specification, plan, group-observation, and node-state stores.
+    /// Builds the registry from the five replicated volume stores.
     pub fn new(
         specs: VolumeSpecStore,
         nodes: VolumeNodeStore,
         plans: ReplicatedVolumePlanStore,
         group_statuses: ReplicatedVolumeGroupStatusStore,
+        capacity_requests: ReplicatedVolumeCapacityRequestStore,
     ) -> Self {
         Self {
             specs,
             nodes,
             plans,
             group_statuses,
+            capacity_requests,
             change_version: Arc::new(AtomicU64::new(0)),
             changed: Arc::new(Notify::new()),
         }
@@ -463,6 +468,125 @@ impl VolumeRegistry {
         Ok(())
     }
 
+    /// Saves one desired capacity after validating its generation and storage size.
+    pub async fn upsert_capacity_request(
+        &self,
+        value: ReplicatedVolumeCapacityRequest,
+    ) -> Result<()> {
+        let expected_id =
+            compute_replicated_volume_capacity_request_id(value.volume_id, value.volume_epoch);
+        if value.id != expected_id || value.request_id.is_nil() || value.revision == 0 {
+            return Err(anyhow!(
+                "replicated volume capacity request has invalid identity"
+            ));
+        }
+        let spec = self
+            .get_spec_including_deleting(value.volume_id)?
+            .ok_or_else(|| anyhow!("unknown volume {}", value.volume_id))?;
+        if spec.is_delete_marker() {
+            return Err(anyhow!("volume {} is deleted", value.volume_id));
+        }
+        if !spec.driver.is_replicated() {
+            return Err(anyhow!("volume {} is not replicated", value.volume_id));
+        }
+        if value.volume_epoch != spec.volume_epoch {
+            return Err(anyhow!(
+                "capacity request belongs to generation {}, current generation is {}",
+                value.volume_epoch,
+                spec.volume_epoch
+            ));
+        }
+        if value.target_capacity_bytes == 0
+            || !value
+                .target_capacity_bytes
+                .is_multiple_of(REPLICATED_VOLUME_BLOCK_SIZE)
+        {
+            return Err(anyhow!(
+                "replicated volume capacity must be non-zero and aligned to {} bytes",
+                REPLICATED_VOLUME_BLOCK_SIZE
+            ));
+        }
+        let replica_space = mantissa_volume::storage_format::ReplicaSpace::for_capacity(
+            value.target_capacity_bytes,
+        )?;
+        replica_space.total_bytes()?;
+        self.capacity_requests
+            .upsert(&UuidKey::from(value.id), value)
+            .await
+            .map_err(|error| anyhow!("volume capacity request upsert failed: {error}"))?;
+        self.record_change();
+        Ok(())
+    }
+
+    /// Reads the canonical desired capacity for the current volume generation.
+    pub fn get_capacity_request(
+        &self,
+        volume_id: Uuid,
+    ) -> Result<Option<ReplicatedVolumeCapacityRequest>> {
+        let Some(spec) = self.get_spec_including_deleting(volume_id)? else {
+            return Ok(None);
+        };
+        let key = compute_replicated_volume_capacity_request_id(volume_id, spec.volume_epoch);
+        let snapshot = self
+            .capacity_requests
+            .get_snapshot(&UuidKey::from(key))
+            .map_err(|error| anyhow!("volume capacity request lookup failed: {error}"))?;
+        Ok(snapshot.and_then(|values| {
+            values
+                .as_slice()
+                .iter()
+                .filter(|value| {
+                    value.id == key
+                        && value.volume_id == volume_id
+                        && value.volume_epoch == spec.volume_epoch
+                })
+                .cloned()
+                .max_by(ReplicatedVolumeCapacityRequest::precedence_cmp)
+        }))
+    }
+
+    /// Removes capacity rows that belong to a generation superseded by known desired state.
+    ///
+    /// A request whose volume is completely absent is retained because MST delivery may have
+    /// reordered the request before its spec. A known newer generation or delete marker is
+    /// sufficient durable proof that the older request can never become current again.
+    pub async fn remove_stale_capacity_requests(&self) -> Result<usize> {
+        let (rows, _) = self
+            .capacity_requests
+            .load_all()
+            .map_err(|error| anyhow!("volume capacity request load_all failed: {error}"))?;
+        let mut removed = 0_usize;
+        for (key, values) in rows {
+            let Some(request) = values
+                .as_slice()
+                .iter()
+                .max_by(|left, right| left.precedence_cmp(right))
+            else {
+                continue;
+            };
+            let Some(spec) = self.get_spec_including_deleting(request.volume_id)? else {
+                continue;
+            };
+            let stale = request.volume_epoch < spec.volume_epoch
+                || (request.volume_epoch == spec.volume_epoch
+                    && (spec.is_delete_marker() || !spec.driver.is_replicated()));
+            if !stale {
+                continue;
+            }
+            self.capacity_requests
+                .remove(&key)
+                .await
+                .map_err(|error| anyhow!("volume capacity request remove failed: {error}"))?;
+            removed = removed
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("removed capacity request count overflowed"))?;
+        }
+        if removed > 0 {
+            self.record_change();
+        }
+        Ok(removed)
+    }
+
     /// Removes observations and the plan left behind by reordered deletion gossip.
     pub async fn remove_deleted_volume_records(&self, volume_id: Uuid) -> Result<()> {
         let spec = self
@@ -472,6 +596,7 @@ impl VolumeRegistry {
             return Err(anyhow!("volume {volume_id} is not deleted"));
         }
 
+        let mut changed = false;
         let (nodes, _) = self
             .nodes
             .load_all()
@@ -484,6 +609,7 @@ impl VolumeRegistry {
                     .remove(&key)
                     .await
                     .map_err(|error| anyhow!("volume node-state remove failed: {error}"))?;
+                changed = true;
             }
         }
 
@@ -498,6 +624,7 @@ impl VolumeRegistry {
                 self.group_statuses.remove(&key).await.map_err(|error| {
                     anyhow!("replicated volume group status remove failed: {error}")
                 })?;
+                changed = true;
             }
         }
 
@@ -513,9 +640,28 @@ impl VolumeRegistry {
                     .remove(&key)
                     .await
                     .map_err(|error| anyhow!("replicated volume plan remove failed: {error}"))?;
+                changed = true;
             }
         }
-        self.record_change();
+
+        let capacity_request_id =
+            compute_replicated_volume_capacity_request_id(volume_id, spec.volume_epoch);
+        let capacity_key = UuidKey::from(capacity_request_id);
+        if self
+            .capacity_requests
+            .get_snapshot(&capacity_key)
+            .map_err(|error| anyhow!("volume capacity request lookup failed: {error}"))?
+            .is_some()
+        {
+            self.capacity_requests
+                .remove(&capacity_key)
+                .await
+                .map_err(|error| anyhow!("volume capacity request remove failed: {error}"))?;
+            changed = true;
+        }
+        if changed {
+            self.record_change();
+        }
         Ok(())
     }
 
@@ -553,7 +699,7 @@ impl VolumeRegistry {
         Ok(Some(first.clone()))
     }
 
-    /// Checks one plan against the current immutable volume request.
+    /// Checks one plan against the current generation-defining volume request.
     fn validate_plan(&self, value: &ReplicatedVolumePlan) -> Result<()> {
         let spec = self
             .get_spec_including_deleting(value.volume_id)?
@@ -607,7 +753,7 @@ impl VolumeRegistry {
             .ok_or_else(|| anyhow!("replicated volume generation is exhausted"))?;
         if descriptor.volume_id().as_uuid() != &value.volume_id
             || descriptor.generation().get() != expected_generation
-            || Some(descriptor.capacity().bytes()) != spec.requested_bytes
+            || Some(descriptor.capacity().bytes()) != spec.initial_capacity_bytes
         {
             return Err(anyhow!(
                 "replicated volume plan descriptor does not match the current volume request"
@@ -707,6 +853,20 @@ fn compare_volume_node_states(
         .then(left.state.cmp(&right.state))
         .then(left.published_task_ids.cmp(&right.published_task_ids))
         .then(left.capacity_bytes.cmp(&right.capacity_bytes))
+        .then(
+            left.reserved_capacity_bytes
+                .cmp(&right.reserved_capacity_bytes),
+        )
+        .then(
+            left.prepared_capacity_bytes
+                .cmp(&right.prepared_capacity_bytes),
+        )
+        .then(left.served_capacity_bytes.cmp(&right.served_capacity_bytes))
+        .then(left.device_capacity_bytes.cmp(&right.device_capacity_bytes))
+        .then(
+            left.filesystem_expansion_pending
+                .cmp(&right.filesystem_expansion_pending),
+        )
         .then(left.used_bytes.cmp(&right.used_bytes))
         .then(left.last_error.cmp(&right.last_error))
         .then(left.local_path.cmp(&right.local_path))
@@ -717,13 +877,14 @@ fn compare_volume_node_states(
 mod tests {
     use super::*;
     use crate::store::replicated::volumes::{
-        open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
-        open_volume_node_store, open_volume_spec_store,
+        open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
+        open_replicated_volume_plan_store, open_volume_node_store, open_volume_spec_store,
     };
     use crate::volumes::types::{
         FilesystemOwnership, ReplicatedVolumeSpec, VolumeAccessMode, VolumeBindingMode,
         VolumeNodeState, VolumeReclaimPolicy, VolumeSpecDraft,
     };
+    use mantissa_store::gc::StoreGcPolicy;
     use mantissa_store::mvreg::{MvReg, MvRegEntry, VectorClock};
     use std::sync::Arc;
 
@@ -732,10 +893,11 @@ mod tests {
         spec_store: VolumeSpecStore,
         node_store: VolumeNodeStore,
         group_status_store: ReplicatedVolumeGroupStatusStore,
+        capacity_store: ReplicatedVolumeCapacityRequestStore,
         _dir: tempfile::TempDir,
     }
 
-    /// Opens one isolated registry and all four volume stores.
+    /// Opens one isolated registry and all five volume stores.
     async fn test_registry() -> TestRegistry {
         let dir = tempfile::tempdir().expect("create volume registry tempdir");
         let db = Arc::new(
@@ -747,8 +909,10 @@ mod tests {
         let nodes = open_volume_node_store(db.clone(), actor).expect("open volume node store");
         let plans =
             open_replicated_volume_plan_store(db.clone(), actor).expect("open volume plan store");
-        let group_statuses = open_replicated_volume_group_status_store(db, actor)
+        let group_statuses = open_replicated_volume_group_status_store(db.clone(), actor)
             .expect("open volume group status store");
+        let capacity_requests = open_replicated_volume_capacity_request_store(db, actor)
+            .expect("open volume capacity store");
         specs
             .rebuild_mst_from_disk()
             .await
@@ -765,18 +929,158 @@ mod tests {
             .rebuild_mst_from_disk()
             .await
             .expect("rebuild volume group status store");
+        capacity_requests
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume capacity store");
         TestRegistry {
             registry: VolumeRegistry::new(
                 specs.clone(),
                 nodes.clone(),
                 plans,
                 group_statuses.clone(),
+                capacity_requests.clone(),
             ),
             spec_store: specs,
             node_store: nodes,
             group_status_store: group_statuses,
+            capacity_store: capacity_requests,
             _dir: dir,
         }
+    }
+
+    /// Builds one deterministic desired-capacity row for direct merge tests.
+    fn capacity_request(
+        volume_id: Uuid,
+        volume_epoch: u64,
+        revision: u64,
+        request_id: u128,
+        target_capacity_bytes: u64,
+    ) -> ReplicatedVolumeCapacityRequest {
+        ReplicatedVolumeCapacityRequest {
+            id: compute_replicated_volume_capacity_request_id(volume_id, volume_epoch),
+            volume_id,
+            volume_epoch,
+            revision,
+            request_id: Uuid::from_u128(request_id),
+            target_capacity_bytes,
+            updated_at: "2026-08-12T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Concurrent requests select one deterministic winner and a later correction supersedes it.
+    #[tokio::test]
+    async fn capacity_request_merge_compacts_and_accepts_a_later_correction() {
+        let test = test_registry().await;
+        let spec = replicated_request(
+            "capacity-merge",
+            VolumeBindingMode::WaitForFirstConsumer,
+            Some(64 << 20),
+        );
+        test.registry
+            .upsert_spec(spec.clone())
+            .await
+            .expect("save replicated volume");
+        let left = capacity_request(spec.id, spec.volume_epoch, 1, 10, 128 << 20);
+        let right = capacity_request(spec.id, spec.volume_epoch, 1, 11, 192 << 20);
+        let mut left_clock = VectorClock::new();
+        left_clock.apply(Uuid::from_u128(1), 1);
+        let mut right_clock = VectorClock::new();
+        right_clock.apply(Uuid::from_u128(2), 1);
+        test.capacity_store
+            .apply_delta_chunk_update_mst(
+                vec![(
+                    UuidKey::from(left.id),
+                    MvReg::from_entries(vec![
+                        MvRegEntry::new(left_clock, left),
+                        MvRegEntry::new(right_clock, right.clone()),
+                    ]),
+                )],
+                Vec::new(),
+            )
+            .await
+            .expect("merge concurrent capacity requests");
+
+        assert_eq!(
+            test.registry
+                .get_capacity_request(spec.id)
+                .expect("read winning capacity request"),
+            Some(right.clone())
+        );
+        let report = test
+            .capacity_store
+            .compact_registers(&StoreGcPolicy {
+                mvreg_batch_limit: 10,
+                mvreg_max_values: Some(1),
+                ..StoreGcPolicy::default()
+            })
+            .await
+            .expect("compact concurrent capacity requests");
+        assert_eq!(report.registers_compacted, 1);
+        let snapshot = test
+            .capacity_store
+            .get_snapshot(&UuidKey::from(right.id))
+            .expect("read compacted request")
+            .expect("capacity request exists");
+        assert_eq!(snapshot.as_slice(), std::slice::from_ref(&right));
+
+        let corrected = capacity_request(spec.id, spec.volume_epoch, 2, 12, 96 << 20);
+        test.registry
+            .upsert_capacity_request(corrected.clone())
+            .await
+            .expect("save later correction");
+        assert_eq!(
+            test.registry
+                .get_capacity_request(spec.id)
+                .expect("read corrected request"),
+            Some(corrected)
+        );
+    }
+
+    /// Cleanup removes proven stale generations but retains values that may precede their spec.
+    #[tokio::test]
+    async fn stale_capacity_cleanup_is_safe_under_reordered_delivery() {
+        let test = test_registry().await;
+        let mut spec = replicated_request(
+            "capacity-cleanup",
+            VolumeBindingMode::WaitForFirstConsumer,
+            Some(64 << 20),
+        );
+        spec.volume_epoch = 2;
+        test.registry
+            .upsert_spec(spec.clone())
+            .await
+            .expect("save replicated volume");
+        let stale = capacity_request(spec.id, spec.volume_epoch - 1, 1, 20, 128 << 20);
+        test.capacity_store
+            .upsert(&UuidKey::from(stale.id), stale.clone())
+            .await
+            .expect("inject stale generation request");
+        let unknown = capacity_request(Uuid::from_u128(999), 1, 1, 21, 128 << 20);
+        test.capacity_store
+            .upsert(&UuidKey::from(unknown.id), unknown.clone())
+            .await
+            .expect("inject request delivered before its spec");
+
+        assert_eq!(
+            test.registry
+                .remove_stale_capacity_requests()
+                .await
+                .expect("remove proven stale requests"),
+            1
+        );
+        assert!(
+            test.capacity_store
+                .get_snapshot(&UuidKey::from(stale.id))
+                .expect("read stale request")
+                .is_none()
+        );
+        assert!(
+            test.capacity_store
+                .get_snapshot(&UuidKey::from(unknown.id))
+                .expect("read reordered request")
+                .is_some()
+        );
     }
 
     /// Conflicting immutable requests fail closed without blocking independent volume scans.
@@ -832,7 +1136,7 @@ mod tests {
     fn replicated_request(
         name: &str,
         binding_mode: VolumeBindingMode,
-        requested_bytes: Option<u64>,
+        initial_capacity_bytes: Option<u64>,
     ) -> VolumeSpecValue {
         let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
             name: name.to_string(),
@@ -842,7 +1146,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode,
             reclaim_policy: VolumeReclaimPolicy::Delete,
-            requested_bytes,
+            initial_capacity_bytes,
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,
@@ -919,7 +1223,7 @@ mod tests {
             crate::volumes::types::SavedVolumeDescriptor::for_volume(
                 request.id,
                 request.volume_epoch,
-                request.requested_bytes.expect("test capacity"),
+                request.initial_capacity_bytes.expect("test capacity"),
             )
             .expect("test descriptor"),
         );
@@ -941,7 +1245,7 @@ mod tests {
             "node-a",
             None,
             VolumeNodeState::Ready,
-            request.requested_bytes,
+            request.initial_capacity_bytes,
             request.volume_epoch,
         )
         .with_group_id(group_id);
@@ -1026,7 +1330,7 @@ mod tests {
             crate::volumes::types::SavedVolumeDescriptor::for_volume(
                 request.id,
                 request.volume_epoch,
-                request.requested_bytes.expect("test capacity"),
+                request.initial_capacity_bytes.expect("test capacity"),
             )
             .expect("test descriptor"),
         );
@@ -1062,7 +1366,7 @@ mod tests {
             "node-a",
             None,
             VolumeNodeState::Ready,
-            request.requested_bytes,
+            request.initial_capacity_bytes,
             request.volume_epoch,
         )
         .with_group_id(group_id);
@@ -1110,7 +1414,7 @@ mod tests {
             .expect("merge stale node register");
 
         let mut changed_request = request.clone();
-        changed_request.requested_bytes = Some(16 * 4096);
+        changed_request.initial_capacity_bytes = Some(16 * 4096);
         assert!(test.registry.upsert_spec(changed_request).await.is_err());
 
         assert_eq!(
@@ -1146,6 +1450,11 @@ mod tests {
             .upsert_spec(request.clone())
             .await
             .expect("save replicated request");
+        let capacity = capacity_request(request.id, request.volume_epoch, 1, 40, 16 * 4096);
+        test.registry
+            .upsert_capacity_request(capacity.clone())
+            .await
+            .expect("save capacity request");
 
         let nodes = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let plan = ReplicatedVolumePlan::new(
@@ -1157,7 +1466,7 @@ mod tests {
             crate::volumes::types::SavedVolumeDescriptor::for_volume(
                 request.id,
                 request.volume_epoch,
-                request.requested_bytes.expect("test capacity"),
+                request.initial_capacity_bytes.expect("test capacity"),
             )
             .expect("test descriptor"),
         );
@@ -1178,7 +1487,7 @@ mod tests {
             "node-a",
             None,
             VolumeNodeState::Ready,
-            request.requested_bytes,
+            request.initial_capacity_bytes,
             request.volume_epoch,
         )
         .with_group_id(compute_replicated_volume_group_id(
@@ -1242,6 +1551,12 @@ mod tests {
             .remove_deleted_volume_records(node.volume_id)
             .await
             .expect("remove reordered dependent records");
+        let change_after_cleanup = test.registry.change_version();
+        test.registry
+            .remove_deleted_volume_records(node.volume_id)
+            .await
+            .expect("repeat deleted dependent cleanup");
+        assert_eq!(test.registry.change_version(), change_after_cleanup);
 
         assert!(
             test.registry
@@ -1259,6 +1574,12 @@ mod tests {
             test.registry
                 .get_node_state(node.volume_id, node.node_id)
                 .expect("read node status after final marker")
+                .is_none()
+        );
+        assert!(
+            test.capacity_store
+                .get_snapshot(&UuidKey::from(capacity.id))
+                .expect("read deleted capacity request")
                 .is_none()
         );
 

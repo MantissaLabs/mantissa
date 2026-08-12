@@ -189,7 +189,7 @@ fn assert_volume_values_roundtrip(input: &InfraInput) {
         } else {
             VolumeReclaimPolicy::Retain
         },
-        requested_bytes: Some(nonzero(input.numbers[1])),
+        initial_capacity_bytes: Some(nonzero(input.numbers[1])),
         labels: vec![VolumeLabel {
             key: token("label", &input.text),
             value: token("value", &input.other_text),

@@ -775,7 +775,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                             ownership,
                             binding_mode: binding,
                             reclaim_policy: reclaim,
-                            requested_bytes: args
+                            initial_capacity_bytes: args
                                 .capacity_mb
                                 .map(mantissa_client::volumes::capacity_mb_to_bytes)
                                 .transpose()?,
@@ -814,6 +814,15 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             VolumesCommand::Restore(args) => {
                 local
                     .run_until(crate::volumes::restore(&cfg, &args.selector))
+                    .await?;
+            }
+            VolumesCommand::Expand(args) => {
+                local
+                    .run_until(crate::volumes::expand(
+                        &cfg,
+                        &args.selector,
+                        args.capacity_mb,
+                    ))
                     .await?;
             }
             VolumesCommand::Delete(args) => {

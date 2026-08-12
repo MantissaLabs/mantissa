@@ -538,6 +538,7 @@ async fn open_replicated_volumes(
         stores.volume_nodes.clone(),
         stores.volume_plans.clone(),
         stores.volume_group_statuses.clone(),
+        stores.volume_capacity_requests.clone(),
     );
     let desired_specs = desired_registry.list_reconcilable_specs_including_deleting()?;
     storage.replace_desired_generations(desired_replica_generations(&desired_specs));
@@ -724,6 +725,7 @@ async fn build_runtime_components(
         stores.volume_nodes.clone(),
         stores.volume_plans.clone(),
         stores.volume_group_statuses.clone(),
+        stores.volume_capacity_requests.clone(),
     );
     let ingress_pool_registry = IngressPoolRegistry::new(stores.ingress_pools.clone());
     let registry = build_registry(ctx, stores, health_monitor.clone());
@@ -1079,6 +1081,7 @@ fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
         volume_nodes: stores.volume_nodes.clone(),
         volume_plans: stores.volume_plans.clone(),
         volume_group_statuses: stores.volume_group_statuses.clone(),
+        volume_capacity_requests: stores.volume_capacity_requests.clone(),
         scheduler_digests: stores.scheduler_digests.clone(),
         ingress_pools: stores.ingress_pools.clone(),
     })

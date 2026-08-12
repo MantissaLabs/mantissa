@@ -208,6 +208,7 @@ fn write_volume_mount(
     builder.set_owner_uid(volume_mount.owner_uid());
     builder.set_owner_gid(volume_mount.owner_gid());
     builder.set_mode(volume_mount.mode());
+    builder.set_filesystem_expanded_to_bytes(volume_mount.filesystem_expanded_to_bytes());
 }
 
 /// Reads and checks one restart-safe ext4 mount record.
@@ -233,12 +234,14 @@ fn read_volume_mount(
         reader.get_owner_uid(),
         reader.get_owner_gid(),
         reader.get_mode(),
+        reader.get_filesystem_expanded_to_bytes(),
     )?)
 }
 
 /// Writes one saved ublk device and the attachment it serves.
 fn write_ublk_device(mut builder: local_ublk_device::Builder<'_>, device: SavedUblkDevice) {
     builder.set_device_id(device.id().get());
+    builder.set_capacity_bytes(device.capacity().bytes());
     builder.set_fence(device.fence().get());
     builder.set_session_id(device.session_id().as_bytes());
     builder.set_queue_count(device.queue_count());
@@ -256,6 +259,7 @@ fn read_ublk_device(
     }
     Ok(SavedUblkDevice::from_stored_parts(
         crate::driver::UblkDeviceId::new(device_id),
+        crate::VolumeCapacity::new(reader.get_capacity_bytes())?,
         crate::FenceEpoch::new(reader.get_fence())?,
         crate::DriverSessionId::new(read_uuid(reader.get_session_id()?, "driver session ID")?)?,
         reader.get_queue_count(),
@@ -276,8 +280,15 @@ pub(super) fn encode_attachment(
     if let Some(fence) = record.granted_fence() {
         root.set_granted_fence(fence.get());
     }
-    if let Some(device) = record.ublk_device() {
-        write_ublk_device(root.reborrow().init_ublk_device(), device);
+    let mut devices =
+        root.reborrow()
+            .init_ublk_devices(u32::try_from(record.ublk_devices().len()).map_err(|_| {
+                CatalogProtocolError::TooManyUblkDevices {
+                    actual: record.ublk_devices().len(),
+                }
+            })?);
+    for (index, device) in record.ublk_devices().iter().copied().enumerate() {
+        write_ublk_device(devices.reborrow().get(index as u32), device);
     }
     if let Some(volume_mount) = record.volume_mount() {
         write_volume_mount(root.reborrow().init_volume_mount(), volume_mount);
@@ -300,30 +311,47 @@ pub(super) fn decode_attachment(
         0 => None,
         value => Some(crate::FenceEpoch::new(value)?),
     };
-    let ublk_device = if root.has_ublk_device() {
-        let device = read_ublk_device(root.get_ublk_device()?)?;
+    let saved_devices = root.get_ublk_devices()?;
+    if saved_devices.len() > 2 {
+        return Err(CatalogProtocolError::TooManyUblkDevices {
+            actual: saved_devices.len() as usize,
+        });
+    }
+    let mut ublk_devices = Vec::with_capacity(saved_devices.len() as usize);
+    for saved in saved_devices.iter() {
+        let device = read_ublk_device(saved)?;
         device.settings(&descriptor)?;
-        Some(device)
-    } else {
-        None
-    };
+        if ublk_devices.iter().any(|existing: &SavedUblkDevice| {
+            existing.id() == device.id() || existing.capacity() == device.capacity()
+        }) {
+            return Err(CatalogProtocolError::DuplicateUblkDevice);
+        }
+        ublk_devices.push(device);
+    }
     let volume_mount = if root.has_volume_mount() {
         Some(read_volume_mount(root.get_volume_mount()?)?)
     } else {
         None
     };
-    if ublk_device.is_some() && granted_fence.is_none() {
+    if volume_mount
+        .as_ref()
+        .is_some_and(|mount| mount.filesystem_expanded_to_bytes() > descriptor.capacity().bytes())
+    {
+        return Err(CatalogProtocolError::FilesystemCapacityExceedsDevice);
+    }
+    if !ublk_devices.is_empty() && granted_fence.is_none() {
         return Err(CatalogProtocolError::AttachmentFenceMismatch);
     }
-    if let Some(device) = ublk_device
-        && (device.session_id() != session_id || Some(device.fence()) != granted_fence)
+    if ublk_devices
+        .iter()
+        .any(|device| device.session_id() != session_id || Some(device.fence()) != granted_fence)
     {
         return Err(CatalogProtocolError::AttachmentFenceMismatch);
     }
     if let Some(volume_mount) = volume_mount.as_ref()
-        && ublk_device.is_none_or(|device| {
-            device.fence() != volume_mount.fence()
-                || device.session_id() != volume_mount.session_id()
+        && !ublk_devices.iter().any(|device| {
+            device.fence() == volume_mount.fence()
+                && device.session_id() == volume_mount.session_id()
         })
     {
         return Err(CatalogProtocolError::VolumeMountDeviceMismatch);
@@ -332,8 +360,8 @@ pub(super) fn decode_attachment(
     if let Some(fence) = granted_fence {
         record.set_granted_fence(fence);
     }
-    if let Some(device) = ublk_device {
-        record.set_ublk_device(device);
+    for device in ublk_devices {
+        record.add_ublk_device(device);
     }
     let mount_is_unmounting = volume_mount
         .as_ref()
@@ -570,6 +598,10 @@ pub enum CatalogProtocolError {
     #[error(transparent)]
     Volume(#[from] ProtocolError),
 
+    /// A saved ublk capacity does not fit the volume descriptor.
+    #[error(transparent)]
+    Descriptor(#[from] crate::DescriptorError),
+
     /// A stored operation UUID was invalid.
     #[error(transparent)]
     Identity(#[from] IdentityError),
@@ -601,6 +633,18 @@ pub enum CatalogProtocolError {
     /// A saved device does not match the attachment's committed control state.
     #[error("saved ublk device does not match the attachment fence")]
     AttachmentFenceMismatch,
+
+    /// An attachment can own at most an active and a retiring ublk device.
+    #[error("saved attachment contains {actual} ublk devices; maximum is two")]
+    TooManyUblkDevices { actual: usize },
+
+    /// One kernel device identity may appear only once in an attachment.
+    #[error("saved attachment contains a duplicate ublk device ID")]
+    DuplicateUblkDevice,
+
+    /// A durable receipt cannot exceed the descriptor selected by device mapper.
+    #[error("saved filesystem capacity exceeds the mapped device capacity")]
+    FilesystemCapacityExceedsDevice,
 
     /// libublk represents device numbers as non-negative signed integers.
     #[error("saved ublk device ID {actual} exceeds the libublk range")]

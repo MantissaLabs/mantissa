@@ -13,22 +13,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use devicemapper::{DM, DevId, DmName, DmOptions, DmUuid};
+use devicemapper::{DM, DevId, DmFlags, DmName, DmOptions, DmUuid};
 use mantissa_volume::driver::{
     BlockHandler, BlockIoError, MappedVolumeError, MappedVolumeLayout, MappedVolumeSystem,
     UblkDevice, UblkDeviceId, UblkDeviceState, UblkOwnerId, UblkQueueSettings, UblkSettings,
     UblkSystem,
 };
-use mantissa_volume::{VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId};
+use mantissa_volume::{
+    VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId, VolumeNodeId,
+};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 use uuid::Uuid;
 
 const BLOCK_BYTES: usize = 4 * 1024;
 const CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+const EXPANDED_CAPACITY_BYTES: u64 = 128 * 1024 * 1024;
 const RECOVERY_MARKER: &str = "MANTISSA_MAPPED_RECOVERY_MARKER";
 const TEST_OWNER: UblkOwnerId = UblkOwnerId::new(u64::from_be_bytes(*b"MNTS-DM-"));
 const WAIT: Duration = Duration::from_secs(10);
+
+/// Returns the local node encoded in every mapping owned by this test binary.
+fn mapped_node_id() -> VolumeNodeId {
+    VolumeNodeId::new(Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0))
+        .expect("non-zero mapped-volume test node")
+}
 
 #[derive(Default)]
 struct MemoryBlocks {
@@ -131,7 +140,7 @@ impl BlockHandler for MemoryBlocks {
 
 struct MappingCleanup {
     mapped_volumes: MappedVolumeSystem,
-    key: Option<mantissa_volume::catalog::ReplicaKey>,
+    mapping: Option<(VolumeNodeId, mantissa_volume::catalog::ReplicaKey)>,
     mount_path: Option<PathBuf>,
 }
 
@@ -140,7 +149,7 @@ impl MappingCleanup {
     fn new(mapped_volumes: MappedVolumeSystem, layout: &MappedVolumeLayout) -> Self {
         Self {
             mapped_volumes,
-            key: Some(layout.key()),
+            mapping: Some((layout.node_id(), layout.key())),
             mount_path: None,
         }
     }
@@ -163,7 +172,7 @@ impl MappingCleanup {
 
     /// Stops removing a mapping that the test removed successfully.
     fn mapping_removed(&mut self) {
-        self.key = None;
+        self.mapping = None;
     }
 }
 
@@ -173,8 +182,8 @@ impl Drop for MappingCleanup {
         if let Some(path) = self.mount_path.take() {
             let _ = Command::new("umount").arg(path).status();
         }
-        if let Some(key) = self.key.take() {
-            let _ = self.mapped_volumes.remove(key);
+        if let Some((node_id, key)) = self.mapping.take() {
+            let _ = self.mapped_volumes.remove(node_id, key);
         }
     }
 }
@@ -202,7 +211,11 @@ impl Drop for RawMappingCleanup {
 struct RecoveryCleanup {
     child: Option<Child>,
     device_id: Option<UblkDeviceId>,
-    mapping: Option<(MappedVolumeSystem, mantissa_volume::catalog::ReplicaKey)>,
+    mapping: Option<(
+        MappedVolumeSystem,
+        VolumeNodeId,
+        mantissa_volume::catalog::ReplicaKey,
+    )>,
 }
 
 impl RecoveryCleanup {
@@ -224,9 +237,10 @@ impl RecoveryCleanup {
     fn mapping_created(
         &mut self,
         mapped_volumes: MappedVolumeSystem,
+        node_id: VolumeNodeId,
         key: mantissa_volume::catalog::ReplicaKey,
     ) {
-        self.mapping = Some((mapped_volumes, key));
+        self.mapping = Some((mapped_volumes, node_id, key));
     }
 
     /// Kills and reaps the child so the backend enters user recovery.
@@ -252,8 +266,8 @@ impl Drop for RecoveryCleanup {
     /// Removes the mapped device before any backend left by a failed test.
     fn drop(&mut self) {
         self.kill_child();
-        if let Some((mapped_volumes, key)) = self.mapping.take() {
-            let _ = mapped_volumes.remove(key);
+        if let Some((mapped_volumes, node_id, key)) = self.mapping.take() {
+            let _ = mapped_volumes.remove(node_id, key);
         }
         if let Some(device_id) = self.device_id.take() {
             let _ = UblkSystem::system(TEST_OWNER).remove(device_id);
@@ -261,16 +275,21 @@ impl Drop for RecoveryCleanup {
     }
 }
 
-/// Creates an immutable descriptor with a unique generation for each live case.
-fn descriptor(generation: u64) -> VolumeDescriptor {
+/// Creates a descriptor with one exact capacity for a live kernel case.
+fn descriptor_with_capacity(generation: u64, capacity_bytes: u64) -> VolumeDescriptor {
     VolumeDescriptor::new(
         VolumeId::new(Uuid::from_u128(0x1234_5678_90ab_cdef_1234_5678_90ab_cdef))
             .expect("non-zero test volume ID"),
         VolumeGeneration::new(generation).expect("non-zero test generation"),
-        CAPACITY_BYTES,
+        capacity_bytes,
         VolumeBlockSizes::supported(),
     )
     .expect("valid mapped-volume descriptor")
+}
+
+/// Creates a descriptor with a unique generation for each live case.
+fn descriptor(generation: u64) -> VolumeDescriptor {
+    descriptor_with_capacity(generation, CAPACITY_BYTES)
 }
 
 /// Creates one small ublk configuration for mapper qualification.
@@ -298,6 +317,42 @@ fn run(command: &mut Command, label: &str) -> Result<(), Box<dyn Error>> {
         .into());
     }
     Ok(())
+}
+
+/// Reads one block device's exact byte capacity through the kernel.
+fn block_device_capacity(path: &Path) -> Result<u64, Box<dyn Error>> {
+    let output = Command::new("blockdev")
+        .arg("--getsize64")
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read block device capacity failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().parse()?)
+}
+
+/// Reads the mounted filesystem size reported in bytes by the host tools.
+fn filesystem_capacity(path: &Path) -> Result<u64, Box<dyn Error>> {
+    let output = Command::new("df")
+        .args(["--block-size=1", "--output=size"])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "read filesystem capacity failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    String::from_utf8(output.stdout)?
+        .lines()
+        .nth(1)
+        .ok_or_else(|| "filesystem capacity output has no value".into())
+        .and_then(|value| value.trim().parse::<u64>().map_err(Into::into))
 }
 
 /// Returns the current Mantissa-owned ublk device IDs.
@@ -443,7 +498,7 @@ fn live_mapped_volume_io_mount_and_cleanup() -> Result<(), Box<dyn Error>> {
     let descriptor = descriptor(1);
     let blocks = Arc::new(MemoryBlocks::default());
     let mut backend = UblkDevice::start(TEST_OWNER, ublk_settings(&descriptor), blocks.clone())?;
-    let layout = MappedVolumeLayout::new(&descriptor, backend.block_path())?;
+    let layout = MappedVolumeLayout::new(mapped_node_id(), &descriptor, backend.block_path())?;
     let mut cleanup = MappingCleanup::new(mapped_volumes.clone(), &layout);
     let first = mapped_volumes.ensure(&layout)?;
     let second = mapped_volumes.ensure(&layout)?;
@@ -526,7 +581,7 @@ fn live_mapped_volume_io_mount_and_cleanup() -> Result<(), Box<dyn Error>> {
     std::fs::write(mount_path.join("mapped-path-check"), b"mapped")?;
     assert!(
         matches!(
-            mapped_volumes.remove(layout.key()),
+            mapped_volumes.remove(layout.node_id(), layout.key()),
             Err(MappedVolumeError::Kernel { .. })
         ),
         "an open filesystem must keep the mapping busy"
@@ -534,11 +589,221 @@ fn live_mapped_volume_io_mount_and_cleanup() -> Result<(), Box<dyn Error>> {
     assert!(mapped_volumes.inspect(&layout)?.is_some());
     cleanup.unmount()?;
 
-    mapped_volumes.remove(layout.key())?;
+    mapped_volumes.remove(layout.node_id(), layout.key())?;
     cleanup.mapping_removed();
     assert!(mapped_volumes.inspect(&layout)?.is_none());
     assert!(!mapped_volumes.backend_is_referenced(backend.block_path())?);
     backend.stop()?;
+    assert_eq!(before_mapped, mapped_names(&mapped_volumes));
+    assert_eq!(before_ublk, ublk_ids());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, Linux ublk, dm-linear, ext4, and mount"]
+fn live_failed_io_mapping_allows_ext4_detach() -> Result<(), Box<dyn Error>> {
+    let ublk_system = UblkSystem::system(TEST_OWNER);
+    ublk_system.require_features()?;
+    let mapped_volumes = MappedVolumeSystem::new()?;
+    mapped_volumes.require_features()?;
+    let before_ublk = ublk_ids();
+    let before_mapped = mapped_names(&mapped_volumes);
+
+    let descriptor = descriptor(5);
+    let mut backend = UblkDevice::start(
+        TEST_OWNER,
+        ublk_settings(&descriptor),
+        Arc::new(MemoryBlocks::default()),
+    )?;
+    let layout = MappedVolumeLayout::new(mapped_node_id(), &descriptor, backend.block_path())?;
+    let mut cleanup = MappingCleanup::new(mapped_volumes.clone(), &layout);
+    let mapped_path = mapped_volumes.ensure(&layout)?;
+    run(
+        Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096", "-E", "nodiscard"])
+            .arg(mapped_path.as_path()),
+        "format cleanup-test mapped volume",
+    )?;
+    let root = TempDir::new()?;
+    let mount_path = root.path().join("mount");
+    std::fs::create_dir(&mount_path)?;
+    run(
+        Command::new("mount")
+            .args(["-t", "ext4", "-o", "noatime"])
+            .arg(mapped_path.as_path())
+            .arg(&mount_path),
+        "mount cleanup-test mapped volume",
+    )?;
+    cleanup.mounted(mount_path.clone());
+    let mut sentinel = File::create(mount_path.join("cleanup-check"))?;
+    sentinel.write_all(b"durable before fencing")?;
+    sentinel.sync_all()?;
+    drop(sentinel);
+
+    assert!(
+        mapped_volumes
+            .fail_io_for_cleanup(layout.node_id(), layout.key(), &[])
+            .is_err(),
+        "an existing mapping requires one exact saved layout"
+    );
+    mapped_volumes.fail_io_for_cleanup(
+        layout.node_id(),
+        layout.key(),
+        std::slice::from_ref(&layout),
+    )?;
+    mapped_volumes.fail_io_for_cleanup(
+        layout.node_id(),
+        layout.key(),
+        std::slice::from_ref(&layout),
+    )?;
+    run(
+        Command::new("umount").arg("--lazy").arg(&mount_path),
+        "detach filesystem from failed-I/O mapping",
+    )?;
+    cleanup.mount_path = None;
+    mapped_volumes.remove(layout.node_id(), layout.key())?;
+    cleanup.mapping_removed();
+    mapped_volumes.fail_io_for_cleanup(layout.node_id(), layout.key(), &[])?;
+    backend.stop()?;
+    assert_eq!(before_mapped, mapped_names(&mapped_volumes));
+    assert_eq!(before_ublk, ublk_ids());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires root, Linux ublk, dm-linear, ext4, resize2fs, and mount"]
+fn live_mapped_volume_expands_without_unmounting() -> Result<(), Box<dyn Error>> {
+    let ublk_system = UblkSystem::system(TEST_OWNER);
+    ublk_system.require_features()?;
+    let mapped_volumes = MappedVolumeSystem::new()?;
+    mapped_volumes.require_features()?;
+    let before_ublk = ublk_ids();
+    let before_mapped = mapped_names(&mapped_volumes);
+
+    let initial = descriptor_with_capacity(4, CAPACITY_BYTES);
+    let expanded = descriptor_with_capacity(4, EXPANDED_CAPACITY_BYTES);
+    let blocks = Arc::new(MemoryBlocks::default());
+    let mut initial_backend =
+        UblkDevice::start(TEST_OWNER, ublk_settings(&initial), blocks.clone())?;
+    let mut expanded_backend =
+        UblkDevice::start(TEST_OWNER, ublk_settings(&expanded), blocks.clone())?;
+    let initial_layout =
+        MappedVolumeLayout::new(mapped_node_id(), &initial, initial_backend.block_path())?;
+    let expanded_layout =
+        MappedVolumeLayout::new(mapped_node_id(), &expanded, expanded_backend.block_path())?;
+    let mut cleanup = MappingCleanup::new(mapped_volumes.clone(), &initial_layout);
+    let mapped_path = mapped_volumes.ensure(&initial_layout)?;
+
+    run(
+        Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096", "-E", "nodiscard"])
+            .arg(mapped_path.as_path()),
+        "format expandable mapped volume",
+    )?;
+    let root = TempDir::new()?;
+    let mount_path = root.path().join("mount");
+    std::fs::create_dir(&mount_path)?;
+    run(
+        Command::new("mount")
+            .args(["-t", "ext4", "-o", "noatime"])
+            .arg(mapped_path.as_path())
+            .arg(&mount_path),
+        "mount expandable mapped volume",
+    )?;
+    cleanup.mounted(mount_path.clone());
+    let sentinel_path = mount_path.join("before-expansion");
+    let mut sentinel = File::create(&sentinel_path)?;
+    sentinel.write_all(b"survives online expansion")?;
+    sentinel.sync_all()?;
+    let initial_filesystem_capacity = filesystem_capacity(&mount_path)?;
+
+    assert_eq!(
+        mapped_path,
+        mapped_volumes.suspend_for_backend_switch(&initial_layout, &expanded_layout)?,
+        "suspending the old backend must preserve the public mapped path"
+    );
+    assert_eq!(
+        mapped_path,
+        mapped_volumes.suspend_for_backend_switch(&initial_layout, &expanded_layout)?,
+        "retrying the suspended boundary must be idempotent"
+    );
+    assert_eq!(
+        mapped_path,
+        mapped_volumes.switch_backend(&initial_layout, &expanded_layout)?,
+        "the public mapped path must not change during expansion"
+    );
+    assert_eq!(
+        mapped_path,
+        mapped_volumes.switch_backend(&initial_layout, &expanded_layout)?,
+        "retrying a completed backend switch must be idempotent"
+    );
+    assert_eq!(
+        EXPANDED_CAPACITY_BYTES,
+        block_device_capacity(mapped_path.as_path())?
+    );
+    assert_eq!(
+        Some(1),
+        mapped_volumes.active_layout(&[initial_layout.clone(), expanded_layout.clone()])?
+    );
+    let mapping_name = mapped_path
+        .as_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("mapped path has no UTF-8 device name")?;
+    let dm = DM::new()?;
+    let dm_name = DmName::new(mapping_name)?;
+    dm.device_suspend(
+        &DevId::Name(dm_name),
+        DmOptions::default().set_flags(DmFlags::DM_SUSPEND),
+    )?;
+    assert_eq!(
+        mapped_path,
+        mapped_volumes.resume_exact(&expanded_layout)?,
+        "startup recovery must resume an exact larger active table"
+    );
+    assert_eq!(
+        mapped_path,
+        mapped_volumes.resume_exact(&expanded_layout)?,
+        "retrying saved-mapping recovery must be idempotent"
+    );
+    let during_path = mount_path.join("during-expansion");
+    let mut during = File::create(&during_path)?;
+    during.write_all(b"written after the mapper switch")?;
+    during.sync_all()?;
+
+    run(
+        Command::new("resize2fs").arg(mapped_path.as_path()),
+        "expand mounted ext4 filesystem",
+    )?;
+    run(
+        Command::new("resize2fs").arg(mapped_path.as_path()),
+        "retry completed ext4 expansion before saving its receipt",
+    )?;
+    assert!(
+        filesystem_capacity(&mount_path)? > initial_filesystem_capacity,
+        "online ext4 expansion must expose more filesystem capacity"
+    );
+    assert_eq!(
+        b"survives online expansion",
+        std::fs::read(&sentinel_path)?.as_slice()
+    );
+    assert_eq!(
+        b"written after the mapper switch",
+        std::fs::read(&during_path)?.as_slice()
+    );
+    let after_path = mount_path.join("after-expansion");
+    let mut after = File::create(after_path)?;
+    after.write_all(&vec![0x5a; 1024 * 1024])?;
+    after.sync_all()?;
+
+    drop(after);
+    drop(during);
+    drop(sentinel);
+    cleanup.unmount()?;
+    mapped_volumes.remove(initial_layout.node_id(), initial_layout.key())?;
+    cleanup.mapping_removed();
+    expanded_backend.stop()?;
+    initial_backend.stop()?;
     assert_eq!(before_mapped, mapped_names(&mapped_volumes));
     assert_eq!(before_ublk, ublk_ids());
     Ok(())
@@ -555,7 +820,7 @@ fn live_foreign_name_and_wrong_table_are_rejected() -> Result<(), Box<dyn Error>
         ublk_settings(&descriptor),
         Arc::new(MemoryBlocks::default()),
     )?;
-    let layout = MappedVolumeLayout::new(&descriptor, backend.block_path())?;
+    let layout = MappedVolumeLayout::new(mapped_node_id(), &descriptor, backend.block_path())?;
     let name = layout
         .expected_path()
         .file_name()
@@ -590,7 +855,8 @@ fn live_foreign_name_and_wrong_table_are_rejected() -> Result<(), Box<dyn Error>
     drop(foreign_cleanup);
 
     let uuid = format!(
-        "MANTISSA-RV-{}-G{}",
+        "MANTISSA-RV-{}-V{}-G{}",
+        layout.node_id().as_uuid().simple(),
         descriptor.volume_id().as_uuid().simple(),
         descriptor.generation().get()
     );
@@ -601,12 +867,12 @@ fn live_foreign_name_and_wrong_table_are_rejected() -> Result<(), Box<dyn Error>
     let empty = mapped_volumes
         .owned_devices()?
         .into_iter()
-        .find(|mapped| mapped.key() == layout.key())
+        .find(|mapped| mapped.node_id() == layout.node_id() && mapped.key() == layout.key())
         .expect("empty owned mapping is visible");
     assert!(empty.backend_device_numbers().is_empty());
     mapped_volumes.ensure(&layout)?;
     assert!(mapped_volumes.backend_is_referenced(backend.block_path())?);
-    mapped_volumes.remove(layout.key())?;
+    mapped_volumes.remove(layout.node_id(), layout.key())?;
     drop(empty_cleanup);
 
     let dm_name = DmName::new(&name)?;
@@ -615,13 +881,28 @@ fn live_foreign_name_and_wrong_table_are_rejected() -> Result<(), Box<dyn Error>
     let wrong_cleanup = RawMappingCleanup::new(name.clone());
     dm.table_load(
         &DevId::Name(dm_name),
-        &[(0, CAPACITY_BYTES / 512, "error".to_string(), String::new())],
+        &[(
+            0,
+            CAPACITY_BYTES / 512 - BLOCK_BYTES as u64 / 512,
+            "linear".to_string(),
+            format!("{} 0", backend_number.trim()),
+        )],
         DmOptions::default(),
     )?;
+    dm.device_suspend(&DevId::Name(dm_name), DmOptions::default())?;
     assert!(matches!(
         mapped_volumes.ensure(&layout),
         Err(MappedVolumeError::WrongLayout { .. })
     ));
+    let cleanup_result = mapped_volumes.fail_io_for_cleanup(
+        layout.node_id(),
+        layout.key(),
+        std::slice::from_ref(&layout),
+    );
+    assert!(
+        matches!(cleanup_result, Err(MappedVolumeError::WrongLayout { .. })),
+        "unexpected failed-I/O cleanup result: {cleanup_result:?}"
+    );
     drop(wrong_cleanup);
 
     let wrong_name = format!("{name}-alias");
@@ -709,9 +990,9 @@ fn live_mapped_volume_user_recovery() -> Result<(), Box<dyn Error>> {
         .block_path()
         .to_path_buf();
     let descriptor = descriptor(3);
-    let layout = MappedVolumeLayout::new(&descriptor, &backend_path)?;
+    let layout = MappedVolumeLayout::new(mapped_node_id(), &descriptor, &backend_path)?;
     let mapped_path = mapped_volumes.ensure(&layout)?;
-    cleanup.mapping_created(mapped_volumes.clone(), layout.key());
+    cleanup.mapping_created(mapped_volumes.clone(), layout.node_id(), layout.key());
 
     cleanup.kill_child();
     wait_for(
@@ -741,7 +1022,7 @@ fn live_mapped_volume_user_recovery() -> Result<(), Box<dyn Error>> {
         read_block(mapped_path.as_path(), 0)?
     );
 
-    mapped_volumes.remove(layout.key())?;
+    mapped_volumes.remove(layout.node_id(), layout.key())?;
     cleanup.mapping_removed();
     recovered.stop()?;
     cleanup.backend_removed();

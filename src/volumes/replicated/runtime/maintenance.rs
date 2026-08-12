@@ -33,7 +33,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::data;
-use super::driver::{DriverAttachment, DriverRebuildPause};
+use super::driver::{DriverAttachment, DriverIoPause};
 use super::{ReplacementMembershipGoal, ReplicatedVolumeRuntime, require_command_postcondition};
 
 const MAINTENANCE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -733,7 +733,7 @@ impl ReplicatedVolumeRuntime {
             self.copy_online_replacement_base(&state, replacement, cancel)
                 .await?;
             let pause = self.replacement_pause(key, writer, &state).await?;
-            cancellable(cancel, pause.run()).await?;
+            cancellable(cancel, pause.drain_and_flush()).await?;
             let fence = state.data().context("replacement grant has no data")?.fence;
             Some((writer, fence, pause))
         } else {
@@ -991,7 +991,7 @@ impl ReplicatedVolumeRuntime {
         key: ReplicaKey,
         writer: WriterGrant,
         state: &VolumeControlState,
-    ) -> Result<DriverRebuildPause> {
+    ) -> Result<DriverIoPause> {
         let fence = state.data().context("replacement grant has no data")?.fence;
         let driver = self
             .tracked_driver(key)
@@ -1007,7 +1007,7 @@ impl ReplicatedVolumeRuntime {
         {
             anyhow::bail!("replacement driver differs from current writer grant");
         }
-        driver.rebuild_pause().map_err(Into::into)
+        driver.io_pause().map_err(Into::into)
     }
 
     /// Resumes an old path only after proving that adoption did not commit.
@@ -1017,7 +1017,7 @@ impl ReplicatedVolumeRuntime {
         replacement: ReplacementGrant,
         writer: WriterGrant,
         old_fence: FenceEpoch,
-        pause: &DriverRebuildPause,
+        pause: &DriverIoPause,
     ) -> Result<()> {
         let current = self.read_quorum_state(key).await?;
         if current.disposition() == VolumeDisposition::Live

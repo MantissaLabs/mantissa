@@ -15,7 +15,7 @@ fn volume_create_request(name: &str, node_id: &str) -> serde_json::Value {
         "name": name,
         "binding_mode": "immediate",
         "reclaim_policy": "retain",
-        "requested_bytes": 1048576,
+        "initial_capacity_bytes": 1048576,
         "node_selector": node_id,
         "labels": [{"key": "purpose", "value": "rest"}]
     })
@@ -46,7 +46,7 @@ local_test!(rest_volumes_create_and_list_bound_local_volume, {
     assert_eq!(value["driver"]["kind"], "local_managed");
     assert_eq!(value["binding_mode"], "immediate");
     assert_eq!(value["reclaim_policy"], "retain");
-    assert_eq!(value["requested_bytes"], 1048576);
+    assert_eq!(value["initial_capacity_bytes"], 1048576);
     assert_eq!(value["bound_node_id"], node_id);
     assert_eq!(value["labels"][0]["key"], "purpose");
     assert_eq!(value["labels"][0]["value"], "rest");
@@ -83,7 +83,7 @@ local_test!(rest_volumes_create_unbound_replicated_volume, {
                     "gid": 2000
                 },
                 "binding_mode": "wait_for_first_consumer",
-                "requested_bytes": 67108864
+                "initial_capacity_bytes": 67108864
             })),
         )
         .await;
@@ -108,6 +108,102 @@ local_test!(rest_volumes_create_unbound_replicated_volume, {
 });
 
 local_test!(
+    rest_volumes_accept_idempotent_expansion_and_pending_correction,
+    {
+        let harness = RestTestHarness::new().await;
+        let (status, value) = harness
+            .json_request(
+                Method::POST,
+                "/v1/volumes",
+                true,
+                Some(json!({
+                    "name": "rest-expand",
+                    "driver": "replicated",
+                    "binding_mode": "wait_for_first_consumer",
+                    "initial_capacity_bytes": 67108864
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "create response body={value}");
+
+        for desired_capacity_changed in [true, false] {
+            let (status, value) = harness
+                .json_request(
+                    Method::POST,
+                    "/v1/volumes/rest-expand/expand",
+                    true,
+                    Some(json!({"capacity_bytes": 134217728})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "expand response body={value}");
+            assert_eq!(value["initial_capacity_bytes"], 67108864);
+            assert_eq!(value["desired_capacity_bytes"], 134217728);
+            assert_eq!(value["replicated_capacity_bytes"], 67108864);
+            assert_eq!(value["desired_capacity_changed"], desired_capacity_changed);
+        }
+
+        let (status, value) = harness
+            .json_request(
+                Method::POST,
+                "/v1/volumes/rest-expand/expand",
+                true,
+                Some(json!({"capacity_bytes": 100663296})),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "correct response body={value}"
+        );
+        assert_eq!(value["desired_capacity_bytes"], 100663296);
+        assert_eq!(value["desired_capacity_changed"], true);
+
+        for rejected in [33554432_u64, 100663297_u64] {
+            let (status, value) = harness
+                .json_request(
+                    Method::POST,
+                    "/v1/volumes/rest-expand/expand",
+                    true,
+                    Some(json!({"capacity_bytes": rejected})),
+                )
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "unsafe target {rejected} response body={value}"
+            );
+        }
+
+        let (status, value) = harness
+            .json_request(Method::GET, "/v1/volumes/rest-expand", true, None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["desired_capacity_bytes"], 100663296);
+        assert_eq!(value["spec"]["initial_capacity_bytes"], 67108864);
+
+        for desired_capacity_changed in [true, false] {
+            let (status, value) = harness
+                .json_request(
+                    Method::POST,
+                    "/v1/volumes/rest-expand/expand",
+                    true,
+                    Some(json!({"capacity_bytes": 67108864})),
+                )
+                .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "cancel response body={value}");
+            assert_eq!(value["desired_capacity_bytes"], 67108864);
+            assert_eq!(value["desired_capacity_changed"], desired_capacity_changed);
+        }
+
+        let (status, value) = harness
+            .json_request(Method::GET, "/v1/volumes/rest-expand", true, None)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["desired_capacity_bytes"], 67108864);
+    }
+);
+
+local_test!(
     rest_volume_status_shows_plan_control_state_and_all_three_nodes,
     {
         let harness = RestTestHarness::new().await;
@@ -120,7 +216,7 @@ local_test!(
                     "name": "rest-replica-status",
                     "driver": "replicated",
                     "binding_mode": "wait_for_first_consumer",
-                    "requested_bytes": 67108864
+                    "initial_capacity_bytes": 67108864
                 })),
             )
             .await;
@@ -154,7 +250,7 @@ local_test!(
             SavedVolumeDescriptor::for_volume(
                 volume_id,
                 spec.volume_epoch,
-                spec.requested_bytes.expect("volume capacity"),
+                spec.initial_capacity_bytes.expect("volume capacity"),
             )
             .expect("volume descriptor"),
         );
@@ -181,6 +277,9 @@ local_test!(
         );
         group.leader_node_id = Some(harness.node_id);
         group.control_revision = 3;
+        group.replicated_capacity_bytes = spec
+            .initial_capacity_bytes
+            .expect("replicated volume capacity");
         group.fence = Some(1);
         group.copy_node_ids = replica_node_ids.to_vec();
         group.copy_node_ids.sort_unstable();
@@ -194,16 +293,18 @@ local_test!(
             .expect("save group status");
 
         for (index, node_id) in replica_node_ids.into_iter().enumerate() {
-            let state = VolumeNodeStateValue::new(
+            let mut state = VolumeNodeStateValue::new(
                 volume_id,
                 node_id,
                 format!("node-{}", index + 1),
                 None,
                 VolumeNodeState::Ready,
-                spec.requested_bytes,
+                spec.initial_capacity_bytes,
                 spec.volume_epoch,
             )
             .with_group_id(group_id);
+            state.prepared_capacity_bytes = spec.initial_capacity_bytes;
+            state.served_capacity_bytes = spec.initial_capacity_bytes;
             harness
                 .node()
                 .node
@@ -350,7 +451,7 @@ local_test!(rest_volumes_import_existing_local_path, {
                 "name": "rest-volume-import",
                 "node_selector": harness.node_id.to_string(),
                 "path": import_dir.path().to_string_lossy(),
-                "requested_bytes": 4096,
+                "initial_capacity_bytes": 4096,
                 "labels": [{"key": "kind", "value": "import"}]
             })),
         )
@@ -358,7 +459,7 @@ local_test!(rest_volumes_import_existing_local_path, {
     assert_eq!(status, StatusCode::OK, "import response body={value}");
     assert_eq!(value["name"], "rest-volume-import");
     assert_eq!(value["driver"]["kind"], "local_imported_path");
-    assert_eq!(value["requested_bytes"], 4096);
+    assert_eq!(value["initial_capacity_bytes"], 4096);
     assert_eq!(value["labels"][0]["value"], "import");
 });
 
@@ -385,7 +486,7 @@ local_test!(rest_volumes_reject_invalid_create_requests, {
             "name": "bad-replicated-binding",
             "driver": "replicated",
             "binding_mode": "immediate",
-            "requested_bytes": 67108864
+            "initial_capacity_bytes": 67108864
         }),
         json!({
             "name": "bad-replicated-capacity",
@@ -396,7 +497,7 @@ local_test!(rest_volumes_reject_invalid_create_requests, {
             "name": "bad-replicated-alignment",
             "driver": "replicated",
             "binding_mode": "wait_for_first_consumer",
-            "requested_bytes": 67108865
+            "initial_capacity_bytes": 67108865
         }),
     ] {
         let (status, value) = harness

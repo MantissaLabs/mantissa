@@ -40,7 +40,7 @@ pub(super) trait ReplicatedVolumeAccess: Send + Sync {
     async fn local_mount_paths(&self) -> Result<std::collections::BTreeSet<PathBuf>>;
 
     /// Returns whether local Ready state has a live Raft quorum.
-    async fn is_ready(&self, key: ReplicaKey) -> Result<bool>;
+    async fn is_ready(&self, key: ReplicaKey, required_capacity_bytes: u64) -> Result<bool>;
 
     /// Returns whether the saved local attachment is actually serving and mounted.
     async fn is_mounted(&self, key: ReplicaKey) -> Result<bool>;
@@ -60,8 +60,9 @@ impl ReplicatedVolumeAccess for crate::volumes::replicated::ReplicatedVolumeRunt
     }
 
     /// Checks Ready state and confirms a live Raft quorum.
-    async fn is_ready(&self, key: ReplicaKey) -> Result<bool> {
-        self.volume_is_ready(key).await
+    async fn is_ready(&self, key: ReplicaKey, required_capacity_bytes: u64) -> Result<bool> {
+        self.volume_is_ready_for_capacity(key, required_capacity_bytes)
+            .await
     }
 
     /// Checks catalog, driver, and kernel mount inventory for one attachment.
@@ -142,8 +143,8 @@ impl WorkloadManager {
                     });
                     if !plan_exists && !bound_can_serve && seen.insert(spec.id) {
                         let capacity = spec
-                            .requested_bytes
-                            .context("replicated volume has no requested capacity")?;
+                            .initial_capacity_bytes
+                            .context("replicated volume has no initial capacity")?;
                         let space = ReplicaSpace::for_capacity(capacity)?;
                         let required = space.total_bytes()?;
                         new_replica_bytes = new_replica_bytes.checked_add(required).context(
@@ -345,7 +346,7 @@ impl WorkloadManager {
                     node_name,
                     None,
                     VolumeNodeState::Pending,
-                    spec.requested_bytes,
+                    spec.initial_capacity_bytes,
                     spec.volume_epoch,
                 );
                 self.upsert_volume_node_state(state).await?;
@@ -434,6 +435,7 @@ impl WorkloadManager {
                 if !spec.driver.is_replicated() {
                     continue;
                 }
+                let desired_capacity_bytes = self.desired_replicated_capacity(&spec)?;
                 let plan = self.volumes.volume_registry.get_plan(volume_id)?;
                 let group = self.volumes.volume_registry.get_group_status(volume_id)?;
                 let ready = plan.as_ref().is_some_and(|plan| {
@@ -445,6 +447,7 @@ impl WorkloadManager {
                         group.volume_epoch == plan.volume_epoch
                             && group.group_id == group_id
                             && matches!(group.status, VolumeStatus::Ready | VolumeStatus::InUse)
+                            && group.replicated_capacity_bytes >= desired_capacity_bytes
                     })
                 });
                 if !ready {
@@ -458,7 +461,7 @@ impl WorkloadManager {
                     let key = self.replicated_volume_key(&spec)?;
                     let ready = self
                         .replicated_volume_runtime()?
-                        .is_ready(key)
+                        .is_ready(key, desired_capacity_bytes)
                         .await
                         .map_err(|error| {
                             VolumeAccessError::unavailable(format!(
@@ -533,13 +536,17 @@ impl WorkloadManager {
                 VolumeDriver::Local(_) => self.ensure_local_volume_ready(&spec).await?,
                 VolumeDriver::Replicated(_) => {
                     let key = self.replicated_volume_key(&spec)?;
+                    let desired_capacity_bytes = self.desired_replicated_capacity(&spec)?;
                     let runtime = self.replicated_volume_runtime()?;
-                    let ready = runtime.is_ready(key).await.map_err(|error| {
-                        VolumeAccessError::unavailable(format!(
-                            "failed to check replicated volume '{}': {error:#}",
-                            spec.name
-                        ))
-                    })?;
+                    let ready = runtime
+                        .is_ready(key, desired_capacity_bytes)
+                        .await
+                        .map_err(|error| {
+                            VolumeAccessError::unavailable(format!(
+                                "failed to check replicated volume '{}': {error:#}",
+                                spec.name
+                            ))
+                        })?;
                     if !ready {
                         return Err(VolumeAccessError::unavailable(format!(
                             "volume '{}' is not ready in local Raft state",
@@ -633,7 +640,7 @@ impl WorkloadManager {
                     }
                     let ready = self
                         .replicated_volume_runtime()?
-                        .is_ready(key)
+                        .is_ready(key, self.desired_replicated_capacity(&spec)?)
                         .await
                         .map_err(|error| {
                             VolumeAccessError::unavailable(format!(
@@ -845,7 +852,7 @@ impl WorkloadManager {
                     self.local_node_name.clone(),
                     None,
                     VolumeNodeState::Pending,
-                    spec.requested_bytes,
+                    spec.initial_capacity_bytes,
                     spec.volume_epoch,
                 )
             });
@@ -879,7 +886,7 @@ impl WorkloadManager {
         {
             let mut desired = current.clone();
             desired.local_path = Some(path_string);
-            desired.capacity_bytes = spec.requested_bytes;
+            desired.capacity_bytes = spec.initial_capacity_bytes;
             desired.state = if desired.published_task_ids.is_empty() {
                 VolumeNodeState::Ready
             } else {
@@ -1003,7 +1010,7 @@ impl WorkloadManager {
                     self.local_node_name.clone(),
                     None,
                     VolumeNodeState::Ready,
-                    volume.requested_bytes,
+                    volume.initial_capacity_bytes,
                     volume.volume_epoch,
                 )
                 .with_group_id(group_id)
@@ -1139,6 +1146,24 @@ impl WorkloadManager {
                 )
                 .into()
             })
+    }
+
+    /// Returns the capacity a newly starting consumer must wait to receive.
+    fn desired_replicated_capacity(&self, spec: &VolumeSpecValue) -> Result<u64> {
+        let initial = spec
+            .initial_capacity_bytes
+            .context("replicated volume has no initial capacity")?;
+        let requested = self
+            .volumes
+            .volume_registry
+            .get_capacity_request(spec.id)?
+            .map_or(initial, |request| request.target_capacity_bytes);
+        let replicated = self
+            .volumes
+            .volume_registry
+            .get_group_status(spec.id)?
+            .map_or(initial, |group| group.replicated_capacity_bytes);
+        Ok(initial.max(requested).max(replicated))
     }
 
     /// Resolves the saved local replica key for the current volume generation.

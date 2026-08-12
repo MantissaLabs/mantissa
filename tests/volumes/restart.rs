@@ -40,6 +40,8 @@ local_test!(restart_restores_volume_node_state, {
         open_replicated_volume_plan_store(db.clone(), self_id).expect("open volume plan store"),
         open_replicated_volume_group_status_store(db.clone(), self_id)
             .expect("open volume group status store"),
+        open_replicated_volume_capacity_request_store(db.clone(), self_id)
+            .expect("open volume capacity store"),
     );
     let mut stale_state = registry
         .get_node_state(volume_id, self_id)

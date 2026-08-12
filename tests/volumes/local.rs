@@ -84,7 +84,7 @@ local_test!(volumes_import_requires_request_on_target_node, {
         inner.set_name("remote-import");
         inner.set_node_id(cluster[1].id().as_bytes());
         inner.set_path(imported_path.to_str().expect("imported path utf8"));
-        inner.set_requested_bytes(0);
+        inner.set_initial_capacity_bytes(0);
     }
 
     let err = match request.send().promise.await {
@@ -208,7 +208,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
         reclaim_policy: VolumeReclaimPolicy::Retain,
-        requested_bytes: None,
+        initial_capacity_bytes: None,
         labels: Vec::new(),
         bound_node_id: Some(node.id),
         bound_node_name: Some("local".to_string()),
@@ -219,7 +219,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
         reclaim_policy: VolumeReclaimPolicy::Retain,
-        requested_bytes: None,
+        initial_capacity_bytes: None,
         labels: Vec::new(),
         bound_node_id: Some(other_node),
         bound_node_name: Some("remote".to_string()),

@@ -6,7 +6,8 @@ use mantissa_protocol::volumes::{
     VolumeNodeState as ProtoVolumeNodeState, VolumeReclaimPolicy as ProtoVolumeReclaimPolicy,
     VolumeState as ProtoVolumeState, VolumeStatus as ProtoVolumeStatus, filesystem_ownership,
     local_volume_spec, replicated_volume_group_status, replicated_volume_plan, volume_driver_spec,
-    volume_filesystem_space, volume_inspect, volume_node_status, volume_spec, volume_summary,
+    volume_expand_result, volume_filesystem_space, volume_inspect, volume_node_status, volume_spec,
+    volume_summary,
 };
 use serde::Deserialize;
 use std::fmt;
@@ -342,7 +343,7 @@ pub struct VolumeSummary {
     pub state: VolumeState,
     pub bound_node_id: Option<Uuid>,
     pub bound_node_name: Option<String>,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub in_use: bool,
     pub reason: Option<String>,
     pub updated_at: String,
@@ -358,7 +359,7 @@ pub struct VolumeSpec {
     pub access_mode: VolumeAccessMode,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: VolumeReclaimPolicy,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub labels: Vec<VolumeLabel>,
     pub bound_node_id: Option<Uuid>,
     pub bound_node_name: Option<String>,
@@ -401,6 +402,11 @@ pub struct VolumeNodeStatus {
     pub state: VolumeNodeState,
     pub health: NodeHealth,
     pub capacity_bytes: Option<u64>,
+    pub reserved_capacity_bytes: Option<u64>,
+    pub prepared_capacity_bytes: Option<u64>,
+    pub served_capacity_bytes: Option<u64>,
+    pub device_capacity_bytes: Option<u64>,
+    pub filesystem_expansion_pending: bool,
     pub used_bytes: Option<u64>,
     pub published_task_ids: Vec<Uuid>,
     pub updated_at: String,
@@ -419,7 +425,7 @@ pub struct ReplicatedVolumePlan {
     pub workload_node_id: Uuid,
     pub replica_node_ids: [Uuid; 3],
     pub generation: u64,
-    pub capacity_bytes: u64,
+    pub initial_capacity_bytes: u64,
     pub logical_sector_bytes: u32,
     pub physical_block_bytes: u32,
     pub minimum_io_bytes: u32,
@@ -441,6 +447,7 @@ pub struct ReplicatedVolumeGroupStatus {
     pub updated_at: String,
     pub message: Option<String>,
     pub control_revision: u64,
+    pub replicated_capacity_bytes: u64,
     pub fence: Option<u64>,
     pub copy_node_ids: Vec<Uuid>,
     pub voter_node_ids: Vec<Uuid>,
@@ -460,6 +467,7 @@ pub struct VolumeInspect {
     pub plan: Option<ReplicatedVolumePlan>,
     pub group_status: Option<ReplicatedVolumeGroupStatus>,
     pub filesystem_space: Option<VolumeFilesystemSpace>,
+    pub desired_capacity_bytes: Option<u64>,
 }
 
 /// Live filesystem space measured on the mounted replicated-volume writer.
@@ -496,6 +504,29 @@ pub struct VolumeDeleteResult {
     pub disposition: VolumeDeleteDisposition,
 }
 
+/// Durable result returned after saving one desired capacity request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeExpandResult {
+    pub volume_id: Uuid,
+    pub initial_capacity_bytes: u64,
+    pub desired_capacity_bytes: u64,
+    pub replicated_capacity_bytes: u64,
+    pub desired_capacity_changed: bool,
+}
+
+impl VolumeExpandResult {
+    /// Decodes the accepted desired target and best known committed capacity.
+    pub fn from_reader(reader: volume_expand_result::Reader<'_>) -> Result<Self> {
+        Ok(Self {
+            volume_id: read_uuid(reader.get_volume_id()?, "volume id")?,
+            initial_capacity_bytes: reader.get_initial_capacity_bytes(),
+            desired_capacity_bytes: reader.get_desired_capacity_bytes(),
+            replicated_capacity_bytes: reader.get_replicated_capacity_bytes(),
+            desired_capacity_changed: reader.get_desired_capacity_changed(),
+        })
+    }
+}
+
 /// Logical outcome accepted by one volume delete request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeDeleteDisposition {
@@ -529,7 +560,7 @@ impl VolumeSummary {
             state: VolumeState::from_proto(reader.get_state()?),
             bound_node_id: read_optional_uuid(reader.get_bound_node_id()?, "bound node id")?,
             bound_node_name: empty_text(reader.get_bound_node_name()?.to_str()?),
-            requested_bytes: zero_means_none(reader.get_requested_bytes()),
+            initial_capacity_bytes: zero_means_none(reader.get_initial_capacity_bytes()),
             in_use: reader.get_in_use(),
             reason: empty_text(reader.get_reason()?.to_str()?),
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
@@ -558,7 +589,7 @@ impl VolumeSpec {
             access_mode: VolumeAccessMode::from_proto(reader.get_access_mode()?),
             binding_mode: VolumeBindingMode::from_proto(reader.get_binding_mode()?),
             reclaim_policy: VolumeReclaimPolicy::from_proto(reader.get_reclaim_policy()?),
-            requested_bytes: zero_means_none(reader.get_requested_bytes()),
+            initial_capacity_bytes: zero_means_none(reader.get_initial_capacity_bytes()),
             labels,
             bound_node_id: read_optional_uuid(reader.get_bound_node_id()?, "bound node id")?,
             bound_node_name: empty_text(reader.get_bound_node_name()?.to_str()?),
@@ -603,6 +634,11 @@ impl VolumeNodeStatus {
             state: VolumeNodeState::from_proto(reader.get_state()?),
             health: NodeHealth::from_proto(reader.get_health()?),
             capacity_bytes: zero_means_none(reader.get_capacity_bytes()),
+            reserved_capacity_bytes: zero_means_none(reader.get_reserved_capacity_bytes()),
+            prepared_capacity_bytes: zero_means_none(reader.get_prepared_capacity_bytes()),
+            served_capacity_bytes: zero_means_none(reader.get_served_capacity_bytes()),
+            device_capacity_bytes: zero_means_none(reader.get_device_capacity_bytes()),
+            filesystem_expansion_pending: reader.get_filesystem_expansion_pending(),
             used_bytes: zero_means_none(reader.get_used_bytes()),
             published_task_ids,
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
@@ -636,7 +672,7 @@ impl ReplicatedVolumePlan {
                 read_uuid(replicas.get(2)?, "third replica node id")?,
             ],
             generation: descriptor.get_generation(),
-            capacity_bytes: descriptor.get_capacity_bytes(),
+            initial_capacity_bytes: descriptor.get_capacity_bytes(),
             logical_sector_bytes: block_sizes.get_logical_sector_bytes(),
             physical_block_bytes: block_sizes.get_physical_block_bytes(),
             minimum_io_bytes: block_sizes.get_minimum_io_bytes(),
@@ -672,6 +708,7 @@ impl ReplicatedVolumeGroupStatus {
             updated_at: reader.get_updated_at()?.to_str()?.to_string(),
             message: empty_text(reader.get_message()?.to_str()?),
             control_revision: reader.get_control_revision(),
+            replicated_capacity_bytes: reader.get_replicated_capacity_bytes(),
             fence: zero_means_none(reader.get_fence()),
             copy_node_ids,
             voter_node_ids,
@@ -728,6 +765,7 @@ impl VolumeInspect {
             plan,
             group_status,
             filesystem_space,
+            desired_capacity_bytes: zero_means_none(reader.get_desired_capacity_bytes()),
         })
     }
 }

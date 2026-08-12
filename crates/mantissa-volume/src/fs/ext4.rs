@@ -33,6 +33,9 @@ pub struct Options {
     /// Absolute path to the mkfs.ext4 executable.
     pub mkfs_ext4_path: PathBuf,
 
+    /// Absolute path to the resize2fs executable.
+    pub resize2fs_path: PathBuf,
+
     /// Exact ext4 features enabled on newly created filesystems.
     pub features: Vec<String>,
 
@@ -294,6 +297,7 @@ pub struct Manager {
     mount_root: PathBuf,
     wipefs_path: PathBuf,
     mkfs_ext4_path: PathBuf,
+    resize2fs_path: PathBuf,
     mke2fs_config_path: PathBuf,
     format_profile: Ext4FormatProfile,
     mount_flags: MsFlags,
@@ -313,7 +317,8 @@ impl Manager {
         #[cfg(target_os = "linux")]
         {
             check_tool(&settings.options.wipefs_path, "wipefs")?;
-            check_tool(&settings.options.mkfs_ext4_path, "mkfs.ext4")
+            check_tool(&settings.options.mkfs_ext4_path, "mkfs.ext4")?;
+            check_tool(&settings.options.resize2fs_path, "resize2fs")
         }
     }
 
@@ -322,6 +327,7 @@ impl Manager {
         let mount_root = settings.options.mount_root.clone();
         let wipefs_path = settings.options.wipefs_path.clone();
         let mkfs_ext4_path = settings.options.mkfs_ext4_path.clone();
+        let resize2fs_path = settings.options.resize2fs_path.clone();
         Self::check_tools(settings)?;
         prepare_mount_root(&mount_root)?;
 
@@ -337,6 +343,7 @@ impl Manager {
             mount_root,
             wipefs_path,
             mkfs_ext4_path,
+            resize2fs_path,
             mke2fs_config_path,
             format_profile,
             mount_flags,
@@ -414,6 +421,15 @@ impl Manager {
         run_command_while_io_progresses(command, self.command_timeout, "format ext4", progress)
             .await?;
         Ok(())
+    }
+
+    /// Expands mounted ext4 to the full current mapped-device capacity.
+    pub async fn expand(&self, device: &Path, progress: RequestProgress) -> Result<()> {
+        let mut command = Command::new(&self.resize2fs_path);
+        command.env_clear().arg(device);
+        run_command_while_io_progresses(command, self.command_timeout, "expand ext4", progress)
+            .await
+            .map(drop)
     }
 
     /// Creates an empty private directory before it becomes a mount point.
@@ -604,6 +620,7 @@ fn check_settings(options: &Options) -> std::result::Result<(), InvalidSettings>
         ("mount root", &options.mount_root),
         ("wipefs executable", &options.wipefs_path),
         ("mkfs.ext4 executable", &options.mkfs_ext4_path),
+        ("resize2fs executable", &options.resize2fs_path),
     ] {
         if path.as_os_str().is_empty() {
             return Err(InvalidSettings::new(format!(
@@ -1084,6 +1101,7 @@ mod tests {
             mount_root: mount_root.to_path_buf(),
             wipefs_path: PathBuf::from("/bin/false"),
             mkfs_ext4_path: PathBuf::from("/bin/true"),
+            resize2fs_path: PathBuf::from("/bin/true"),
             features: vec![
                 "has_journal".to_string(),
                 "extent".to_string(),
@@ -1320,6 +1338,61 @@ mod tests {
         let manager = Manager::prepare(&settings, Duration::from_secs(1)).expect("prepare manager");
         let result = manager.probe(Path::new("/dev/null")).await;
         assert!(result.is_err());
+    }
+
+    /// Expansion invokes resize2fs once with only the stable mapped-device path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn expansion_uses_the_full_current_device_size() {
+        let temp = tempfile::tempdir().expect("create mount root");
+        let resize2fs = temp.path().join("resize2fs-test");
+        fs::write(
+            &resize2fs,
+            b"#!/bin/sh\n/bin/printf '%s\\n' \"$@\" > \"$0.args\"\n",
+        )
+        .expect("write resize2fs test command");
+        fs::set_permissions(&resize2fs, fs::Permissions::from_mode(0o700))
+            .expect("make resize2fs test command executable");
+        let mut options = filesystem_options(&temp.path().join("mounts"));
+        options.resize2fs_path = resize2fs.clone();
+        let settings = Settings::new(options).expect("valid ext4 test settings");
+        let manager = Manager::prepare(&settings, Duration::from_secs(1)).expect("prepare manager");
+
+        manager
+            .expand(
+                Path::new("/dev/mapper/test-volume"),
+                RequestProgress::default(),
+            )
+            .await
+            .expect("expand test filesystem");
+
+        let arguments = fs::read_to_string(format!("{}.args", resize2fs.display()))
+            .expect("read resize2fs arguments");
+        assert_eq!(arguments, "/dev/mapper/test-volume\n");
+    }
+
+    /// A failed expansion remains retryable and never produces a receipt.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_expansion_reports_the_resize2fs_failure() {
+        let temp = tempfile::tempdir().expect("create mount root");
+        let mut options = filesystem_options(&temp.path().join("mounts"));
+        options.resize2fs_path = PathBuf::from("/bin/false");
+        let settings = Settings::new(options).expect("valid ext4 test settings");
+        let manager = Manager::prepare(&settings, Duration::from_secs(1)).expect("prepare manager");
+
+        assert!(matches!(
+            manager
+                .expand(
+                    Path::new("/dev/mapper/test-volume"),
+                    RequestProgress::default()
+                )
+                .await,
+            Err(Error::CommandFailed {
+                action: "expand ext4",
+                ..
+            })
+        ));
     }
 
     /// The progress-aware owner captures child output without a detached waiter.

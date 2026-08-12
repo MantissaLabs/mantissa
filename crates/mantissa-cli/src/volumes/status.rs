@@ -32,11 +32,27 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
         "  Bound node: {}",
         volume.spec.bound_node_name.as_deref().unwrap_or("-")
     )?;
-    writeln!(
-        &mut rendered,
-        "  Requested capacity: {}",
-        format_bytes(volume.spec.requested_bytes)
-    )?;
+    if matches!(
+        volume.spec.driver,
+        mantissa_client::volumes::VolumeDriver::Replicated
+    ) {
+        writeln!(
+            &mut rendered,
+            "  Initial capacity: {}",
+            format_bytes(volume.spec.initial_capacity_bytes)
+        )?;
+        writeln!(
+            &mut rendered,
+            "  Desired capacity: {}",
+            format_bytes(volume.desired_capacity_bytes)
+        )?;
+    } else {
+        writeln!(
+            &mut rendered,
+            "  Capacity: {}",
+            format_bytes(volume.spec.initial_capacity_bytes)
+        )?;
+    }
     writeln!(
         &mut rendered,
         "  Message: {}",
@@ -61,8 +77,28 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
             )?;
             writeln!(
                 &mut rendered,
-                "      Requested capacity: {}",
-                format_bytes(state.capacity_bytes)
+                "      Reserved capacity: {}",
+                format_bytes(state.reserved_capacity_bytes)
+            )?;
+            writeln!(
+                &mut rendered,
+                "      Prepared capacity: {}",
+                format_bytes(state.prepared_capacity_bytes)
+            )?;
+            writeln!(
+                &mut rendered,
+                "      Served capacity: {}",
+                format_bytes(state.served_capacity_bytes)
+            )?;
+            writeln!(
+                &mut rendered,
+                "      Device capacity: {}",
+                format_bytes(state.device_capacity_bytes)
+            )?;
+            writeln!(
+                &mut rendered,
+                "      Filesystem expansion pending: {}",
+                state.filesystem_expansion_pending
             )?;
             writeln!(
                 &mut rendered,

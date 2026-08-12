@@ -92,6 +92,10 @@ pub enum CatalogError {
     #[error(transparent)]
     Identity(#[from] IdentityError),
 
+    /// A requested capacity does not fit the volume's fixed block layout.
+    #[error(transparent)]
+    Descriptor(#[from] crate::DescriptorError),
+
     /// The saved pool belongs to a different path, device, or filesystem.
     #[error("local replica catalog belongs to a different storage pool")]
     PoolChanged,
@@ -120,6 +124,18 @@ pub enum CatalogError {
     #[error("local replica reservation conflicts with the existing descriptor")]
     ConflictingReplica,
 
+    /// A reservation change tried to release space already committed by Raft.
+    #[error("replica reservation cannot be smaller than its applied capacity")]
+    ReservationBelowAppliedCapacity,
+
+    /// Raft capacity cannot be applied before this node reserves the space.
+    #[error("replica capacity exceeds its durable local reservation")]
+    CapacityExceedsReservation,
+
+    /// Applied replica capacity is monotonic within one generation.
+    #[error("replica capacity cannot shrink")]
+    CapacityCannotShrink,
+
     /// An immutable bootstrap plan cannot recreate a copy removed by control state.
     #[error("local replica was retired from the current group")]
     ReplicaRetired,
@@ -147,6 +163,10 @@ pub enum CatalogError {
     /// A mount must use the same writer session as its saved backend.
     #[error("local volume mount does not match the saved backend session")]
     VolumeMountDeviceMismatch,
+
+    /// A filesystem-expansion receipt cannot exceed the mapped frontend.
+    #[error("saved filesystem capacity exceeds the mapped device capacity")]
+    FilesystemCapacityExceedsDevice,
 
     /// Another unfinished ext4 format is already saved for this replica.
     #[error("local replica already has a different filesystem format")]

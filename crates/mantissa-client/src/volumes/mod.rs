@@ -1,5 +1,6 @@
 mod create;
 mod delete;
+mod expand;
 mod import;
 mod inspect;
 mod list;
@@ -15,6 +16,7 @@ use uuid::Uuid;
 
 pub use create::{VolumeCreateDriver, VolumeCreateRequest, create, create_with_request};
 pub use delete::delete;
+pub use expand::expand;
 pub use import::{VolumeImportRequest, import, import_with_request};
 pub use inspect::inspect;
 pub use list::list;
@@ -23,9 +25,9 @@ pub use status::status;
 pub use types::{
     DesiredVolumeDisposition, FilesystemOwnership, ReplicatedVolumeGroupStatus,
     ReplicatedVolumePlan, VolumeAccessMode, VolumeBindingMode, VolumeDeleteDisposition,
-    VolumeDeleteResult, VolumeDriver, VolumeFilesystemSpace, VolumeInspect, VolumeLabel,
-    VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec, VolumeState, VolumeStatus,
-    VolumeSummary,
+    VolumeDeleteResult, VolumeDriver, VolumeExpandResult, VolumeFilesystemSpace, VolumeInspect,
+    VolumeLabel, VolumeNodeState, VolumeNodeStatus, VolumeReclaimPolicy, VolumeSpec, VolumeState,
+    VolumeStatus, VolumeSummary,
 };
 
 /// Converts MiB to bytes and rejects values that are too large for `u64`.

@@ -181,6 +181,7 @@ pub struct ReplicatedVolumeFilesystemSettings {
     pub mount_root: String,
     pub wipefs_path: String,
     pub mkfs_ext4_path: String,
+    pub resize2fs_path: String,
     pub features: Vec<String>,
     pub inode_size_bytes: u16,
     pub bytes_per_inode: u32,
@@ -329,6 +330,15 @@ impl ReplicatedVolumeConfig {
                 "/bin/mkfs.ext4",
             ],
         )?;
+        let resize2fs_path = find_replicated_volume_tool(
+            "resize2fs",
+            &[
+                "/usr/sbin/resize2fs",
+                "/sbin/resize2fs",
+                "/usr/bin/resize2fs",
+                "/bin/resize2fs",
+            ],
+        )?;
 
         Ok(Self::with_defaults(
             pool_path,
@@ -338,10 +348,12 @@ impl ReplicatedVolumeConfig {
             SocketAddr::new(advertise_ip, 7578),
             wipefs_path,
             mkfs_ext4_path,
+            resize2fs_path,
         ))
     }
 
     /// Fills paths and addresses around the built-in limits and ext4 profile.
+    #[allow(clippy::too_many_arguments)]
     fn with_defaults(
         pool_path: PathBuf,
         catalog_path: PathBuf,
@@ -350,6 +362,7 @@ impl ReplicatedVolumeConfig {
         advertise_address: SocketAddr,
         wipefs_path: PathBuf,
         mkfs_ext4_path: PathBuf,
+        resize2fs_path: PathBuf,
     ) -> Self {
         Self {
             pool_path: pool_path.display().to_string(),
@@ -375,6 +388,7 @@ impl ReplicatedVolumeConfig {
                 mount_root: mount_root.display().to_string(),
                 wipefs_path: wipefs_path.display().to_string(),
                 mkfs_ext4_path: mkfs_ext4_path.display().to_string(),
+                resize2fs_path: resize2fs_path.display().to_string(),
                 features: vec![
                     "has_journal".to_string(),
                     "extent".to_string(),
@@ -2644,6 +2658,7 @@ mod tests {
                 .expect("test advertise address should parse"),
             PathBuf::from("/usr/sbin/wipefs"),
             PathBuf::from("/usr/sbin/mkfs.ext4"),
+            PathBuf::from("/usr/sbin/resize2fs"),
         )
     }
 

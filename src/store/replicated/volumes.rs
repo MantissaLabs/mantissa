@@ -1,8 +1,8 @@
 use crate::store::replicated::compaction::ParsedOrRawTimestampRank;
 use crate::store::replicated::open::open_arc_store;
 use crate::volumes::types::{
-    ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan, VolumeNodeState, VolumeNodeStateValue,
-    VolumeSpecValue, VolumeStatus,
+    ReplicatedVolumeCapacityRequest, ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan,
+    VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue, VolumeStatus,
 };
 use mantissa_store::adapter::{
     CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker, RegAdapter, StoreMvRegAdapterSorted,
@@ -57,6 +57,16 @@ impl TableSet for ReplicatedVolumeGroupStatusTables {
     const META: &'static str = "replicated_volume_group_status_meta";
 }
 
+/// Redb table names for replicated-volume capacity requests.
+pub struct ReplicatedVolumeCapacityRequestTables;
+
+impl TableSet for ReplicatedVolumeCapacityRequestTables {
+    const VALUES: &'static str = "replicated_volume_capacity_request_values";
+    const TOMBS: &'static str = "replicated_volume_capacity_request_tombs";
+    const TOMBS_BY_OBSERVED: &'static str = "replicated_volume_capacity_request_tombs_by_observed";
+    const META: &'static str = "replicated_volume_capacity_request_meta";
+}
+
 /// Volume-spec compaction ranker used by the generic MVReg adapter.
 pub struct VolumeSpecCompactionRank;
 
@@ -98,6 +108,11 @@ pub struct VolumeNodeRank {
     state: VolumeNodeState,
     published_task_ids: Vec<Uuid>,
     capacity_bytes: Option<u64>,
+    reserved_capacity_bytes: Option<u64>,
+    prepared_capacity_bytes: Option<u64>,
+    served_capacity_bytes: Option<u64>,
+    device_capacity_bytes: Option<u64>,
+    filesystem_expansion_pending: bool,
     used_bytes: Option<u64>,
     last_error: Option<String>,
     local_path: Option<String>,
@@ -117,6 +132,11 @@ impl MvRegCompactionRanker<VolumeNodeStateValue, Uuid> for VolumeNodeCompactionR
             state: value.state,
             published_task_ids: value.published_task_ids.clone(),
             capacity_bytes: value.capacity_bytes,
+            reserved_capacity_bytes: value.reserved_capacity_bytes,
+            prepared_capacity_bytes: value.prepared_capacity_bytes,
+            served_capacity_bytes: value.served_capacity_bytes,
+            device_capacity_bytes: value.device_capacity_bytes,
+            filesystem_expansion_pending: value.filesystem_expansion_pending,
             used_bytes: value.used_bytes,
             last_error: value.last_error.clone(),
             local_path: value.local_path.clone(),
@@ -158,6 +178,38 @@ impl MvRegCompactionRanker<ReplicatedVolumeGroupStatusValue, Uuid>
             attached_node_id: value.attached_node_id,
             tie_breaker: Reverse(value.clone()),
         }
+    }
+}
+
+/// Capacity-request compaction ranker used by registry reads and MST sync.
+pub struct ReplicatedVolumeCapacityRequestCompactionRank;
+
+/// Total capacity-request ordering key matching the public winner selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicatedVolumeCapacityRequestRank(ReplicatedVolumeCapacityRequest);
+
+impl Ord for ReplicatedVolumeCapacityRequestRank {
+    /// Uses the desired-capacity precedence rule without a second ordering.
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.precedence_cmp(&other.0)
+    }
+}
+
+impl PartialOrd for ReplicatedVolumeCapacityRequestRank {
+    /// Returns the total desired-capacity order used by reads and compaction.
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl MvRegCompactionRanker<ReplicatedVolumeCapacityRequest, Uuid>
+    for ReplicatedVolumeCapacityRequestCompactionRank
+{
+    type Rank = ReplicatedVolumeCapacityRequestRank;
+
+    /// Ranks one request by generation, revision, and deterministic request ID.
+    fn rank(entry: &MvRegEntry<ReplicatedVolumeCapacityRequest, Uuid>) -> Self::Rank {
+        ReplicatedVolumeCapacityRequestRank(entry.value().clone())
     }
 }
 
@@ -294,6 +346,24 @@ pub type ReplicatedVolumeGroupStatusStoreInner = CrdtMstStore<
 /// Shared handle to the replicated-volume group-status store.
 pub type ReplicatedVolumeGroupStatusStore = Arc<ReplicatedVolumeGroupStatusStoreInner>;
 
+/// Store adapter that compacts capacity requests to their canonical winner.
+pub type ReplicatedVolumeCapacityRequestRegAdapter = CompactingStoreMvRegAdapterSorted<
+    UuidKey,
+    ReplicatedVolumeCapacityRequest,
+    Uuid,
+    ReplicatedVolumeCapacityRequestCompactionRank,
+>;
+
+/// Specialized MST/CRDT store for desired replicated-volume capacity.
+pub type ReplicatedVolumeCapacityRequestStoreInner = CrdtMstStore<
+    ReplicatedVolumeCapacityRequestRegAdapter,
+    XXHash128,
+    ReplicatedVolumeCapacityRequestTables,
+>;
+
+/// Shared handle to the replicated-volume capacity-request store.
+pub type ReplicatedVolumeCapacityRequestStore = Arc<ReplicatedVolumeCapacityRequestStoreInner>;
+
 /// Open or create the volume specification store scoped to the provided actor.
 pub fn open_volume_spec_store(
     db: Arc<redb::Database>,
@@ -337,6 +407,18 @@ pub fn open_replicated_volume_group_status_store(
 ) -> std::io::Result<ReplicatedVolumeGroupStatusStore> {
     open_arc_store(db, actor, |db, actor| {
         ReplicatedVolumeGroupStatusStoreInner::builder(db, actor)
+            .with_preserve_local_tombs(true)
+            .build()
+    })
+}
+
+/// Opens the desired-capacity store for replicated volumes.
+pub fn open_replicated_volume_capacity_request_store(
+    db: Arc<redb::Database>,
+    actor: Uuid,
+) -> std::io::Result<ReplicatedVolumeCapacityRequestStore> {
+    open_arc_store(db, actor, |db, actor| {
+        ReplicatedVolumeCapacityRequestStoreInner::builder(db, actor)
             .with_preserve_local_tombs(true)
             .build()
     })
@@ -391,7 +473,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Delete,
-            requested_bytes: None,
+            initial_capacity_bytes: None,
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,
@@ -448,7 +530,7 @@ mod tests {
         let mut left = live_volume("request-conflict");
         left.plan_coordinator_node_id = None;
         let mut right = left.clone();
-        right.requested_bytes = Some(4096);
+        right.initial_capacity_bytes = Some(4096);
 
         let mut left_clock = VectorClock::new();
         left_clock.apply(Uuid::from_u128(1), 1);

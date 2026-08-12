@@ -11,12 +11,12 @@ use super::{
 };
 use crate::catalog::ReplicaKey;
 use crate::control_state::{
-    BeginReplicaReplacement, BeginVolumeRecovery, ExpectedVolumeRevision, FenceVolumeWriter,
-    GrantVolumeWriter, InitializeVolume, RecoveryGrant, ReplacementGrant, VolumeCommand,
-    VolumeControlState, WriterGrant,
+    BeginReplicaReplacement, BeginVolumeRecovery, ExpandVolume, ExpectedVolumeRevision,
+    FenceVolumeWriter, GrantVolumeWriter, InitializeVolume, RecoveryGrant, ReplacementGrant,
+    VolumeCommand, VolumeControlState, WriterGrant,
 };
 use crate::{
-    DriverSessionId, RecoveryId, ReplacementId, VolumeBlockSizes, VolumeDescriptor,
+    DriverSessionId, RecoveryId, ReplacementId, VolumeBlockSizes, VolumeCapacity, VolumeDescriptor,
     VolumeGeneration, VolumeId, VolumeNodeId,
 };
 
@@ -165,6 +165,49 @@ fn applied_state_reconstructs_the_exact_bounded_state() {
         cell.load()
             .control_state()
             .expect("published control state must remain valid")
+    );
+}
+
+#[test]
+fn larger_applied_capacity_accepts_old_bounded_requests_but_rejects_future_capacity() {
+    let registry = AppliedVolumeStateRegistry::new();
+    let (attached, writer) = attached();
+    let cell = registry
+        .publish(ApplyContext::new(1, 2), &attached)
+        .expect("attached control state must publish")
+        .expect("attached control state must produce a cell");
+    let expanded = attached
+        .evaluate(&VolumeCommand::Expand(ExpandVolume {
+            expected: expected(&attached),
+            target_capacity: VolumeCapacity::new(128 << 20).expect("larger capacity"),
+        }))
+        .state;
+    registry
+        .publish(ApplyContext::new(1, 3), &expanded)
+        .expect("larger capacity must publish");
+    let gate = FenceAdmission::new(cell, node(1));
+    gate.enable_for(3).expect("current active copy must enable");
+
+    let old = descriptor();
+    drop(
+        gate.admit(&foreground_request(&old, &attached, writer))
+            .expect("old descriptor remains valid within its smaller range"),
+    );
+    let current = expanded
+        .descriptor()
+        .expect("expanded state has descriptor")
+        .clone();
+    drop(
+        gate.admit(&foreground_request(&current, &expanded, writer))
+            .expect("current descriptor must be admitted"),
+    );
+    let future = current
+        .with_capacity(VolumeCapacity::new(192 << 20).expect("future capacity"))
+        .expect("compatible future descriptor");
+    assert_eq!(
+        gate.admit(&foreground_request(&future, &expanded, writer))
+            .err(),
+        Some(IoAdmissionError::WrongDescriptor)
     );
 }
 

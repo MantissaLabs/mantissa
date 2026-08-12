@@ -2572,19 +2572,30 @@ impl WorkloadManager {
         }
 
         if let Ok(current) = self.load_spec(task_id).await {
+            // This failure belongs to the launch and owner carried by `spec`. A stop request,
+            // task replacement, or later launch that became durable while cleanup was running
+            // must win permanently; otherwise this stale failure can turn `Stopping` back into
+            // `VolumeUnavailable` and delay removal until a later service safety sweep.
+            if current.task_epoch != spec.task_epoch
+                || current.node_id != spec.node_id
+                || current.launch_attempt > spec.launch_attempt
+                || matches!(
+                    current.state,
+                    WorkloadPhase::Stopping
+                        | WorkloadPhase::Stopped
+                        | WorkloadPhase::Failed
+                        | WorkloadPhase::Exited(_)
+                )
+            {
+                return error;
+            }
             if matches!(current.state, WorkloadPhase::VolumeUnavailable)
                 && current.phase_reason.as_deref() == Some(reason.as_str())
             {
                 return error;
             }
             if current.phase_version > spec.phase_version {
-                spec.phase_version = current.phase_version;
-            }
-            if current.launch_attempt > spec.launch_attempt {
-                spec.launch_attempt = current.launch_attempt;
-            }
-            if spec.last_terminal_observed_launch.is_none() {
-                spec.last_terminal_observed_launch = current.last_terminal_observed_launch;
+                spec = current;
             }
         }
 

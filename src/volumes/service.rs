@@ -5,10 +5,10 @@ use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::replicated::{ReplicatedVolumeRuntime, WriterFilesystemSpace};
 use crate::volumes::types::{
     DesiredVolumeDisposition, ExternalVolumeSpec, FilesystemOwnership, LocalVolumeSpec,
-    ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan, ReplicatedVolumeSpec, VolumeAccessMode,
-    VolumeBindingMode, VolumeDriver, VolumeEvent, VolumeLabel, VolumeLifecycleIntent,
-    VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy, VolumeSpecDraft, VolumeSpecValue,
-    VolumeStatus, compute_replicated_volume_node_score,
+    ReplicatedVolumeCapacityRequest, ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan,
+    ReplicatedVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver, VolumeEvent,
+    VolumeLabel, VolumeLifecycleIntent, VolumeNodeState, VolumeNodeStateValue, VolumeReclaimPolicy,
+    VolumeSpecDraft, VolumeSpecValue, VolumeStatus, compute_replicated_volume_node_score,
 };
 use anyhow::Result;
 use capnp::Error;
@@ -17,9 +17,9 @@ use mantissa_health::Status as NodeHealth;
 use mantissa_protocol::health::NodeStatus as ProtocolNodeHealth;
 use mantissa_protocol::volumes::{
     VolumeDeleteDisposition as ProtocolVolumeDeleteDisposition, filesystem_ownership,
-    local_volume_spec, replicated_volume_group_status, replicated_volume_plan, volume_driver_spec,
-    volume_event, volume_filesystem_space, volume_inspect, volume_label, volume_node_status,
-    volume_spec, volume_summary, volumes,
+    local_volume_spec, replicated_volume_capacity_request, replicated_volume_group_status,
+    replicated_volume_plan, volume_driver_spec, volume_event, volume_filesystem_space,
+    volume_inspect, volume_label, volume_node_status, volume_spec, volume_summary, volumes,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashMap;
@@ -29,7 +29,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 const FILESYSTEM_SPACE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -439,7 +439,7 @@ fn write_volume_spec(mut builder: volume_spec::Builder<'_>, spec: &VolumeSpecVal
     builder.set_access_mode(spec.access_mode.to_proto());
     builder.set_binding_mode(spec.binding_mode.to_proto());
     builder.set_reclaim_policy(spec.reclaim_policy.to_proto());
-    builder.set_requested_bytes(spec.requested_bytes.unwrap_or(0));
+    builder.set_initial_capacity_bytes(spec.initial_capacity_bytes.unwrap_or(0));
     let mut labels = builder.reborrow().init_labels(spec.labels.len() as u32);
     write_labels(&mut labels, &spec.labels);
     builder.set_bound_node_id(
@@ -494,7 +494,7 @@ fn read_volume_spec(reader: volume_spec::Reader<'_>) -> Result<VolumeSpecValue, 
         access_mode: VolumeAccessMode::from_proto(reader.get_access_mode()?),
         binding_mode: VolumeBindingMode::from_proto(reader.get_binding_mode()?),
         reclaim_policy: VolumeReclaimPolicy::from_proto(reader.get_reclaim_policy()?),
-        requested_bytes: zero_means_none(reader.get_requested_bytes()),
+        initial_capacity_bytes: zero_means_none(reader.get_initial_capacity_bytes()),
         labels: read_labels(reader.get_labels()?)?,
         bound_node_id: read_optional_uuid(reader.get_bound_node_id()?, "bound node id")?,
         bound_node_name: empty_means_none(reader.get_bound_node_name()?.to_str()?.trim()),
@@ -566,6 +566,11 @@ fn write_volume_node_status(
     builder.set_local_path(value.local_path.as_deref().unwrap_or(""));
     builder.set_state(value.state.to_proto());
     builder.set_capacity_bytes(value.capacity_bytes.unwrap_or(0));
+    builder.set_reserved_capacity_bytes(value.reserved_capacity_bytes.unwrap_or(0));
+    builder.set_prepared_capacity_bytes(value.prepared_capacity_bytes.unwrap_or(0));
+    builder.set_served_capacity_bytes(value.served_capacity_bytes.unwrap_or(0));
+    builder.set_device_capacity_bytes(value.device_capacity_bytes.unwrap_or(0));
+    builder.set_filesystem_expansion_pending(value.filesystem_expansion_pending);
     builder.set_used_bytes(value.used_bytes.unwrap_or(0));
     let mut task_ids = builder
         .reborrow()
@@ -613,6 +618,11 @@ fn read_volume_node_status(
         local_path: empty_means_none(reader.get_local_path()?.to_str()?.trim()),
         state: crate::volumes::types::VolumeNodeState::from_proto(reader.get_state()?),
         capacity_bytes: zero_means_none(reader.get_capacity_bytes()),
+        reserved_capacity_bytes: zero_means_none(reader.get_reserved_capacity_bytes()),
+        prepared_capacity_bytes: zero_means_none(reader.get_prepared_capacity_bytes()),
+        served_capacity_bytes: zero_means_none(reader.get_served_capacity_bytes()),
+        device_capacity_bytes: zero_means_none(reader.get_device_capacity_bytes()),
+        filesystem_expansion_pending: reader.get_filesystem_expansion_pending(),
         used_bytes: zero_means_none(reader.get_used_bytes()),
         published_task_ids,
         updated_at: reader.get_updated_at()?.to_str()?.to_string(),
@@ -751,6 +761,7 @@ fn write_replicated_volume_group_status(
     builder.set_updated_at(&value.updated_at);
     builder.set_message(value.message.as_deref().unwrap_or(""));
     builder.set_control_revision(value.control_revision);
+    builder.set_replicated_capacity_bytes(value.replicated_capacity_bytes);
     builder.set_fence(value.fence.unwrap_or_default());
     let mut copies = builder
         .reborrow()
@@ -810,6 +821,7 @@ fn read_replicated_volume_group_status(
         updated_at: reader.get_updated_at()?.to_str()?.to_string(),
         message: empty_means_none(reader.get_message()?.to_str()?.trim()),
         control_revision: reader.get_control_revision(),
+        replicated_capacity_bytes: reader.get_replicated_capacity_bytes(),
         fence: zero_means_none(reader.get_fence()),
         copy_node_ids,
         voter_node_ids,
@@ -847,6 +859,59 @@ impl StoreValueCodec for ReplicatedVolumeGroupStatusValue {
             .get_root::<replicated_volume_group_status::Reader<'_>>()
             .map_err(volume_store_codec_error)?;
         read_replicated_volume_group_status(status).map_err(volume_store_codec_error)
+    }
+}
+
+/// Serializes one desired-capacity request for storage, sync, and gossip.
+fn write_replicated_volume_capacity_request(
+    mut builder: replicated_volume_capacity_request::Builder<'_>,
+    value: &ReplicatedVolumeCapacityRequest,
+) {
+    builder.set_id(value.id.as_bytes());
+    builder.set_volume_id(value.volume_id.as_bytes());
+    builder.set_volume_epoch(value.volume_epoch);
+    builder.set_revision(value.revision);
+    builder.set_request_id(value.request_id.as_bytes());
+    builder.set_target_capacity_bytes(value.target_capacity_bytes);
+    builder.set_updated_at(&value.updated_at);
+}
+
+/// Deserializes one desired-capacity request without selecting a CRDT winner.
+fn read_replicated_volume_capacity_request(
+    reader: replicated_volume_capacity_request::Reader<'_>,
+) -> Result<ReplicatedVolumeCapacityRequest, Error> {
+    Ok(ReplicatedVolumeCapacityRequest {
+        id: read_uuid(reader.get_id()?, "capacity request id")?,
+        volume_id: read_uuid(reader.get_volume_id()?, "volume id")?,
+        volume_epoch: reader.get_volume_epoch(),
+        revision: reader.get_revision(),
+        request_id: read_uuid(reader.get_request_id()?, "capacity request revision id")?,
+        target_capacity_bytes: reader.get_target_capacity_bytes(),
+        updated_at: reader.get_updated_at()?.to_str()?.to_string(),
+    })
+}
+
+impl StoreValueCodec for ReplicatedVolumeCapacityRequest {
+    /// Encodes one capacity request as a stable Cap'n Proto store value.
+    fn encode_store_value(&self) -> mantissa_store::Result<Vec<u8>> {
+        let mut message = capnp::message::Builder::new_default();
+        write_replicated_volume_capacity_request(
+            message.init_root::<replicated_volume_capacity_request::Builder<'_>>(),
+            self,
+        );
+        Ok(capnp::serialize::write_message_to_words(&message))
+    }
+
+    /// Decodes one capacity request from its stable Cap'n Proto store value.
+    fn decode_store_value(bytes: &[u8]) -> mantissa_store::Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let reader =
+            capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())
+                .map_err(volume_store_codec_error)?;
+        let request = reader
+            .get_root::<replicated_volume_capacity_request::Reader<'_>>()
+            .map_err(volume_store_codec_error)?;
+        read_replicated_volume_capacity_request(request).map_err(volume_store_codec_error)
     }
 }
 
@@ -907,7 +972,7 @@ fn write_volume_summary(
             .as_slice(),
     );
     builder.set_bound_node_name(spec.bound_node_name.as_deref().unwrap_or(""));
-    builder.set_requested_bytes(spec.requested_bytes.unwrap_or(0));
+    builder.set_initial_capacity_bytes(spec.initial_capacity_bytes.unwrap_or(0));
     builder.set_in_use(in_use);
     builder.set_reason(public.message.as_deref().unwrap_or(""));
     builder.set_updated_at(&spec.updated_at);
@@ -918,6 +983,25 @@ fn write_volume_summary(
 struct PublicVolumeStatus {
     state: mantissa_protocol::volumes::VolumeState,
     message: Option<String>,
+}
+
+/// Returns the requested replicated capacity without presenting it as applied.
+fn effective_desired_capacity(
+    spec: &VolumeSpecValue,
+    request: Option<&ReplicatedVolumeCapacityRequest>,
+    group: Option<&ReplicatedVolumeGroupStatusValue>,
+) -> Option<u64> {
+    if !matches!(spec.driver, VolumeDriver::Replicated(_)) {
+        return None;
+    }
+    let initial = spec.initial_capacity_bytes?;
+    Some(
+        request
+            .map_or(initial, |request| request.target_capacity_bytes)
+            .max(group.map_or(initial, |group| {
+                group.replicated_capacity_bytes.max(initial)
+            })),
+    )
 }
 
 /// Explains whether current node health can support a retained-volume restore.
@@ -1148,6 +1232,7 @@ fn public_volume_status(
 }
 
 /// Serializes one inspect payload with the canonical spec and all known node-state rows.
+#[allow(clippy::too_many_arguments)]
 fn write_volume_inspect(
     mut builder: volume_inspect::Builder<'_>,
     spec: &VolumeSpecValue,
@@ -1155,12 +1240,17 @@ fn write_volume_inspect(
     plan: Option<&ReplicatedVolumePlan>,
     group_status: Option<&ReplicatedVolumeGroupStatusValue>,
     filesystem_space: Option<WriterFilesystemSpace>,
+    desired_capacity_bytes: Option<u64>,
     node_health: &HashMap<Uuid, NodeHealth>,
 ) -> Result<(), Error> {
     write_volume_spec(builder.reborrow().init_spec(), spec);
     let public_status = public_volume_status(spec, node_states, plan, group_status, node_health);
     builder.set_state(public_status.state);
-    builder.set_state_message(public_status.message.as_deref().unwrap_or(""));
+    let state_message = public_status
+        .message
+        .or_else(|| replicated_capacity_message(node_states, group_status, desired_capacity_bytes));
+    builder.set_state_message(state_message.as_deref().unwrap_or(""));
+    builder.set_desired_capacity_bytes(desired_capacity_bytes.unwrap_or(0));
     let mut states = builder
         .reborrow()
         .init_node_states(node_states.len() as u32);
@@ -1181,6 +1271,66 @@ fn write_volume_inspect(
         write_volume_filesystem_space(builder.reborrow().init_filesystem_space(), filesystem_space);
     }
     Ok(())
+}
+
+/// Names the first concrete local fact still behind desired capacity.
+fn replicated_capacity_message(
+    node_states: &[VolumeNodeStateValue],
+    group: Option<&ReplicatedVolumeGroupStatusValue>,
+    desired_capacity_bytes: Option<u64>,
+) -> Option<String> {
+    let desired = desired_capacity_bytes?;
+    let group = group?;
+    if group.replicated_capacity_bytes < desired {
+        if let Some(node) = group.copy_node_ids.iter().find_map(|copy| {
+            node_states.iter().find(|node| {
+                node.node_id == *copy && node.prepared_capacity_bytes.unwrap_or_default() < desired
+            })
+        }) {
+            return Some(format!(
+                "Expanding: {} prepared {} of {} bytes",
+                node.node_name,
+                node.prepared_capacity_bytes.unwrap_or_default(),
+                desired
+            ));
+        }
+        return Some(format!(
+            "Expanding: replicated capacity is {} of {} bytes",
+            group.replicated_capacity_bytes, desired
+        ));
+    }
+    if let Some(node) = group.copy_node_ids.iter().find_map(|copy| {
+        node_states.iter().find(|node| {
+            node.node_id == *copy && node.served_capacity_bytes.unwrap_or_default() < desired
+        })
+    }) {
+        return Some(format!(
+            "Expanding: {} serves {} of {} bytes",
+            node.node_name,
+            node.served_capacity_bytes.unwrap_or_default(),
+            desired
+        ));
+    }
+    if let Some(writer) = node_states.iter().find(|node| {
+        node.device_capacity_bytes
+            .is_some_and(|bytes| bytes < desired)
+    }) {
+        return Some(format!(
+            "Expanding: {} mapped device is {} of {} bytes",
+            writer.node_name,
+            writer.device_capacity_bytes.unwrap_or_default(),
+            desired
+        ));
+    }
+    node_states
+        .iter()
+        .find(|node| node.filesystem_expansion_pending)
+        .map(|writer| {
+            format!(
+                "Expanding: {} filesystem is still being expanded",
+                writer.node_name
+            )
+        })
 }
 
 /// Serializes one live filesystem-space measurement from its writer node.
@@ -1232,6 +1382,13 @@ pub(crate) fn write_volume_event(
             builder.set_event(volume_event::EventType::GroupStatusRemove);
             builder.set_group_status_id(id.as_bytes());
         }
+        VolumeEvent::CapacityRequestUpsert(value) => {
+            builder.set_event(volume_event::EventType::CapacityRequestUpsert);
+            write_replicated_volume_capacity_request(
+                builder.reborrow().init_capacity_request(),
+                value,
+            );
+        }
     }
     Ok(())
 }
@@ -1264,6 +1421,11 @@ pub(crate) fn read_volume_event(reader: volume_event::Reader<'_>) -> Result<Volu
                 reader.get_group_status_id()?,
                 "replicated volume group status id",
             )?))
+        }
+        volume_event::EventType::CapacityRequestUpsert => {
+            Ok(VolumeEvent::CapacityRequestUpsert(Box::new(
+                read_replicated_volume_capacity_request(reader.get_capacity_request()?)?,
+            )))
         }
     }
 }
@@ -1314,7 +1476,7 @@ impl volumes::Server for VolumesRpc {
         let access_mode = VolumeAccessMode::from_proto(request.get_access_mode()?);
         let binding_mode = VolumeBindingMode::from_proto(request.get_binding_mode()?);
         let reclaim_policy = VolumeReclaimPolicy::from_proto(request.get_reclaim_policy()?);
-        let requested_bytes = zero_means_none(request.get_requested_bytes());
+        let initial_capacity_bytes = zero_means_none(request.get_initial_capacity_bytes());
         let labels = read_labels(request.get_labels()?)?;
         let bound_node_id = read_optional_uuid(request.get_bound_node_id()?, "bound node id")?;
 
@@ -1360,7 +1522,7 @@ impl volumes::Server for VolumesRpc {
             access_mode,
             binding_mode,
             reclaim_policy,
-            requested_bytes,
+            initial_capacity_bytes,
             labels,
             bound_node_id: resolved_node_id,
             bound_node_name: resolved_node_name.clone(),
@@ -1387,7 +1549,7 @@ impl volumes::Server for VolumesRpc {
                 resolved_node_name.unwrap_or_else(|| node_id.to_string()),
                 None,
                 VolumeNodeState::Pending,
-                spec.requested_bytes,
+                spec.initial_capacity_bytes,
                 spec.volume_epoch,
             );
             self.registry
@@ -1441,7 +1603,7 @@ impl volumes::Server for VolumesRpc {
             ));
         }
 
-        let requested_bytes = zero_means_none(request.get_requested_bytes());
+        let initial_capacity_bytes = zero_means_none(request.get_initial_capacity_bytes());
         let labels = read_labels(request.get_labels()?)?;
         let driver = VolumeDriver::Local(LocalVolumeSpec::imported_path(path.clone()));
         let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
@@ -1450,7 +1612,7 @@ impl volumes::Server for VolumesRpc {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::Immediate,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes,
+            initial_capacity_bytes,
             labels,
             bound_node_id: Some(node_id),
             bound_node_name: Some(node_name.clone()),
@@ -1473,7 +1635,7 @@ impl volumes::Server for VolumesRpc {
             node_name,
             Some(path),
             VolumeNodeState::Ready,
-            spec.requested_bytes,
+            spec.initial_capacity_bytes,
             spec.volume_epoch,
         );
         self.registry
@@ -1695,6 +1857,102 @@ impl volumes::Server for VolumesRpc {
         Ok(())
     }
 
+    /// Saves a larger desired total capacity for asynchronous reconciliation.
+    async fn expand(
+        self: Rc<Self>,
+        params: volumes::ExpandParams,
+        mut results: volumes::ExpandResults,
+    ) -> Result<(), Error> {
+        self.ensure_mutation_allowed("expand replicated volumes")?;
+
+        let request = params.get()?;
+        let selector = Self::read_non_empty_text(request.get_selector()?, "selector")?;
+        let target_capacity_bytes = request.get_target_capacity_bytes();
+        let spec = self.resolve_spec_by_selector(&selector)?;
+        if !spec.driver.is_replicated() {
+            return Err(Error::failed(format!(
+                "volume '{}' is not a replicated volume",
+                spec.name
+            )));
+        }
+        if spec.is_retained() {
+            return Err(Error::failed(format!(
+                "volume '{}' is retained and cannot expand until it is restored",
+                spec.name
+            )));
+        }
+        let initial_capacity_bytes = spec.initial_capacity_bytes.ok_or_else(|| {
+            Error::failed(format!(
+                "replicated volume '{}' has no initial capacity",
+                spec.name
+            ))
+        })?;
+        super::types::SavedVolumeDescriptor::for_volume(
+            spec.id,
+            spec.volume_epoch,
+            target_capacity_bytes,
+        )
+        .map_err(|error| Error::failed(format!("invalid target capacity: {error}")))?;
+
+        let replicated_capacity_bytes = self
+            .registry
+            .get_group_status(spec.id)
+            .map_err(to_capnp)?
+            .map(|status| status.replicated_capacity_bytes)
+            .filter(|capacity| *capacity != 0)
+            .unwrap_or(initial_capacity_bytes);
+        if target_capacity_bytes < replicated_capacity_bytes {
+            return Err(Error::failed(format!(
+                "replicated volume capacity cannot shrink from {} to {} bytes",
+                replicated_capacity_bytes, target_capacity_bytes
+            )));
+        }
+
+        let current = self
+            .registry
+            .get_capacity_request(spec.id)
+            .map_err(to_capnp)?;
+        let current_desired_capacity_bytes =
+            current.as_ref().map_or(replicated_capacity_bytes, |value| {
+                value.target_capacity_bytes.max(replicated_capacity_bytes)
+            });
+        let desired_capacity_changed = target_capacity_bytes != current_desired_capacity_bytes;
+        if desired_capacity_changed {
+            let next = match current {
+                Some(current) => current.next(target_capacity_bytes).map_err(to_capnp)?,
+                None => ReplicatedVolumeCapacityRequest::first(
+                    spec.id,
+                    spec.volume_epoch,
+                    target_capacity_bytes,
+                ),
+            };
+            self.registry
+                .upsert_capacity_request(next.clone())
+                .await
+                .map_err(to_capnp)?;
+            if let Err(error) = self
+                .replicator
+                .broadcast(VolumeEvent::CapacityRequestUpsert(Box::new(next)))
+                .await
+            {
+                warn!(
+                    target: "volumes",
+                    volume_id = %spec.id,
+                    error = %error,
+                    "saved replicated-volume expansion request; prompt gossip failed"
+                );
+            }
+        }
+
+        let mut result = results.get().init_result();
+        result.set_volume_id(spec.id.as_bytes());
+        result.set_initial_capacity_bytes(initial_capacity_bytes);
+        result.set_desired_capacity_bytes(target_capacity_bytes);
+        result.set_replicated_capacity_bytes(replicated_capacity_bytes);
+        result.set_desired_capacity_changed(desired_capacity_changed);
+        Ok(())
+    }
+
     /// Lists the canonical volume summaries known to the local node.
     async fn list(
         self: Rc<Self>,
@@ -1744,6 +2002,12 @@ impl volumes::Server for VolumesRpc {
             .map_err(to_capnp)?;
         let plan = self.registry.get_plan(spec.id).map_err(to_capnp)?;
         let group_status = self.registry.get_group_status(spec.id).map_err(to_capnp)?;
+        let capacity_request = self
+            .registry
+            .get_capacity_request(spec.id)
+            .map_err(to_capnp)?;
+        let desired_capacity_bytes =
+            effective_desired_capacity(&spec, capacity_request.as_ref(), group_status.as_ref());
         let node_health = self.cluster_registry.health_monitor().snapshot();
         let filesystem_space = self
             .query_writer_filesystem_space(plan.as_ref(), group_status.as_ref(), &node_health)
@@ -1755,6 +2019,7 @@ impl volumes::Server for VolumesRpc {
             plan.as_ref(),
             group_status.as_ref(),
             filesystem_space,
+            desired_capacity_bytes,
             &node_health,
         )?;
         Ok(())
@@ -1774,6 +2039,12 @@ impl volumes::Server for VolumesRpc {
             .map_err(to_capnp)?;
         let plan = self.registry.get_plan(spec.id).map_err(to_capnp)?;
         let group_status = self.registry.get_group_status(spec.id).map_err(to_capnp)?;
+        let capacity_request = self
+            .registry
+            .get_capacity_request(spec.id)
+            .map_err(to_capnp)?;
+        let desired_capacity_bytes =
+            effective_desired_capacity(&spec, capacity_request.as_ref(), group_status.as_ref());
         let node_health = self.cluster_registry.health_monitor().snapshot();
         write_volume_inspect(
             results.get().init_volume(),
@@ -1782,6 +2053,7 @@ impl volumes::Server for VolumesRpc {
             plan.as_ref(),
             group_status.as_ref(),
             None,
+            desired_capacity_bytes,
             &node_health,
         )?;
         Ok(())
@@ -1811,7 +2083,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes: Some(10 * 1024 * 1024),
+            initial_capacity_bytes: Some(10 * 1024 * 1024),
             labels: vec![VolumeLabel {
                 key: "tier".to_string(),
                 value: "cache".to_string(),
@@ -1842,6 +2114,11 @@ mod tests {
             local_path: Some("/var/lib/mantissa/volumes/cache".to_string()),
             state: VolumeNodeState::Published,
             capacity_bytes: Some(20 * 1024 * 1024),
+            reserved_capacity_bytes: Some(20 * 1024 * 1024),
+            prepared_capacity_bytes: Some(20 * 1024 * 1024),
+            served_capacity_bytes: Some(20 * 1024 * 1024),
+            device_capacity_bytes: Some(20 * 1024 * 1024),
+            filesystem_expansion_pending: false,
             used_bytes: Some(4 * 1024 * 1024),
             published_task_ids: vec![Uuid::new_v4()],
             updated_at: "2026-03-25T12:02:00Z".to_string(),
@@ -1861,7 +2138,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes: Some(64 * 1024 * 1024),
+            initial_capacity_bytes: Some(64 * 1024 * 1024),
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,
@@ -1889,6 +2166,7 @@ mod tests {
             None,
             None,
             Some(measurement),
+            spec.initial_capacity_bytes,
             &node_health,
         )
         .expect("inspect payload should serialize");
@@ -1915,6 +2193,7 @@ mod tests {
             None,
             None,
             None,
+            spec.initial_capacity_bytes,
             &node_health,
         )
         .expect("inspect without live space should still serialize");
@@ -1922,6 +2201,86 @@ mod tests {
             .get_root_as_reader::<volume_inspect::Reader<'_>>()
             .expect("inspect without live space should be readable");
         assert!(!inspect.has_filesystem_space());
+    }
+
+    /// Inspect names the first durable or local capacity fact still behind the request.
+    #[test]
+    fn inspect_reports_expansion_progress_in_reconciliation_order() {
+        let spec = sample_replicated_spec();
+        let desired = 128 << 20;
+        let initial = spec.initial_capacity_bytes.expect("test capacity");
+        let nodes = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let descriptor = SavedVolumeDescriptor::for_volume(spec.id, spec.volume_epoch, initial)
+            .expect("test descriptor");
+        let group_id = crate::volumes::types::compute_replicated_volume_group_id(
+            descriptor.volume_id,
+            descriptor.generation,
+        );
+        let mut group = ReplicatedVolumeGroupStatusValue::new(
+            spec.id,
+            spec.volume_epoch,
+            group_id,
+            nodes[0],
+            VolumeStatus::InUse,
+            10,
+        );
+        group.copy_node_ids = nodes.to_vec();
+        group.replicated_capacity_bytes = initial;
+        let mut states = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, node_id)| {
+                let mut state = VolumeNodeStateValue::new(
+                    spec.id,
+                    node_id,
+                    format!("node-{index}"),
+                    None,
+                    VolumeNodeState::Ready,
+                    Some(initial),
+                    spec.volume_epoch,
+                )
+                .with_group_id(group_id);
+                state.prepared_capacity_bytes = Some(initial);
+                state
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            replicated_capacity_message(&states, Some(&group), Some(desired)).as_deref(),
+            Some("Expanding: node-0 prepared 67108864 of 134217728 bytes")
+        );
+        for state in &mut states {
+            state.prepared_capacity_bytes = Some(desired);
+        }
+        assert_eq!(
+            replicated_capacity_message(&states, Some(&group), Some(desired)).as_deref(),
+            Some("Expanding: replicated capacity is 67108864 of 134217728 bytes")
+        );
+
+        group.replicated_capacity_bytes = desired;
+        assert_eq!(
+            replicated_capacity_message(&states, Some(&group), Some(desired)).as_deref(),
+            Some("Expanding: node-0 serves 0 of 134217728 bytes")
+        );
+        for state in &mut states {
+            state.served_capacity_bytes = Some(desired);
+        }
+        states[0].device_capacity_bytes = Some(initial);
+        assert_eq!(
+            replicated_capacity_message(&states, Some(&group), Some(desired)).as_deref(),
+            Some("Expanding: node-0 mapped device is 67108864 of 134217728 bytes")
+        );
+        states[0].device_capacity_bytes = Some(desired);
+        states[0].filesystem_expansion_pending = true;
+        assert_eq!(
+            replicated_capacity_message(&states, Some(&group), Some(desired)).as_deref(),
+            Some("Expanding: node-0 filesystem is still being expanded")
+        );
+        states[0].filesystem_expansion_pending = false;
+        assert_eq!(
+            replicated_capacity_message(&states, Some(&group), Some(desired)),
+            None
+        );
     }
 
     /// Checks public state derived from intent, committed control state, and health.
@@ -1945,7 +2304,7 @@ mod tests {
             SavedVolumeDescriptor::for_volume(
                 spec.id,
                 spec.volume_epoch,
-                spec.requested_bytes.expect("test capacity"),
+                spec.initial_capacity_bytes.expect("test capacity"),
             )
             .expect("test descriptor"),
         );
@@ -1974,7 +2333,7 @@ mod tests {
             "node-b",
             None,
             VolumeNodeState::Error,
-            spec.requested_bytes,
+            spec.initial_capacity_bytes,
             spec.volume_epoch,
         )
         .with_group_id(group_id);
@@ -2105,7 +2464,7 @@ mod tests {
             SavedVolumeDescriptor::for_volume(
                 spec.id,
                 spec.volume_epoch,
-                spec.requested_bytes.expect("test capacity"),
+                spec.initial_capacity_bytes.expect("test capacity"),
             )
             .expect("test descriptor"),
         );
@@ -2157,7 +2516,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Delete,
-            requested_bytes: Some(16 * 4096),
+            initial_capacity_bytes: Some(16 * 4096),
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,
@@ -2190,7 +2549,7 @@ mod tests {
         assert_eq!(decoded.reclaim_policy, VolumeReclaimPolicy::Retain);
     }
 
-    /// Plan and group-status gossip events should use their Cap'n Proto fields.
+    /// Replicated-volume gossip records should use their exact Cap'n Proto fields.
     #[test]
     fn volume_gossip_roundtrips_replicated_records() {
         let volume_id = Uuid::new_v4();
@@ -2214,12 +2573,14 @@ mod tests {
             VolumeStatus::Ready,
             24,
         );
+        let capacity_request = ReplicatedVolumeCapacityRequest::first(volume_id, 2, 32 * 4096);
 
         for event in [
             VolumeEvent::PlanUpsert(Box::new(plan.clone())),
             VolumeEvent::PlanRemove(plan.id),
             VolumeEvent::GroupStatusUpsert(Box::new(status.clone())),
             VolumeEvent::GroupStatusRemove(status.id),
+            VolumeEvent::CapacityRequestUpsert(Box::new(capacity_request)),
         ] {
             let mut message = capnp::message::Builder::new_default();
             write_volume_event(message.init_root::<volume_event::Builder<'_>>(), &event)
@@ -2250,7 +2611,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::Immediate,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes: None,
+            initial_capacity_bytes: None,
             labels: Vec::new(),
             bound_node_id: Some(Uuid::new_v4()),
             bound_node_name: Some("node-a".to_string()),
@@ -2285,7 +2646,7 @@ mod tests {
             SavedVolumeDescriptor::for_volume(
                 spec.id,
                 spec.volume_epoch,
-                spec.requested_bytes.expect("test capacity"),
+                spec.initial_capacity_bytes.expect("test capacity"),
             )
             .expect("test descriptor"),
         );

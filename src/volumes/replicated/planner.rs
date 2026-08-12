@@ -104,8 +104,8 @@ impl ReplicatedVolumePlanner {
     /// Creates genesis from one bound desired generation and the current eligible peer set.
     fn create_plan(&self, spec: &VolumeSpecValue) -> Result<ReplicatedVolumePlan> {
         let capacity = spec
-            .requested_bytes
-            .context("replicated volume has no requested capacity")?;
+            .initial_capacity_bytes
+            .context("replicated volume has no initial capacity")?;
         let workload_node_id = spec
             .bound_node_id
             .context("replicated volume has no winning workload binding")?;
@@ -173,8 +173,8 @@ mod tests {
     use crate::runtime::types::RuntimeSupportProfile;
     use crate::store::replicated::peers::open_peers_store;
     use crate::store::replicated::volumes::{
-        open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
-        open_volume_node_store, open_volume_spec_store,
+        open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
+        open_replicated_volume_plan_store, open_volume_node_store, open_volume_spec_store,
     };
     use crate::topology::peers::{PeerLabelState, PeerMembership, PeerSchedulingState, PeerValue};
     use crate::volumes::replicated::{REPLICATED_VOLUME_FORMAT_VERSION, ReplicatedVolumeSupport};
@@ -232,8 +232,10 @@ mod tests {
         let nodes = open_volume_node_store(db.clone(), coordinator).expect("open planner nodes");
         let plans =
             open_replicated_volume_plan_store(db.clone(), coordinator).expect("open planner plans");
-        let statuses = open_replicated_volume_group_status_store(db, coordinator)
+        let statuses = open_replicated_volume_group_status_store(db.clone(), coordinator)
             .expect("open planner statuses");
+        let capacity_requests = open_replicated_volume_capacity_request_store(db, coordinator)
+            .expect("open planner capacity requests");
         peers
             .rebuild_mst_from_disk()
             .await
@@ -254,6 +256,10 @@ mod tests {
             .rebuild_mst_from_disk()
             .await
             .expect("rebuild planner status store");
+        capacity_requests
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild planner capacity request store");
         for (ordinal, node_id) in [workload, rebound, third].into_iter().enumerate() {
             peers
                 .upsert(
@@ -264,7 +270,7 @@ mod tests {
                 .expect("save ready planner peer");
         }
 
-        let registry = VolumeRegistry::new(specs, nodes, plans, statuses);
+        let registry = VolumeRegistry::new(specs, nodes, plans, statuses, capacity_requests);
         let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
             name: "coordinator-window".to_string(),
             driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
@@ -273,7 +279,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Delete,
-            requested_bytes: Some(64 * 1024 * 1024),
+            initial_capacity_bytes: Some(64 * 1024 * 1024),
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,

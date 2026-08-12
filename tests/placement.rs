@@ -1881,7 +1881,7 @@ async fn create_immediate_managed_volume_on_node(
         inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(mantissa_protocol::volumes::VolumeBindingMode::Immediate);
         inner.set_reclaim_policy(mantissa_protocol::volumes::VolumeReclaimPolicy::Retain);
-        inner.set_requested_bytes(0);
+        inner.set_initial_capacity_bytes(0);
         inner.set_bound_node_id(node_id.as_bytes());
     }
 

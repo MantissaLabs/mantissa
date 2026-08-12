@@ -263,6 +263,10 @@ pub enum InvalidDriverLimits {
 /// Rejects ublk queue settings that are invalid or exceed caller limits.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum InvalidUblkSettings {
+    /// The saved capacity does not fit the volume's fixed block layout.
+    #[error("ublk capacity does not fit the volume block layout")]
+    InvalidCapacity,
+
     /// A device needs at least one queue.
     #[error("ublk queue count must be greater than zero")]
     ZeroQueueCount,

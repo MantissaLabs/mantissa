@@ -58,6 +58,7 @@ impl CheckedReplicatedVolumeConfig {
             mount_root: PathBuf::from(&config.filesystem.mount_root),
             wipefs_path: PathBuf::from(&config.filesystem.wipefs_path),
             mkfs_ext4_path: PathBuf::from(&config.filesystem.mkfs_ext4_path),
+            resize2fs_path: PathBuf::from(&config.filesystem.resize2fs_path),
             features: config.filesystem.features.clone(),
             inode_size_bytes: config.filesystem.inode_size_bytes,
             bytes_per_inode: config.filesystem.bytes_per_inode,

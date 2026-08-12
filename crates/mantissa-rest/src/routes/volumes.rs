@@ -5,13 +5,14 @@ use crate::{
     routes::worker_error_to_rest,
     state::AppState,
     types::volumes::{
-        VolumeCreateRequest, VolumeDeleteQuery, VolumeDeleteResponse, VolumeImportRequest,
-        VolumeInspect, VolumeSpec, VolumeSummary,
+        VolumeCreateRequest, VolumeDeleteQuery, VolumeDeleteResponse, VolumeExpandRequest,
+        VolumeExpandResponse, VolumeImportRequest, VolumeInspect, VolumeSpec, VolumeSummary,
     },
 };
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
 };
 
 /// Lists volumes visible to the local daemon.
@@ -139,6 +140,29 @@ pub async fn restore(
         .restore_volume(selector)
         .await
         .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Saves a larger desired total capacity for one replicated volume.
+#[utoipa::path(
+    post,
+    path = "/v1/volumes/{selector}/expand",
+    tag = "volumes",
+    params(("selector" = String, Path, description = "Replicated volume UUID or exact name.")),
+    request_body = VolumeExpandRequest,
+    responses((status = 202, description = "Volume expansion request accepted.", body = VolumeExpandResponse))
+)]
+pub async fn expand(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(selector): Path<String>,
+    RestJson(request): RestJson<VolumeExpandRequest>,
+) -> Result<(StatusCode, Json<VolumeExpandResponse>), RestError> {
+    state
+        .client()
+        .expand_volume(selector, request.capacity_bytes)
+        .await
+        .map(|response| (StatusCode::ACCEPTED, Json(response)))
         .map_err(worker_error_to_rest)
 }
 

@@ -13,7 +13,7 @@ use super::protocol::{
 };
 use super::{CatalogError, ReplicaPool};
 use crate::storage_format::ReplicaSpace;
-use crate::{DriverSessionId, FenceEpoch, VolumeDescriptor};
+use crate::{DriverSessionId, FenceEpoch, VolumeCapacity, VolumeDescriptor};
 
 const REPLICAS: TableDefinition<'static, &'static [u8], &'static [u8]> =
     TableDefinition::new("mantissa_volume_local_replicas");
@@ -233,6 +233,168 @@ impl ReplicaCatalog {
         Ok(Some(decode_checked(key_bytes.as_slice(), stored.value())?))
     }
 
+    /// Holds complete pool space before this node extends its local replica file.
+    pub fn reserve_replica_capacity(
+        &self,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+    ) -> Result<ReplicaRecord, CatalogError> {
+        self.update_replica(key, |record, pool| {
+            if target < record.descriptor().capacity() {
+                return Err(CatalogError::ReservationBelowAppliedCapacity);
+            }
+            if target.bytes() <= record.reserved_space().data_bytes() {
+                return Ok(record.clone());
+            }
+
+            let requested = ReplicaSpace::for_capacity(target.bytes())?;
+            let current = record.reserved_space();
+            let added_data = requested
+                .data_bytes()
+                .checked_sub(current.data_bytes())
+                .ok_or(CatalogError::SpaceOverflow)?;
+            let added_metadata = requested
+                .metadata_bytes()
+                .checked_sub(current.metadata_bytes())
+                .ok_or(CatalogError::SpaceOverflow)?;
+            let added_bytes = added_data
+                .checked_add(added_metadata)
+                .ok_or(CatalogError::SpaceOverflow)?;
+            let available_bytes = self.pool.available_bytes()?;
+            if added_bytes > available_bytes {
+                return Err(CatalogError::NotEnoughFreeSpace {
+                    available_bytes,
+                    required_bytes: added_bytes,
+                });
+            }
+
+            let new_data = pool
+                .data_bytes
+                .checked_add(added_data)
+                .ok_or(CatalogError::SpaceOverflow)?;
+            let new_metadata = pool
+                .metadata_bytes
+                .checked_add(added_metadata)
+                .ok_or(CatalogError::SpaceOverflow)?;
+            check_new_replica_space(pool, new_data, new_metadata)?;
+            pool.data_bytes = new_data;
+            pool.metadata_bytes = new_metadata;
+            record.set_reserved_space(ReservedSpace::new(
+                requested.data_bytes(),
+                requested.metadata_bytes(),
+            ));
+            Ok(record.clone())
+        })
+    }
+
+    /// Releases only reservation above both the requested and applied capacities.
+    pub fn reduce_replica_reservation(
+        &self,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+    ) -> Result<ReplicaRecord, CatalogError> {
+        self.update_replica(key, |record, pool| {
+            if target < record.descriptor().capacity() {
+                return Err(CatalogError::ReservationBelowAppliedCapacity);
+            }
+            if target.bytes() >= record.reserved_space().data_bytes() {
+                return Ok(record.clone());
+            }
+
+            let requested = ReplicaSpace::for_capacity(target.bytes())?;
+            let current = record.reserved_space();
+            pool.data_bytes = pool
+                .data_bytes
+                .checked_sub(current.data_bytes() - requested.data_bytes())
+                .ok_or(CatalogError::SpaceTotalsMismatch)?;
+            pool.metadata_bytes = pool
+                .metadata_bytes
+                .checked_sub(current.metadata_bytes() - requested.metadata_bytes())
+                .ok_or(CatalogError::SpaceTotalsMismatch)?;
+            record.set_reserved_space(ReservedSpace::new(
+                requested.data_bytes(),
+                requested.metadata_bytes(),
+            ));
+            Ok(record.clone())
+        })
+    }
+
+    /// Records a capacity already committed by Raft after local files cover it.
+    pub fn apply_replica_capacity(
+        &self,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+    ) -> Result<ReplicaRecord, CatalogError> {
+        self.update_replica(key, |record, _pool| {
+            let current = record.descriptor().capacity();
+            if target < current {
+                return Err(CatalogError::CapacityCannotShrink);
+            }
+            if target.bytes() > record.reserved_space().data_bytes() {
+                return Err(CatalogError::CapacityExceedsReservation);
+            }
+            if target == current {
+                return Ok(record.clone());
+            }
+            let descriptor = record.descriptor().with_capacity(target)?;
+            record.set_descriptor(descriptor);
+            Ok(record.clone())
+        })
+    }
+
+    /// Reassigns one excluded local slot before its complete replacement rebuild.
+    ///
+    /// The caller must first prove from locally applied Raft state that this node
+    /// is the inactive replacement target. This atomic change makes a crash leave
+    /// the row in `Preparing`, so startup recreates the file instead of admitting
+    /// its former contents.
+    pub fn begin_replica_replacement(
+        &self,
+        key: ReplicaKey,
+        descriptor: VolumeDescriptor,
+        origin: LocalReplicaOrigin,
+    ) -> Result<ReplicaRecord, CatalogError> {
+        if !matches!(origin, LocalReplicaOrigin::Replacement { .. }) {
+            return Err(CatalogError::ConflictingReplica);
+        }
+        let key_bytes = encode_key(key);
+        let write = self.database.begin_write()?;
+        let mut replicas = write.open_table(REPLICAS)?;
+        let attachments = write.open_table(ATTACHMENTS)?;
+        let mut record = {
+            let stored = replicas
+                .get(key_bytes.as_slice())?
+                .ok_or(CatalogError::ReplicaNotFound)?;
+            decode_checked(key_bytes.as_slice(), stored.value())?
+        };
+        if ReplicaKey::from(&descriptor) != key
+            || !record.descriptor().has_same_storage_identity(&descriptor)
+            || record.descriptor().capacity() > descriptor.capacity()
+            || descriptor.capacity().bytes() > record.reserved_space().data_bytes()
+            || !matches!(
+                record.state(),
+                ReplicaState::Preparing | ReplicaState::Ready
+            )
+        {
+            return Err(CatalogError::ConflictingReplica);
+        }
+        if attachments.get(key_bytes.as_slice())?.is_some() {
+            return Err(CatalogError::ReplicaStillAttached);
+        }
+
+        record.set_descriptor(descriptor);
+        record.set_origin(origin);
+        record.set_state(ReplicaState::Preparing);
+        record.set_health(ReplicaHealth::Healthy);
+        record.clear_filesystem_format();
+        let encoded = encode_replica(&record)?;
+        replicas.insert(key_bytes.as_slice(), encoded.as_slice())?;
+        drop(replicas);
+        drop(attachments);
+        write.commit()?;
+        Ok(record)
+    }
+
     /// Returns durable proof that current control state removed this node's live copy.
     pub fn retirement(
         &self,
@@ -283,7 +445,9 @@ impl ReplicaCatalog {
                 .ok_or(CatalogError::ReplicaNotFound)?;
             decode_checked(key_bytes.as_slice(), stored.value())?
         };
-        if replica.descriptor() != &descriptor {
+        if !replica.descriptor().has_same_storage_identity(&descriptor)
+            || descriptor.capacity() > replica.descriptor().capacity()
+        {
             return Err(CatalogError::ConflictingReplica);
         }
         let existing = {
@@ -293,7 +457,10 @@ impl ReplicaCatalog {
                 .transpose()?
         };
         if let Some(record) = existing {
-            if record.descriptor() != &descriptor || record.session_id() != session_id {
+            if !record.descriptor().has_same_storage_identity(&descriptor)
+                || record.descriptor().capacity() > replica.descriptor().capacity()
+                || record.session_id() != session_id
+            {
                 return Err(CatalogError::AttachmentChanged);
             }
             return Ok(record);
@@ -420,14 +587,62 @@ impl ReplicaCatalog {
             }
             check_attachment_resource_fence(record, expected)?;
             record.set_granted_fence(next);
-            if let Some(device) = record.ublk_device() {
-                record.set_ublk_device(device.with_fence(next));
-            }
+            record.set_ublk_device_fence(next);
             if let Some(volume_mount) = record.volume_mount().cloned() {
                 record.set_volume_mount(volume_mount.with_fence(next));
             }
             Ok(())
         })
+    }
+
+    /// Records a larger descriptor after device mapper proves it active.
+    pub fn advance_attachment_capacity(
+        &self,
+        key: ReplicaKey,
+        target: VolumeDescriptor,
+    ) -> Result<(), CatalogError> {
+        let key_bytes = encode_key(key);
+        let write = self.database.begin_write()?;
+        let replicas = write.open_table(REPLICAS)?;
+        let mut attachments = write.open_table(ATTACHMENTS)?;
+        let replica = {
+            let stored = replicas
+                .get(key_bytes.as_slice())?
+                .ok_or(CatalogError::ReplicaNotFound)?;
+            decode_checked(key_bytes.as_slice(), stored.value())?
+        };
+        let mut attachment = {
+            let stored = attachments
+                .get(key_bytes.as_slice())?
+                .ok_or(CatalogError::AttachmentNotFound)?;
+            decode_attachment_checked(key_bytes.as_slice(), stored.value())?
+        };
+        if !attachment.descriptor().has_same_storage_identity(&target)
+            || !replica.descriptor().has_same_storage_identity(&target)
+        {
+            return Err(CatalogError::AttachmentChanged);
+        }
+        if target.capacity() < attachment.descriptor().capacity() {
+            return Err(CatalogError::CapacityCannotShrink);
+        }
+        if target.capacity() > replica.descriptor().capacity() {
+            return Err(CatalogError::CapacityExceedsReservation);
+        }
+        if target.capacity() > attachment.descriptor().capacity()
+            && !attachment
+                .ublk_devices()
+                .iter()
+                .any(|device| device.capacity() == target.capacity())
+        {
+            return Err(CatalogError::UblkDeviceChanged);
+        }
+        attachment.set_descriptor(target);
+        let encoded = encode_attachment(&attachment)?;
+        attachments.insert(key_bytes.as_slice(), encoded.as_slice())?;
+        drop(replicas);
+        drop(attachments);
+        write.commit()?;
+        Ok(())
     }
 
     /// Saves one active ublk device without replacing a different device.
@@ -436,16 +651,26 @@ impl ReplicaCatalog {
         key: ReplicaKey,
         device: SavedUblkDevice,
     ) -> Result<(), CatalogError> {
+        let replica = self.replica(key)?.ok_or(CatalogError::ReplicaNotFound)?;
+        replica.descriptor().with_capacity(device.capacity())?;
+        if device.capacity() > replica.descriptor().capacity() {
+            return Err(CatalogError::CapacityExceedsReservation);
+        }
         self.update_attachment(key, |record| {
             check_device_fence(record, device)?;
-            match record.ublk_device() {
-                Some(saved) if saved == device => Ok(()),
-                Some(_) => Err(CatalogError::UblkDeviceChanged),
-                None => {
-                    record.set_ublk_device(device);
-                    Ok(())
-                }
+            if record.ublk_devices().contains(&device) {
+                return Ok(());
             }
+            if record.ublk_devices().len() >= 2
+                || record
+                    .ublk_devices()
+                    .iter()
+                    .any(|saved| saved.id() == device.id() || saved.capacity() == device.capacity())
+            {
+                return Err(CatalogError::UblkDeviceChanged);
+            }
+            record.add_ublk_device(device);
+            Ok(())
         })
     }
 
@@ -456,12 +681,22 @@ impl ReplicaCatalog {
         expected: SavedUblkDevice,
         device: SavedUblkDevice,
     ) -> Result<(), CatalogError> {
+        let replica = self.replica(key)?.ok_or(CatalogError::ReplicaNotFound)?;
+        replica.descriptor().with_capacity(device.capacity())?;
+        if device.capacity() > replica.descriptor().capacity() {
+            return Err(CatalogError::CapacityExceedsReservation);
+        }
         self.update_attachment(key, |record| {
             check_device_fence(record, device)?;
-            if record.ublk_device() == Some(device) {
+            if record.ublk_devices().contains(&device) {
                 return Ok(());
             }
-            if record.ublk_device() != Some(expected) {
+            if !record.ublk_devices().contains(&expected)
+                || record.ublk_devices().iter().any(|saved| {
+                    *saved != expected
+                        && (saved.id() == device.id() || saved.capacity() == device.capacity())
+                })
+            {
                 return Err(CatalogError::UblkDeviceChanged);
             }
             if record.volume_mount().is_some_and(|volume_mount| {
@@ -470,7 +705,7 @@ impl ReplicaCatalog {
             }) {
                 return Err(CatalogError::VolumeMountDeviceMismatch);
             }
-            record.set_ublk_device(device);
+            record.replace_ublk_device(expected, device);
             Ok(())
         })
     }
@@ -481,16 +716,22 @@ impl ReplicaCatalog {
         key: ReplicaKey,
         expected: SavedUblkDevice,
     ) -> Result<(), CatalogError> {
-        self.update_attachment(key, |record| match record.ublk_device() {
-            None => Ok(()),
-            Some(saved) if saved == expected => {
-                if record.volume_mount().is_some() {
-                    return Err(CatalogError::VolumeMountDeviceMismatch);
-                }
-                record.clear_ublk_device();
-                Ok(())
+        self.update_attachment(key, |record| {
+            if !record.ublk_devices().contains(&expected) {
+                return if record.ublk_devices().is_empty() {
+                    Ok(())
+                } else {
+                    Err(CatalogError::UblkDeviceChanged)
+                };
             }
-            Some(_) => Err(CatalogError::UblkDeviceChanged),
+            if record.volume_mount().is_some()
+                && (record.ublk_devices().len() == 1
+                    || expected.capacity() == record.descriptor().capacity())
+            {
+                return Err(CatalogError::VolumeMountDeviceMismatch);
+            }
+            record.remove_ublk_device(expected);
+            Ok(())
         })
     }
 
@@ -533,12 +774,14 @@ impl ReplicaCatalog {
         volume_mount: SavedVolumeMount,
     ) -> Result<(), CatalogError> {
         self.update_attachment(key, |record| {
-            let device = record
-                .ublk_device()
-                .ok_or(CatalogError::VolumeMountDeviceMismatch)?;
-            if device.fence() != volume_mount.fence()
-                || device.session_id() != volume_mount.session_id()
+            if volume_mount.filesystem_expanded_to_bytes() > record.descriptor().capacity().bytes()
             {
+                return Err(CatalogError::FilesystemCapacityExceedsDevice);
+            }
+            if !record.ublk_devices().iter().any(|device| {
+                device.fence() == volume_mount.fence()
+                    && device.session_id() == volume_mount.session_id()
+            }) {
                 return Err(CatalogError::VolumeMountDeviceMismatch);
             }
             match record.volume_mount() {
@@ -566,18 +809,17 @@ impl ReplicaCatalog {
             if record.volume_mount() != Some(expected) {
                 return Err(CatalogError::VolumeMountChanged);
             }
-            if !expected
-                .with_state(volume_mount.state())
-                .is_ok_and(|next| next == volume_mount)
-            {
+            if !expected.can_advance_to(&volume_mount) {
                 return Err(CatalogError::VolumeMountChanged);
             }
-            let device = record
-                .ublk_device()
-                .ok_or(CatalogError::VolumeMountDeviceMismatch)?;
-            if device.fence() != volume_mount.fence()
-                || device.session_id() != volume_mount.session_id()
+            if volume_mount.filesystem_expanded_to_bytes() > record.descriptor().capacity().bytes()
             {
+                return Err(CatalogError::FilesystemCapacityExceedsDevice);
+            }
+            if !record.ublk_devices().iter().any(|device| {
+                device.fence() == volume_mount.fence()
+                    && device.session_id() == volume_mount.session_id()
+            }) {
                 return Err(CatalogError::VolumeMountDeviceMismatch);
             }
             if volume_mount.state() == SavedMountState::Unmounting {
@@ -624,7 +866,7 @@ impl ReplicaCatalog {
         if record.session_id() != session_id {
             return Err(CatalogError::AttachmentChanged);
         }
-        if record.ublk_device().is_some() || record.volume_mount().is_some() {
+        if !record.ublk_devices().is_empty() || record.volume_mount().is_some() {
             return Err(CatalogError::AttachmentStillActive);
         }
         attachments.remove(key_bytes.as_slice())?;
@@ -937,9 +1179,10 @@ fn checked_totals(replicas: &redb::Table<'_, &[u8], &[u8]>) -> Result<Totals, Ca
     for row in replicas.iter()? {
         let (key, stored) = row?;
         let record = decode_checked(key.value(), stored.value())?;
-        let expected = ReplicaSpace::for_capacity(record.descriptor().capacity().bytes())?;
-        if record.reserved_space().data_bytes() != expected.data_bytes()
-            || record.reserved_space().metadata_bytes() != expected.metadata_bytes()
+        let applied = ReplicaSpace::for_capacity(record.descriptor().capacity().bytes())?;
+        let reserved = ReplicaSpace::for_capacity(record.reserved_space().data_bytes())?;
+        if record.reserved_space().data_bytes() < applied.data_bytes()
+            || record.reserved_space().metadata_bytes() != reserved.metadata_bytes()
         {
             return Err(CatalogError::SpaceTotalsMismatch);
         }
@@ -967,7 +1210,30 @@ fn check_attachment_rows(
             .get(key.value())?
             .ok_or(CatalogError::ReplicaNotFound)?;
         let replica = decode_checked(key.value(), replica.value())?;
-        if replica.descriptor() != record.descriptor() {
+        if !replica
+            .descriptor()
+            .has_same_storage_identity(record.descriptor())
+            || record.descriptor().capacity() > replica.descriptor().capacity()
+        {
+            return Err(CatalogError::AttachmentIdentityMismatch);
+        }
+        for device in record.ublk_devices() {
+            replica.descriptor().with_capacity(device.capacity())?;
+            if device.capacity() > replica.descriptor().capacity() {
+                return Err(CatalogError::AttachmentIdentityMismatch);
+            }
+        }
+        if !record.ublk_devices().is_empty()
+            && !record
+                .ublk_devices()
+                .iter()
+                .any(|device| device.capacity() == record.descriptor().capacity())
+        {
+            return Err(CatalogError::AttachmentIdentityMismatch);
+        }
+        if record.volume_mount().is_some_and(|mount| {
+            mount.filesystem_expanded_to_bytes() > record.descriptor().capacity().bytes()
+        }) {
             return Err(CatalogError::AttachmentIdentityMismatch);
         }
     }
@@ -1008,8 +1274,9 @@ fn check_attachment_resource_fence(
     fence: FenceEpoch,
 ) -> Result<(), CatalogError> {
     if record
-        .ublk_device()
-        .is_some_and(|device| device.session_id() != record.session_id() || device.fence() != fence)
+        .ublk_devices()
+        .iter()
+        .any(|device| device.session_id() != record.session_id() || device.fence() != fence)
     {
         return Err(CatalogError::AttachmentFenceChanged);
     }
@@ -1159,8 +1426,8 @@ mod tests {
     use crate::driver::{UblkDeviceId, UblkQueueSettings, UblkSettings};
     use crate::storage_format::ReplicaSpace;
     use crate::{
-        DriverSessionId, FenceEpoch, FilesystemId, OperationId, VolumeBlockSizes, VolumeDescriptor,
-        VolumeGeneration, VolumeId,
+        DriverSessionId, FenceEpoch, FilesystemId, OperationId, VolumeBlockSizes, VolumeCapacity,
+        VolumeDescriptor, VolumeGeneration, VolumeId,
     };
 
     /// Creates one deterministic descriptor for catalog tests.
@@ -1213,6 +1480,222 @@ mod tests {
         let catalog =
             ReplicaCatalog::open(database.clone(), pool.clone()).expect("open test catalog");
         (database, pool, catalog)
+    }
+
+    /// Builds bounded ublk settings at one exact test capacity.
+    fn ublk_settings(descriptor: &VolumeDescriptor) -> UblkSettings {
+        UblkSettings::new(
+            descriptor,
+            UblkQueueSettings {
+                queue_count: 2,
+                queue_depth: 32,
+                max_request_bytes: 128 << 10,
+                memory_limit_bytes: 8 << 20,
+            },
+        )
+        .expect("valid test ublk settings")
+    }
+
+    /// Builds one saved device for an exact descriptor and writer session.
+    fn saved_device(
+        id: u32,
+        descriptor: &VolumeDescriptor,
+        fence: FenceEpoch,
+        session: DriverSessionId,
+    ) -> SavedUblkDevice {
+        SavedUblkDevice::new(
+            UblkDeviceId::new(id),
+            fence,
+            session,
+            ublk_settings(descriptor),
+        )
+    }
+
+    /// Reservations may lead Raft capacity but committed capacity never exceeds them.
+    #[test]
+    fn replica_capacity_reservation_and_application_are_monotonic() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let available = Arc::new(AtomicU64::new(1 << 40));
+        let (_database, _pool, catalog) = test_catalog(&directory, 1 << 40, available);
+        let initial = descriptor(90, 64 << 20);
+        let key = ReplicaKey::from(&initial);
+        catalog
+            .reserve_replica(initial.clone(), setup_operation_id())
+            .expect("reserve initial replica");
+        let target = VolumeCapacity::new(128 << 20).expect("aligned target capacity");
+
+        let reserved = catalog
+            .reserve_replica_capacity(key, target)
+            .expect("reserve larger capacity");
+        assert_eq!(reserved.descriptor(), &initial);
+        assert_eq!(reserved.reserved_space().data_bytes(), target.bytes());
+        assert_eq!(
+            catalog
+                .apply_replica_capacity(key, target)
+                .expect("apply reserved capacity")
+                .descriptor()
+                .capacity(),
+            target
+        );
+        catalog
+            .apply_replica_capacity(key, target)
+            .expect("repeat capacity application");
+        assert!(matches!(
+            catalog.apply_replica_capacity(
+                key,
+                VolumeCapacity::new(96 << 20).expect("smaller aligned capacity")
+            ),
+            Err(CatalogError::CapacityCannotShrink)
+        ));
+        assert!(matches!(
+            catalog.reduce_replica_reservation(
+                key,
+                VolumeCapacity::new(96 << 20).expect("smaller aligned capacity")
+            ),
+            Err(CatalogError::ReservationBelowAppliedCapacity)
+        ));
+    }
+
+    /// Correcting an uncommitted target releases only its excess durable promise.
+    #[test]
+    fn pending_capacity_reservation_can_be_corrected_before_commit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let available = Arc::new(AtomicU64::new(1 << 40));
+        let (_database, _pool, catalog) = test_catalog(&directory, 1 << 40, available);
+        let initial = descriptor(91, 64 << 20);
+        let key = ReplicaKey::from(&initial);
+        catalog
+            .reserve_replica(initial.clone(), setup_operation_id())
+            .expect("reserve initial replica");
+        catalog
+            .reserve_replica_capacity(key, VolumeCapacity::new(128 << 20).expect("larger target"))
+            .expect("reserve larger target");
+        let corrected = VolumeCapacity::new(96 << 20).expect("corrected target");
+        let record = catalog
+            .reduce_replica_reservation(key, corrected)
+            .expect("release uncommitted excess");
+        assert_eq!(record.descriptor(), &initial);
+        assert_eq!(record.reserved_space().data_bytes(), corrected.bytes());
+        let pool = catalog.pool_status().expect("read pool status");
+        let expected = ReplicaSpace::for_capacity(corrected.bytes()).expect("corrected space");
+        assert_eq!(pool.data_bytes(), expected.data_bytes());
+        assert_eq!(pool.metadata_bytes(), expected.metadata_bytes());
+    }
+
+    /// A failed larger reservation leaves both the replica and pool totals unchanged.
+    #[test]
+    fn insufficient_pool_space_does_not_partially_reserve_capacity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let available = Arc::new(AtomicU64::new(1 << 40));
+        let initial = descriptor(92, 64 << 20);
+        let initial_space =
+            ReplicaSpace::for_capacity(initial.capacity().bytes()).expect("initial replica space");
+        let managed = initial_space
+            .total_bytes()
+            .expect("initial total space")
+            .checked_add(4096)
+            .expect("test managed space");
+        let (_database, _pool, catalog) = test_catalog(&directory, managed, available);
+        let key = ReplicaKey::from(&initial);
+        catalog
+            .reserve_replica(initial.clone(), setup_operation_id())
+            .expect("reserve initial replica");
+        let before = catalog.pool_status().expect("read initial pool status");
+        assert!(matches!(
+            catalog.reserve_replica_capacity(
+                key,
+                VolumeCapacity::new(128 << 20).expect("larger target")
+            ),
+            Err(CatalogError::NotEnoughSpace { .. })
+        ));
+        let after = catalog.pool_status().expect("read unchanged pool status");
+        assert_eq!(after.data_bytes(), before.data_bytes());
+        assert_eq!(after.metadata_bytes(), before.metadata_bytes());
+        assert_eq!(
+            catalog
+                .replica(key)
+                .expect("read replica")
+                .expect("replica exists")
+                .descriptor(),
+            &initial
+        );
+    }
+
+    /// The active-capacity device remains owned until the mapped descriptor advances.
+    #[test]
+    fn attachment_capacity_switch_keeps_exactly_one_active_device() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let available = Arc::new(AtomicU64::new(1 << 40));
+        let (database, pool, catalog) = test_catalog(&directory, 1 << 40, available);
+        let initial = descriptor(93, 64 << 20);
+        let target = initial
+            .with_capacity(VolumeCapacity::new(128 << 20).expect("larger target"))
+            .expect("compatible target descriptor");
+        let key = ReplicaKey::from(&initial);
+        let session = DriverSessionId::new(Uuid::from_u128(930)).expect("test session");
+        let fence = FenceEpoch::new(7).expect("test fence");
+        catalog
+            .reserve_replica(initial.clone(), setup_operation_id())
+            .expect("reserve initial replica");
+        catalog
+            .reserve_replica_capacity(key, target.capacity())
+            .expect("reserve target capacity");
+        catalog
+            .apply_replica_capacity(key, target.capacity())
+            .expect("apply target capacity");
+        catalog
+            .ensure_attachment(initial.clone(), session)
+            .expect("save attachment");
+        catalog
+            .save_attachment_fence(key, session, fence)
+            .expect("save writer fence");
+        let old = saved_device(31, &initial, fence, session);
+        let larger = saved_device(32, &target, fence, session);
+        catalog.save_ublk_device(key, old).expect("save old device");
+        catalog
+            .save_ublk_device(key, larger)
+            .expect("save larger device");
+        drop(catalog);
+        let catalog = ReplicaCatalog::open(database.clone(), pool.clone())
+            .expect("reopen catalog after saving both capacity devices");
+        assert_eq!(
+            catalog
+                .attachment(key)
+                .expect("read interrupted device switch")
+                .expect("attachment exists")
+                .ublk_devices(),
+            &[old, larger]
+        );
+        let mounting =
+            SavedVolumeMount::mounting(fence, session, directory.path().join("mount"), 0, 0, 0o700)
+                .expect("valid saved mount");
+        catalog
+            .save_volume_mount(key, mounting)
+            .expect("save mount");
+
+        assert!(matches!(
+            catalog.clear_ublk_device(key, old),
+            Err(CatalogError::VolumeMountDeviceMismatch)
+        ));
+        catalog
+            .advance_attachment_capacity(key, target.clone())
+            .expect("record active larger mapping");
+        drop(catalog);
+        let catalog = ReplicaCatalog::open(database, pool)
+            .expect("reopen catalog after recording the larger mapping");
+        assert!(matches!(
+            catalog.clear_ublk_device(key, larger),
+            Err(CatalogError::VolumeMountDeviceMismatch)
+        ));
+        catalog
+            .clear_ublk_device(key, old)
+            .expect("remove inactive old device");
+        let saved = catalog
+            .attachment(key)
+            .expect("read attachment")
+            .expect("attachment exists");
+        assert_eq!(saved.descriptor(), &target);
+        assert_eq!(saved.ublk_devices(), &[larger]);
     }
 
     /// Finds replicas and unfinished work after closing and reopening Redb.
@@ -1391,23 +1874,23 @@ mod tests {
         );
         let reopened = ReplicaCatalog::open(reopened_database, pool).expect("reopen local catalog");
         assert_eq!(
-            Some(second),
+            &[second],
             reopened
                 .attachment(key)
                 .expect("read attachment")
                 .expect("attachment must exist")
-                .ublk_device()
+                .ublk_devices()
         );
         reopened
             .clear_ublk_device(key, second)
             .expect("clear exact ublk device");
-        assert_eq!(
-            None,
+        assert!(
             reopened
                 .attachment(key)
                 .expect("read cleared attachment")
                 .expect("attachment must exist")
-                .ublk_device()
+                .ublk_devices()
+                .is_empty()
         );
     }
 
@@ -1481,7 +1964,22 @@ mod tests {
             .expect("save same mounting step");
         let mounted = mounting
             .with_state(SavedMountState::Mounted)
-            .expect("advance to mounted");
+            .expect("advance to mounted")
+            .with_filesystem_expanded_to(descriptor.capacity().bytes())
+            .expect("save initial filesystem capacity");
+        let impossible = mounting
+            .with_state(SavedMountState::Mounted)
+            .expect("advance to mounted")
+            .with_filesystem_expanded_to(descriptor.capacity().bytes() + 4096)
+            .expect("model permits catalog-level capacity validation");
+        assert!(matches!(
+            catalog.replace_volume_mount(key, &mounting, impossible),
+            Err(CatalogError::FilesystemCapacityExceedsDevice)
+        ));
+        assert!(matches!(
+            mounted.with_filesystem_expanded_to(descriptor.capacity().bytes() - 4096),
+            Err(crate::catalog::InvalidSavedVolumeMount::FilesystemCapacityMovedBackwards)
+        ));
         catalog
             .replace_volume_mount(key, &mounting, mounted.clone())
             .expect("save mounted step");
@@ -1568,7 +2066,7 @@ mod tests {
             .expect("saved attachment must exist");
         assert!(saved.is_detaching());
         assert_eq!(saved.granted_fence(), Some(fence));
-        assert_eq!(saved.ublk_device(), None);
+        assert!(saved.ublk_devices().is_empty());
         assert_eq!(saved.volume_mount(), None);
     }
 
@@ -1635,7 +2133,15 @@ mod tests {
             .expect("read attachment")
             .expect("attachment exists");
         assert_eq!(saved.granted_fence(), Some(new));
-        assert_eq!(saved.ublk_device().map(SavedUblkDevice::fence), Some(new));
+        assert_eq!(
+            saved
+                .ublk_devices()
+                .iter()
+                .copied()
+                .map(SavedUblkDevice::fence)
+                .collect::<Vec<_>>(),
+            vec![new],
+        );
         assert_eq!(saved.volume_mount().map(SavedVolumeMount::fence), Some(new));
         assert!(matches!(
             catalog.advance_attachment_fence(
@@ -1713,6 +2219,58 @@ mod tests {
         assert!(matches!(
             reopened.reserve_replica(descriptor, changed_route),
             Err(CatalogError::ConflictingReplica)
+        ));
+    }
+
+    /// An excluded bootstrap slot becomes crash-retryable replacement work atomically.
+    #[test]
+    fn existing_replica_can_be_rebuilt_for_an_applied_replacement() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let available = Arc::new(AtomicU64::new(1 << 40));
+        let (_database, _pool, catalog) = test_catalog(&directory, 1 << 40, available);
+        let initial = descriptor(15, 64 << 20);
+        let expanded = descriptor(15, 128 << 20);
+        let key = ReplicaKey::from(&initial);
+        let origin = LocalReplicaOrigin::replacement(
+            crate::ReplacementId::new(Uuid::from_u128(701)).expect("non-zero replacement ID"),
+            BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2)]),
+        )
+        .expect("valid replacement origin");
+
+        catalog
+            .reserve_replica(initial, setup_operation_id())
+            .expect("reserve original replica");
+        catalog
+            .set_replica_state(key, ReplicaState::Ready)
+            .expect("finish original replica");
+        catalog
+            .reserve_replica_capacity(key, expanded.capacity())
+            .expect("reserve expanded capacity");
+
+        let rebuilding = catalog
+            .begin_replica_replacement(key, expanded.clone(), origin.clone())
+            .expect("begin replacement rebuild");
+        assert_eq!(rebuilding.descriptor(), &expanded);
+        assert_eq!(rebuilding.origin(), &origin);
+        assert_eq!(rebuilding.state(), ReplicaState::Preparing);
+        assert_eq!(rebuilding.health(), ReplicaHealth::Healthy);
+        assert_eq!(
+            catalog
+                .begin_replica_replacement(key, expanded.clone(), origin.clone())
+                .expect("repeat replacement rebuild"),
+            rebuilding
+        );
+
+        catalog
+            .set_replica_state(key, ReplicaState::Ready)
+            .expect("finish rebuilt replica");
+        let session = DriverSessionId::new(Uuid::from_u128(702)).expect("driver session");
+        catalog
+            .ensure_attachment(expanded.clone(), session)
+            .expect("save attachment");
+        assert!(matches!(
+            catalog.begin_replica_replacement(key, expanded, origin),
+            Err(CatalogError::ReplicaStillAttached)
         ));
     }
 

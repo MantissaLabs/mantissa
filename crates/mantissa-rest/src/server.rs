@@ -120,6 +120,7 @@ fn documented_router() -> OpenApiRouter<AppState> {
             routes::volumes::delete
         ))
         .routes(openapi_routes!(routes::volumes::restore))
+        .routes(openapi_routes!(routes::volumes::expand))
         .routes(openapi_routes!(routes::volumes::status))
         .routes(openapi_routes!(routes::tasks::list, routes::tasks::start))
         .routes(openapi_routes!(routes::tasks::get))

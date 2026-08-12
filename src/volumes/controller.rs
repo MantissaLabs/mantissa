@@ -99,7 +99,7 @@ impl VolumeController {
                     self.local_node_name.clone(),
                     None,
                     VolumeNodeState::Pending,
-                    spec.requested_bytes,
+                    spec.initial_capacity_bytes,
                     spec.volume_epoch,
                 )
             });
@@ -111,12 +111,12 @@ impl VolumeController {
                 let local_path = path.to_string_lossy().to_string();
                 let mut desired = current.clone();
                 desired.local_path = Some(local_path);
-                desired.capacity_bytes = spec.requested_bytes;
+                desired.capacity_bytes = spec.initial_capacity_bytes;
                 desired.used_bytes = Some(used_bytes);
 
                 let over_capacity = self
                     .enforce_capacity_limits
-                    .then_some((used_bytes, spec.requested_bytes))
+                    .then_some((used_bytes, spec.initial_capacity_bytes))
                     .and_then(|(used_bytes, capacity)| {
                         capacity.map(|capacity| (used_bytes, capacity))
                     })
@@ -218,8 +218,8 @@ fn capacity_exceeded_message(volume_name: &str, used_bytes: u64, capacity_bytes:
 mod tests {
     use super::*;
     use crate::store::replicated::volumes::{
-        open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
-        open_volume_node_store, open_volume_spec_store,
+        open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
+        open_replicated_volume_plan_store, open_volume_node_store, open_volume_spec_store,
     };
     use crate::volumes::types::{
         FilesystemOwnership, LocalVolumeSpec, VolumeAccessMode, VolumeBindingMode, VolumeDriver,
@@ -255,14 +255,26 @@ mod tests {
             .rebuild_mst_from_disk()
             .await
             .expect("rebuild volume plan store");
-        let status_store = open_replicated_volume_group_status_store(db, actor)
+        let status_store = open_replicated_volume_group_status_store(db.clone(), actor)
             .expect("open volume group status store");
         status_store
             .rebuild_mst_from_disk()
             .await
             .expect("rebuild volume group status store");
+        let capacity_store = open_replicated_volume_capacity_request_store(db, actor)
+            .expect("open volume capacity store");
+        capacity_store
+            .rebuild_mst_from_disk()
+            .await
+            .expect("rebuild volume capacity store");
         TestRegistry {
-            registry: VolumeRegistry::new(spec_store, node_store, plan_store, status_store),
+            registry: VolumeRegistry::new(
+                spec_store,
+                node_store,
+                plan_store,
+                status_store,
+                capacity_store,
+            ),
             _dir: dir,
         }
     }
@@ -272,7 +284,7 @@ mod tests {
         registry: &VolumeRegistry,
         node_id: Uuid,
         name: &str,
-        requested_bytes: Option<u64>,
+        initial_capacity_bytes: Option<u64>,
     ) -> VolumeSpecValue {
         let spec = VolumeSpecValue::new(VolumeSpecDraft {
             name: name.to_string(),
@@ -280,7 +292,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::Immediate,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes,
+            initial_capacity_bytes,
             labels: Vec::new(),
             bound_node_id: Some(node_id),
             bound_node_name: Some("node-a".to_string()),

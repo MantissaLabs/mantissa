@@ -21,7 +21,7 @@ use crate::{
     VolumeGeneration, VolumeId,
 };
 
-/// Writes one immutable descriptor with all four block sizes.
+/// Writes one current descriptor with all four block sizes.
 pub fn write_descriptor(
     mut builder: volume_descriptor::Builder<'_>,
     descriptor: &VolumeDescriptor,
@@ -46,7 +46,7 @@ pub fn descriptor_message_bytes(descriptor: &VolumeDescriptor) -> usize {
     capnp::serialize::write_message_to_words(&message).len()
 }
 
-/// Reads and validates one immutable descriptor.
+/// Reads and validates one current descriptor.
 pub fn read_descriptor(
     reader: volume_descriptor::Reader<'_>,
 ) -> Result<VolumeDescriptor, ProtocolError> {

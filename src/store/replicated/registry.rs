@@ -19,7 +19,8 @@ use crate::store::replicated::secret_key_sync::SecretMasterKeyStore;
 use crate::store::replicated::secrets::SecretStore;
 use crate::store::replicated::services::ServiceStore;
 use crate::store::replicated::volumes::{
-    ReplicatedVolumeGroupStatusStore, ReplicatedVolumePlanStore, VolumeNodeStore, VolumeSpecStore,
+    ReplicatedVolumeCapacityRequestStore, ReplicatedVolumeGroupStatusStore,
+    ReplicatedVolumePlanStore, VolumeNodeStore, VolumeSpecStore,
 };
 use crate::store::replicated::workloads::WorkloadStore;
 use mantissa_protocol::sync::Domain;
@@ -59,7 +60,7 @@ type DecodedRegisters<C> = Registers<UuidKey, <C as RegAdapter>::Reg>;
 type DecodedDelta<C> = (DecodedRegisters<C>, Tombstones<UuidKey>);
 
 /// Canonical full-sync domain set shared by all replicated-store callers.
-pub const REPLICATED_DOMAINS: [Domain; 18] = [
+pub const REPLICATED_DOMAINS: [Domain; 19] = [
     Domain::Peers,
     Domain::Workloads,
     Domain::Services,
@@ -74,6 +75,7 @@ pub const REPLICATED_DOMAINS: [Domain; 18] = [
     Domain::VolumeNodes,
     Domain::VolumePlans,
     Domain::VolumeGroupStatuses,
+    Domain::VolumeCapacityRequests,
     Domain::SchedulerDigests,
     Domain::SecretMasterKeys,
     Domain::IngressPools,
@@ -99,6 +101,7 @@ pub fn domain_label(domain: Domain) -> &'static str {
         Domain::VolumeNodes => "volume nodes",
         Domain::VolumePlans => "volume plans",
         Domain::VolumeGroupStatuses => "volume group statuses",
+        Domain::VolumeCapacityRequests => "volume capacity requests",
         Domain::SchedulerDigests => "scheduler digests",
         Domain::IngressPools => "ingress pools",
     }
@@ -121,6 +124,7 @@ pub fn domain_key(domain: Domain) -> u16 {
         Domain::VolumeNodes => 11,
         Domain::VolumePlans => 12,
         Domain::VolumeGroupStatuses => 13,
+        Domain::VolumeCapacityRequests => 18,
         Domain::SchedulerDigests => 14,
         Domain::SecretMasterKeys => 15,
         Domain::IngressPools => 16,
@@ -493,6 +497,10 @@ pub fn replicated_store_registry(stores: ReplicatedStoreHandles) -> ReplicatedSt
         ReplicatedStoreEntry::new(Domain::VolumeNodes, stores.volume_nodes),
         ReplicatedStoreEntry::new(Domain::VolumePlans, stores.volume_plans),
         ReplicatedStoreEntry::new(Domain::VolumeGroupStatuses, stores.volume_group_statuses),
+        ReplicatedStoreEntry::new(
+            Domain::VolumeCapacityRequests,
+            stores.volume_capacity_requests,
+        ),
         ReplicatedStoreEntry::new(Domain::SchedulerDigests, stores.scheduler_digests),
         ReplicatedStoreEntry::new(Domain::SecretMasterKeys, stores.secret_master_keys),
         ReplicatedStoreEntry::new(Domain::IngressPools, stores.ingress_pools),
@@ -518,6 +526,7 @@ pub struct ReplicatedStoreHandles {
     pub volume_nodes: VolumeNodeStore,
     pub volume_plans: ReplicatedVolumePlanStore,
     pub volume_group_statuses: ReplicatedVolumeGroupStatusStore,
+    pub volume_capacity_requests: ReplicatedVolumeCapacityRequestStore,
     pub scheduler_digests: SchedulerDigestStore,
     pub ingress_pools: IngressPoolStore,
 }

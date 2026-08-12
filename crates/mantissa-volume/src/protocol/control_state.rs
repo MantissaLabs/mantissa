@@ -7,24 +7,25 @@ use mantissa_protocol::raft::{raft_application_command, raft_application_command
 use mantissa_protocol::volumes::{
     VolumeControlCommandRejection as WireRejection, VolumeDisposition as WireDisposition,
     adopt_replica_replacement, begin_replica_replacement, begin_volume_recovery,
-    cancel_replica_replacement, expected_volume_revision, fence_volume_writer, grant_volume_writer,
-    initialize_volume_control_state, revoke_volume_recovery, set_volume_disposition,
-    volume_control_command, volume_control_command_response, volume_control_snapshot,
-    volume_data_control_state, volume_recovery_grant, volume_replacement_grant,
-    volume_writer_grant,
+    cancel_replica_replacement, expand_volume, expected_volume_revision, fence_volume_writer,
+    grant_volume_writer, initialize_volume_control_state, revoke_volume_recovery,
+    set_volume_disposition, volume_control_command, volume_control_command_response,
+    volume_control_snapshot, volume_data_control_state, volume_recovery_grant,
+    volume_replacement_grant, volume_writer_grant,
 };
 use mantissa_raft::protocol::ApplicationCommandAdapter;
 
 use super::{ProtocolError, read_descriptor, read_uuid, write_descriptor};
 use crate::control_state::{
     AdoptReplicaReplacement, BeginReplicaReplacement, BeginVolumeRecovery,
-    CancelReplicaReplacement, DataControlState, ExpectedVolumeRevision, FenceVolumeWriter,
-    GrantVolumeWriter, InitializeVolume, RecoveryGrant, ReplacementGrant, RevokeVolumeRecovery,
-    SetVolumeDisposition, VolumeCommand, VolumeCommandRejection, VolumeCommandResponse,
-    VolumeControlState, VolumeDisposition, WriterGrant,
+    CancelReplicaReplacement, DataControlState, ExpandVolume, ExpectedVolumeRevision,
+    FenceVolumeWriter, GrantVolumeWriter, InitializeVolume, RecoveryGrant, ReplacementGrant,
+    RevokeVolumeRecovery, SetVolumeDisposition, VolumeCommand, VolumeCommandRejection,
+    VolumeCommandResponse, VolumeControlState, VolumeDisposition, WriterGrant,
 };
 use crate::{
-    DriverSessionId, FenceEpoch, RecoveryId, ReplacementId, VolumeGeneration, VolumeNodeId,
+    DriverSessionId, FenceEpoch, RecoveryId, ReplacementId, VolumeCapacity, VolumeGeneration,
+    VolumeNodeId,
 };
 
 const CONTROL_STATE_FORMAT_VERSION: u16 = 1;
@@ -71,6 +72,9 @@ pub fn write_volume_command(
         VolumeCommand::Initialize(command) => {
             write_initialize(builder.reborrow().init_initialize(), command);
         }
+        VolumeCommand::Expand(command) => {
+            write_expand(builder.reborrow().init_expand(), *command);
+        }
         VolumeCommand::SetDisposition(command) => {
             write_set_disposition(builder.reborrow().init_set_disposition(), *command);
         }
@@ -106,6 +110,9 @@ pub fn read_volume_command(
         Ok(volume_control_command::Which::Invalid(())) => Err(ProtocolError::InvalidVolumeCommand),
         Ok(volume_control_command::Which::Initialize(command)) => {
             Ok(VolumeCommand::Initialize(read_initialize(command?)?))
+        }
+        Ok(volume_control_command::Which::Expand(command)) => {
+            Ok(VolumeCommand::Expand(read_expand(command?)?))
         }
         Ok(volume_control_command::Which::SetDisposition(command)) => Ok(
             VolumeCommand::SetDisposition(read_set_disposition(command?)?),
@@ -347,6 +354,20 @@ fn read_expected(
     Ok(ExpectedVolumeRevision {
         generation: VolumeGeneration::new(reader.get_generation())?,
         revision: reader.get_revision(),
+    })
+}
+
+/// Writes one monotonic capacity change.
+fn write_expand(mut builder: expand_volume::Builder<'_>, command: ExpandVolume) {
+    write_expected(builder.reborrow().init_expected(), command.expected);
+    builder.set_target_capacity_bytes(command.target_capacity.bytes());
+}
+
+/// Reads one non-zero target capacity and its compare-and-set revision.
+fn read_expand(reader: expand_volume::Reader<'_>) -> Result<ExpandVolume, ProtocolError> {
+    Ok(ExpandVolume {
+        expected: read_expected(reader.get_expected()?)?,
+        target_capacity: VolumeCapacity::new(reader.get_target_capacity_bytes())?,
     })
 }
 
@@ -726,6 +747,8 @@ const fn write_rejection(rejection: VolumeCommandRejection) -> WireRejection {
         VolumeCommandRejection::ReplacementIdConflict => WireRejection::ReplacementIdConflict,
         VolumeCommandRejection::RevisionExhausted => WireRejection::RevisionExhausted,
         VolumeCommandRejection::FenceExhausted => WireRejection::FenceExhausted,
+        VolumeCommandRejection::CapacityCannotShrink => WireRejection::CapacityCannotShrink,
+        VolumeCommandRejection::CapacityNotAligned => WireRejection::CapacityNotAligned,
     }
 }
 
@@ -755,6 +778,8 @@ fn read_rejection(rejection: WireRejection) -> Result<VolumeCommandRejection, Pr
         WireRejection::ReplacementIdConflict => Ok(VolumeCommandRejection::ReplacementIdConflict),
         WireRejection::RevisionExhausted => Ok(VolumeCommandRejection::RevisionExhausted),
         WireRejection::FenceExhausted => Ok(VolumeCommandRejection::FenceExhausted),
+        WireRejection::CapacityCannotShrink => Ok(VolumeCommandRejection::CapacityCannotShrink),
+        WireRejection::CapacityNotAligned => Ok(VolumeCommandRejection::CapacityNotAligned),
     }
 }
 

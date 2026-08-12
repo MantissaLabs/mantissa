@@ -2894,12 +2894,12 @@
               "null"
             ]
           },
-          "control_revision": {
+          "committed_index": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
-          "committed_index": {
+          "control_revision": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -2957,6 +2957,11 @@
               "null"
             ]
           },
+          "replicated_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "reporter_node_id": {
             "type": "string"
           },
@@ -2991,6 +2996,7 @@
           "committed_index",
           "updated_at",
           "control_revision",
+          "replicated_capacity_bytes",
           "copy_node_ids",
           "voter_node_ids",
           "degraded"
@@ -3002,11 +3008,6 @@
         "properties": {
           "bootstrap_id": {
             "type": "string"
-          },
-          "capacity_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
           },
           "data_block_bytes": {
             "format": "int32",
@@ -3020,6 +3021,11 @@
           },
           "id": {
             "type": "string"
+          },
+          "initial_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
           },
           "logical_sector_bytes": {
             "format": "int32",
@@ -3062,7 +3068,7 @@
           "workload_node_id",
           "replica_node_ids",
           "generation",
-          "capacity_bytes",
+          "initial_capacity_bytes",
           "logical_sector_bytes",
           "physical_block_bytes",
           "minimum_io_bytes",
@@ -4599,6 +4605,14 @@
           "driver": {
             "$ref": "#/components/schemas/VolumeCreateDriver"
           },
+          "initial_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "labels": {
             "items": {
               "$ref": "#/components/schemas/VolumeLabel"
@@ -4619,14 +4633,6 @@
           },
           "reclaim_policy": {
             "type": "string"
-          },
-          "requested_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           }
         },
         "required": [
@@ -4690,10 +4696,98 @@
         ],
         "type": "object"
       },
+      "VolumeExpandRequest": {
+        "additionalProperties": false,
+        "description": "REST request body for expanding a replicated volume.",
+        "properties": {
+          "capacity_bytes": {
+            "description": "New total capacity in bytes rather than bytes to add.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "capacity_bytes"
+        ],
+        "type": "object"
+      },
+      "VolumeExpandResponse": {
+        "description": "REST response after a desired capacity is saved locally.",
+        "properties": {
+          "desired_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "desired_capacity_changed": {
+            "type": "boolean"
+          },
+          "initial_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replicated_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "volume_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "volume_id",
+          "initial_capacity_bytes",
+          "desired_capacity_bytes",
+          "replicated_capacity_bytes",
+          "desired_capacity_changed"
+        ],
+        "type": "object"
+      },
+      "VolumeFilesystemSpace": {
+        "description": "Live filesystem space measured on the mounted replicated-volume writer.",
+        "properties": {
+          "available_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "writer_node_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "writer_node_id",
+          "total_bytes",
+          "used_bytes",
+          "available_bytes"
+        ],
+        "type": "object"
+      },
       "VolumeImportRequest": {
         "additionalProperties": false,
         "description": "REST request body for importing an existing local path as a volume.",
         "properties": {
+          "initial_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "labels": {
             "items": {
               "$ref": "#/components/schemas/VolumeLabel"
@@ -4708,14 +4802,6 @@
           },
           "path": {
             "type": "string"
-          },
-          "requested_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           }
         },
         "required": [
@@ -4728,6 +4814,24 @@
       "VolumeInspect": {
         "description": "REST-facing volume inspection payload.",
         "properties": {
+          "desired_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "filesystem_space": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VolumeFilesystemSpace"
+              }
+            ]
+          },
           "group_status": {
             "oneOf": [
               {
@@ -4820,6 +4924,17 @@
               "null"
             ]
           },
+          "device_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "filesystem_expansion_pending": {
+            "type": "boolean"
+          },
           "group_id": {
             "type": [
               "string",
@@ -4850,11 +4965,35 @@
           "node_name": {
             "type": "string"
           },
+          "prepared_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "published_task_ids": {
             "items": {
               "type": "string"
             },
             "type": "array"
+          },
+          "reserved_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "served_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "state": {
             "type": "string"
@@ -4886,6 +5025,7 @@
           "node_name",
           "state",
           "health",
+          "filesystem_expansion_pending",
           "published_task_ids",
           "updated_at",
           "volume_epoch"
@@ -5007,6 +5147,14 @@
           "id": {
             "type": "string"
           },
+          "initial_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "labels": {
             "items": {
               "$ref": "#/components/schemas/VolumeLabel"
@@ -5029,14 +5177,6 @@
           },
           "remove_data": {
             "type": "boolean"
-          },
-          "requested_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           },
           "updated_at": {
             "type": "string"
@@ -5105,6 +5245,14 @@
           "in_use": {
             "type": "boolean"
           },
+          "initial_capacity_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -5116,14 +5264,6 @@
           },
           "reclaim_policy": {
             "type": "string"
-          },
-          "requested_bytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           },
           "state": {
             "type": "string"
@@ -11134,6 +11274,109 @@
           }
         },
         "summary": "Get volume",
+        "tags": [
+          "volumes"
+        ]
+      }
+    },
+    "/v1/volumes/{selector}/expand": {
+      "post": {
+        "description": "Saves a larger desired total capacity for one replicated volume.",
+        "operationId": "expand",
+        "parameters": [
+          {
+            "description": "Replicated volume UUID or exact name.",
+            "in": "path",
+            "name": "selector",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VolumeExpandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VolumeExpandResponse"
+                }
+              }
+            },
+            "description": "Volume expansion request accepted."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Expand volume",
         "tags": [
           "volumes"
         ]

@@ -31,8 +31,8 @@ use crate::types::{
     services::{ServiceDeployRequest, ServiceDeployResponse, ServiceSummary},
     tasks::{TaskAttachQuery, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary},
     volumes::{
-        VolumeCreateRequest, VolumeDeleteResponse, VolumeImportRequest, VolumeInspect, VolumeSpec,
-        VolumeSummary,
+        VolumeCreateRequest, VolumeDeleteResponse, VolumeExpandResponse, VolumeImportRequest,
+        VolumeInspect, VolumeSpec, VolumeSummary,
     },
 };
 use mantissa_client::{
@@ -431,6 +431,20 @@ impl ClientWorkerHandle {
     pub async fn restore_volume(&self, selector: String) -> Result<VolumeSpec, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::RestoreVolume {
             selector,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Saves a larger desired total capacity for one replicated volume.
+    pub async fn expand_volume(
+        &self,
+        selector: String,
+        capacity_bytes: u64,
+    ) -> Result<VolumeExpandResponse, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ExpandVolume {
+            selector,
+            capacity_bytes,
             respond_to,
         })
         .await
@@ -969,6 +983,11 @@ enum ClientCommand {
         selector: String,
         respond_to: oneshot::Sender<Result<VolumeSpec, ClientWorkerError>>,
     },
+    ExpandVolume {
+        selector: String,
+        capacity_bytes: u64,
+        respond_to: oneshot::Sender<Result<VolumeExpandResponse, ClientWorkerError>>,
+    },
     ListTasks(oneshot::Sender<Result<Vec<TaskSummary>, ClientWorkerError>>),
     GetTask {
         selector: String,
@@ -1273,6 +1292,14 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                 respond_to,
             } => {
                 let _ignored = respond_to.send(restore_volume(&config, &selector).await);
+            }
+            ClientCommand::ExpandVolume {
+                selector,
+                capacity_bytes,
+                respond_to,
+            } => {
+                let _ignored =
+                    respond_to.send(expand_volume(&config, &selector, capacity_bytes).await);
             }
             ClientCommand::ListTasks(respond_to) => {
                 let _ignored = respond_to.send(list_tasks(&config).await);
@@ -1899,6 +1926,21 @@ async fn restore_volume(
     volumes::restore(config, selector)
         .await
         .map(VolumeSpec::from)
+        .map_err(conflict_error)
+}
+
+/// Saves one desired replicated-volume capacity through the reusable client.
+async fn expand_volume(
+    config: &ClientConfig,
+    selector: &str,
+    capacity_bytes: u64,
+) -> Result<VolumeExpandResponse, ClientWorkerError> {
+    volumes::inspect(config, selector)
+        .await
+        .map_err(not_found_error)?;
+    volumes::expand(config, selector, capacity_bytes)
+        .await
+        .map(VolumeExpandResponse::from)
         .map_err(conflict_error)
 }
 

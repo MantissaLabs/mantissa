@@ -541,6 +541,12 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         "Restores one retained replicated volume by UUID text or exact name.",
     ),
     (
+        OperationMethod::Post,
+        "/v1/volumes/{selector}/expand",
+        "Expand volume",
+        "Saves a larger desired total capacity for one replicated volume.",
+    ),
+    (
         OperationMethod::Get,
         "/v1/volumes/{selector}/status",
         "Volume status",

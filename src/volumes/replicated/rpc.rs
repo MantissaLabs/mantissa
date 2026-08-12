@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use anyhow::{Context, Result};
 use mantissa_protocol::volumes::{
     LocalReplicaHealth as WireReplicaHealth, LocalReplicaState as WireReplicaState,
-    ReplacementMembershipGoal as WireMembershipGoal, local_replica_status,
+    ReplacementMembershipGoal as WireMembershipGoal, local_replica_status, replica_capacity_status,
     replicated_volume_storage, volume_filesystem_space,
 };
 use mantissa_raft::transport::{
@@ -21,12 +21,14 @@ use mantissa_volume::protocol::{
     read_volume_command_response, write_control_state, write_descriptor, write_volume_command,
     write_volume_command_response,
 };
-use mantissa_volume::{OperationId, ReplacementId, VolumeDescriptor};
+use mantissa_volume::{
+    OperationId, ReplacementId, VolumeCapacity, VolumeDescriptor, VolumeGeneration, VolumeId,
+};
 use uuid::Uuid;
 
 use super::runtime::{
-    LeaderVolumeGroupState, LocalReplicaStatus, ReplacementMembershipGoal, ReplicatedVolumeRuntime,
-    WriterFilesystemSpace,
+    LeaderVolumeGroupState, LocalReplicaStatus, ReplacementMembershipGoal, ReplicaCapacityStatus,
+    ReplicatedVolumeRuntime, WriterFilesystemSpace,
 };
 
 /// Creates authenticated storage services after the runtime is fully owned.
@@ -278,9 +280,16 @@ impl replicated_volume_storage::Server for StorageServer {
             .inspect_quorum_state_as_leader(ReplicaKey::from(&descriptor))
             .await
             .map_err(capnp_error)?;
-        if observation.control_state.descriptor() != Some(&descriptor) {
+        if !observation
+            .control_state
+            .descriptor()
+            .is_some_and(|current| {
+                current.has_same_storage_identity(&descriptor)
+                    && descriptor.capacity() <= current.capacity()
+            })
+        {
             return Err(capnp_error(
-                "leader control-state descriptor differs from request",
+                "leader control-state descriptor is incompatible with request",
             ));
         }
         write_control_state(results.get().init_state(), &observation.control_state);
@@ -307,6 +316,32 @@ impl replicated_volume_storage::Server for StorageServer {
             .await
             .map_err(capnp_error)?;
         write_filesystem_space(results.get().init_space(), measurement);
+        Ok(())
+    }
+
+    /// Reads local capacity facts without starting or advancing expansion.
+    async fn inspect_replica_capacity(
+        self: Rc<Self>,
+        params: replicated_volume_storage::InspectReplicaCapacityParams,
+        mut results: replicated_volume_storage::InspectReplicaCapacityResults,
+    ) -> Result<(), capnp::Error> {
+        let request = params.get()?.get_request()?;
+        let volume_id = VolumeId::new(read_uuid(request.get_volume_id()?, "volume ID")?)
+            .map_err(capnp_error)?;
+        let generation = VolumeGeneration::new(request.get_generation()).map_err(capnp_error)?;
+        let target =
+            VolumeCapacity::new(request.get_target_capacity_bytes()).map_err(capnp_error)?;
+        let key = ReplicaKey::new(volume_id, generation);
+        let runtime = self.runtime()?;
+        if !runtime.generation_is_desired(key) {
+            return Err(capnp_error(
+                "replicated-volume generation is not current desired state",
+            ));
+        }
+        let status = runtime
+            .local_replica_capacity_status(key, Some(target))
+            .map_err(capnp_error)?;
+        write_replica_capacity_status(results.get().init_status(), &status);
         Ok(())
     }
 }
@@ -370,6 +405,34 @@ impl ReplicatedVolumeRuntime {
         })
         .await
         .context("inspect remote replica")
+    }
+
+    /// Reads local or remote capacity facts without advancing expansion.
+    pub(crate) async fn inspect_replica_capacity_on(
+        &self,
+        node_id: Uuid,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+    ) -> Result<ReplicaCapacityStatus> {
+        if node_id == self.node_id() {
+            return self.local_replica_capacity_status(key, Some(target));
+        }
+        self.call_storage(node_id, 256, move |transport| {
+            Box::pin(async move {
+                let client = storage_client(transport).await?;
+                let mut call = client.inspect_replica_capacity_request();
+                {
+                    let mut request = call.get().init_request();
+                    request.set_volume_id(key.volume_id().as_bytes());
+                    request.set_generation(key.generation().get());
+                    request.set_target_capacity_bytes(target.bytes());
+                }
+                let response = call.send().promise.await?;
+                read_replica_capacity_status(response.get()?.get_status()?)
+            })
+        })
+        .await
+        .context("inspect remote replica capacity")
     }
 
     /// Ensures one inactive replacement file directly or over authenticated storage RPC.
@@ -603,7 +666,43 @@ fn write_status(mut builder: local_replica_status::Builder<'_>, status: &LocalRe
             .init_voter_node_ids(status.voter_node_ids.len() as u32),
         &status.voter_node_ids,
     );
-    builder.set_reserved_bytes(status.reserved_bytes);
+    builder.set_reserved_capacity_bytes(status.reserved_capacity_bytes);
+    builder.set_prepared_capacity_bytes(status.prepared_capacity_bytes);
+    builder.set_served_capacity_bytes(status.served_capacity_bytes);
+}
+
+/// Writes concrete local capacity facts into one bounded response.
+fn write_replica_capacity_status(
+    mut builder: replica_capacity_status::Builder<'_>,
+    status: &ReplicaCapacityStatus,
+) {
+    builder.set_reserved_capacity_bytes(status.reserved_capacity_bytes);
+    builder.set_prepared_capacity_bytes(status.prepared_capacity_bytes);
+    builder.set_served_capacity_bytes(status.served_capacity_bytes);
+    builder.set_healthy(status.healthy);
+    builder.set_reason(&status.reason);
+}
+
+/// Reads local capacity facts and rejects internally inconsistent healthy replies.
+fn read_replica_capacity_status(
+    reader: replica_capacity_status::Reader<'_>,
+) -> Result<ReplicaCapacityStatus, capnp::Error> {
+    let status = ReplicaCapacityStatus {
+        reserved_capacity_bytes: reader.get_reserved_capacity_bytes(),
+        prepared_capacity_bytes: reader.get_prepared_capacity_bytes(),
+        served_capacity_bytes: reader.get_served_capacity_bytes(),
+        healthy: reader.get_healthy(),
+        reason: reader.get_reason()?.to_str()?.to_owned(),
+    };
+    if status.healthy
+        && (status.served_capacity_bytes > status.prepared_capacity_bytes
+            || status.prepared_capacity_bytes > status.reserved_capacity_bytes)
+    {
+        return Err(capnp_error(
+            "healthy replica capacity response contains inconsistent bounds",
+        ));
+    }
+    Ok(status)
 }
 
 /// Writes one live filesystem-space measurement from its writer node.
@@ -671,7 +770,11 @@ fn read_status(
             .then(|| reader.get_applied_log_index()),
         leader_node_id: leader,
         voter_node_ids: read_node_ids(reader.get_voter_node_ids()?, maximum_nodes)?,
-        reserved_bytes: reader.get_reserved_bytes(),
+        reserved_capacity_bytes: reader.get_reserved_capacity_bytes(),
+        prepared_capacity_bytes: reader.get_prepared_capacity_bytes(),
+        served_capacity_bytes: reader.get_served_capacity_bytes(),
+        device_capacity_bytes: None,
+        filesystem_expansion_pending: false,
     })
 }
 
@@ -777,5 +880,40 @@ mod tests {
             read_filesystem_space(reader, Uuid::from_u128(2)).is_err(),
             "a response from another writer must not be shown"
         );
+    }
+
+    /// Healthy capacity replies must preserve served <= prepared <= reserved.
+    #[test]
+    fn capacity_reader_rejects_inconsistent_healthy_bounds() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut status = message.init_root::<replica_capacity_status::Builder<'_>>();
+            status.set_reserved_capacity_bytes(128 << 20);
+            status.set_prepared_capacity_bytes(96 << 20);
+            status.set_served_capacity_bytes(64 << 20);
+            status.set_healthy(true);
+        }
+        let reader = message
+            .get_root_as_reader::<replica_capacity_status::Reader<'_>>()
+            .expect("read consistent capacity status");
+        assert!(read_replica_capacity_status(reader).is_ok());
+
+        for (reserved, prepared, served) in [
+            (64 << 20, 96 << 20, 64 << 20),
+            (128 << 20, 64 << 20, 96 << 20),
+        ] {
+            let mut message = capnp::message::Builder::new_default();
+            {
+                let mut status = message.init_root::<replica_capacity_status::Builder<'_>>();
+                status.set_reserved_capacity_bytes(reserved);
+                status.set_prepared_capacity_bytes(prepared);
+                status.set_served_capacity_bytes(served);
+                status.set_healthy(true);
+            }
+            let reader = message
+                .get_root_as_reader::<replica_capacity_status::Reader<'_>>()
+                .expect("read inconsistent capacity status");
+            assert!(read_replica_capacity_status(reader).is_err());
+        }
     }
 }

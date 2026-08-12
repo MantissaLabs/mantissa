@@ -132,7 +132,7 @@ impl VolumeControlState {
         Ok(state)
     }
 
-    /// Returns the immutable descriptor after initialization.
+    /// Returns the current descriptor after initialization.
     #[must_use]
     pub const fn descriptor(&self) -> Option<&VolumeDescriptor> {
         self.descriptor.as_ref()
@@ -230,6 +230,7 @@ impl VolumeControlState {
     pub fn evaluate(&self, command: &VolumeCommand) -> CommandPlan {
         match command {
             VolumeCommand::Initialize(command) => self.initialize(command),
+            VolumeCommand::Expand(command) => self.expand(*command),
             VolumeCommand::SetDisposition(command) => self.set_disposition(*command),
             VolumeCommand::GrantWriter(command) => self.grant_writer(*command),
             VolumeCommand::FenceWriter(command) => self.fence_writer(*command),
@@ -264,6 +265,46 @@ impl VolumeControlState {
             }),
             replacement: None,
         };
+        CommandPlan::applied(next)
+    }
+
+    /// Commits a larger capacity after callers prepare every active copy.
+    fn expand(&self, command: ExpandVolume) -> CommandPlan {
+        if self.expected_generation_is_current(command.expected)
+            && self
+                .descriptor
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.capacity() == command.target_capacity)
+        {
+            return self.current();
+        }
+        if let Some(plan) = self.check_expected(command.expected) {
+            return plan;
+        }
+        if self.disposition != VolumeDisposition::Live {
+            return self.rejected(VolumeCommandRejection::VolumeNotLive);
+        }
+        if self.replacement.is_some() {
+            return self.rejected(VolumeCommandRejection::ReplacementInProgress);
+        }
+        if self.data_ref().recovery.is_some() {
+            return self.rejected(VolumeCommandRejection::RecoveryInProgress);
+        }
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return self.rejected(VolumeCommandRejection::NotInitialized);
+        };
+        if command.target_capacity < descriptor.capacity() {
+            return self.rejected(VolumeCommandRejection::CapacityCannotShrink);
+        }
+        let Ok(descriptor) = descriptor.with_capacity(command.target_capacity) else {
+            return self.rejected(VolumeCommandRejection::CapacityNotAligned);
+        };
+        let Some(revision) = self.revision.checked_add(1) else {
+            return self.rejected(VolumeCommandRejection::RevisionExhausted);
+        };
+        let mut next = self.clone();
+        next.revision = revision;
+        next.descriptor = Some(descriptor);
         CommandPlan::applied(next)
     }
 
@@ -703,11 +744,21 @@ pub struct ExpectedVolumeRevision {
 /// Initializes one pristine group with exactly three active copies.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitializeVolume {
-    /// Immutable descriptor shared by every replica and request.
+    /// Initial descriptor shared by every replica and request.
     pub descriptor: VolumeDescriptor,
 
     /// Exact three-node set used for common bootstrap.
     pub initial_copies: BTreeSet<VolumeNodeId>,
+}
+
+/// Commits one larger capacity after every active copy is prepared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpandVolume {
+    /// Expected volume revision used to validate the active copy set.
+    pub expected: ExpectedVolumeRevision,
+
+    /// Larger address space every active copy can already serve.
+    pub target_capacity: crate::VolumeCapacity,
 }
 
 /// Changes whether the generation is live or retained.
@@ -808,6 +859,9 @@ pub enum VolumeCommand {
     /// Initializes a pristine group.
     Initialize(InitializeVolume),
 
+    /// Commits one larger address space without changing the data fence.
+    Expand(ExpandVolume),
+
     /// Changes the generation disposition.
     SetDisposition(SetVolumeDisposition),
 
@@ -894,6 +948,12 @@ pub enum VolumeCommandRejection {
 
     /// No larger data-plane fence can be represented.
     FenceExhausted,
+
+    /// A committed volume capacity can never decrease.
+    CapacityCannotShrink,
+
+    /// The requested capacity is not aligned to the volume block sizes.
+    CapacityNotAligned,
 }
 
 /// Deterministic result of evaluating one committed control state command.

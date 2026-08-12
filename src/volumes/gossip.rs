@@ -64,6 +64,9 @@ impl VolumeReplicator {
                 self.registry.upsert_group_status(*value).await?
             }
             VolumeEvent::GroupStatusRemove(id) => self.registry.remove_group_status(id).await?,
+            VolumeEvent::CapacityRequestUpsert(value) => {
+                self.registry.upsert_capacity_request(*value).await?
+            }
         }
         Ok(())
     }

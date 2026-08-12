@@ -155,7 +155,9 @@ pub(super) fn decode_header_slot(
         ));
     }
     let descriptor = read_descriptor(root.get_descriptor()?)?;
-    if &descriptor != expected_descriptor {
+    if !descriptor.has_same_storage_identity(expected_descriptor)
+        || descriptor.capacity() > expected_descriptor.capacity()
+    {
         return Err(ReplicaFileError::WrongDescriptor);
     }
     let data_fence =
@@ -404,7 +406,7 @@ fn changed_regions_digest(
     *hasher.finalize().as_bytes()
 }
 
-/// Adds every immutable descriptor field to a stable digest.
+/// Adds every descriptor field to a stable digest.
 fn update_descriptor(hasher: &mut blake3::Hasher, descriptor: &VolumeDescriptor) {
     hasher.update(descriptor.volume_id().as_bytes());
     hasher.update(&descriptor.generation().get().to_le_bytes());

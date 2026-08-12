@@ -44,11 +44,51 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         "  Bound node: {}",
         volume.spec.bound_node_name.as_deref().unwrap_or("-")
     )?;
-    writeln!(
-        &mut rendered,
-        "  Requested capacity: {}",
-        format_bytes(volume.spec.requested_bytes)
-    )?;
+    if matches!(
+        volume.spec.driver,
+        mantissa_client::volumes::VolumeDriver::Replicated
+    ) {
+        writeln!(&mut rendered, "  Capacity:")?;
+        writeln!(
+            &mut rendered,
+            "    Initial: {}",
+            format_bytes(volume.spec.initial_capacity_bytes)
+        )?;
+        writeln!(
+            &mut rendered,
+            "    Desired: {}",
+            format_bytes(volume.desired_capacity_bytes)
+        )?;
+        writeln!(
+            &mut rendered,
+            "    Replicated: {}",
+            format_bytes(
+                volume
+                    .group_status
+                    .as_ref()
+                    .map(|status| status.replicated_capacity_bytes)
+            )
+        )?;
+        let writer_device = volume
+            .node_states
+            .iter()
+            .find_map(|state| state.device_capacity_bytes.map(|bytes| (state, bytes)));
+        match writer_device {
+            Some((state, bytes)) => writeln!(
+                &mut rendered,
+                "    Device: {} on {}",
+                format_bytes(Some(bytes)),
+                state.node_name
+            )?,
+            None => writeln!(&mut rendered, "    Device: -")?,
+        }
+    } else {
+        writeln!(
+            &mut rendered,
+            "  Capacity: {}",
+            format_bytes(volume.spec.initial_capacity_bytes)
+        )?;
+    }
     if let Some(space) = volume.filesystem_space {
         writeln!(&mut rendered, "  Filesystem:")?;
         writeln!(&mut rendered, "    Writer node: {}", space.writer_node_id)?;
@@ -71,7 +111,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         volume.spec.driver,
         mantissa_client::volumes::VolumeDriver::Replicated
     ) {
-        writeln!(&mut rendered, "  Filesystem capacity: unavailable")?;
+        writeln!(&mut rendered, "  Filesystem: -")?;
     }
     writeln!(&mut rendered, "  Created: {}", volume.spec.created_at)?;
     writeln!(&mut rendered, "  Updated: {}", volume.spec.updated_at)?;

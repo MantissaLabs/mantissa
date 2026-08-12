@@ -30,7 +30,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             volume.binding_mode,
             volume.bound_node_name.unwrap_or_else(|| "-".to_string()),
             volume.state,
-            format_bytes(volume.requested_bytes),
+            format_bytes(volume.initial_capacity_bytes),
             if volume.in_use { "yes" } else { "no" },
             volume.reclaim_policy,
             volume.reason.unwrap_or_else(|| "-".to_string()),

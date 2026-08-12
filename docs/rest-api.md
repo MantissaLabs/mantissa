@@ -467,7 +467,7 @@ Create a managed local volume:
 ```bash
 curl -sS "${AUTH[@]}" \
   -H "Content-Type: application/json" \
-  -d '{"name":"demo-data","requested_bytes":1073741824}' \
+  -d '{"name":"demo-data","initial_capacity_bytes":1073741824}' \
   "$REST/v1/volumes"
 ```
 
@@ -476,14 +476,22 @@ Create, retain, restore, or permanently remove a replicated volume:
 ```bash
 curl -sS "${AUTH[@]}" \
   -H "Content-Type: application/json" \
-  -d '{"name":"demo-replicated","driver":"replicated","requested_bytes":1073741824}' \
+  -d '{"name":"demo-replicated","driver":"replicated","initial_capacity_bytes":1073741824}' \
   "$REST/v1/volumes"
 curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/volumes/demo-replicated"
 curl -sS -X POST "${AUTH[@]}" \
   "$REST/v1/volumes/demo-replicated/restore"
+curl -sS -X POST "${AUTH[@]}" \
+  -H "Content-Type: application/json" \
+  -d '{"capacity_bytes":2147483648}' \
+  "$REST/v1/volumes/demo-replicated/expand"
 curl -sS -X DELETE "${AUTH[@]}" \
   "$REST/v1/volumes/demo-replicated?delete_data=true"
 ```
+
+Expansion is asynchronous and expand-only. `capacity_bytes` is the desired total
+size, not bytes to add. Inspect the volume to follow desired, replicated,
+device, and filesystem capacity as reconciliation completes.
 
 Create a secret:
 

@@ -22,7 +22,7 @@ pub struct VolumeCreateRequest {
     pub ownership: FilesystemOwnership,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: super::VolumeReclaimPolicy,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub labels: Vec<VolumeLabel>,
     pub node_selector: Option<String>,
 }
@@ -47,14 +47,16 @@ impl VolumeCreateRequest {
             VolumeCreateDriver::Replicated if self.node_selector.is_some() => Err(anyhow!(
                 "replicated volumes choose their nodes when the first workload is placed"
             )),
-            VolumeCreateDriver::Replicated if self.requested_bytes.is_none() => {
+            VolumeCreateDriver::Replicated if self.initial_capacity_bytes.is_none() => {
                 Err(anyhow!("replicated volumes require a capacity"))
             }
-            VolumeCreateDriver::Replicated if self.requested_bytes == Some(0) => Err(anyhow!(
-                "replicated volume capacity must be greater than zero"
-            )),
+            VolumeCreateDriver::Replicated if self.initial_capacity_bytes == Some(0) => Err(
+                anyhow!("replicated volume capacity must be greater than zero"),
+            ),
             VolumeCreateDriver::Replicated
-                if self.requested_bytes.is_some_and(|bytes| bytes % 4096 != 0) =>
+                if self
+                    .initial_capacity_bytes
+                    .is_some_and(|bytes| bytes % 4096 != 0) =>
             {
                 Err(anyhow!(
                     "replicated volume capacity must be a multiple of 4096 bytes"
@@ -132,7 +134,7 @@ pub async fn create_with_request(
                 mantissa_protocol::volumes::VolumeReclaimPolicy::Delete
             }
         });
-        inner.set_requested_bytes(request.requested_bytes.unwrap_or(0));
+        inner.set_initial_capacity_bytes(request.initial_capacity_bytes.unwrap_or(0));
         let mut labels = inner.reborrow().init_labels(request.labels.len() as u32);
         for (idx, label) in request.labels.iter().enumerate() {
             let mut entry = labels.reborrow().get(idx as u32);
@@ -167,7 +169,7 @@ mod tests {
             ownership: FilesystemOwnership::Daemon,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: super::super::VolumeReclaimPolicy::Retain,
-            requested_bytes: Some(64 * 1024 * 1024),
+            initial_capacity_bytes: Some(64 * 1024 * 1024),
             labels: Vec::new(),
             node_selector: None,
         }
@@ -180,7 +182,7 @@ mod tests {
         assert!(valid.validate().is_ok());
 
         let mut missing_capacity = valid.clone();
-        missing_capacity.requested_bytes = None;
+        missing_capacity.initial_capacity_bytes = None;
         assert!(
             missing_capacity
                 .validate()
@@ -204,7 +206,7 @@ mod tests {
     #[test]
     fn replicated_create_rejects_unaligned_capacity_and_fixed_node() {
         let mut unaligned = replicated_request();
-        unaligned.requested_bytes = Some(64 * 1024 * 1024 + 1);
+        unaligned.initial_capacity_bytes = Some(64 * 1024 * 1024 + 1);
         assert!(
             unaligned
                 .validate()

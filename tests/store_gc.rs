@@ -377,7 +377,7 @@ fn volume_spec_value(name: &str, version: u64) -> VolumeSpecValue {
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::Immediate,
         reclaim_policy: VolumeReclaimPolicy::Retain,
-        requested_bytes: Some(version * 1024),
+        initial_capacity_bytes: Some(version * 1024),
         labels: Vec::new(),
         bound_node_id: Some(Uuid::from_u128(11_000 + u128::from(version))),
         bound_node_name: Some(format!("node-{version}")),

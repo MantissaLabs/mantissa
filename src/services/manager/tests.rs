@@ -14,8 +14,8 @@ use crate::store::replicated::networks::{
     open_network_attachment_store, open_network_peer_store, open_network_spec_store,
 };
 use crate::store::replicated::volumes::{
-    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
-    open_volume_node_store, open_volume_spec_store,
+    open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
+    open_replicated_volume_plan_store, open_volume_node_store, open_volume_spec_store,
 };
 use crate::volumes::types::{
     FilesystemOwnership, LocalVolumeSpec, ReplicatedVolumeSpec, VolumeAccessMode,
@@ -187,14 +187,26 @@ async fn make_test_volume_registry() -> TestVolumeRegistry {
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume plan store");
-    let status_store = open_replicated_volume_group_status_store(db, actor)
+    let status_store = open_replicated_volume_group_status_store(db.clone(), actor)
         .expect("open volume group status store");
     status_store
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume group status store");
+    let capacity_store = open_replicated_volume_capacity_request_store(db, actor)
+        .expect("open volume capacity store");
+    capacity_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume capacity store");
     TestVolumeRegistry {
-        registry: VolumeRegistry::new(spec_store, node_store, plan_store, status_store),
+        registry: VolumeRegistry::new(
+            spec_store,
+            node_store,
+            plan_store,
+            status_store,
+            capacity_store,
+        ),
         _dir: dir,
     }
 }
@@ -368,7 +380,7 @@ fn make_local_volume_spec(name: &str, bound_node_id: Option<Uuid>) -> VolumeSpec
             VolumeBindingMode::WaitForFirstConsumer
         },
         reclaim_policy: VolumeReclaimPolicy::Retain,
-        requested_bytes: None,
+        initial_capacity_bytes: None,
         labels: Vec::new(),
         bound_node_id,
         bound_node_name: bound_node_id.map(|_| "node-a".to_string()),
@@ -385,7 +397,7 @@ fn make_replicated_volume_spec(name: &str, bound_node_id: Uuid) -> VolumeSpecVal
         access_mode: VolumeAccessMode::ReadWriteOnce,
         binding_mode: VolumeBindingMode::WaitForFirstConsumer,
         reclaim_policy: VolumeReclaimPolicy::Retain,
-        requested_bytes: Some(64 * 1_024 * 1_024),
+        initial_capacity_bytes: Some(64 * 1_024 * 1_024),
         labels: Vec::new(),
         bound_node_id: Some(bound_node_id),
         bound_node_name: Some("node-a".to_string()),

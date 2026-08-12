@@ -2,7 +2,7 @@ use crate::config::ClientConfig;
 use crate::config::NetworkIpFamily;
 use crate::networks;
 use crate::volumes;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
@@ -593,14 +593,16 @@ pub async fn ensure_declared_volumes(
             DeclaredVolumeDriverKind::Replicated => {}
         }
 
-        let requested_bytes = volume
+        let initial_capacity_bytes = volume
             .capacity_mb
             .map(volumes::capacity_mb_to_bytes)
             .transpose()?;
         let spec = if existing_names.contains(&volume.name) {
-            let existing = volumes::inspect(cfg, &volume.name).await?.spec;
-            validate_declared_volume_compatibility(&existing, volume, requested_bytes)?;
-            existing
+            let existing = volumes::inspect(cfg, &volume.name).await?;
+            validate_declared_volume_compatibility(&existing.spec, volume, initial_capacity_bytes)?;
+            reconcile_declared_replicated_capacity(cfg, &existing, volume, initial_capacity_bytes)
+                .await?;
+            existing.spec
         } else {
             let request = volumes::VolumeCreateRequest {
                 name: volume.name.clone(),
@@ -615,7 +617,7 @@ pub async fn ensure_declared_volumes(
                 ownership: volume.filesystem_ownership.clone().unwrap_or_default(),
                 binding_mode: volume.binding_mode,
                 reclaim_policy: volume.reclaim_policy,
-                requested_bytes,
+                initial_capacity_bytes,
                 labels: volume
                     .labels
                     .iter()
@@ -633,8 +635,15 @@ pub async fn ensure_declared_volumes(
                         validate_declared_volume_compatibility(
                             &existing.spec,
                             volume,
-                            requested_bytes,
+                            initial_capacity_bytes,
                         )?;
+                        reconcile_declared_replicated_capacity(
+                            cfg,
+                            &existing,
+                            volume,
+                            initial_capacity_bytes,
+                        )
+                        .await?;
                         existing.spec
                     }
                     Err(_) => return Err(create_error),
@@ -658,7 +667,7 @@ pub async fn ensure_declared_volumes(
 fn validate_declared_volume_compatibility(
     existing: &volumes::VolumeSpec,
     declared: &DeclaredVolumeSpec,
-    requested_bytes: Option<u64>,
+    initial_capacity_bytes: Option<u64>,
 ) -> Result<()> {
     match (&existing.driver, declared.driver_kind) {
         (volumes::VolumeDriver::LocalManaged, DeclaredVolumeDriverKind::LocalManaged) => {}
@@ -702,7 +711,9 @@ fn validate_declared_volume_compatibility(
             declared.name
         ));
     }
-    if existing.requested_bytes != requested_bytes {
+    if !matches!(existing.driver, volumes::VolumeDriver::Replicated)
+        && existing.initial_capacity_bytes != initial_capacity_bytes
+    {
         return Err(anyhow!(
             "existing volume '{}' does not match the manifest capacity_mb",
             declared.name
@@ -728,6 +739,39 @@ fn validate_declared_volume_compatibility(
         ));
     }
 
+    Ok(())
+}
+
+/// Reuses the public expansion API for a changed replicated manifest capacity.
+async fn reconcile_declared_replicated_capacity(
+    cfg: &ClientConfig,
+    existing: &volumes::VolumeInspect,
+    declared: &DeclaredVolumeSpec,
+    target_capacity_bytes: Option<u64>,
+) -> Result<()> {
+    if !matches!(existing.spec.driver, volumes::VolumeDriver::Replicated) {
+        return Ok(());
+    }
+    let target = target_capacity_bytes.context("replicated manifest volume has no capacity_mb")?;
+    let initial = existing
+        .spec
+        .initial_capacity_bytes
+        .context("existing replicated volume has no initial capacity")?;
+    let replicated = existing.group_status.as_ref().map_or(initial, |status| {
+        status.replicated_capacity_bytes.max(initial)
+    });
+    if target < replicated {
+        return Err(anyhow!(
+            "existing volume '{}' has replicated capacity {} bytes and cannot shrink to {} bytes",
+            declared.name,
+            replicated,
+            target
+        ));
+    }
+    let desired = existing.desired_capacity_bytes.unwrap_or(replicated);
+    if target != desired {
+        volumes::expand(cfg, &declared.name, target).await?;
+    }
     Ok(())
 }
 
@@ -758,7 +802,7 @@ mod volume_tests {
             access_mode: declared.access_mode,
             binding_mode: declared.binding_mode,
             reclaim_policy: declared.reclaim_policy,
-            requested_bytes: Some(64 * 1024 * 1024),
+            initial_capacity_bytes: Some(64 * 1024 * 1024),
             labels: vec![volumes::VolumeLabel {
                 key: "purpose".to_string(),
                 value: "database".to_string(),
@@ -776,9 +820,9 @@ mod volume_tests {
         (declared, spec)
     }
 
-    /// Checks exact manifest reuse and rejects changed capacity or policy.
+    /// Replicated manifests may request expansion but cannot rewrite lifecycle policy.
     #[test]
-    fn replicated_manifest_reuse_requires_the_same_request() {
+    fn replicated_manifest_reuse_accepts_capacity_change_only() {
         let (declared, spec) = matching_replicated_volume();
         assert!(
             validate_declared_volume_compatibility(&spec, &declared, Some(64 * 1024 * 1024))
@@ -793,9 +837,7 @@ mod volume_tests {
                 &changed_capacity,
                 Some(128 * 1024 * 1024)
             )
-            .expect_err("changed capacity")
-            .to_string()
-            .contains("capacity_mb")
+            .is_ok()
         );
 
         let mut changed_policy = declared;

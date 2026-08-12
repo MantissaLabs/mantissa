@@ -215,6 +215,7 @@ impl ReservedSpace {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SavedUblkDevice {
     id: UblkDeviceId,
+    capacity: crate::VolumeCapacity,
     fence: FenceEpoch,
     session_id: DriverSessionId,
     queue_count: u16,
@@ -233,6 +234,7 @@ impl SavedUblkDevice {
     ) -> Self {
         Self {
             id,
+            capacity: crate::VolumeCapacity::from_validated(settings.capacity_bytes()),
             fence,
             session_id,
             queue_count: settings.queue_count(),
@@ -244,6 +246,7 @@ impl SavedUblkDevice {
     /// Rebuilds one record read from Cap'n Proto before settings are checked.
     pub(super) const fn from_stored_parts(
         id: UblkDeviceId,
+        capacity: crate::VolumeCapacity,
         fence: FenceEpoch,
         session_id: DriverSessionId,
         queue_count: u16,
@@ -252,6 +255,7 @@ impl SavedUblkDevice {
     ) -> Self {
         Self {
             id,
+            capacity,
             fence,
             session_id,
             queue_count,
@@ -264,6 +268,12 @@ impl SavedUblkDevice {
     #[must_use]
     pub const fn id(self) -> UblkDeviceId {
         self.id
+    }
+
+    /// Returns the logical capacity fixed when this ublk device started.
+    #[must_use]
+    pub const fn capacity(self) -> crate::VolumeCapacity {
+        self.capacity
     }
 
     /// Returns the committed attachment number served by the device.
@@ -293,8 +303,11 @@ impl SavedUblkDevice {
             .checked_mul(u64::from(self.queue_depth))
             .and_then(|value| value.checked_mul(u64::from(self.max_request_bytes)))
             .ok_or(InvalidUblkSettings::QueueMemoryOverflow)?;
+        let device_descriptor = descriptor
+            .with_capacity(self.capacity)
+            .map_err(|_| InvalidUblkSettings::InvalidCapacity)?;
         UblkSettings::new(
-            descriptor,
+            &device_descriptor,
             UblkQueueSettings {
                 queue_count: self.queue_count,
                 queue_depth: self.queue_depth,
@@ -343,6 +356,7 @@ pub struct SavedVolumeMount {
     owner_uid: u32,
     owner_gid: u32,
     mode: u32,
+    filesystem_expanded_to_bytes: u64,
 }
 
 impl SavedVolumeMount {
@@ -363,10 +377,12 @@ impl SavedVolumeMount {
             owner_uid,
             owner_gid,
             mode,
+            0,
         )
     }
 
     /// Rebuilds and checks one mount read from the local catalog.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_stored_parts(
         state: SavedMountState,
         fence: FenceEpoch,
@@ -375,6 +391,7 @@ impl SavedVolumeMount {
         owner_uid: u32,
         owner_gid: u32,
         mode: u32,
+        filesystem_expanded_to_bytes: u64,
     ) -> Result<Self, InvalidSavedVolumeMount> {
         if !path.is_absolute() {
             return Err(InvalidSavedVolumeMount::PathNotAbsolute);
@@ -390,6 +407,7 @@ impl SavedVolumeMount {
             owner_uid,
             owner_gid,
             mode,
+            filesystem_expanded_to_bytes,
         })
     }
 
@@ -435,6 +453,12 @@ impl SavedVolumeMount {
         self.mode
     }
 
+    /// Returns the largest mapped capacity to which ext4 was successfully expanded.
+    #[must_use]
+    pub const fn filesystem_expanded_to_bytes(&self) -> u64 {
+        self.filesystem_expanded_to_bytes
+    }
+
     /// Returns the same mounted filesystem owned by a later session fence.
     pub(super) fn with_fence(&self, fence: FenceEpoch) -> Self {
         let mut changed = self.clone();
@@ -460,6 +484,33 @@ impl SavedVolumeMount {
         changed.state = state;
         Ok(changed)
     }
+
+    /// Returns the same mount with a monotonic filesystem-expansion receipt.
+    pub fn with_filesystem_expanded_to(
+        &self,
+        capacity_bytes: u64,
+    ) -> Result<Self, InvalidSavedVolumeMount> {
+        if capacity_bytes < self.filesystem_expanded_to_bytes {
+            return Err(InvalidSavedVolumeMount::FilesystemCapacityMovedBackwards);
+        }
+        let mut changed = self.clone();
+        changed.filesystem_expanded_to_bytes = capacity_bytes;
+        Ok(changed)
+    }
+
+    /// Checks that a replacement changes only monotonic mount progress.
+    pub(super) fn can_advance_to(&self, next: &Self) -> bool {
+        self.fence == next.fence
+            && self.session_id == next.session_id
+            && self.path == next.path
+            && self.owner_uid == next.owner_uid
+            && self.owner_gid == next.owner_gid
+            && self.mode == next.mode
+            && self
+                .with_state(next.state)
+                .is_ok_and(|state| state.state == next.state)
+            && next.filesystem_expanded_to_bytes >= self.filesystem_expanded_to_bytes
+    }
 }
 
 /// Explains why one saved mount cannot be trusted after a restart.
@@ -479,6 +530,10 @@ pub enum InvalidSavedVolumeMount {
     /// Completed mount steps must not move back to earlier work.
     #[error("saved volume mount state cannot move backwards")]
     StateMovedBackwards,
+
+    /// A successful filesystem expansion receipt is monotonic.
+    #[error("saved filesystem expansion capacity cannot move backwards")]
+    FilesystemCapacityMovedBackwards,
 }
 
 /// One unfinished ext4 format saved across a daemon restart.
@@ -548,7 +603,7 @@ impl ReplicaRecord {
         ReplicaKey::from(&self.descriptor)
     }
 
-    /// Returns the fixed volume descriptor.
+    /// Returns the latest Raft descriptor applied to this local copy.
     #[must_use]
     pub const fn descriptor(&self) -> &VolumeDescriptor {
         &self.descriptor
@@ -600,6 +655,21 @@ impl ReplicaRecord {
         self.health = health;
     }
 
+    /// Records the replacement grant that now owns this excluded local file slot.
+    pub(super) fn set_origin(&mut self, origin: LocalReplicaOrigin) {
+        self.origin = origin;
+    }
+
+    /// Records a capacity already committed by Raft for this generation.
+    pub(super) fn set_descriptor(&mut self, descriptor: VolumeDescriptor) {
+        self.descriptor = descriptor;
+    }
+
+    /// Records the complete pool space currently held for this copy.
+    pub(super) fn set_reserved_space(&mut self, reserved: ReservedSpace) {
+        self.reserved = reserved;
+    }
+
     /// Saves one unfinished ext4 format before tool writes begin.
     pub(super) fn set_filesystem_format(&mut self, format: SavedFilesystemFormat) {
         self.filesystem_format = Some(format);
@@ -622,7 +692,7 @@ pub struct LocalAttachmentRecord {
     descriptor: VolumeDescriptor,
     session_id: DriverSessionId,
     granted_fence: Option<FenceEpoch>,
-    ublk_device: Option<SavedUblkDevice>,
+    ublk_devices: Vec<SavedUblkDevice>,
     volume_mount: Option<SavedVolumeMount>,
     detaching: bool,
 }
@@ -634,7 +704,7 @@ impl LocalAttachmentRecord {
             descriptor,
             session_id,
             granted_fence: None,
-            ublk_device: None,
+            ublk_devices: Vec::new(),
             volume_mount: None,
             detaching: false,
         }
@@ -645,7 +715,7 @@ impl LocalAttachmentRecord {
         ReplicaKey::from(&self.descriptor)
     }
 
-    /// Returns the immutable descriptor served by this attachment.
+    /// Returns the descriptor exposed by the active mapped frontend.
     pub const fn descriptor(&self) -> &VolumeDescriptor {
         &self.descriptor
     }
@@ -660,9 +730,9 @@ impl LocalAttachmentRecord {
         self.granted_fence
     }
 
-    /// Returns the saved ublk device, when kernel creation completed.
-    pub const fn ublk_device(&self) -> Option<SavedUblkDevice> {
-        self.ublk_device
+    /// Returns every saved ublk device still owned by this attachment.
+    pub fn ublk_devices(&self) -> &[SavedUblkDevice] {
+        &self.ublk_devices
     }
 
     /// Returns the saved mount operation and path, when present.
@@ -680,14 +750,45 @@ impl LocalAttachmentRecord {
         self.granted_fence = Some(fence);
     }
 
-    /// Saves the exact running kernel device.
-    pub(super) fn set_ublk_device(&mut self, device: SavedUblkDevice) {
-        self.ublk_device = Some(device);
+    /// Records the descriptor proven active in the mapped frontend.
+    pub(super) fn set_descriptor(&mut self, descriptor: VolumeDescriptor) {
+        self.descriptor = descriptor;
     }
 
-    /// Clears the device only after its owner reaches terminal cleanup.
-    pub(super) fn clear_ublk_device(&mut self) {
-        self.ublk_device = None;
+    /// Adds one checked device while preserving deterministic device order.
+    pub(super) fn add_ublk_device(&mut self, device: SavedUblkDevice) {
+        if !self.ublk_devices.contains(&device) {
+            self.ublk_devices.push(device);
+            self.ublk_devices.sort_by_key(|saved| saved.id());
+        }
+    }
+
+    /// Replaces one exact device after its old kernel identity disappeared.
+    pub(super) fn replace_ublk_device(
+        &mut self,
+        expected: SavedUblkDevice,
+        device: SavedUblkDevice,
+    ) {
+        if let Some(saved) = self
+            .ublk_devices
+            .iter_mut()
+            .find(|saved| **saved == expected)
+        {
+            *saved = device;
+            self.ublk_devices.sort_by_key(|saved| saved.id());
+        }
+    }
+
+    /// Removes one exact device only after its owner reaches terminal cleanup.
+    pub(super) fn remove_ublk_device(&mut self, expected: SavedUblkDevice) {
+        self.ublk_devices.retain(|saved| *saved != expected);
+    }
+
+    /// Advances every owned device to the same committed writer fence.
+    pub(super) fn set_ublk_device_fence(&mut self, fence: FenceEpoch) {
+        for device in &mut self.ublk_devices {
+            *device = device.with_fence(fence);
+        }
     }
 
     /// Saves one restart-safe mount transition.

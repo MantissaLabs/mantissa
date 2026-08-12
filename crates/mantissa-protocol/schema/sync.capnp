@@ -81,6 +81,9 @@ enum Domain {
 
   volumeGroupStatuses @17;
   # Latest reports copied from replicated-volume Raft groups.
+
+  volumeCapacityRequests @18;
+  # Latest desired capacity for replicated volume generations.
 }
 
 struct PageRange {

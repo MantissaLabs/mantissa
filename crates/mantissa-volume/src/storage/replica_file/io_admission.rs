@@ -117,7 +117,10 @@ impl AppliedVolumeStateCell {
         }
         if applied_state.revision < current.revision
             || applied_state.data.fence < current.data.fence
-            || applied_state.descriptor != current.descriptor
+            || !applied_state
+                .descriptor
+                .has_same_storage_identity(&current.descriptor)
+            || applied_state.descriptor.capacity() < current.descriptor.capacity()
         {
             return Err(AppliedVolumeStatePublicationError::ControlStateRegressed);
         }
@@ -505,7 +508,11 @@ fn validate_request(
     local_node: VolumeNodeId,
     request: &IoAdmissionRequest<'_>,
 ) -> Result<(), IoAdmissionError> {
-    if &applied_state.descriptor != request.descriptor {
+    if !applied_state
+        .descriptor
+        .has_same_storage_identity(request.descriptor)
+        || request.descriptor.capacity() > applied_state.descriptor.capacity()
+    {
         return Err(IoAdmissionError::WrongDescriptor);
     }
     if applied_state.disposition != VolumeDisposition::Live {
@@ -594,7 +601,7 @@ pub enum AppliedVolumeStatePublicationError {
         index: u64,
     },
 
-    /// Revision, fence, or immutable descriptor regressed at a newer index.
+    /// Revision, fence, storage identity, or capacity regressed at a newer index.
     #[error("newer applied entry regresses volume control state")]
     ControlStateRegressed,
 }

@@ -469,7 +469,7 @@ impl FixedReplicaCopy {
     #[must_use]
     pub fn local(file: Arc<ReplicaFile>) -> Self {
         Self {
-            descriptor: file.descriptor().clone(),
+            descriptor: file.descriptor(),
             progress: ReplicaDataProgress::from_file(file.progress()),
             kind: FixedReplicaCopyKind::Local(file),
         }

@@ -2320,7 +2320,7 @@ pub(crate) async fn import_local_volume_for_service(
             path.to_str()
                 .expect("imported volume path should be valid utf8"),
         );
-        inner.set_requested_bytes(0);
+        inner.set_initial_capacity_bytes(0);
     }
 
     let response = request.send().promise.await.expect("import volume send");

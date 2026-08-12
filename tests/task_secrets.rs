@@ -37,8 +37,8 @@ use mantissa::store::replicated::secret_key_sync::{
 use mantissa::store::replicated::secrets::open_secret_store;
 use mantissa::store::replicated::services::open_service_store;
 use mantissa::store::replicated::volumes::{
-    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
-    open_volume_node_store, open_volume_spec_store,
+    open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
+    open_replicated_volume_plan_store, open_volume_node_store, open_volume_spec_store,
 };
 use mantissa::store::replicated::workloads::open_workload_store;
 use mantissa::task::types::{TaskEnvironmentVariable, TaskSecretFile, TaskSecretReference};
@@ -376,11 +376,18 @@ async fn setup_workload_manager() -> TestHarness {
         .rebuild_mst_from_disk()
         .await
         .expect("rebuild volume group status store");
+    let volume_capacity_store = open_replicated_volume_capacity_request_store(volume_db, actor)
+        .expect("open volume capacity store");
+    volume_capacity_store
+        .rebuild_mst_from_disk()
+        .await
+        .expect("rebuild volume capacity store");
     let volume_registry = VolumeRegistry::new(
         volume_spec_store,
         volume_node_store,
         volume_plan_store,
         volume_group_status_store,
+        volume_capacity_store,
     );
 
     let master_dir = tempdir().expect("master tempdir");

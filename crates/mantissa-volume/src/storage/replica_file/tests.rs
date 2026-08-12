@@ -38,7 +38,7 @@ use crate::control_state::{
 use crate::driver::BlockHandler;
 use crate::{
     DriverSessionId, FenceEpoch, OperationId, RecoveryId, ReplacementId, VolumeBlockSizes,
-    VolumeDescriptor, VolumeGeneration, VolumeId, VolumeNodeId,
+    VolumeCapacity, VolumeDescriptor, VolumeGeneration, VolumeId, VolumeNodeId,
 };
 
 const BLOCK_BYTES: usize = 4096;
@@ -379,6 +379,66 @@ fn data_connection_header_round_trips_admission_identity() {
     let decoded =
         decode_connection_open(&encoded, data_limits()).expect("connection identity must decode");
     assert_eq!(decoded, open);
+}
+
+/// File extension stays invisible until Raft capacity is published and survives restart.
+#[test]
+fn prepared_capacity_is_not_served_before_commit_and_reopens_at_the_larger_size() {
+    let directory = TempDir::new().expect("temporary replica directory");
+    let initial = VolumeDescriptor::new(
+        descriptor().volume_id(),
+        descriptor().generation(),
+        64 << 20,
+        VolumeBlockSizes::supported(),
+    )
+    .expect("valid initial descriptor");
+    let target_capacity = VolumeCapacity::new(128 << 20).expect("valid target capacity");
+    let target = initial
+        .with_capacity(target_capacity)
+        .expect("compatible target descriptor");
+    let file = ReplicaFile::create(directory.path(), initial.clone(), data_fence(), settings())
+        .expect("create initial replica file");
+
+    file.prepare_capacity(target_capacity)
+        .expect("durably prepare larger file");
+    drop(file);
+    let file = ReplicaFile::open(directory.path(), initial.clone(), settings())
+        .expect("reopen the prepared file before capacity commit");
+    assert_eq!(
+        file.prepared_capacity().expect("prepared capacity"),
+        target_capacity
+    );
+    assert_eq!(file.served_capacity(), initial.capacity());
+    let first_new_block = initial.capacity().bytes() / BLOCK_BYTES as u64;
+    let larger_write = ReplicaWrite::new(
+        target.clone(),
+        data_fence(),
+        1,
+        vec![ReplicaBlockChange::Zero {
+            block: first_new_block,
+        }],
+        settings(),
+    )
+    .expect("valid larger-range write");
+    assert!(matches!(
+        file.write(&larger_write),
+        Err(ReplicaFileError::WrongDescriptor)
+    ));
+
+    file.serve_capacity(target_capacity)
+        .expect("publish committed capacity");
+    file.write(&larger_write)
+        .expect("larger-range write after publication");
+    drop(file);
+
+    let reopened = ReplicaFile::open(directory.path(), target, settings())
+        .expect("reopen expanded replica from its initial header");
+    assert_eq!(reopened.served_capacity(), target_capacity);
+    let mut bytes = vec![1_u8; BLOCK_BYTES];
+    reopened
+        .read(initial.capacity().bytes(), &mut bytes)
+        .expect("read first expanded block");
+    assert_eq!(bytes, vec![0_u8; BLOCK_BYTES]);
 }
 
 /// Creates several independent sparse copies of the same test volume.

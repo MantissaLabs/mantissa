@@ -9,7 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::catalog::ReplicaKey;
-use crate::{VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId};
+use crate::{VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId, VolumeNodeId};
 
 const DEVICE_MAPPER_SECTOR_BYTES: u64 = 512;
 const MANTISSA_NAME_PREFIX: &str = "mantissa-rv-";
@@ -61,8 +61,9 @@ pub struct MappedVolumeLayout {
 }
 
 impl MappedVolumeLayout {
-    /// Derives one mapped device from an immutable descriptor and ublk backend.
+    /// Derives one mapped device from the current descriptor and ublk backend.
     pub fn new(
+        node_id: VolumeNodeId,
         descriptor: &VolumeDescriptor,
         backend_path: impl Into<PathBuf>,
     ) -> Result<Self, MappedVolumeError> {
@@ -71,7 +72,7 @@ impl MappedVolumeLayout {
             return Err(MappedVolumeError::CapacityNotSectorAligned { capacity_bytes });
         }
         Ok(Self {
-            identity: MappedVolumeIdentity::new(ReplicaKey::from(descriptor))?,
+            identity: MappedVolumeIdentity::new(node_id, ReplicaKey::from(descriptor))?,
             capacity_bytes,
             block_sizes: descriptor.block_sizes(),
             backend_path: backend_path.into(),
@@ -82,6 +83,12 @@ impl MappedVolumeLayout {
     #[must_use]
     pub const fn key(&self) -> ReplicaKey {
         self.identity.key
+    }
+
+    /// Returns the local volume node that owns this kernel mapping.
+    #[must_use]
+    pub const fn node_id(&self) -> VolumeNodeId {
+        self.identity.node_id
     }
 
     /// Returns the deterministic path after an ensure call succeeds.
@@ -136,6 +143,7 @@ impl MappedVolumePath {
 /// One kernel mapping whose exact UUID proves Mantissa ownership.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedMappedVolume {
+    node_id: VolumeNodeId,
     key: ReplicaKey,
     name: String,
     uuid: String,
@@ -144,6 +152,12 @@ pub struct OwnedMappedVolume {
 }
 
 impl OwnedMappedVolume {
+    /// Returns the local volume node encoded in the device-mapper UUID.
+    #[must_use]
+    pub const fn node_id(&self) -> VolumeNodeId {
+        self.node_id
+    }
+
     /// Returns the volume generation encoded in the device-mapper UUID.
     #[must_use]
     pub const fn key(&self) -> ReplicaKey {
@@ -258,9 +272,10 @@ pub enum MappedVolumeError {
     },
 }
 
-/// Deterministic device-mapper identity derived only from ReplicaKey.
+/// Deterministic device-mapper identity scoped to one local volume runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MappedVolumeIdentity {
+    node_id: VolumeNodeId,
     key: ReplicaKey,
     name: String,
     uuid: String,
@@ -269,15 +284,17 @@ struct MappedVolumeIdentity {
 
 impl MappedVolumeIdentity {
     /// Builds and validates the exact kernel name, UUID, and path.
-    fn new(key: ReplicaKey) -> Result<Self, MappedVolumeError> {
+    fn new(node_id: VolumeNodeId, key: ReplicaKey) -> Result<Self, MappedVolumeError> {
+        let node = node_id.as_uuid().simple();
         let volume = key.volume_id().as_uuid().simple();
         let generation = key.generation().get();
-        let name = format!("{MANTISSA_NAME_PREFIX}{volume}-g{generation}");
-        let uuid = format!("{MANTISSA_UUID_PREFIX}{volume}-G{generation}");
+        let name = format!("{MANTISSA_NAME_PREFIX}{node}-{volume}-g{generation}");
+        let uuid = format!("{MANTISSA_UUID_PREFIX}{node}-V{volume}-G{generation}");
         validate_identity_value("name", &name, DEVICE_MAPPER_NAME_MAX_BYTES)?;
         validate_identity_value("UUID", &uuid, DEVICE_MAPPER_UUID_MAX_BYTES)?;
         let path = PathBuf::from("/dev/mapper").join(&name);
         Ok(Self {
+            node_id,
             key,
             name,
             uuid,
@@ -288,13 +305,15 @@ impl MappedVolumeIdentity {
     /// Parses only the exact UUID namespace emitted by this module.
     fn from_uuid(value: &str) -> Option<Self> {
         let body = value.strip_prefix(MANTISSA_UUID_PREFIX)?;
-        let (volume, generation) = body.split_once("-G")?;
-        if volume.len() != 32 || generation.is_empty() {
+        let (node, volume_and_generation) = body.split_once("-V")?;
+        let (volume, generation) = volume_and_generation.split_once("-G")?;
+        if node.len() != 32 || volume.len() != 32 || generation.is_empty() {
             return None;
         }
+        let node_id = VolumeNodeId::new(Uuid::parse_str(node).ok()?).ok()?;
         let volume_id = VolumeId::new(Uuid::parse_str(volume).ok()?).ok()?;
         let generation = VolumeGeneration::new(generation.parse::<u64>().ok()?).ok()?;
-        let identity = Self::new(ReplicaKey::new(volume_id, generation)).ok()?;
+        let identity = Self::new(node_id, ReplicaKey::new(volume_id, generation)).ok()?;
         (identity.uuid == value).then_some(identity)
     }
 }
@@ -319,7 +338,7 @@ fn validate_identity_value(
 /// Raw target row returned by device-mapper table inspection.
 type RawTarget = (u64, u64, String, String);
 
-/// Checks one active or inactive table against the immutable volume layout.
+/// Checks one active or inactive table against the expected volume layout.
 fn validate_linear_table(
     name: &str,
     table: &[RawTarget],
@@ -358,6 +377,104 @@ fn validate_linear_table(
     Ok(())
 }
 
+/// One saved backend candidate reduced to the values stored in a linear table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SavedLinearLayout {
+    sectors: u64,
+    backend: BlockDeviceNumber,
+}
+
+/// Selects the saved backend used by the active table and checks any pending table.
+fn select_saved_linear_layout(
+    name: &str,
+    active: &[RawTarget],
+    inactive: &[RawTarget],
+    candidates: &[SavedLinearLayout],
+) -> Result<usize, MappedVolumeError> {
+    let matching = |table: &[RawTarget]| {
+        candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                validate_linear_table(name, table, candidate.sectors, candidate.backend)
+                    .is_ok()
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>()
+    };
+    let active_matches = matching(active);
+    let inactive_matches = if inactive.is_empty() {
+        Vec::new()
+    } else {
+        matching(inactive)
+    };
+    if active_matches.len() != 1 || (!inactive.is_empty() && inactive_matches.len() != 1) {
+        return Err(MappedVolumeError::WrongLayout {
+            name: name.to_string(),
+            reason: format!(
+                "saved layouts match active={} and inactive={} tables",
+                active_matches.len(),
+                inactive_matches.len()
+            ),
+        });
+    }
+    if let Some(inactive_index) = inactive_matches.first().copied()
+        && candidates[inactive_index].sectors <= candidates[active_matches[0]].sectors
+    {
+        return Err(MappedVolumeError::WrongLayout {
+            name: name.to_string(),
+            reason: "inactive saved layout is not larger than the active layout".to_string(),
+        });
+    }
+    Ok(active_matches[0])
+}
+
+/// Next safe action derived from exact active and inactive linear tables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendSwitchAction {
+    /// The larger table is already active; resume it if it is suspended.
+    Finish,
+    /// The old table is active and the larger table must be loaded.
+    LoadLarger,
+    /// The larger table is loaded and must atomically replace the old table.
+    ActivateLarger,
+}
+
+/// Classifies only the states that an interrupted backend switch may leave behind.
+fn classify_backend_switch(
+    name: &str,
+    active: &[RawTarget],
+    inactive: &[RawTarget],
+    suspended: bool,
+    current: SavedLinearLayout,
+    larger: SavedLinearLayout,
+) -> Result<BackendSwitchAction, MappedVolumeError> {
+    let active_is_current =
+        validate_linear_table(name, active, current.sectors, current.backend).is_ok();
+    let active_is_larger =
+        validate_linear_table(name, active, larger.sectors, larger.backend).is_ok();
+    let inactive_is_larger =
+        validate_linear_table(name, inactive, larger.sectors, larger.backend).is_ok();
+
+    if active_is_larger && inactive.is_empty() {
+        return Ok(BackendSwitchAction::Finish);
+    }
+    if active_is_current && inactive.is_empty() {
+        return Ok(BackendSwitchAction::LoadLarger);
+    }
+    if active_is_current && inactive_is_larger {
+        return Ok(BackendSwitchAction::ActivateLarger);
+    }
+    Err(MappedVolumeError::WrongLayout {
+        name: name.to_string(),
+        reason: format!(
+            "backend switch found active_targets={}, inactive_targets={}, suspended={suspended}",
+            active.len(),
+            inactive.len()
+        ),
+    })
+}
+
 /// Parses one kernel major:minor pair without accepting path aliases.
 fn parse_device_number(value: &str) -> Option<BlockDeviceNumber> {
     let (major, minor) = value.split_once(':')?;
@@ -379,8 +496,10 @@ mod platform {
     use nix::sys::stat::{major, minor};
 
     use super::{
-        BlockDeviceNumber, MappedVolumeError, MappedVolumeIdentity, MappedVolumeLayout,
-        MappedVolumePath, OwnedMappedVolume, RawTarget, ReplicaKey, validate_linear_table,
+        BackendSwitchAction, BlockDeviceNumber, MappedVolumeError, MappedVolumeIdentity,
+        MappedVolumeLayout, MappedVolumePath, OwnedMappedVolume, RawTarget, ReplicaKey,
+        SavedLinearLayout, VolumeNodeId, classify_backend_switch, select_saved_linear_layout,
+        validate_linear_table,
     };
 
     /// Shared access to the node-wide device-mapper control device.
@@ -515,6 +634,359 @@ mod platform {
             }
         }
 
+        /// Identifies the exact saved backend selected by one active mapping.
+        pub fn active_layout(
+            &self,
+            candidates: &[MappedVolumeLayout],
+        ) -> Result<Option<usize>, MappedVolumeError> {
+            let Some(first) = candidates.first() else {
+                return Ok(None);
+            };
+            if candidates.iter().any(|candidate| {
+                candidate.key() != first.key()
+                    || candidate.block_sizes() != first.block_sizes()
+                    || candidate.identity != first.identity
+            }) {
+                return Err(MappedVolumeError::WrongLayout {
+                    name: first.identity.name.clone(),
+                    reason: "saved layout candidates do not describe one mapped volume".to_string(),
+                });
+            }
+            let devices = self.inner.all_mappings()?;
+            let Some(found) = devices
+                .iter()
+                .find(|device| device.name == first.identity.name)
+            else {
+                return Ok(None);
+            };
+            if found.uuid.as_deref() != Some(first.identity.uuid.as_str()) {
+                return Err(MappedVolumeError::ForeignName {
+                    name: first.identity.name.clone(),
+                    actual_uuid: found.uuid.clone(),
+                });
+            }
+            let id = DevId::Name(dm_name(&first.identity)?);
+            let active = self
+                .inner
+                .dm
+                .table_status(
+                    &id,
+                    DmOptions::default().set_flags(DmFlags::DM_STATUS_TABLE),
+                )
+                .map_err(|error| kernel_error("inspect active saved table", error))?
+                .1;
+            let inactive = self
+                .inner
+                .dm
+                .table_status(
+                    &id,
+                    DmOptions::default()
+                        .set_flags(DmFlags::DM_STATUS_TABLE | DmFlags::DM_QUERY_INACTIVE_TABLE),
+                )
+                .map_err(|error| kernel_error("inspect inactive saved table", error))?
+                .1;
+            let saved = candidates
+                .iter()
+                .map(|candidate| {
+                    Ok(SavedLinearLayout {
+                        sectors: candidate.device_mapper_sectors(),
+                        backend: block_device_number(candidate.backend_path())?,
+                    })
+                })
+                .collect::<Result<Vec<_>, MappedVolumeError>>()?;
+            let selected =
+                select_saved_linear_layout(&first.identity.name, &active, &inactive, &saved)?;
+            verify_mapped_path(&candidates[selected], found.info.device())?;
+            Ok(Some(selected))
+        }
+
+        /// Resumes one exact active saved mapping without accepting a pending table.
+        pub fn resume_exact(
+            &self,
+            layout: &MappedVolumeLayout,
+        ) -> Result<MappedVolumePath, MappedVolumeError> {
+            let backend = block_device_number(layout.backend_path())?;
+            let devices = self.inner.all_mappings()?;
+            let found = devices
+                .iter()
+                .find(|device| device.name == layout.identity.name)
+                .ok_or_else(|| MappedVolumeError::WrongLayout {
+                    name: layout.identity.name.clone(),
+                    reason: "saved mapped volume does not exist".to_string(),
+                })?;
+            if found.uuid.as_deref() != Some(layout.identity.uuid.as_str()) {
+                return Err(MappedVolumeError::ForeignName {
+                    name: layout.identity.name.clone(),
+                    actual_uuid: found.uuid.clone(),
+                });
+            }
+            let id = DevId::Name(dm_name(&layout.identity)?);
+            for _ in 0..3 {
+                let info =
+                    self.inner.dm.device_info(&id).map_err(|error| {
+                        kernel_error("inspect saved mapping before resume", error)
+                    })?;
+                let active = self
+                    .inner
+                    .dm
+                    .table_status(
+                        &id,
+                        DmOptions::default().set_flags(DmFlags::DM_STATUS_TABLE),
+                    )
+                    .map_err(|error| kernel_error("inspect saved active table", error))?
+                    .1;
+                let inactive = self
+                    .inner
+                    .dm
+                    .table_status(
+                        &id,
+                        DmOptions::default()
+                            .set_flags(DmFlags::DM_STATUS_TABLE | DmFlags::DM_QUERY_INACTIVE_TABLE),
+                    )
+                    .map_err(|error| kernel_error("inspect saved inactive table", error))?
+                    .1;
+                validate_linear_table(
+                    &layout.identity.name,
+                    &active,
+                    layout.device_mapper_sectors(),
+                    backend,
+                )?;
+                if !inactive.is_empty() {
+                    return Err(MappedVolumeError::WrongLayout {
+                        name: layout.identity.name.clone(),
+                        reason: "saved mapping has an unfinished inactive table".to_string(),
+                    });
+                }
+                if !info.flags().contains(DmFlags::DM_SUSPEND) {
+                    verify_mapped_path(layout, info.device())?;
+                    return Ok(MappedVolumePath(layout.identity.path.clone()));
+                }
+                self.inner
+                    .dm
+                    .device_suspend(&id, DmOptions::default())
+                    .map_err(|error| kernel_error("resume exact saved mapping", error))?;
+            }
+            Err(MappedVolumeError::WrongLayout {
+                name: layout.identity.name.clone(),
+                reason: "saved mapping remained suspended after resume".to_string(),
+            })
+        }
+
+        /// Suspends old mapped I/O before the replicated backend is flushed and replaced.
+        pub fn suspend_for_backend_switch(
+            &self,
+            current: &MappedVolumeLayout,
+            larger: &MappedVolumeLayout,
+        ) -> Result<MappedVolumePath, MappedVolumeError> {
+            if current.identity != larger.identity
+                || current.block_sizes() != larger.block_sizes()
+                || larger.capacity_bytes() <= current.capacity_bytes()
+            {
+                return Err(MappedVolumeError::WrongLayout {
+                    name: current.identity.name.clone(),
+                    reason: "backend switch requires the same volume and block sizes at a larger capacity"
+                        .to_string(),
+                });
+            }
+            let current_backend = block_device_number(current.backend_path())?;
+            let larger_backend = block_device_number(larger.backend_path())?;
+            let devices = self.inner.all_mappings()?;
+            let found = devices
+                .iter()
+                .find(|device| device.name == current.identity.name)
+                .ok_or_else(|| MappedVolumeError::WrongLayout {
+                    name: current.identity.name.clone(),
+                    reason: "mapped volume does not exist".to_string(),
+                })?;
+            if found.uuid.as_deref() != Some(current.identity.uuid.as_str()) {
+                return Err(MappedVolumeError::ForeignName {
+                    name: current.identity.name.clone(),
+                    actual_uuid: found.uuid.clone(),
+                });
+            }
+            let name = dm_name(&current.identity)?;
+            let id = DevId::Name(name);
+            for _ in 0..3 {
+                let info = self
+                    .inner
+                    .dm
+                    .device_info(&id)
+                    .map_err(|error| kernel_error("inspect mapping before suspend", error))?;
+                let active = self
+                    .inner
+                    .dm
+                    .table_status(
+                        &id,
+                        DmOptions::default().set_flags(DmFlags::DM_STATUS_TABLE),
+                    )
+                    .map_err(|error| kernel_error("inspect active table before suspend", error))?
+                    .1;
+                let inactive = self
+                    .inner
+                    .dm
+                    .table_status(
+                        &id,
+                        DmOptions::default()
+                            .set_flags(DmFlags::DM_STATUS_TABLE | DmFlags::DM_QUERY_INACTIVE_TABLE),
+                    )
+                    .map_err(|error| kernel_error("inspect inactive table before suspend", error))?
+                    .1;
+                let suspended = info.flags().contains(DmFlags::DM_SUSPEND);
+                let action = classify_backend_switch(
+                    &current.identity.name,
+                    &active,
+                    &inactive,
+                    suspended,
+                    SavedLinearLayout {
+                        sectors: current.device_mapper_sectors(),
+                        backend: current_backend,
+                    },
+                    SavedLinearLayout {
+                        sectors: larger.device_mapper_sectors(),
+                        backend: larger_backend,
+                    },
+                )?;
+                if action == BackendSwitchAction::Finish {
+                    verify_mapped_path(larger, info.device())?;
+                    return Ok(MappedVolumePath(larger.identity.path.clone()));
+                }
+                if suspended {
+                    verify_mapped_path(current, info.device())?;
+                    return Ok(MappedVolumePath(current.identity.path.clone()));
+                }
+                self.inner
+                    .dm
+                    .device_suspend(&id, DmOptions::default().set_flags(DmFlags::DM_SUSPEND))
+                    .map_err(|error| kernel_error("suspend mapped volume", error))?;
+            }
+            Err(MappedVolumeError::WrongLayout {
+                name: current.identity.name.clone(),
+                reason: "mapped volume did not reach its suspended state".to_string(),
+            })
+        }
+
+        /// Switches one exact active layout to a strictly larger backend and verifies it.
+        pub fn switch_backend(
+            &self,
+            current: &MappedVolumeLayout,
+            larger: &MappedVolumeLayout,
+        ) -> Result<MappedVolumePath, MappedVolumeError> {
+            if current.identity != larger.identity
+                || current.block_sizes() != larger.block_sizes()
+                || larger.capacity_bytes() <= current.capacity_bytes()
+            {
+                return Err(MappedVolumeError::WrongLayout {
+                    name: current.identity.name.clone(),
+                    reason: "backend switch requires the same volume and block sizes at a larger capacity"
+                        .to_string(),
+                });
+            }
+            let current_backend = block_device_number(current.backend_path())?;
+            let larger_backend = block_device_number(larger.backend_path())?;
+            let devices = self.inner.all_mappings()?;
+            let found = devices
+                .iter()
+                .find(|device| device.name == current.identity.name)
+                .ok_or_else(|| MappedVolumeError::WrongLayout {
+                    name: current.identity.name.clone(),
+                    reason: "mapped volume does not exist".to_string(),
+                })?;
+            if found.uuid.as_deref() != Some(current.identity.uuid.as_str()) {
+                return Err(MappedVolumeError::ForeignName {
+                    name: current.identity.name.clone(),
+                    actual_uuid: found.uuid.clone(),
+                });
+            }
+            let name = dm_name(&current.identity)?;
+            let id = DevId::Name(name);
+
+            for _ in 0..4 {
+                let info = self.inner.dm.device_info(&id).map_err(|error| {
+                    kernel_error("inspect mapping before backend switch", error)
+                })?;
+                let active = self
+                    .inner
+                    .dm
+                    .table_status(
+                        &id,
+                        DmOptions::default().set_flags(DmFlags::DM_STATUS_TABLE),
+                    )
+                    .map_err(|error| kernel_error("inspect active switch table", error))?
+                    .1;
+                let inactive = self
+                    .inner
+                    .dm
+                    .table_status(
+                        &id,
+                        DmOptions::default()
+                            .set_flags(DmFlags::DM_STATUS_TABLE | DmFlags::DM_QUERY_INACTIVE_TABLE),
+                    )
+                    .map_err(|error| kernel_error("inspect inactive switch table", error))?
+                    .1;
+                let suspended = info.flags().contains(DmFlags::DM_SUSPEND);
+                let action = classify_backend_switch(
+                    &current.identity.name,
+                    &active,
+                    &inactive,
+                    suspended,
+                    SavedLinearLayout {
+                        sectors: current.device_mapper_sectors(),
+                        backend: current_backend,
+                    },
+                    SavedLinearLayout {
+                        sectors: larger.device_mapper_sectors(),
+                        backend: larger_backend,
+                    },
+                )?;
+
+                match action {
+                    BackendSwitchAction::Finish => {
+                        if suspended {
+                            self.inner
+                                .dm
+                                .device_suspend(&id, DmOptions::default())
+                                .map_err(|error| {
+                                    kernel_error("resume larger mapped volume", error)
+                                })?;
+                            continue;
+                        }
+                        verify_mapped_path(larger, info.device())?;
+                        return Ok(MappedVolumePath(larger.identity.path.clone()));
+                    }
+                    BackendSwitchAction::LoadLarger => {
+                        self.inner
+                            .dm
+                            .table_load(
+                                &id,
+                                &expected_table(larger, larger_backend),
+                                DmOptions::default(),
+                            )
+                            .map_err(|error| kernel_error("load larger linear table", error))?;
+                    }
+                    BackendSwitchAction::ActivateLarger => {
+                        if !suspended {
+                            self.inner
+                                .dm
+                                .device_suspend(
+                                    &id,
+                                    DmOptions::default().set_flags(DmFlags::DM_SUSPEND),
+                                )
+                                .map_err(|error| kernel_error("suspend mapped volume", error))?;
+                        }
+                        if let Err(error) = self.inner.dm.device_suspend(&id, DmOptions::default())
+                        {
+                            let _ = self.inner.dm.device_suspend(&id, DmOptions::default());
+                            return Err(kernel_error("activate larger linear table", error));
+                        }
+                    }
+                }
+            }
+            Err(MappedVolumeError::WrongLayout {
+                name: current.identity.name.clone(),
+                reason: "larger backend did not become active".to_string(),
+            })
+        }
+
         /// Lists mappings whose exact UUID format proves Mantissa ownership.
         pub fn owned_devices(&self) -> Result<Vec<OwnedMappedVolume>, MappedVolumeError> {
             self.inner.owned_devices()
@@ -523,19 +995,24 @@ mod platform {
         /// Removes every owned mapping not named by a saved local attachment.
         pub fn remove_unexpected(
             &self,
+            node_id: VolumeNodeId,
             expected: &BTreeSet<ReplicaKey>,
         ) -> Result<(), MappedVolumeError> {
             for device in self.owned_devices()? {
-                if !expected.contains(&device.key()) {
+                if device.node_id() == node_id && !expected.contains(&device.key()) {
                     self.inner.remove_owned(&device)?;
                 }
             }
             Ok(())
         }
 
-        /// Removes every Mantissa-owned mapping for one volume generation.
-        pub fn remove(&self, key: ReplicaKey) -> Result<(), MappedVolumeError> {
-            let identity = MappedVolumeIdentity::new(key)?;
+        /// Removes this node's owned mapping for one volume generation.
+        pub fn remove(
+            &self,
+            node_id: VolumeNodeId,
+            key: ReplicaKey,
+        ) -> Result<(), MappedVolumeError> {
+            let identity = MappedVolumeIdentity::new(node_id, key)?;
             let devices = self.inner.all_mappings()?;
             if let Some(named) = devices.iter().find(|device| device.name == identity.name)
                 && named.uuid.as_deref() != Some(identity.uuid.as_str())
@@ -548,7 +1025,7 @@ mod platform {
             let owned = self
                 .owned_devices()?
                 .into_iter()
-                .filter(|device| device.key() == key)
+                .filter(|device| device.node_id() == node_id && device.key() == key)
                 .collect::<Vec<_>>();
             for device in &owned {
                 self.inner.remove_owned(device)?;
@@ -556,7 +1033,7 @@ mod platform {
             if self
                 .owned_devices()?
                 .iter()
-                .any(|device| device.key() == key)
+                .any(|device| device.node_id() == node_id && device.key() == key)
             {
                 return Err(MappedVolumeError::WrongLayout {
                     name: identity.name,
@@ -564,6 +1041,53 @@ mod platform {
                 });
             }
             Ok(())
+        }
+
+        /// Replaces one owned dead-backend mapping with immediate I/O errors.
+        ///
+        /// This is used only after durable attachment cleanup has begun and no
+        /// userspace driver remains to answer the final ext4 unmount flush.
+        /// Exact name, UUID, and device-number checks prevent changing a
+        /// foreign or replaced mapping.
+        pub fn fail_io_for_cleanup(
+            &self,
+            node_id: VolumeNodeId,
+            key: ReplicaKey,
+            candidates: &[MappedVolumeLayout],
+        ) -> Result<(), MappedVolumeError> {
+            if candidates
+                .iter()
+                .any(|layout| layout.node_id() != node_id || layout.key() != key)
+            {
+                return Err(MappedVolumeError::InvalidIdentity {
+                    reason: "failed-I/O cleanup mixes volume nodes or generations".to_string(),
+                });
+            }
+            let identity = MappedVolumeIdentity::new(node_id, key)?;
+            let devices = self.inner.all_mappings()?;
+            let Some(named) = devices.iter().find(|device| device.name == identity.name) else {
+                return Ok(());
+            };
+            if named.uuid.as_deref() != Some(identity.uuid.as_str()) {
+                return Err(MappedVolumeError::ForeignName {
+                    name: identity.name,
+                    actual_uuid: named.uuid.clone(),
+                });
+            }
+            if candidates.is_empty() {
+                return Err(MappedVolumeError::InvalidIdentity {
+                    reason: "failed-I/O cleanup has no saved layout for an existing mapping"
+                        .to_string(),
+                });
+            }
+            let Some(owned) = self
+                .owned_devices()?
+                .into_iter()
+                .find(|device| device.node_id() == node_id && device.key() == key)
+            else {
+                return Ok(());
+            };
+            self.inner.fail_owned_io(&owned, candidates)
         }
 
         /// Returns whether any active or inactive mapping references a block device.
@@ -753,6 +1277,7 @@ mod platform {
                     .into_iter()
                     .collect();
                 owned.push(OwnedMappedVolume {
+                    node_id: identity.node_id,
                     key: identity.key,
                     name: device.name,
                     uuid: uuid.to_string(),
@@ -760,7 +1285,7 @@ mod platform {
                     backend_device_numbers,
                 });
             }
-            owned.sort_by_key(|device| (device.key, device.name.clone()));
+            owned.sort_by_key(|device| (device.node_id, device.key, device.name.clone()));
             Ok(owned)
         }
 
@@ -783,6 +1308,122 @@ mod platform {
             self.dm
                 .device_remove(&DevId::Name(name), DmOptions::default())
                 .map_err(|error| kernel_error("remove mapped volume", error))?;
+            Ok(())
+        }
+
+        /// Atomically replaces one still-identical owned table with `error`.
+        fn fail_owned_io(
+            &self,
+            expected: &OwnedMappedVolume,
+            candidates: &[MappedVolumeLayout],
+        ) -> Result<(), MappedVolumeError> {
+            let name = DmName::new(expected.name())
+                .map_err(|error| kernel_error("validate failed-I/O mapping name", error))?;
+            let id = DevId::Name(name);
+            let info = self
+                .dm
+                .device_info(&id)
+                .map_err(|error| kernel_error("inspect mapping before failing I/O", error))?;
+            if info.uuid().map(ToString::to_string).as_deref() != Some(expected.uuid())
+                || block_number(info.device()) != expected.device_number()
+            {
+                return Err(MappedVolumeError::WrongLayout {
+                    name: expected.name.clone(),
+                    reason: "mapping identity changed before failing I/O".to_string(),
+                });
+            }
+            let active = self
+                .dm
+                .table_status(
+                    &id,
+                    DmOptions::default().set_flags(DmFlags::DM_STATUS_TABLE),
+                )
+                .map_err(|error| kernel_error("inspect table before failing I/O", error))?
+                .1;
+            if active.is_empty() {
+                return Ok(());
+            }
+            let inactive = self
+                .dm
+                .table_status(
+                    &id,
+                    DmOptions::default()
+                        .set_flags(DmFlags::DM_STATUS_TABLE | DmFlags::DM_QUERY_INACTIVE_TABLE),
+                )
+                .map_err(|error| kernel_error("inspect inactive table before failing I/O", error))?
+                .1;
+            let [target] = active.as_slice() else {
+                return Err(MappedVolumeError::WrongLayout {
+                    name: expected.name.clone(),
+                    reason: format!("cleanup expected one active target, found {}", active.len()),
+                });
+            };
+            if target.0 != 0 || target.1 == 0 {
+                return Err(MappedVolumeError::WrongLayout {
+                    name: expected.name.clone(),
+                    reason: format!(
+                        "cleanup found active target at sector {} with length {}",
+                        target.0, target.1
+                    ),
+                });
+            }
+            let suspended = info.flags().contains(DmFlags::DM_SUSPEND);
+            let candidate_sectors = candidates
+                .iter()
+                .map(MappedVolumeLayout::device_mapper_sectors)
+                .collect::<BTreeSet<_>>();
+            if target.2 == "error"
+                && target.3.is_empty()
+                && inactive.is_empty()
+                && candidate_sectors.contains(&target.1)
+                && !suspended
+            {
+                return Ok(());
+            }
+            let saved = candidates
+                .iter()
+                .map(|layout| {
+                    Ok(SavedLinearLayout {
+                        sectors: layout.device_mapper_sectors(),
+                        backend: block_device_number(layout.backend_path())?,
+                    })
+                })
+                .collect::<Result<Vec<_>, MappedVolumeError>>()?;
+            select_saved_linear_layout(expected.name(), &active, &inactive, &saved)?;
+            self.dm
+                .table_load(
+                    &id,
+                    &[(0, target.1, "error".to_string(), String::new())],
+                    DmOptions::default(),
+                )
+                .map_err(|error| kernel_error("load failed-I/O table", error))?;
+            if !suspended {
+                self.dm
+                    .device_suspend(
+                        &id,
+                        DmOptions::default().set_flags(
+                            DmFlags::DM_SUSPEND | DmFlags::DM_NOFLUSH | DmFlags::DM_SKIP_LOCKFS,
+                        ),
+                    )
+                    .map_err(|error| kernel_error("suspend dead mapped backend", error))?;
+            }
+            self.dm
+                .device_suspend(&id, DmOptions::default())
+                .map_err(|error| kernel_error("activate failed-I/O table", error))?;
+            let active = self
+                .dm
+                .table_status(
+                    &id,
+                    DmOptions::default().set_flags(DmFlags::DM_STATUS_TABLE),
+                )
+                .map_err(|error| kernel_error("verify failed-I/O table", error))?
+                .1;
+            if active != vec![(0, target.1, "error".to_string(), String::new())] {
+                return Err(MappedVolumeError::WrongLayout {
+                    name: expected.name.clone(),
+                    reason: "failed-I/O table did not become active".to_string(),
+                });
+            }
             Ok(())
         }
     }
@@ -925,7 +1566,7 @@ mod platform {
 mod platform {
     use super::{
         MappedVolumeError, MappedVolumeLayout, MappedVolumePath, OwnedMappedVolume, Path,
-        ReplicaKey,
+        ReplicaKey, VolumeNodeId,
     };
 
     /// Unsupported-platform placeholder preserving the portable crate API.
@@ -960,6 +1601,40 @@ mod platform {
         }
 
         /// Reports that Linux device-mapper is unavailable.
+        pub fn active_layout(
+            &self,
+            _candidates: &[MappedVolumeLayout],
+        ) -> Result<Option<usize>, MappedVolumeError> {
+            Err(MappedVolumeError::UnsupportedPlatform)
+        }
+
+        /// Reports that Linux device-mapper is unavailable.
+        pub fn resume_exact(
+            &self,
+            _layout: &MappedVolumeLayout,
+        ) -> Result<MappedVolumePath, MappedVolumeError> {
+            Err(MappedVolumeError::UnsupportedPlatform)
+        }
+
+        /// Reports that Linux device-mapper is unavailable.
+        pub fn suspend_for_backend_switch(
+            &self,
+            _current: &MappedVolumeLayout,
+            _larger: &MappedVolumeLayout,
+        ) -> Result<MappedVolumePath, MappedVolumeError> {
+            Err(MappedVolumeError::UnsupportedPlatform)
+        }
+
+        /// Reports that Linux device-mapper is unavailable.
+        pub fn switch_backend(
+            &self,
+            _current: &MappedVolumeLayout,
+            _larger: &MappedVolumeLayout,
+        ) -> Result<MappedVolumePath, MappedVolumeError> {
+            Err(MappedVolumeError::UnsupportedPlatform)
+        }
+
+        /// Reports that Linux device-mapper is unavailable.
         pub fn owned_devices(&self) -> Result<Vec<OwnedMappedVolume>, MappedVolumeError> {
             Err(MappedVolumeError::UnsupportedPlatform)
         }
@@ -967,13 +1642,28 @@ mod platform {
         /// Reports that Linux device-mapper is unavailable.
         pub fn remove_unexpected(
             &self,
+            _node_id: VolumeNodeId,
             _expected: &std::collections::BTreeSet<ReplicaKey>,
         ) -> Result<(), MappedVolumeError> {
             Err(MappedVolumeError::UnsupportedPlatform)
         }
 
         /// Reports that Linux device-mapper is unavailable.
-        pub fn remove(&self, _key: ReplicaKey) -> Result<(), MappedVolumeError> {
+        pub fn remove(
+            &self,
+            _node_id: VolumeNodeId,
+            _key: ReplicaKey,
+        ) -> Result<(), MappedVolumeError> {
+            Err(MappedVolumeError::UnsupportedPlatform)
+        }
+
+        /// Reports that Linux device-mapper is unavailable.
+        pub fn fail_io_for_cleanup(
+            &self,
+            _node_id: VolumeNodeId,
+            _key: ReplicaKey,
+            _candidates: &[MappedVolumeLayout],
+        ) -> Result<(), MappedVolumeError> {
             Err(MappedVolumeError::UnsupportedPlatform)
         }
 
@@ -991,7 +1681,13 @@ mod tests {
     use super::*;
     use crate::VolumeBlockSizes;
 
-    /// Creates one immutable descriptor for identity and table tests.
+    /// Returns the local node encoded in deterministic test mappings.
+    fn node_id() -> VolumeNodeId {
+        VolumeNodeId::new(Uuid::from_u128(0x87654321_4321_8765_abcd_ef0123456789))
+            .expect("non-zero volume node ID")
+    }
+
+    /// Creates one checked descriptor for identity and table tests.
     fn descriptor(generation: u64) -> VolumeDescriptor {
         VolumeDescriptor::new(
             VolumeId::new(Uuid::from_u128(0x12345678_1234_5678_9abc_def012345678))
@@ -1005,19 +1701,21 @@ mod tests {
 
     #[test]
     fn identity_is_deterministic_and_parseable() {
-        let layout =
-            MappedVolumeLayout::new(&descriptor(7), "/dev/ublkb42").expect("valid mapped layout");
+        let layout = MappedVolumeLayout::new(node_id(), &descriptor(7), "/dev/ublkb42")
+            .expect("valid mapped layout");
         assert_eq!(
             layout.identity.name,
-            "mantissa-rv-12345678123456789abcdef012345678-g7"
+            "mantissa-rv-8765432143218765abcdef0123456789-12345678123456789abcdef012345678-g7"
         );
         assert_eq!(
             layout.identity.uuid,
-            "MANTISSA-RV-12345678123456789abcdef012345678-G7"
+            "MANTISSA-RV-8765432143218765abcdef0123456789-V12345678123456789abcdef012345678-G7"
         );
         assert_eq!(
             layout.expected_path(),
-            Path::new("/dev/mapper/mantissa-rv-12345678123456789abcdef012345678-g7")
+            Path::new(
+                "/dev/mapper/mantissa-rv-8765432143218765abcdef0123456789-12345678123456789abcdef012345678-g7"
+            )
         );
         assert_eq!(
             MappedVolumeIdentity::from_uuid(&layout.identity.uuid),
@@ -1026,8 +1724,27 @@ mod tests {
     }
 
     #[test]
+    fn identity_is_scoped_to_one_local_volume_node() {
+        let first = MappedVolumeLayout::new(node_id(), &descriptor(7), "/dev/ublkb42")
+            .expect("first node mapping");
+        let second_node =
+            VolumeNodeId::new(Uuid::from_u128(0x11111111_2222_3333_4444_555555555555))
+                .expect("second non-zero volume node ID");
+        let second = MappedVolumeLayout::new(second_node, &descriptor(7), "/dev/ublkb42")
+            .expect("second node mapping");
+
+        assert_eq!(first.key(), second.key());
+        assert_ne!(first.expected_path(), second.expected_path());
+        assert_ne!(first.identity.uuid, second.identity.uuid);
+        assert_eq!(
+            MappedVolumeIdentity::from_uuid(&second.identity.uuid),
+            Some(second.identity)
+        );
+    }
+
+    #[test]
     fn maximum_generation_fits_kernel_identity_limits() {
-        let layout = MappedVolumeLayout::new(&descriptor(u64::MAX), "/dev/ublkb42")
+        let layout = MappedVolumeLayout::new(node_id(), &descriptor(u64::MAX), "/dev/ublkb42")
             .expect("maximum generation fits");
         assert!(layout.identity.name.len() <= DEVICE_MAPPER_NAME_MAX_BYTES);
         assert!(layout.identity.uuid.len() <= DEVICE_MAPPER_UUID_MAX_BYTES);
@@ -1037,12 +1754,16 @@ mod tests {
     fn foreign_uuid_formats_are_not_owned() {
         assert!(MappedVolumeIdentity::from_uuid("foreign").is_none());
         assert!(
-            MappedVolumeIdentity::from_uuid("MANTISSA-RV-12345678123456789abcdef012345678-G0")
-                .is_none()
+            MappedVolumeIdentity::from_uuid(
+                "MANTISSA-RV-8765432143218765abcdef0123456789-V12345678123456789abcdef012345678-G0"
+            )
+            .is_none()
         );
         assert!(
-            MappedVolumeIdentity::from_uuid("MANTISSA-RV-12345678123456789ABCDEF012345678-G1")
-                .is_none()
+            MappedVolumeIdentity::from_uuid(
+                "MANTISSA-RV-8765432143218765abcdef0123456789-V12345678123456789ABCDEF012345678-G1"
+            )
+            .is_none()
         );
     }
 
@@ -1063,6 +1784,144 @@ mod tests {
         ] {
             assert!(validate_linear_table("test", &wrong, 2048, backend).is_err());
         }
+    }
+
+    /// Builds the exact raw table row used by the pure recovery-state tests.
+    fn linear_table(sectors: u64, backend: BlockDeviceNumber) -> Vec<RawTarget> {
+        vec![(0, sectors, "linear".to_string(), format!("{backend} 0"))]
+    }
+
+    /// Restores either side of the atomic table activation without guessing.
+    #[test]
+    fn saved_layout_selection_accepts_every_interrupted_switch_boundary() {
+        let old = SavedLinearLayout {
+            sectors: 2048,
+            backend: BlockDeviceNumber::new(259, 17),
+        };
+        let larger = SavedLinearLayout {
+            sectors: 4096,
+            backend: BlockDeviceNumber::new(259, 18),
+        };
+        let candidates = [old, larger];
+
+        assert_eq!(
+            select_saved_linear_layout(
+                "test",
+                &linear_table(old.sectors, old.backend),
+                &linear_table(larger.sectors, larger.backend),
+                &candidates,
+            )
+            .expect("old active table and pending larger table are recoverable"),
+            0
+        );
+        assert_eq!(
+            select_saved_linear_layout(
+                "test",
+                &linear_table(larger.sectors, larger.backend),
+                &[],
+                &candidates,
+            )
+            .expect("larger active table is recoverable"),
+            1
+        );
+    }
+
+    /// Rejects kernel tables that cannot be tied to one exact saved backend.
+    #[test]
+    fn saved_layout_selection_rejects_unknown_or_ambiguous_tables() {
+        let old = SavedLinearLayout {
+            sectors: 2048,
+            backend: BlockDeviceNumber::new(259, 17),
+        };
+        let larger = SavedLinearLayout {
+            sectors: 4096,
+            backend: BlockDeviceNumber::new(259, 18),
+        };
+        let unknown = SavedLinearLayout {
+            sectors: 8192,
+            backend: BlockDeviceNumber::new(259, 19),
+        };
+
+        assert!(
+            select_saved_linear_layout(
+                "test",
+                &linear_table(unknown.sectors, unknown.backend),
+                &[],
+                &[old, larger],
+            )
+            .is_err()
+        );
+        assert!(
+            select_saved_linear_layout(
+                "test",
+                &linear_table(larger.sectors, larger.backend),
+                &linear_table(old.sectors, old.backend),
+                &[old, larger],
+            )
+            .is_err(),
+            "startup must reject a smaller inactive table behind a larger active table"
+        );
+        assert!(
+            select_saved_linear_layout(
+                "test",
+                &linear_table(old.sectors, old.backend),
+                &linear_table(unknown.sectors, unknown.backend),
+                &[old, larger],
+            )
+            .is_err()
+        );
+        assert!(
+            select_saved_linear_layout(
+                "test",
+                &linear_table(old.sectors, old.backend),
+                &[],
+                &[old, old],
+            )
+            .is_err()
+        );
+    }
+
+    /// Accepts only the three states produced by a monotonic backend switch.
+    #[test]
+    fn backend_switch_classification_is_retryable_and_fail_closed() {
+        let old = SavedLinearLayout {
+            sectors: 2048,
+            backend: BlockDeviceNumber::new(259, 17),
+        };
+        let larger = SavedLinearLayout {
+            sectors: 4096,
+            backend: BlockDeviceNumber::new(259, 18),
+        };
+        let old_table = linear_table(old.sectors, old.backend);
+        let larger_table = linear_table(larger.sectors, larger.backend);
+
+        assert_eq!(
+            classify_backend_switch("test", &old_table, &[], false, old, larger)
+                .expect("initial state is valid"),
+            BackendSwitchAction::LoadLarger
+        );
+        for suspended in [false, true] {
+            assert_eq!(
+                classify_backend_switch("test", &old_table, &larger_table, suspended, old, larger,)
+                    .expect("loaded larger table is valid"),
+                BackendSwitchAction::ActivateLarger
+            );
+            assert_eq!(
+                classify_backend_switch("test", &larger_table, &[], suspended, old, larger,)
+                    .expect("activated larger table is valid"),
+                BackendSwitchAction::Finish
+            );
+        }
+
+        assert_eq!(
+            classify_backend_switch("test", &old_table, &[], true, old, larger)
+                .expect("a suspended old table is retryable"),
+            BackendSwitchAction::LoadLarger
+        );
+        assert!(
+            classify_backend_switch("test", &larger_table, &old_table, false, old, larger,)
+                .is_err()
+        );
     }
 
     #[test]

@@ -55,6 +55,38 @@ fn openapi_spec_makes_volume_data_deletion_optional() {
     assert_eq!(delete_data["required"], false);
 }
 
+/// Ensures REST volume inspection exposes every capacity needed to follow expansion.
+#[test]
+fn openapi_spec_exposes_replicated_volume_expansion_progress() {
+    let value = openapi::json_value(&server::openapi());
+    let schemas = &value["components"]["schemas"];
+
+    for field in [
+        "reserved_capacity_bytes",
+        "prepared_capacity_bytes",
+        "served_capacity_bytes",
+        "device_capacity_bytes",
+        "filesystem_expansion_pending",
+    ] {
+        assert!(
+            schemas["VolumeNodeStatus"]["properties"][field].is_object(),
+            "volume node status is missing expansion field '{field}'"
+        );
+    }
+    assert_required(
+        &schemas["ReplicatedVolumeGroupStatus"],
+        &["replicated_capacity_bytes"],
+    );
+    assert_required(
+        &schemas["ReplicatedVolumePlan"],
+        &["initial_capacity_bytes"],
+    );
+    assert!(
+        schemas["ReplicatedVolumePlan"]["properties"]["capacity_bytes"].is_null(),
+        "the immutable plan must name its capacity as initial capacity"
+    );
+}
+
 /// Ensures workload submission schemas keep CPU and memory resources mandatory.
 #[test]
 fn openapi_spec_requires_workload_resource_bounds() {
@@ -269,6 +301,7 @@ fn expected_operations() -> BTreeSet<(String, String)> {
         ("POST", "/v1/tasks/{selector}/stop"),
         ("POST", "/v1/volumes"),
         ("POST", "/v1/volumes/import"),
+        ("POST", "/v1/volumes/{selector}/expand"),
         ("POST", "/v1/volumes/{selector}/restore"),
         ("PUT", "/v1/ingress"),
         ("PUT", "/v1/nodes/{node_id}/labels"),

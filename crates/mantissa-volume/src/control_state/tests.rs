@@ -4,14 +4,14 @@ use uuid::Uuid;
 
 use super::{
     AdoptReplicaReplacement, BeginReplicaReplacement, BeginVolumeRecovery,
-    CancelReplicaReplacement, ExpectedVolumeRevision, FenceVolumeWriter, GrantVolumeWriter,
-    InitializeVolume, RecoveryGrant, ReplacementGrant, RevokeVolumeRecovery, SetVolumeDisposition,
-    VolumeCommand, VolumeCommandRejection, VolumeCommandResponse, VolumeControlState,
-    VolumeDisposition, WriterGrant,
+    CancelReplicaReplacement, ExpandVolume, ExpectedVolumeRevision, FenceVolumeWriter,
+    GrantVolumeWriter, InitializeVolume, RecoveryGrant, ReplacementGrant, RevokeVolumeRecovery,
+    SetVolumeDisposition, VolumeCommand, VolumeCommandRejection, VolumeCommandResponse,
+    VolumeControlState, VolumeDisposition, WriterGrant,
 };
 use crate::{
-    DriverSessionId, FenceEpoch, RecoveryId, ReplacementId, VolumeBlockSizes, VolumeDescriptor,
-    VolumeGeneration, VolumeId, VolumeNodeId,
+    DriverSessionId, FenceEpoch, RecoveryId, ReplacementId, VolumeBlockSizes, VolumeCapacity,
+    VolumeDescriptor, VolumeGeneration, VolumeId, VolumeNodeId,
 };
 
 /// Returns one deterministic node identity.
@@ -329,7 +329,7 @@ fn generated_command(
         };
     }
 
-    match rng.index(11) {
+    match rng.index(12) {
         0 => VolumeCommand::SetDisposition(SetVolumeDisposition {
             expected: current,
             disposition: VolumeDisposition::Live,
@@ -383,6 +383,25 @@ fn generated_command(
             descriptor: descriptor(),
             initial_copies: initial_copies(),
         }),
+        10 => VolumeCommand::Expand(ExpandVolume {
+            expected: current,
+            target_capacity: VolumeCapacity::new(
+                state
+                    .descriptor()
+                    .expect("generated initialized state must have a descriptor")
+                    .capacity()
+                    .bytes()
+                    .checked_mul(2)
+                    .unwrap_or_else(|| {
+                        state
+                            .descriptor()
+                            .expect("generated initialized state must have a descriptor")
+                            .capacity()
+                            .bytes()
+                    }),
+            )
+            .expect("generated expansion capacity must remain non-zero"),
+        }),
         _ => VolumeCommand::FenceWriter(FenceVolumeWriter {
             expected: ExpectedVolumeRevision {
                 revision: current.revision.saturating_sub(1),
@@ -408,6 +427,7 @@ const fn command_slot(command: &VolumeCommand) -> usize {
         VolumeCommand::BeginReplacement(_) => 6,
         VolumeCommand::CancelReplacement(_) => 7,
         VolumeCommand::AdoptReplacement(_) => 8,
+        VolumeCommand::Expand(_) => 9,
     }
 }
 
@@ -439,6 +459,153 @@ fn exact_initialize_retry_is_current_and_conflicts_are_rejected() {
     assert_eq!(
         conflict.response,
         VolumeCommandResponse::Rejected(VolumeCommandRejection::AlreadyInitialized)
+    );
+}
+
+#[test]
+fn expansion_changes_only_capacity_and_revision() {
+    let initialized = initialized();
+    let writer = WriterGrant {
+        node_id: node(1),
+        session_id: session(41),
+    };
+    let attached = apply(
+        &initialized,
+        VolumeCommand::GrantWriter(GrantVolumeWriter {
+            expected: expected(&initialized),
+            writer,
+        }),
+    );
+    let target = VolumeCapacity::new(128 << 20).expect("aligned expansion capacity");
+    let command = VolumeCommand::Expand(ExpandVolume {
+        expected: expected(&attached),
+        target_capacity: target,
+    });
+    let plan = attached.evaluate(&command);
+    assert!(matches!(
+        plan.response,
+        VolumeCommandResponse::Applied { revision: 3, .. }
+    ));
+    assert_eq!(plan.state.revision(), 3);
+    assert_eq!(
+        plan.state
+            .descriptor()
+            .expect("expanded state has a descriptor")
+            .capacity(),
+        target
+    );
+    assert_eq!(plan.state.data(), attached.data());
+    assert_eq!(plan.state.disposition(), attached.disposition());
+    assert_eq!(plan.state.replacement(), attached.replacement());
+
+    let retried = plan.state.evaluate(&command);
+    assert_eq!(retried.state, plan.state);
+    assert!(matches!(
+        retried.response,
+        VolumeCommandResponse::Current { revision: 3, .. }
+    ));
+}
+
+#[test]
+fn expansion_rejects_every_unsafe_control_state() {
+    let state = initialized();
+    let current_capacity = state
+        .descriptor()
+        .expect("initialized state has a descriptor")
+        .capacity();
+    let larger = VolumeCapacity::new(128 << 20).expect("aligned expansion capacity");
+    let evaluate = |state: &VolumeControlState, target_capacity| {
+        state.evaluate(&VolumeCommand::Expand(ExpandVolume {
+            expected: expected(state),
+            target_capacity,
+        }))
+    };
+
+    let stale = state.evaluate(&VolumeCommand::Expand(ExpandVolume {
+        expected: ExpectedVolumeRevision {
+            generation: generation(),
+            revision: 0,
+        },
+        target_capacity: larger,
+    }));
+    assert_eq!(
+        stale.response,
+        VolumeCommandResponse::Conflict {
+            current_revision: state.revision(),
+        }
+    );
+    assert_eq!(
+        evaluate(
+            &state,
+            VolumeCapacity::new(current_capacity.bytes() - 4096).expect("smaller aligned capacity"),
+        )
+        .response,
+        VolumeCommandResponse::Rejected(VolumeCommandRejection::CapacityCannotShrink)
+    );
+    assert_eq!(
+        evaluate(
+            &state,
+            VolumeCapacity::new(current_capacity.bytes() + 1).expect("non-zero unaligned capacity"),
+        )
+        .response,
+        VolumeCommandResponse::Rejected(VolumeCommandRejection::CapacityNotAligned)
+    );
+
+    let retained = apply(
+        &state,
+        VolumeCommand::SetDisposition(SetVolumeDisposition {
+            expected: expected(&state),
+            disposition: VolumeDisposition::Retained,
+        }),
+    );
+    assert_eq!(
+        evaluate(&retained, larger).response,
+        VolumeCommandResponse::Rejected(VolumeCommandRejection::VolumeNotLive)
+    );
+
+    let recovery = RecoveryGrant {
+        id: recovery_id(91),
+        coordinator_node_id: node(1),
+        source_node_id: node(1),
+        target_node_ids: initial_copies(),
+    };
+    let recovering = apply(
+        &state,
+        VolumeCommand::BeginRecovery(BeginVolumeRecovery {
+            expected: expected(&state),
+            expected_writer: None,
+            replaced_recovery_id: None,
+            recovery,
+        }),
+    );
+    assert_eq!(
+        evaluate(&recovering, larger).response,
+        VolumeCommandResponse::Rejected(VolumeCommandRejection::RecoveryInProgress)
+    );
+
+    let replacing = apply(
+        &state,
+        VolumeCommand::BeginReplacement(BeginReplicaReplacement {
+            expected: expected(&state),
+            replacement: ReplacementGrant {
+                id: replacement_id(92),
+                coordinator_node_id: node(1),
+                old_node_id: Some(node(2)),
+                new_node_id: node(4),
+                source_node_id: node(1),
+            },
+        }),
+    );
+    assert_eq!(
+        evaluate(&replacing, larger).response,
+        VolumeCommandResponse::Rejected(VolumeCommandRejection::ReplacementInProgress)
+    );
+
+    let mut exhausted = state;
+    exhausted.revision = u64::MAX;
+    assert_eq!(
+        evaluate(&exhausted, larger).response,
+        VolumeCommandResponse::Rejected(VolumeCommandRejection::RevisionExhausted)
     );
 }
 
@@ -1228,7 +1395,7 @@ fn one_hundred_thousand_attach_cycles_keep_state_bounded() {
 
 #[test]
 fn arbitrary_valid_command_sequences_preserve_every_invariant() {
-    let mut command_counts = [0_usize; 9];
+    let mut command_counts = [0_usize; 10];
     let mut response_counts = [0_usize; 4];
 
     for seed in 1..=64_u64 {

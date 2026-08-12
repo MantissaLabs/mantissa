@@ -351,9 +351,11 @@ pub enum VolumeRequestError {
     ImmediateBinding,
     #[error("replicated volumes require a non-zero capacity")]
     MissingCapacity,
-    #[error("replicated volume capacity {requested_bytes} is not aligned to {block_size} bytes")]
+    #[error(
+        "replicated volume capacity {initial_capacity_bytes} is not aligned to {block_size} bytes"
+    )]
     UnalignedCapacity {
-        requested_bytes: u64,
+        initial_capacity_bytes: u64,
         block_size: u64,
     },
     #[error("replicated volume capacity cannot fit in 64-bit replica accounting")]
@@ -373,7 +375,7 @@ pub struct VolumeSpecValue {
     pub access_mode: VolumeAccessMode,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: VolumeReclaimPolicy,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub labels: Vec<VolumeLabel>,
     pub bound_node_id: Option<Uuid>,
     pub bound_node_name: Option<String>,
@@ -400,7 +402,7 @@ impl VolumeSpecValue {
             access_mode: draft.access_mode,
             binding_mode: draft.binding_mode,
             reclaim_policy: draft.reclaim_policy,
-            requested_bytes: draft.requested_bytes,
+            initial_capacity_bytes: draft.initial_capacity_bytes,
             labels: normalize_labels(draft.labels),
             bound_node_id: draft.bound_node_id,
             bound_node_name: draft.bound_node_name,
@@ -433,18 +435,18 @@ impl VolumeSpecValue {
         if self.binding_mode != VolumeBindingMode::WaitForFirstConsumer {
             return Err(VolumeRequestError::ImmediateBinding);
         }
-        let requested_bytes = self
-            .requested_bytes
+        let initial_capacity_bytes = self
+            .initial_capacity_bytes
             .filter(|value| *value != 0)
             .ok_or(VolumeRequestError::MissingCapacity)?;
-        if requested_bytes % REPLICATED_VOLUME_BLOCK_SIZE != 0 {
+        if initial_capacity_bytes % REPLICATED_VOLUME_BLOCK_SIZE != 0 {
             return Err(VolumeRequestError::UnalignedCapacity {
-                requested_bytes,
+                initial_capacity_bytes,
                 block_size: REPLICATED_VOLUME_BLOCK_SIZE,
             });
         }
         let replica_space =
-            mantissa_volume::storage_format::ReplicaSpace::for_capacity(requested_bytes)
+            mantissa_volume::storage_format::ReplicaSpace::for_capacity(initial_capacity_bytes)
                 .map_err(|_| VolumeRequestError::CapacityOverflow)?;
         replica_space
             .total_bytes()
@@ -458,7 +460,7 @@ impl VolumeSpecValue {
         Ok(())
     }
 
-    /// Returns whether two rows describe the same immutable volume request.
+    /// Returns whether two rows have the same generation-defining volume request.
     pub fn has_same_request(&self, other: &Self) -> bool {
         self.id == other.id
             && self.name == other.name
@@ -466,7 +468,7 @@ impl VolumeSpecValue {
             && self.access_mode == other.access_mode
             && self.binding_mode == other.binding_mode
             && self.reclaim_policy == other.reclaim_policy
-            && self.requested_bytes == other.requested_bytes
+            && self.initial_capacity_bytes == other.initial_capacity_bytes
             && self.labels == other.labels
             && self.plan_coordinator_node_id == other.plan_coordinator_node_id
             && self.volume_epoch == other.volume_epoch
@@ -600,7 +602,10 @@ impl VolumeSpecValue {
             .then(self.access_mode.cmp(&other.access_mode))
             .then(self.binding_mode.cmp(&other.binding_mode))
             .then(self.reclaim_policy.cmp(&other.reclaim_policy))
-            .then(self.requested_bytes.cmp(&other.requested_bytes))
+            .then(
+                self.initial_capacity_bytes
+                    .cmp(&other.initial_capacity_bytes),
+            )
             .then(
                 self.plan_coordinator_node_id
                     .cmp(&other.plan_coordinator_node_id),
@@ -643,6 +648,11 @@ pub struct VolumeNodeStateValue {
     pub local_path: Option<String>,
     pub state: VolumeNodeState,
     pub capacity_bytes: Option<u64>,
+    pub reserved_capacity_bytes: Option<u64>,
+    pub prepared_capacity_bytes: Option<u64>,
+    pub served_capacity_bytes: Option<u64>,
+    pub device_capacity_bytes: Option<u64>,
+    pub filesystem_expansion_pending: bool,
     pub used_bytes: Option<u64>,
     pub published_task_ids: Vec<Uuid>,
     pub updated_at: String,
@@ -671,6 +681,11 @@ impl VolumeNodeStateValue {
             local_path,
             state,
             capacity_bytes,
+            reserved_capacity_bytes: None,
+            prepared_capacity_bytes: None,
+            served_capacity_bytes: None,
+            device_capacity_bytes: None,
+            filesystem_expansion_pending: false,
             used_bytes: None,
             published_task_ids: Vec::new(),
             updated_at: current_timestamp(),
@@ -774,8 +789,71 @@ pub struct ReplicatedVolumePlan {
     pub workload_node_id: Uuid,
     /// Three nodes selected to store the volume.
     pub replica_node_ids: [Uuid; 3],
-    /// Exact identity, capacity, and block sizes used by all three replicas.
+    /// Exact identity, initial capacity, and block sizes used by all three replicas.
     pub descriptor: SavedVolumeDescriptor,
+}
+
+/// Latest requested capacity for one replicated volume generation.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReplicatedVolumeCapacityRequest {
+    /// Stable key derived from the volume and generation.
+    pub id: Uuid,
+    /// Volume whose capacity should expand.
+    pub volume_id: Uuid,
+    /// Volume generation that owns this request.
+    pub volume_epoch: u64,
+    /// Monotonic request revision within the generation.
+    pub revision: u64,
+    /// Deterministic tie-breaker for concurrent requests at one revision.
+    pub request_id: Uuid,
+    /// Requested total capacity rather than bytes to add.
+    pub target_capacity_bytes: u64,
+    /// RFC3339 timestamp used only after revision and request identity.
+    pub updated_at: String,
+}
+
+impl ReplicatedVolumeCapacityRequest {
+    /// Builds the first capacity request for one volume generation.
+    pub fn first(volume_id: Uuid, volume_epoch: u64, target_capacity_bytes: u64) -> Self {
+        Self {
+            id: compute_replicated_volume_capacity_request_id(volume_id, volume_epoch),
+            volume_id,
+            volume_epoch,
+            revision: 1,
+            request_id: Uuid::new_v4(),
+            target_capacity_bytes,
+            updated_at: current_timestamp(),
+        }
+    }
+
+    /// Builds a causally later target without changing the volume generation.
+    pub fn next(&self, target_capacity_bytes: u64) -> Result<Self, anyhow::Error> {
+        Ok(Self {
+            id: self.id,
+            volume_id: self.volume_id,
+            volume_epoch: self.volume_epoch,
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("volume capacity request revision is exhausted"))?,
+            request_id: Uuid::new_v4(),
+            target_capacity_bytes,
+            updated_at: current_timestamp(),
+        })
+    }
+
+    /// Orders concurrent values so every node selects the same desired target.
+    pub fn precedence_cmp(&self, other: &Self) -> Ordering {
+        self.volume_epoch
+            .cmp(&other.volume_epoch)
+            .then(self.revision.cmp(&other.revision))
+            .then(self.request_id.cmp(&other.request_id))
+            .then(compare_volume_timestamps(
+                &self.updated_at,
+                &other.updated_at,
+            ))
+            .then_with(|| other.cmp(self))
+    }
 }
 
 impl ReplicatedVolumePlan {
@@ -835,6 +913,8 @@ pub struct ReplicatedVolumeGroupStatusValue {
     pub message: Option<String>,
     /// Revision of the committed bounded volume control state.
     pub control_revision: u64,
+    /// Logical capacity committed by the volume Raft group.
+    pub replicated_capacity_bytes: u64,
     /// Current non-zero data fence, or none before initialization.
     pub fence: Option<u64>,
     /// Current active data copies from committed control state.
@@ -874,6 +954,7 @@ impl ReplicatedVolumeGroupStatusValue {
             updated_at: current_timestamp(),
             message: None,
             control_revision: 0,
+            replicated_capacity_bytes: 0,
             fence: None,
             copy_node_ids: Vec::new(),
             voter_node_ids: Vec::new(),
@@ -908,7 +989,7 @@ pub struct VolumeSpecDraft {
     pub access_mode: VolumeAccessMode,
     pub binding_mode: VolumeBindingMode,
     pub reclaim_policy: VolumeReclaimPolicy,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub labels: Vec<VolumeLabel>,
     pub bound_node_id: Option<Uuid>,
     pub bound_node_name: Option<String>,
@@ -924,6 +1005,7 @@ pub enum VolumeEvent {
     PlanRemove(Uuid),
     GroupStatusUpsert(Box<ReplicatedVolumeGroupStatusValue>),
     GroupStatusRemove(Uuid),
+    CapacityRequestUpsert(Box<ReplicatedVolumeCapacityRequest>),
 }
 
 /// Computes one stable volume identifier from its logical name.
@@ -949,6 +1031,11 @@ pub fn compute_volume_node_state_id(volume_id: Uuid, node_id: Uuid, volume_epoch
 /// Computes the stable immutable-plan ID for one volume generation.
 pub fn compute_replicated_volume_plan_id(volume_id: Uuid, volume_epoch: u64) -> Uuid {
     compute_volume_record_id(b"replicated-volume-plan", volume_id, volume_epoch)
+}
+
+/// Computes the stable capacity-request ID for one volume generation.
+pub fn compute_replicated_volume_capacity_request_id(volume_id: Uuid, volume_epoch: u64) -> Uuid {
+    compute_volume_record_id(b"replicated-volume-capacity", volume_id, volume_epoch)
 }
 
 /// Gives every volume a stable pseudo-random node order for balanced storage placement.
@@ -1020,7 +1107,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes: Some(capacity_bytes),
+            initial_capacity_bytes: Some(capacity_bytes),
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,
@@ -1052,7 +1139,7 @@ mod tests {
             access_mode: VolumeAccessMode::ReadWriteOnce,
             binding_mode: VolumeBindingMode::WaitForFirstConsumer,
             reclaim_policy: VolumeReclaimPolicy::Retain,
-            requested_bytes: None,
+            initial_capacity_bytes: None,
             labels: Vec::new(),
             bound_node_id: None,
             bound_node_name: None,
@@ -1071,6 +1158,45 @@ mod tests {
             replicated_request(u64::MAX - 4095).validate_request(),
             Err(VolumeRequestError::CapacityOverflow)
         );
+    }
+
+    /// Capacity intent advances by revision and rejects counter exhaustion.
+    #[test]
+    fn capacity_request_revision_is_monotonic_and_bounded() {
+        let volume_id = Uuid::from_u128(22);
+        let first =
+            ReplicatedVolumeCapacityRequest::first(volume_id, 3, 2 * REPLICATED_VOLUME_BLOCK_SIZE);
+        let next = first
+            .next(3 * REPLICATED_VOLUME_BLOCK_SIZE)
+            .expect("capacity request revision must advance");
+        assert_eq!(next.id, first.id);
+        assert_eq!(next.volume_id, first.volume_id);
+        assert_eq!(next.volume_epoch, first.volume_epoch);
+        assert_eq!(next.revision, first.revision + 1);
+        assert!(next.precedence_cmp(&first).is_gt());
+
+        let exhausted = ReplicatedVolumeCapacityRequest {
+            revision: u64::MAX,
+            ..next
+        };
+        assert!(exhausted.next(4 * REPLICATED_VOLUME_BLOCK_SIZE).is_err());
+    }
+
+    /// Concurrent requests use one deterministic ID winner on every node.
+    #[test]
+    fn capacity_request_conflict_order_does_not_depend_on_target_or_time() {
+        let volume_id = Uuid::from_u128(23);
+        let mut lower_id =
+            ReplicatedVolumeCapacityRequest::first(volume_id, 4, 8 * REPLICATED_VOLUME_BLOCK_SIZE);
+        lower_id.request_id = Uuid::from_u128(10);
+        lower_id.updated_at = "2099-01-01T00:00:00Z".to_string();
+        let mut higher_id = lower_id.clone();
+        higher_id.request_id = Uuid::from_u128(11);
+        higher_id.target_capacity_bytes = 2 * REPLICATED_VOLUME_BLOCK_SIZE;
+        higher_id.updated_at = "2000-01-01T00:00:00Z".to_string();
+
+        assert!(higher_id.precedence_cmp(&lower_id).is_gt());
+        assert!(lower_id.precedence_cmp(&higher_id).is_lt());
     }
 
     /// A later binding level wins independently of operation IDs and wall clocks.

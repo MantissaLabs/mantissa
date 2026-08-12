@@ -25,8 +25,8 @@ use mantissa_volume::control_state::{
     VolumeCommandResponse, VolumeControlState, VolumeDisposition, WriterGrant,
 };
 use mantissa_volume::driver::{
-    DriverLimits, MappedVolumeLayout, MappedVolumeSystem, UblkDeviceId, UblkDeviceState,
-    UblkOwnerId, UblkSystem,
+    DriverLimits, MappedVolumeLayout, MappedVolumeSystem, UblkDeviceId, UblkDeviceInfo,
+    UblkDeviceState, UblkOwnerId, UblkSystem,
 };
 use mantissa_volume::fs::{
     ext4,
@@ -49,7 +49,7 @@ use mantissa_volume::storage::replica_file::wire::{
 use mantissa_volume::storage::replica_file::{
     ReplicaFile, ReplicaFileError, ReplicaFileSettings, ReplicaFileWorkerPool,
 };
-use mantissa_volume::{FenceEpoch, ReplacementId, VolumeNodeId};
+use mantissa_volume::{FenceEpoch, ReplacementId, VolumeCapacity, VolumeDescriptor, VolumeNodeId};
 use openraft::{EmptyNode, Membership, StoredMembership};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -224,7 +224,21 @@ pub(crate) struct LocalReplicaStatus {
     pub(crate) applied_log_index: Option<u64>,
     pub(crate) leader_node_id: Option<Uuid>,
     pub(crate) voter_node_ids: BTreeSet<Uuid>,
-    pub(crate) reserved_bytes: u64,
+    pub(crate) reserved_capacity_bytes: u64,
+    pub(crate) prepared_capacity_bytes: u64,
+    pub(crate) served_capacity_bytes: u64,
+    pub(crate) device_capacity_bytes: Option<u64>,
+    pub(crate) filesystem_expansion_pending: bool,
+}
+
+/// Local capacity facts read without starting or advancing expansion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReplicaCapacityStatus {
+    pub(crate) reserved_capacity_bytes: u64,
+    pub(crate) prepared_capacity_bytes: u64,
+    pub(crate) served_capacity_bytes: u64,
+    pub(crate) healthy: bool,
+    pub(crate) reason: String,
 }
 
 /// Membership predicate requested for one exact replacement authorization.
@@ -989,7 +1003,7 @@ impl ReplicatedVolumeRuntime {
                 .replicas
                 .replica(key)?
                 .context("in-place replacement voter has no local replica")?;
-            if record.descriptor() != &descriptor {
+            if !replacement_capacity_can_converge(record.descriptor(), &descriptor) {
                 anyhow::bail!("in-place replacement voter has a conflicting descriptor");
             }
             if self.groups.catalog().group(&key)?.is_none() {
@@ -1006,9 +1020,103 @@ impl ReplicatedVolumeRuntime {
             if record.state() != ReplicaState::Ready || record.health() != ReplicaHealth::Healthy {
                 anyhow::bail!("in-place replacement voter has no usable ready replica");
             }
+            if record.descriptor().capacity() < descriptor.capacity() {
+                self.apply_local_replica_capacity_locked(key, descriptor.capacity())
+                    .await?;
+                record = self
+                    .replicas
+                    .replica(key)?
+                    .context("expanded in-place replacement replica disappeared")?;
+            }
+            if record.descriptor() != &descriptor {
+                anyhow::bail!("in-place replacement voter did not reach current capacity");
+            }
             if !self.data_connections.reopen(key) {
                 anyhow::bail!("old in-place replacement streams are still closing");
             }
+            self.ensure_local_gate(&record).await?;
+            return self.local_status(key).await;
+        }
+        if let Some(mut record) = self.replicas.replica(key)? {
+            // A node that returns after quorum removed it still owns its old
+            // bootstrap row. Wake its saved Raft endpoint first, but do not
+            // erase the file until caught-up applied state names this exact
+            // node and replacement grant while excluding it from data work.
+            if !replacement_capacity_can_converge(record.descriptor(), &descriptor) {
+                anyhow::bail!("excluded replacement target has a conflicting descriptor");
+            }
+            if self.groups.catalog().group(&key)?.is_none() {
+                anyhow::bail!("excluded replacement target has no saved Raft group");
+            }
+            self.close_replica_io(key).await?;
+            let group = self
+                .groups
+                .activate(&key)
+                .await
+                .context("activate excluded replacement Raft endpoint")?;
+            let applied = group.state();
+            drop(group);
+            if applied.descriptor() != Some(&descriptor)
+                || validate_replacement_target_reset(&applied, replacement_id, self.volume_node_id)
+                    .is_err()
+            {
+                return self.local_status(key).await;
+            }
+
+            self.close_replica_file(key)?;
+            let replacement_origin =
+                LocalReplicaOrigin::replacement(replacement_id, voters.clone())?;
+            if record.origin() != &replacement_origin
+                || record.state() == ReplicaState::Preparing
+                || record.health() == ReplicaHealth::NeedsRecovery
+            {
+                let replicas = self.replicas.clone();
+                let settings = self.replica_file_settings;
+                self.lifecycle_calls
+                    .run(
+                        key,
+                        "mantissa-volume-reuse-excluded-replica",
+                        self.operation_timeout,
+                        move || -> Result<()> {
+                            replicas.reserve_replica_capacity(key, descriptor.capacity())?;
+                            let record = replicas.begin_replica_replacement(
+                                key,
+                                descriptor,
+                                replacement_origin,
+                            )?;
+                            prepare_empty_replica_file(&replicas, &record, settings, false)
+                        },
+                    )
+                    .await
+                    .context("rebuild excluded replica as the current replacement")?;
+            } else {
+                if record.descriptor().capacity() < descriptor.capacity() {
+                    self.apply_local_replica_capacity_locked(key, descriptor.capacity())
+                        .await?;
+                    record = self
+                        .replicas
+                        .replica(key)?
+                        .context("expanded replacement replica disappeared")?;
+                }
+                let replicas = self.replicas.clone();
+                let settings = self.replica_file_settings;
+                self.lifecycle_calls
+                    .run(
+                        key,
+                        "mantissa-volume-verify-replacement-replica",
+                        self.operation_timeout,
+                        move || prepare_empty_replica_file(&replicas, &record, settings, false),
+                    )
+                    .await
+                    .context("verify existing replacement replica")?;
+            }
+            if !self.data_connections.reopen(key) {
+                anyhow::bail!("old excluded replacement streams are still closing");
+            }
+            let record = self
+                .replicas
+                .replica(key)?
+                .context("rebuilt replacement replica disappeared before admission")?;
             self.ensure_local_gate(&record).await?;
             return self.local_status(key).await;
         }
@@ -1094,7 +1202,7 @@ impl ReplicatedVolumeRuntime {
             .context("activate unhealthy in-place replacement voter")?;
         let control_state = group.state();
         drop(group);
-        validate_unhealthy_replacement_reset(&control_state, replacement_id, self.volume_node_id)?;
+        validate_replacement_target_reset(&control_state, replacement_id, self.volume_node_id)?;
         if !matches!(
             record.state(),
             ReplicaState::Ready | ReplicaState::Preparing
@@ -1512,6 +1620,7 @@ impl ReplicatedVolumeRuntime {
     /// Reports local catalog, group, and applied-state facts without advancing work.
     pub(crate) async fn local_status(&self, key: ReplicaKey) -> Result<LocalReplicaStatus> {
         let record = self.replicas.replica(key)?;
+        let capacity = self.local_replica_capacity_status(key, None)?;
         let saved = self.groups.catalog().group(&key)?;
         let running = self.groups.group(&key).await.ok();
         let applied_state = self.applied_volume_states.cell(key).map(|cell| cell.load());
@@ -1521,6 +1630,21 @@ impl ReplicatedVolumeRuntime {
             .and_then(|group| group.membership())
             .map(|membership| membership.voter_ids().collect())
             .unwrap_or_default();
+        let attachment = self.replicas.attachment(key)?;
+        let device_capacity_bytes = match (
+            attachment
+                .as_ref()
+                .and_then(LocalAttachmentRecord::volume_mount),
+            self.tracked_driver(key),
+        ) {
+            (Some(_), Some(driver)) => Some(driver.lock().await.device_capacity_bytes()),
+            _ => None,
+        };
+        let filesystem_expansion_pending = attachment
+            .as_ref()
+            .and_then(LocalAttachmentRecord::volume_mount)
+            .zip(device_capacity_bytes)
+            .is_some_and(|(mount, device)| mount.filesystem_expanded_to_bytes() < device);
         Ok(LocalReplicaStatus {
             exists: record.is_some(),
             state: record
@@ -1543,13 +1667,220 @@ impl ReplicatedVolumeRuntime {
                 }),
             leader_node_id: metrics.and_then(|metrics| metrics.leader),
             voter_node_ids,
-            reserved_bytes: record.as_ref().map_or(0, |record| {
-                record
-                    .reserved_space()
-                    .data_bytes()
-                    .saturating_add(record.reserved_space().metadata_bytes())
-            }),
+            reserved_capacity_bytes: capacity.reserved_capacity_bytes,
+            prepared_capacity_bytes: capacity.prepared_capacity_bytes,
+            served_capacity_bytes: capacity.served_capacity_bytes,
+            device_capacity_bytes,
+            filesystem_expansion_pending,
         })
+    }
+
+    /// Reads local reservation, file coverage, and served bounds without advancing work.
+    pub(crate) fn local_replica_capacity_status(
+        &self,
+        key: ReplicaKey,
+        target: Option<VolumeCapacity>,
+    ) -> Result<ReplicaCapacityStatus> {
+        let Some(record) = self.replicas.replica(key)? else {
+            return Ok(ReplicaCapacityStatus {
+                reserved_capacity_bytes: 0,
+                prepared_capacity_bytes: 0,
+                served_capacity_bytes: 0,
+                healthy: false,
+                reason: "local replica is not present".to_owned(),
+            });
+        };
+        let reserved_capacity_bytes = record.reserved_space().data_bytes();
+        let open_file = self.replica_files.lock().get(&key).cloned();
+        let prepared = if let Some(file) = open_file.as_ref() {
+            file.prepared_capacity()
+        } else {
+            ReplicaFile::prepared_capacity_at(
+                record.path(self.replicas.pool_root()).join("blocks"),
+                record.descriptor(),
+            )
+        };
+        let prepared_capacity_bytes = match prepared {
+            Ok(prepared) => prepared.bytes().min(reserved_capacity_bytes),
+            Err(error) => {
+                return Ok(ReplicaCapacityStatus {
+                    reserved_capacity_bytes,
+                    prepared_capacity_bytes: 0,
+                    served_capacity_bytes: 0,
+                    healthy: false,
+                    reason: format!("local replica file coverage is unavailable: {error}"),
+                });
+            }
+        };
+        let served_capacity_bytes = open_file.as_ref().map_or_else(
+            || record.descriptor().capacity().bytes(),
+            |file| file.served_capacity().bytes(),
+        );
+        let base_healthy = record.state() == ReplicaState::Ready
+            && record.health() == ReplicaHealth::Healthy
+            && served_capacity_bytes <= prepared_capacity_bytes
+            && record.descriptor().capacity().bytes() <= served_capacity_bytes;
+        let reason = if record.state() != ReplicaState::Ready {
+            format!("local replica is {}", record.state())
+        } else if record.health() != ReplicaHealth::Healthy {
+            "local replica requires recovery".to_owned()
+        } else if let Some(target) = target
+            && reserved_capacity_bytes < target.bytes()
+        {
+            format!(
+                "reserved capacity is {} bytes, below target {} bytes",
+                reserved_capacity_bytes,
+                target.bytes()
+            )
+        } else if let Some(target) = target
+            && prepared_capacity_bytes < target.bytes()
+        {
+            format!(
+                "prepared capacity is {} bytes, below target {} bytes",
+                prepared_capacity_bytes,
+                target.bytes()
+            )
+        } else if !base_healthy {
+            "local served capacity is inconsistent with durable file coverage".to_owned()
+        } else {
+            String::new()
+        };
+        Ok(ReplicaCapacityStatus {
+            reserved_capacity_bytes,
+            prepared_capacity_bytes,
+            served_capacity_bytes,
+            healthy: base_healthy,
+            reason,
+        })
+    }
+
+    /// Reserves and durably prepares one desired capacity without exposing it.
+    pub(crate) async fn reconcile_local_replica_capacity(
+        &self,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+    ) -> Result<ReplicaCapacityStatus> {
+        self.ensure_generation_desired(key)?;
+        let singleflight = self.volume_singleflight.get(key);
+        let _singleflight = singleflight.lock().await;
+        self.ensure_generation_desired(key)?;
+        let record = self
+            .replicas
+            .replica(key)?
+            .context("capacity preparation has no local replica")?;
+        if record.state() != ReplicaState::Ready || record.health() != ReplicaHealth::Healthy {
+            return self.local_replica_capacity_status(key, Some(target));
+        }
+        record.descriptor().with_capacity(target)?;
+        if target < record.descriptor().capacity() {
+            anyhow::bail!("desired replica capacity is below applied Raft capacity");
+        }
+
+        let replicas = self.replicas.clone();
+        let settings = self.replica_file_settings;
+        let directory = record.path(replicas.pool_root()).join("blocks");
+        let open_file = self.replica_files.lock().get(&key).cloned();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-prepare-capacity",
+                self.operation_timeout,
+                move || -> Result<()> {
+                    let current = replicas
+                        .replica(key)?
+                        .context("capacity preparation replica disappeared")?;
+                    if current.reserved_space().data_bytes() < target.bytes() {
+                        replicas.reserve_replica_capacity(key, target)?;
+                    } else if current.reserved_space().data_bytes() > target.bytes() {
+                        replicas.reduce_replica_reservation(key, target)?;
+                    }
+                    if let Some(file) = open_file.as_ref() {
+                        file.prepare_capacity(target)?;
+                    } else {
+                        let file =
+                            ReplicaFile::open(&directory, current.descriptor().clone(), settings)?;
+                        file.prepare_capacity(target)?;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .context("prepare local replica capacity")?;
+        self.local_replica_capacity_status(key, Some(target))
+    }
+
+    /// Applies one committed capacity locally and then raises the live request bound.
+    async fn apply_local_replica_capacity(
+        &self,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+    ) -> Result<()> {
+        let singleflight = self.volume_singleflight.get(key);
+        let _singleflight = singleflight.lock().await;
+        self.apply_local_replica_capacity_locked(key, target).await
+    }
+
+    /// Applies committed capacity while the caller holds this replica's exclusive lane.
+    async fn apply_local_replica_capacity_locked(
+        &self,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+    ) -> Result<()> {
+        let record = self
+            .replicas
+            .replica(key)?
+            .context("committed capacity has no local replica")?;
+        if target < record.descriptor().capacity() {
+            anyhow::bail!("committed replica capacity moved backwards");
+        }
+        if target == record.descriptor().capacity() {
+            if let Some(file) = self.replica_files.lock().get(&key).cloned() {
+                file.serve_capacity(target)?;
+            }
+            return Ok(());
+        }
+
+        let replicas = self.replicas.clone();
+        let settings = self.replica_file_settings;
+        let directory = record.path(replicas.pool_root()).join("blocks");
+        let open_file = self.replica_files.lock().get(&key).cloned();
+        let file_for_call = open_file.clone();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-apply-capacity",
+                self.operation_timeout,
+                move || -> Result<()> {
+                    let current = replicas
+                        .replica(key)?
+                        .context("capacity application replica disappeared")?;
+                    if current.reserved_space().data_bytes() < target.bytes() {
+                        replicas.reserve_replica_capacity(key, target)?;
+                    }
+                    if let Some(file) = file_for_call.as_ref() {
+                        file.prepare_capacity(target)?;
+                    } else {
+                        let file =
+                            ReplicaFile::open(&directory, current.descriptor().clone(), settings)?;
+                        file.prepare_capacity(target)?;
+                    }
+                    replicas.apply_replica_capacity(key, target)?;
+                    Ok(())
+                },
+            )
+            .await
+            .context("apply committed local replica capacity")?;
+        if let Some(file) = open_file {
+            file.serve_capacity(target)?;
+        }
+        info!(
+            target: "mantissa::volumes::replicated",
+            volume_id = %key.volume_id().as_uuid(),
+            generation = key.generation().get(),
+            capacity_bytes = target.bytes(),
+            "applied expanded replicated-volume capacity locally"
+        );
+        Ok(())
     }
 
     /// Reconciles every durable attachment from current control state and local resources.
@@ -1643,6 +1974,24 @@ impl ReplicatedVolumeRuntime {
                 }
                 return Ok(());
             }
+            let record = self
+                .replicas
+                .replica(key)?
+                .context("saved attachment has no local replica")?;
+            if saved.descriptor().capacity() < record.descriptor().capacity() {
+                if !self
+                    .all_active_copies_serve_capacity(&state, record.descriptor().capacity())
+                    .await
+                {
+                    return Ok(());
+                }
+                self.reconcile_writer_frontend_capacity(&record, &saved, &state)
+                    .await?;
+                return Ok(());
+            }
+            if saved.descriptor().capacity() > record.descriptor().capacity() {
+                anyhow::bail!("saved mapped capacity exceeds the applied replica capacity");
+            }
             let serving = if let Some(driver) = self.tracked_driver(key) {
                 let mut driver = driver.lock().await;
                 let attachment = DriverAttachment {
@@ -1652,19 +2001,49 @@ impl ReplicatedVolumeRuntime {
                     session_id: saved.session_id(),
                 };
                 if driver.attachment() == attachment
-                    && driver.is_rebuild_paused()
+                    && driver.is_io_paused()
                     && state.replacement().is_none()
                 {
-                    driver.resume_rebuild()?;
+                    driver.resume_io()?;
                 }
                 if driver.attachment() == attachment && driver.is_available() {
                     driver.stop_retiring_path().await?;
+                    driver.stop_retiring_device().await?;
+                    let active_device = driver.saved_device()?;
+                    let backend_path = driver.backend_path()?.to_path_buf();
+                    drop(driver);
+                    if saved.volume_mount().is_some() {
+                        let layout = MappedVolumeLayout::new(
+                            self.volume_node_id,
+                            saved.descriptor(),
+                            backend_path,
+                        )?;
+                        let mapped_volumes = self.mapped_volumes.clone();
+                        self.lifecycle_calls
+                            .run(
+                                key,
+                                "mantissa-volume-resume-saved-mapping",
+                                self.operation_timeout,
+                                move || mapped_volumes.resume_exact(&layout).map(drop),
+                            )
+                            .await
+                            .context("resume exact saved mapped volume")?;
+                    }
+                    for stale in saved
+                        .ublk_devices()
+                        .iter()
+                        .copied()
+                        .filter(|device| device.id() != active_device.id())
+                    {
+                        self.remove_untracked_device(key, stale).await?;
+                        self.replicas.clear_ublk_device(key, stale)?;
+                    }
                     true
                 } else {
                     false
                 }
             } else {
-                saved.ublk_device().is_none()
+                saved.ublk_devices().is_empty()
             };
             if serving {
                 if let Some(volume_mount) = saved.volume_mount()
@@ -1681,11 +2060,20 @@ impl ReplicatedVolumeRuntime {
                         driver.lock().await.backend_path()?.to_path_buf()
                     };
                     let mapped_path = self
-                        .ensure_mapped_volume_device(&record, backend_path)
+                        .ensure_mapped_volume_device(saved.descriptor(), backend_path)
                         .await?;
-                    self.recover_saved_mount(&record, &saved, &state, volume_mount, mapped_path)
-                        .await?;
+                    self.recover_saved_mount(
+                        &record,
+                        &saved,
+                        &state,
+                        volume_mount,
+                        saved.descriptor(),
+                        mapped_path,
+                    )
+                    .await?;
                 }
+                self.reconcile_mounted_filesystem_capacity(key, record.descriptor())
+                    .await?;
                 return Ok(());
             }
             if saved.volume_mount().is_none() {
@@ -1760,11 +2148,11 @@ impl ReplicatedVolumeRuntime {
             && let Some(driver) = self.tracked_driver(key)
         {
             let driver = driver.lock().await;
-            if driver.is_rebuild_paused() {
+            if driver.is_io_paused() {
                 // Once no replacement owns the pause, release held I/O
                 // through the dynamically fenced old path. Its bounded
                 // failure lets the workload stop and local cleanup run.
-                driver.resume_rebuild()?;
+                driver.resume_io()?;
             }
         }
         if saved
@@ -1772,6 +2160,248 @@ impl ReplicatedVolumeRuntime {
             .is_none_or(|mount| mount.state() != SavedMountState::Mounted)
         {
             self.cleanup_attachment(key).await?;
+        }
+        Ok(())
+    }
+
+    /// Confirms every current data copy serves the committed capacity before frontend exposure.
+    async fn all_active_copies_serve_capacity(
+        &self,
+        state: &VolumeControlState,
+        target: VolumeCapacity,
+    ) -> bool {
+        let Some(data) = state.data() else {
+            return false;
+        };
+        let Some(key) = state.descriptor().map(ReplicaKey::from) else {
+            return false;
+        };
+        let checks = data
+            .copies
+            .iter()
+            .map(|copy| self.inspect_replica_capacity_on(*copy.as_uuid(), key, target));
+        let checked = futures::future::join_all(checks).await;
+        let Ok(statuses) = checked.into_iter().collect::<Result<Vec<_>>>() else {
+            return false;
+        };
+        all_copies_serve_capacity(data.copies.len(), &statuses, target)
+    }
+
+    /// Switches one attached writer to the locally applied replicated capacity.
+    async fn reconcile_writer_frontend_capacity(
+        &self,
+        record: &ReplicaRecord,
+        saved: &LocalAttachmentRecord,
+        state: &VolumeControlState,
+    ) -> Result<()> {
+        let key = record.key();
+        let current = saved.descriptor().clone();
+        let target = record.descriptor().clone();
+        if !current.has_same_storage_identity(&target) || current.capacity() >= target.capacity() {
+            anyhow::bail!("writer frontend expansion requires one larger compatible descriptor");
+        }
+        let fence = saved
+            .granted_fence()
+            .context("writer frontend expansion has no granted fence")?;
+        let attachment = DriverAttachment {
+            node_id: self.volume_node_id,
+            generation: key.generation(),
+            fence,
+            session_id: saved.session_id(),
+        };
+        validate_saved_writer(state, self.volume_node_id, saved.session_id(), fence)?;
+        let owner = self
+            .tracked_driver(key)
+            .context("writer frontend expansion has no tracked driver")?;
+
+        let active_capacity_bytes = owner.lock().await.device_capacity_bytes();
+        if active_capacity_bytes == current.capacity().bytes() {
+            let needs_target_path = owner.lock().await.path_capacity() < target.capacity();
+            let next_settings = ReplicatedDriverSettings::new(
+                self.ublk_owner_id,
+                self.driver_limits.ublk_settings(&target)?,
+                self.stop_io_timeout,
+            );
+            {
+                let mut driver = owner.lock().await;
+                driver.start_larger_device(next_settings)?;
+                driver.finish_larger_device_start().await?;
+            }
+            let (old_backend, larger_backend, larger_device) = {
+                let driver = owner.lock().await;
+                (
+                    driver.backend_path()?.to_path_buf(),
+                    driver.larger_backend_path()?.to_path_buf(),
+                    driver.saved_larger_device()?,
+                )
+            };
+            self.replicas.save_ublk_device(key, larger_device)?;
+            let current_layout =
+                MappedVolumeLayout::new(self.volume_node_id, &current, old_backend)?;
+            let larger_layout =
+                MappedVolumeLayout::new(self.volume_node_id, &target, larger_backend)?;
+
+            let mapped_volumes = self.mapped_volumes.clone();
+            let current_to_suspend = current_layout.clone();
+            let larger_after_suspend = larger_layout.clone();
+            self.lifecycle_calls
+                .run(
+                    key,
+                    "mantissa-volume-suspend-mapping",
+                    self.operation_timeout,
+                    move || {
+                        mapped_volumes
+                            .suspend_for_backend_switch(&current_to_suspend, &larger_after_suspend)
+                            .map(drop)
+                    },
+                )
+                .await
+                .context("suspend mapped volume before backend expansion")?;
+
+            let pause = {
+                let driver = owner.lock().await;
+                if driver.attachment() != attachment {
+                    anyhow::bail!("writer frontend expansion found another driver attachment");
+                }
+                driver.io_pause()?
+            };
+            pause.drain_and_flush().await?;
+
+            // The old path must be fully drained before its replacement is
+            // opened. A busy path normally has writes between its stored and
+            // durable counters, so preparing first would make online
+            // expansion wait forever for an accidental idle instant.
+            let target_path = if needs_target_path {
+                Some(self.prepare_driver_path(record, attachment, state).await?)
+            } else {
+                None
+            };
+            if let Some(path) = target_path {
+                let mut driver = owner.lock().await;
+                if driver.path_capacity() < target.capacity() {
+                    if !driver.can_install_path() {
+                        anyhow::bail!("writer data path is not held for capacity expansion");
+                    }
+                    driver.install_path(path, target.clone(), attachment);
+                }
+            }
+            owner.lock().await.arm_larger_device()?;
+
+            // Device-mapper resume may issue filesystem I/O before its ioctl
+            // returns. Let those requests reach the already-installed path;
+            // the suspended mapping still prevents them from arriving early.
+            owner.lock().await.resume_io()?;
+
+            let mapped_volumes = self.mapped_volumes.clone();
+            self.lifecycle_calls
+                .run(
+                    key,
+                    "mantissa-volume-expand-mapping",
+                    self.operation_timeout,
+                    move || {
+                        mapped_volumes
+                            .switch_backend(&current_layout, &larger_layout)
+                            .map(drop)
+                    },
+                )
+                .await
+                .context("activate larger mapped volume backend")?;
+            owner.lock().await.promote_larger_device()?;
+        } else if active_capacity_bytes != target.capacity().bytes() {
+            anyhow::bail!(
+                "tracked writer device capacity {active_capacity_bytes} does not match the saved \
+                 or applied capacity"
+            );
+        }
+
+        self.replicas
+            .advance_attachment_capacity(key, target.clone())?;
+        {
+            let driver = owner.lock().await;
+            if driver.is_io_paused() {
+                driver.resume_io()?;
+            }
+        }
+
+        let old_devices = self
+            .replicas
+            .attachment(key)?
+            .context("expanded writer attachment disappeared")?
+            .ublk_devices()
+            .iter()
+            .copied()
+            .filter(|device| device.capacity() < target.capacity())
+            .collect::<Vec<_>>();
+        {
+            let mut driver = owner.lock().await;
+            driver.stop_retiring_device().await?;
+            driver.stop_retiring_path().await?;
+        }
+        for device in old_devices {
+            self.remove_untracked_device(key, device).await?;
+            self.replicas.clear_ublk_device(key, device)?;
+        }
+        self.reconcile_mounted_filesystem_capacity(key, &target)
+            .await?;
+        info!(
+            target: "mantissa::volumes::replicated",
+            volume_id = %key.volume_id().as_uuid(),
+            generation = key.generation().get(),
+            capacity_bytes = target.capacity().bytes(),
+            "expanded replicated-volume writer frontend"
+        );
+        Ok(())
+    }
+
+    /// Runs and records idempotent online ext4 expansion for one saved mount.
+    async fn reconcile_mounted_filesystem_capacity(
+        &self,
+        key: ReplicaKey,
+        descriptor: &VolumeDescriptor,
+    ) -> Result<()> {
+        let Some(mount) = self
+            .replicas
+            .attachment(key)?
+            .and_then(|attachment| attachment.volume_mount().cloned())
+        else {
+            return Ok(());
+        };
+        let target_bytes = descriptor.capacity().bytes();
+        if mount.state() == SavedMountState::Unmounting
+            || mount.filesystem_expanded_to_bytes() >= target_bytes
+        {
+            return Ok(());
+        }
+        let (progress, backend_path) = {
+            let driver = self
+                .tracked_driver(key)
+                .context("filesystem expansion has no tracked block driver")?;
+            let driver = driver.lock().await;
+            (driver.progress(), driver.backend_path()?.to_path_buf())
+        };
+        let mapped_path = MappedVolumeLayout::new(self.volume_node_id, descriptor, backend_path)?
+            .expected_path()
+            .to_path_buf();
+        let fs = self.fs.clone();
+        let resize_path = mapped_path.clone();
+        self.lifecycle_calls
+            .run_async(
+                key,
+                "mantissa-volume-expand-filesystem",
+                self.operation_timeout,
+                async move { fs.expand(&resize_path, progress).await },
+            )
+            .await
+            .context("expand mounted replicated ext4 filesystem")?;
+        let current = self
+            .replicas
+            .attachment(key)?
+            .and_then(|attachment| attachment.volume_mount().cloned())
+            .context("filesystem expansion mount disappeared")?;
+        if current.filesystem_expanded_to_bytes() < target_bytes {
+            let expanded = current.with_filesystem_expanded_to(target_bytes)?;
+            self.replicas
+                .replace_volume_mount(key, &current, expanded)?;
         }
         Ok(())
     }
@@ -1803,7 +2433,7 @@ impl ReplicatedVolumeRuntime {
             .context("adopted writer fence has no tracked local driver")?;
         let mut driver = driver.lock().await;
         if driver.attachment() == previous {
-            if !driver.can_install_rebuild_path() {
+            if !driver.can_install_path() {
                 anyhow::bail!("adopted writer path is not held for its fence handoff");
             }
             let path = match self.prepare_driver_path(record, next, state).await {
@@ -1829,7 +2459,7 @@ impl ReplicatedVolumeRuntime {
                 }
                 Err(error) => return Err(error),
             };
-            driver.install_rebuild_path(path, next);
+            driver.install_path(path, record.descriptor().clone(), next);
         } else if driver.attachment() != next {
             anyhow::bail!("tracked driver differs from the adopted writer session");
         }
@@ -1839,8 +2469,8 @@ impl ReplicatedVolumeRuntime {
             previous_fence,
             next_fence,
         )?;
-        if driver.is_rebuild_paused() {
-            driver.resume_rebuild()?;
+        if driver.is_io_paused() {
+            driver.resume_io()?;
         }
         driver.stop_retiring_path().await?;
         Ok(())
@@ -1880,8 +2510,8 @@ impl ReplicatedVolumeRuntime {
                     .tracked_driver(key)
                     .context("adopted local writer has no tracked driver")?;
                 let mut driver = driver.lock().await;
-                if driver.is_rebuild_paused() {
-                    driver.resume_rebuild()?;
+                if driver.is_io_paused() {
+                    driver.resume_io()?;
                 }
                 driver.stop_retiring_path().await?;
                 Ok(())
@@ -2023,6 +2653,19 @@ impl ReplicatedVolumeRuntime {
         wanted: VolumeDisposition,
     ) -> Result<()> {
         self.ensure_generation_desired(key)?;
+        if let Some(applied_state) = self.applied_state(key)?
+            && applied_state
+                .data()
+                .is_some_and(|data| data.copies.contains(&self.volume_node_id))
+            && let Some(descriptor) = applied_state.descriptor()
+            && self
+                .replicas
+                .replica(key)?
+                .is_some_and(|record| descriptor.capacity() >= record.descriptor().capacity())
+        {
+            self.apply_local_replica_capacity(key, descriptor.capacity())
+                .await?;
+        }
         let singleflight = self.volume_singleflight.get(key);
         let _singleflight = singleflight.lock().await;
         self.lifecycle_calls
@@ -2199,8 +2842,60 @@ impl ReplicatedVolumeRuntime {
         Ok(self.read_quorum_state(key).await?.descriptor().is_some())
     }
 
+    /// Confirms a live quorum has committed at least one required capacity.
+    pub async fn volume_is_ready_for_capacity(
+        &self,
+        key: ReplicaKey,
+        required_capacity_bytes: u64,
+    ) -> Result<bool> {
+        if self.is_stopping()
+            || !self.generation_is_desired(key)
+            || self.groups.catalog().group(&key)?.is_none()
+        {
+            return Ok(false);
+        }
+        let state = self.read_quorum_state(key).await?;
+        let Some(descriptor) = state.descriptor() else {
+            return Ok(false);
+        };
+        let required_capacity = VolumeCapacity::new(required_capacity_bytes)?;
+        if descriptor.capacity() < required_capacity
+            || !self
+                .all_active_copies_serve_capacity(&state, required_capacity)
+                .await
+        {
+            return Ok(false);
+        }
+        let Some(saved) = self.replicas.attachment(key)? else {
+            return Ok(true);
+        };
+        let Some(mount) = saved.volume_mount() else {
+            return Ok(true);
+        };
+        if saved.descriptor().capacity().bytes() < required_capacity_bytes
+            || mount.filesystem_expanded_to_bytes() < required_capacity_bytes
+        {
+            return Ok(false);
+        }
+        let Some(driver) = self.tracked_driver(key) else {
+            return Ok(false);
+        };
+        Ok(driver.lock().await.device_capacity_bytes() >= required_capacity_bytes)
+    }
+
     /// Checks that one saved attachment still owns a serving driver and kernel mount.
     pub async fn volume_is_mounted(&self, key: ReplicaKey) -> Result<bool> {
+        let _lifecycle = self.driver_lifecycle.read().await;
+        if self.is_stopping() {
+            return Ok(false);
+        }
+        let singleflight = self.volume_singleflight.get(key);
+        let _singleflight = singleflight.lock().await;
+        self.volume_is_mounted_locked(key).await
+    }
+
+    /// Checks one mount while its local lifecycle facts cannot be mid-transition.
+    async fn volume_is_mounted_locked(&self, key: ReplicaKey) -> Result<bool> {
         if !self.generation_is_desired(key) {
             return Ok(false);
         }
@@ -2251,11 +2946,8 @@ impl ReplicatedVolumeRuntime {
         }
         let backend_path = driver.backend_path()?.to_path_buf();
         drop(driver);
-        let record = self
-            .replicas
-            .replica(key)?
-            .context("mounted attachment has no local replica")?;
-        let layout = MappedVolumeLayout::new(record.descriptor(), backend_path)?;
+        let layout =
+            MappedVolumeLayout::new(self.volume_node_id, saved.descriptor(), backend_path)?;
         let mapped_volumes = self.mapped_volumes.clone();
         self.lifecycle_calls
             .run(
@@ -2291,7 +2983,7 @@ impl ReplicatedVolumeRuntime {
         }
         let singleflight = self.volume_singleflight.get(key);
         let _singleflight = singleflight.lock().await;
-        if !self.volume_is_mounted(key).await? {
+        if !self.volume_is_mounted_locked(key).await? {
             anyhow::bail!("replicated volume is not mounted on this writer node");
         }
         let path = self.fs.mount_path(key);
@@ -2452,7 +3144,7 @@ impl ReplicatedVolumeRuntime {
             Err(driver_error) => return Err(driver_error),
         };
         let mapped_path = self
-            .ensure_mapped_volume_device(&record, backend_path)
+            .ensure_mapped_volume_device(record.descriptor(), backend_path)
             .await?;
         self.ensure_mounted_filesystem(key, &record, &attachment, &state, mapped_path, ownership)
             .await
@@ -2865,7 +3557,7 @@ impl ReplicatedVolumeRuntime {
             validate_saved_writer(&current, self.volume_node_id, saved.session_id(), fence)?;
             return Ok(backend_path);
         }
-        if saved.ublk_device().is_some() {
+        if !saved.ublk_devices().is_empty() {
             anyhow::bail!("saved ublk device was not recovered before attachment retry");
         }
         let path = self.prepare_driver_path(record, attachment, state).await?;
@@ -2924,11 +3616,11 @@ impl ReplicatedVolumeRuntime {
     /// Ensures the deterministic dm-linear device used by the filesystem.
     async fn ensure_mapped_volume_device(
         &self,
-        record: &ReplicaRecord,
+        descriptor: &VolumeDescriptor,
         backend_path: PathBuf,
     ) -> Result<PathBuf> {
-        let key = record.key();
-        let layout = MappedVolumeLayout::new(record.descriptor(), backend_path)?;
+        let key = ReplicaKey::from(descriptor);
+        let layout = MappedVolumeLayout::new(self.volume_node_id, descriptor, backend_path)?;
         let expected_path = layout.expected_path().to_path_buf();
         let mapped_volumes = self.mapped_volumes.clone();
         self.lifecycle_calls
@@ -3071,6 +3763,8 @@ impl ReplicatedVolumeRuntime {
             let mounted = saved.with_state(SavedMountState::Mounted)?;
             self.replicas.replace_volume_mount(key, &saved, mounted)?;
         }
+        self.reconcile_mounted_filesystem_capacity(key, record.descriptor())
+            .await?;
         Ok(path)
     }
 
@@ -3158,7 +3852,7 @@ impl ReplicatedVolumeRuntime {
             self.replicas.clear_volume_mount(key, &mount)?;
         }
         if let Some(saved) = self.replicas.attachment(key)? {
-            if let Some(device) = saved.ublk_device() {
+            for device in saved.ublk_devices().to_vec() {
                 self.remove_untracked_device(key, device).await?;
                 self.replicas.clear_ublk_device(key, device)?;
             }
@@ -3353,12 +4047,13 @@ impl ReplicatedVolumeRuntime {
     /// Removes every owned mapped device before its ublk backend can stop.
     async fn remove_mapped_volume_device(&self, key: ReplicaKey) -> Result<()> {
         let mapped_volumes = self.mapped_volumes.clone();
+        let node_id = self.volume_node_id;
         self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-unmap",
                 self.stop_io_timeout,
-                move || mapped_volumes.remove(key),
+                move || mapped_volumes.remove(node_id, key),
             )
             .await
             .context("remove mapped replicated-volume device")?;
@@ -3460,22 +4155,23 @@ impl ReplicatedVolumeRuntime {
             .discover_attachments(self.max_saved_replicas)?;
         let expected_mappings = attachments
             .iter()
-            .filter(|saved| saved.ublk_device().is_some())
+            .filter(|saved| !saved.ublk_devices().is_empty())
             .map(LocalAttachmentRecord::key)
             .collect::<BTreeSet<_>>();
         let mapped_volumes = self.mapped_volumes.clone();
+        let node_id = self.volume_node_id;
         self.lifecycle_calls
             .run_global(
                 "mantissa-volume-unexpected-mapping-cleanup",
                 self.stop_io_timeout,
-                move || mapped_volumes.remove_unexpected(&expected_mappings),
+                move || mapped_volumes.remove_unexpected(node_id, &expected_mappings),
             )
             .await
             .context("remove unexpected mapped volume devices")?;
         let saved_ids = attachments
             .iter()
-            .filter_map(LocalAttachmentRecord::ublk_device)
-            .map(SavedUblkDevice::id)
+            .flat_map(LocalAttachmentRecord::ublk_devices)
+            .map(|device| device.id())
             .collect::<Vec<_>>();
         let owner = self.ublk_owner_id;
         let inventory =
@@ -3513,7 +4209,8 @@ impl ReplicatedVolumeRuntime {
         let states = inventory
             .found()
             .iter()
-            .map(|device| (device.id(), device.state()))
+            .cloned()
+            .map(|device| (device.id(), device))
             .collect::<BTreeMap<_, _>>();
 
         for saved in attachments {
@@ -3542,7 +4239,7 @@ impl ReplicatedVolumeRuntime {
     async fn recover_saved_attachment(
         &self,
         mut saved: LocalAttachmentRecord,
-        states: &BTreeMap<UblkDeviceId, UblkDeviceState>,
+        states: &BTreeMap<UblkDeviceId, UblkDeviceInfo>,
     ) -> Result<()> {
         let key = saved.key();
         let Some(record) = self.replicas.replica(key)? else {
@@ -3607,9 +4304,59 @@ impl ReplicatedVolumeRuntime {
         {
             return self.cleanup_attachment(key).await;
         }
-        let Some(saved_device) = saved.ublk_device() else {
+        if saved.ublk_devices().is_empty() {
             return Ok(());
+        }
+        let mut candidates = Vec::new();
+        for device in saved.ublk_devices().iter().copied() {
+            let Some(info) = states.get(&device.id()) else {
+                continue;
+            };
+            let descriptor = saved.descriptor().with_capacity(device.capacity())?;
+            let layout =
+                MappedVolumeLayout::new(self.volume_node_id, &descriptor, info.block_path())?;
+            candidates.push((device, info.clone(), descriptor, layout));
+        }
+        let layouts = candidates
+            .iter()
+            .map(|(_, _, _, layout)| layout.clone())
+            .collect::<Vec<_>>();
+        let mapped_volumes = self.mapped_volumes.clone();
+        let selected = tokio::task::spawn_blocking(move || mapped_volumes.active_layout(&layouts))
+            .await
+            .context("join saved mapped-volume inspection")??;
+        let mapping_exists = selected.is_some();
+        let saved_device = if let Some(index) = selected {
+            candidates
+                .get(index)
+                .map(|(device, _, _, _)| *device)
+                .context("mapped-volume selection exceeded saved candidates")?
+        } else {
+            let active = saved
+                .ublk_devices()
+                .iter()
+                .copied()
+                .filter(|device| device.capacity() == saved.descriptor().capacity())
+                .collect::<Vec<_>>();
+            if active.len() != 1 {
+                anyhow::bail!("saved attachment does not identify one active-capacity device");
+            }
+            active[0]
         };
+        let frontend_descriptor = saved.descriptor().with_capacity(saved_device.capacity())?;
+        if frontend_descriptor.capacity() < saved.descriptor().capacity()
+            || frontend_descriptor.capacity() > record.descriptor().capacity()
+        {
+            anyhow::bail!("active mapped capacity conflicts with the local attachment catalog");
+        }
+        if frontend_descriptor.capacity() > saved.descriptor().capacity() {
+            self.replicas
+                .advance_attachment_capacity(key, frontend_descriptor.clone())?;
+            saved = self
+                .replicas
+                .attachment(key)?
+                .context("advanced mapped attachment disappeared")?;
+        }
         let path = self
             .prepare_driver_path(
                 &record,
@@ -3622,7 +4369,7 @@ impl ReplicatedVolumeRuntime {
                 &state,
             )
             .await?;
-        let ublk = saved_device.settings(record.descriptor())?;
+        let ublk = saved_device.settings(&frontend_descriptor)?;
         self.check_saved_driver_limits(ublk)?;
         let settings =
             ReplicatedDriverSettings::new(self.ublk_owner_id, ublk, self.stop_io_timeout);
@@ -3638,7 +4385,7 @@ impl ReplicatedVolumeRuntime {
             .get(&key)
             .cloned()
             .context("local data gate is unavailable")?;
-        let recover_existing = match states.get(&saved_device.id()).copied() {
+        let recover_existing = match states.get(&saved_device.id()).map(UblkDeviceInfo::state) {
             Some(UblkDeviceState::NeedsRecovery) => true,
             Some(UblkDeviceState::Running) => {
                 anyhow::bail!("saved ublk device {} is still running", saved_device.id())
@@ -3686,14 +4433,96 @@ impl ReplicatedVolumeRuntime {
             let replacement = driver.lock().await.saved_device()?;
             self.replicas
                 .replace_ublk_device(key, saved_device, replacement)?;
+            saved = self
+                .replicas
+                .attachment(key)?
+                .context("recovered attachment disappeared")?;
+        }
+        let active_device = driver.lock().await.saved_device()?;
+        if frontend_descriptor.capacity() < record.descriptor().capacity() {
+            let larger = saved
+                .ublk_devices()
+                .iter()
+                .copied()
+                .find(|device| device.capacity() == record.descriptor().capacity());
+            if let Some(larger) = larger {
+                match states.get(&larger.id()).map(UblkDeviceInfo::state) {
+                    Some(UblkDeviceState::NeedsRecovery) => {
+                        let ublk = larger.settings(record.descriptor())?;
+                        self.check_saved_driver_limits(ublk)?;
+                        let settings = ReplicatedDriverSettings::new(
+                            self.ublk_owner_id,
+                            ublk,
+                            self.stop_io_timeout,
+                        );
+                        let mut owner = driver.lock().await;
+                        owner.recover_larger_device(larger.id(), settings)?;
+                        owner.finish_larger_device_start().await?;
+                    }
+                    Some(UblkDeviceState::Running) => {
+                        anyhow::bail!("saved ublk device {} is still running", larger.id());
+                    }
+                    Some(_) | None => {
+                        self.remove_untracked_device(key, larger).await?;
+                        self.replicas.clear_ublk_device(key, larger)?;
+                        saved = self
+                            .replicas
+                            .attachment(key)?
+                            .context("saved attachment disappeared during device cleanup")?;
+                    }
+                }
+            }
+        } else {
+            for stale in saved
+                .ublk_devices()
+                .iter()
+                .copied()
+                .filter(|device| device.id() != active_device.id())
+                .collect::<Vec<_>>()
+            {
+                self.remove_untracked_device(key, stale).await?;
+                self.replicas.clear_ublk_device(key, stale)?;
+            }
+            saved = self
+                .replicas
+                .attachment(key)?
+                .context("saved attachment disappeared during old-device cleanup")?;
         }
         let backend_path = driver.lock().await.backend_path()?.to_path_buf();
-        let mapped_path = self
-            .ensure_mapped_volume_device(&record, backend_path)
-            .await?;
+        let active_layout =
+            MappedVolumeLayout::new(self.volume_node_id, &frontend_descriptor, backend_path)?;
+        let mapped_path = if mapping_exists {
+            if frontend_descriptor.capacity() == record.descriptor().capacity() {
+                let mapped_volumes = self.mapped_volumes.clone();
+                let layout = active_layout.clone();
+                self.lifecycle_calls
+                    .run(
+                        key,
+                        "mantissa-volume-resume-saved-mapping",
+                        self.operation_timeout,
+                        move || mapped_volumes.resume_exact(&layout).map(drop),
+                    )
+                    .await
+                    .context("resume exact saved mapped volume")?;
+            }
+            active_layout.expected_path().to_path_buf()
+        } else {
+            self.ensure_mapped_volume_device(
+                &frontend_descriptor,
+                active_layout.backend_path().to_path_buf(),
+            )
+            .await?
+        };
         if let Some(volume_mount) = saved.volume_mount().cloned() {
-            self.recover_saved_mount(&record, &saved, &state, &volume_mount, mapped_path)
-                .await?;
+            self.recover_saved_mount(
+                &record,
+                &saved,
+                &state,
+                &volume_mount,
+                &frontend_descriptor,
+                mapped_path,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -3705,6 +4534,7 @@ impl ReplicatedVolumeRuntime {
         attachment: &LocalAttachmentRecord,
         state: &VolumeControlState,
         saved: &SavedVolumeMount,
+        frontend_descriptor: &VolumeDescriptor,
         mapped_path: PathBuf,
     ) -> Result<()> {
         let key = record.key();
@@ -3750,6 +4580,8 @@ impl ReplicatedVolumeRuntime {
                 saved.with_state(SavedMountState::Mounted)?,
             )?;
         }
+        self.reconcile_mounted_filesystem_capacity(key, frontend_descriptor)
+            .await?;
         Ok(())
     }
 
@@ -3770,20 +4602,61 @@ impl ReplicatedVolumeRuntime {
 
     /// Removes mount, mapping, and backend while retaining the writer session.
     async fn quiesce_attachment_resources(&self, key: ReplicaKey) -> Result<()> {
+        let saved_attachment = self.replicas.attachment(key)?;
+        if saved_attachment.is_none() && self.tracked_driver(key).is_none() {
+            // A volume key identifies the same mapper name on every node. Do
+            // not remove a mapping without a node-local attachment or driver
+            // proving that this runtime owns it. Startup inventory cleanup is
+            // the separate owner for local kernel orphans.
+            return Ok(());
+        }
         self.quiesce_driver_requests(key).await?;
-        if let Some(saved) = self.replicas.attachment(key)?
+        if let Some(saved) = saved_attachment
             && let Some(volume_mount) = saved.volume_mount().cloned()
         {
+            if self.tracked_driver(key).is_none() {
+                let mapped_volumes = self.mapped_volumes.clone();
+                let owner = self.ublk_owner_id;
+                let descriptor = saved.descriptor().clone();
+                let devices = saved.ublk_devices().to_vec();
+                let node_id = self.volume_node_id;
+                self.lifecycle_calls
+                    .run(
+                        key,
+                        "mantissa-volume-fail-dead-mapping",
+                        self.stop_io_timeout,
+                        move || -> Result<()> {
+                            let system = UblkSystem::system(owner);
+                            let mut layouts = Vec::with_capacity(devices.len());
+                            for device in devices {
+                                let Some(found) = system.device(device.id())? else {
+                                    continue;
+                                };
+                                let device_descriptor =
+                                    descriptor.with_capacity(device.capacity())?;
+                                layouts.push(MappedVolumeLayout::new(
+                                    node_id,
+                                    &device_descriptor,
+                                    found.block_path(),
+                                )?);
+                            }
+                            mapped_volumes.fail_io_for_cleanup(node_id, key, &layouts)?;
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .context("make dead mapped backend fail before detaching ext4")?;
+            }
             self.detach_quarantined_mount(key, &volume_mount).await?;
         }
         self.remove_mapped_volume_device(key).await?;
         self.stop_tracked_driver(key).await?;
-        if let Some(saved) = self.replicas.attachment(key)?
-            && let Some(device) = saved.ublk_device()
-        {
-            self.remove_untracked_device(key, device).await?;
-            if saved.volume_mount().is_none() {
-                self.replicas.clear_ublk_device(key, device)?;
+        if let Some(saved) = self.replicas.attachment(key)? {
+            for device in saved.ublk_devices().to_vec() {
+                self.remove_untracked_device(key, device).await?;
+                if saved.volume_mount().is_none() {
+                    self.replicas.clear_ublk_device(key, device)?;
+                }
             }
         }
         Ok(())
@@ -4269,6 +5142,30 @@ fn same_mount(left: &SavedVolumeMount, right: &SavedVolumeMount) -> bool {
         && left.mode() == right.mode()
 }
 
+/// Requires every current copy to have published the committed served bound.
+fn all_copies_serve_capacity(
+    active_copy_count: usize,
+    statuses: &[ReplicaCapacityStatus],
+    target: VolumeCapacity,
+) -> bool {
+    active_copy_count != 0
+        && statuses.len() == active_copy_count
+        && statuses.iter().all(|status| {
+            status.healthy
+                && status.reserved_capacity_bytes >= target.bytes()
+                && status.prepared_capacity_bytes >= target.bytes()
+                && status.served_capacity_bytes >= target.bytes()
+        })
+}
+
+/// Accepts only an older or equal capacity for the same replacement storage identity.
+fn replacement_capacity_can_converge(
+    saved: &VolumeDescriptor,
+    committed: &VolumeDescriptor,
+) -> bool {
+    saved.has_same_storage_identity(committed) && saved.capacity() <= committed.capacity()
+}
+
 /// Returns true only for the one exact deterministic ext4 signature.
 fn is_exact_ext4(
     signatures: &[ext4::Signature],
@@ -4319,23 +5216,23 @@ fn validate_replacement_rollback_voters(
 }
 
 /// Requires the exact applied grant and data exclusion before destructive file reset.
-fn validate_unhealthy_replacement_reset(
+fn validate_replacement_target_reset(
     state: &VolumeControlState,
     replacement_id: ReplacementId,
     local_node_id: VolumeNodeId,
 ) -> Result<()> {
     if state.disposition() != VolumeDisposition::Live {
-        anyhow::bail!("unhealthy replacement reset requires live control state");
+        anyhow::bail!("replacement target reset requires live control state");
     }
     let replacement = state
         .replacement()
         .filter(|replacement| {
             replacement.id == replacement_id && replacement.new_node_id == local_node_id
         })
-        .context("local control state does not name this unhealthy replacement target")?;
+        .context("local control state does not name this replacement target")?;
     let data = state
         .data()
-        .context("unhealthy replacement grant is not initialized")?;
+        .context("replacement target reset has no initialized data state")?;
     if data.copies.contains(&replacement.new_node_id) {
         anyhow::bail!("refusing to reset a replica that remains in data control state");
     }
@@ -4355,9 +5252,10 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SavedAttachmentMountAction, WriterReplicaRecoveryRequired, raft_group_idle_timeout,
+        ReplicaCapacityStatus, SavedAttachmentMountAction, WriterReplicaRecoveryRequired,
+        all_copies_serve_capacity, raft_group_idle_timeout, replacement_capacity_can_converge,
         replacement_voter_hint_is_valid, saved_attachment_mount_action, stale_replacement_learners,
-        validate_replacement_rollback_voters, validate_unhealthy_replacement_reset,
+        validate_replacement_rollback_voters, validate_replacement_target_reset,
         writer_fence_install_generation, writer_path_failure_requires_recovery,
     };
     use mantissa_volume::catalog::SavedMountState;
@@ -4367,8 +5265,8 @@ mod tests {
         WriterGrant,
     };
     use mantissa_volume::{
-        DriverSessionId, FenceEpoch, RecoveryId, ReplacementId, VolumeBlockSizes, VolumeDescriptor,
-        VolumeGeneration, VolumeId, VolumeNodeId,
+        DriverSessionId, FenceEpoch, RecoveryId, ReplacementId, VolumeBlockSizes, VolumeCapacity,
+        VolumeDescriptor, VolumeGeneration, VolumeId, VolumeNodeId,
     };
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -4387,6 +5285,74 @@ mod tests {
             mantissa_volume::control_state::VolumeCommandResponse::Applied { .. }
         ));
         result.state
+    }
+
+    /// The mapped writer waits until every active copy serves the committed range.
+    #[test]
+    fn writer_capacity_requires_every_copy_to_serve() {
+        let target = VolumeCapacity::new(128 << 20).expect("valid test capacity");
+        let ready = ReplicaCapacityStatus {
+            reserved_capacity_bytes: target.bytes(),
+            prepared_capacity_bytes: target.bytes(),
+            served_capacity_bytes: target.bytes(),
+            healthy: true,
+            reason: String::new(),
+        };
+        assert!(!all_copies_serve_capacity(
+            3,
+            &[ready.clone(), ready.clone()],
+            target
+        ));
+        assert!(all_copies_serve_capacity(
+            3,
+            &[ready.clone(), ready.clone(), ready.clone()],
+            target
+        ));
+
+        let mut behind = ready.clone();
+        behind.served_capacity_bytes = 64 << 20;
+        assert!(!all_copies_serve_capacity(
+            3,
+            &[ready.clone(), ready.clone(), behind],
+            target
+        ));
+        let mut unhealthy = ready.clone();
+        unhealthy.healthy = false;
+        assert!(!all_copies_serve_capacity(
+            3,
+            &[ready.clone(), ready, unhealthy],
+            target
+        ));
+    }
+
+    /// A returning voter may catch up from an older capacity but never from another identity.
+    #[test]
+    fn replacement_voter_accepts_only_convergent_capacity() {
+        let initial = VolumeDescriptor::new(
+            VolumeId::new(Uuid::from_u128(10)).expect("test volume ID"),
+            VolumeGeneration::new(1).expect("test volume generation"),
+            64 << 20,
+            VolumeBlockSizes::supported(),
+        )
+        .expect("test initial descriptor");
+        let expanded = initial
+            .with_capacity(VolumeCapacity::new(128 << 20).expect("expanded test capacity"))
+            .expect("compatible expanded descriptor");
+        let other_generation = VolumeDescriptor::new(
+            initial.volume_id(),
+            VolumeGeneration::new(2).expect("other test generation"),
+            expanded.capacity().bytes(),
+            VolumeBlockSizes::supported(),
+        )
+        .expect("other generation descriptor");
+
+        assert!(replacement_capacity_can_converge(&initial, &expanded));
+        assert!(replacement_capacity_can_converge(&expanded, &expanded));
+        assert!(!replacement_capacity_can_converge(&expanded, &initial));
+        assert!(!replacement_capacity_can_converge(
+            &initial,
+            &other_generation
+        ));
     }
 
     /// A fence handoff cannot erase evidence that selected copies diverged.
@@ -4563,10 +5529,10 @@ mod tests {
             }),
         );
 
-        validate_unhealthy_replacement_reset(&replacing, replacement_id, volume_node(3))
+        validate_replacement_target_reset(&replacing, replacement_id, volume_node(3))
             .expect("the exact excluded replacement target may reset");
         assert!(
-            validate_unhealthy_replacement_reset(
+            validate_replacement_target_reset(
                 &replacing,
                 ReplacementId::new(Uuid::from_u128(31)).expect("other replacement ID"),
                 volume_node(3),
@@ -4574,11 +5540,10 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate_unhealthy_replacement_reset(&replacing, replacement_id, volume_node(2))
-                .is_err()
+            validate_replacement_target_reset(&replacing, replacement_id, volume_node(2)).is_err()
         );
         assert!(
-            validate_unhealthy_replacement_reset(&initial, replacement_id, volume_node(3)).is_err()
+            validate_replacement_target_reset(&initial, replacement_id, volume_node(3)).is_err()
         );
     }
 

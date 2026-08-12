@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -298,7 +298,6 @@ impl Drop for DriverDevice {
 /// Gates one fixed data path while the kernel device remains registered.
 struct DriverHandler {
     route: RwLock<DriverRoute>,
-    descriptor: VolumeDescriptor,
     admission: Arc<FenceAdmission>,
     mode: AtomicU8,
     in_flight: AtomicUsize,
@@ -310,7 +309,93 @@ struct DriverHandler {
 /// Handler and committed writer identity changed together during a paused handoff.
 struct DriverRoute {
     handler: Arc<dyn DriverPath>,
+    descriptor: VolumeDescriptor,
     attachment: DriverAttachment,
+}
+
+/// Admits the mapped backend and queues an armed successor during a paused handoff.
+struct DriverDeviceGate {
+    enabled: AtomicBool,
+    shared: Arc<DriverHandler>,
+}
+
+impl DriverDeviceGate {
+    /// Creates one gate in the state required before or after mapping activation.
+    fn new(shared: Arc<DriverHandler>, enabled: bool) -> Self {
+        Self {
+            enabled: AtomicBool::new(enabled),
+            shared,
+        }
+    }
+
+    /// Lets this device enter the shared path once mapped or armed for handoff.
+    fn enable(&self) {
+        self.enabled.store(true, Ordering::Release);
+    }
+
+    /// Prevents new I/O through a device no longer referenced by dm-linear.
+    fn disable(&self) {
+        self.enabled.store(false, Ordering::Release);
+    }
+
+    /// Returns whether this private device may currently enter the shared path.
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    /// Rejects a request unless the device is the active mapped backend.
+    fn check_enabled(&self) -> Result<(), BlockIoError> {
+        if self.enabled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(BlockIoError::NotServing)
+    }
+}
+
+#[async_trait]
+impl BlockHandler for DriverDeviceGate {
+    /// Reads through the one currently mapped private device.
+    async fn read(&self, offset: u64, output: &mut [u8]) -> Result<(), BlockIoError> {
+        self.check_enabled()?;
+        self.shared.read(offset, output).await
+    }
+
+    /// Writes through the one currently mapped private device.
+    async fn write(
+        &self,
+        offset: u64,
+        input: Bytes,
+        force_unit_access: bool,
+    ) -> Result<(), BlockIoError> {
+        self.check_enabled()?;
+        self.shared.write(offset, input, force_unit_access).await
+    }
+
+    /// Flushes through the one currently mapped private device.
+    async fn flush(&self) -> Result<(), BlockIoError> {
+        self.check_enabled()?;
+        self.shared.flush().await
+    }
+
+    /// Discards through the one currently mapped private device.
+    async fn discard(&self, offset: u64, length: u64) -> Result<(), BlockIoError> {
+        self.check_enabled()?;
+        self.shared.discard(offset, length).await
+    }
+
+    /// Writes zeroes through the one currently mapped private device.
+    async fn write_zeroes(
+        &self,
+        offset: u64,
+        length: u64,
+        force_unit_access: bool,
+        allow_discard: bool,
+    ) -> Result<(), BlockIoError> {
+        self.check_enabled()?;
+        self.shared
+            .write_zeroes(offset, length, force_unit_access, allow_discard)
+            .await
+    }
 }
 
 /// Narrow permit-carrying boundary between ublk and the fixed replica path.
@@ -440,9 +525,9 @@ impl DriverHandler {
         Self {
             route: RwLock::new(DriverRoute {
                 handler,
+                descriptor,
                 attachment,
             }),
-            descriptor,
             admission,
             mode: AtomicU8::new(DRIVER_SERVING),
             in_flight: AtomicUsize::new(0),
@@ -462,8 +547,8 @@ impl DriverHandler {
         self.mode.load(Ordering::Acquire) == DRIVER_SERVING
     }
 
-    /// Returns whether this handler is serving or held by a planned rebuild.
-    fn can_finish_rebuild(&self) -> bool {
+    /// Returns whether this handler can enter or finish a planned I/O pause.
+    fn can_pause_io(&self) -> bool {
         self.mode.load(Ordering::Acquire) != DRIVER_STOPPED
     }
 
@@ -487,7 +572,7 @@ impl DriverHandler {
     }
 
     /// Stops admission and reports whether the old cache still needs a flush.
-    async fn drain_for_rebuild(&self) -> Result<bool, BlockIoError> {
+    async fn begin_io_pause(&self) -> Result<bool, BlockIoError> {
         match self.mode.compare_exchange(
             DRIVER_SERVING,
             DRIVER_DRAINING,
@@ -519,7 +604,7 @@ impl DriverHandler {
             let permit = self
                 .admission
                 .admit(&IoAdmissionRequest {
-                    descriptor: &self.descriptor,
+                    descriptor: &route.descriptor,
                     fence: route.attachment.fence,
                     session_id: route.attachment.session_id,
                     authenticated_peer: route.attachment.node_id,
@@ -532,7 +617,7 @@ impl DriverHandler {
     }
 
     /// Records that the drained cache and its direct writer are fully durable.
-    fn finish_rebuild_drain(&self) -> Result<(), BlockIoError> {
+    fn finish_io_pause(&self) -> Result<(), BlockIoError> {
         if self
             .mode
             .compare_exchange(
@@ -548,7 +633,7 @@ impl DriverHandler {
         Ok(())
     }
 
-    /// Lets requests held during a rebuild continue through the old handler.
+    /// Lets requests held during planned local work continue.
     fn resume_current(&self) -> Result<(), BlockIoError> {
         let mode = self.mode.load(Ordering::Acquire);
         if !matches!(mode, DRIVER_DRAINING | DRIVER_WAITING)
@@ -564,14 +649,20 @@ impl DriverHandler {
     }
 
     /// Installs the next fixed path while admission remains paused.
-    fn install_waiting(&self, handler: Arc<dyn DriverPath>, attachment: DriverAttachment) {
+    fn install_waiting(
+        &self,
+        handler: Arc<dyn DriverPath>,
+        descriptor: VolumeDescriptor,
+        attachment: DriverAttachment,
+    ) {
         *self.route.write() = DriverRoute {
             handler,
+            descriptor,
             attachment,
         };
     }
 
-    /// Waits through a planned rebuild pause and counts one admitted request.
+    /// Waits through a planned I/O pause and counts one admitted request.
     async fn current(&self) -> Result<ActiveRequest<'_>, BlockIoError> {
         loop {
             let changed = self.mode_changed.notified();
@@ -581,7 +672,7 @@ impl DriverHandler {
                 DRIVER_SERVING => {
                     let route = self.route.read();
                     let permit = match self.admission.admit(&IoAdmissionRequest {
-                        descriptor: &self.descriptor,
+                        descriptor: &route.descriptor,
                         fence: route.attachment.fence,
                         session_id: route.attachment.session_id,
                         authenticated_peer: route.attachment.node_id,
@@ -722,16 +813,16 @@ impl DriverQuarantine {
 }
 
 /// Cloned handles used to pause one driver without locking every other driver.
-pub(super) struct DriverRebuildPause {
+pub(super) struct DriverIoPause {
     handler: Arc<DriverHandler>,
 }
 
-impl DriverRebuildPause {
+impl DriverIoPause {
     /// Drains old requests and makes every accepted change durable.
-    pub(super) async fn run(&self) -> Result<(), DriverError> {
+    pub(super) async fn drain_and_flush(&self) -> Result<(), DriverError> {
         let needs_flush = self
             .handler
-            .drain_for_rebuild()
+            .begin_io_pause()
             .await
             .map_err(DriverError::Block)?;
         if needs_flush {
@@ -739,9 +830,7 @@ impl DriverRebuildPause {
                 .flush_draining()
                 .await
                 .map_err(DriverError::Block)?;
-            self.handler
-                .finish_rebuild_drain()
-                .map_err(DriverError::Block)?;
+            self.handler.finish_io_pause().map_err(DriverError::Block)?;
         }
         Ok(())
     }
@@ -758,6 +847,13 @@ pub(super) struct ReplicatedDriver {
     device: Option<DriverDevice>,
     device_id: Option<UblkDeviceId>,
     backend_path: Option<PathBuf>,
+    device_gate: Arc<DriverDeviceGate>,
+    next_device: Option<DriverDevice>,
+    next_device_id: Option<UblkDeviceId>,
+    next_backend_path: Option<PathBuf>,
+    next_device_gate: Option<Arc<DriverDeviceGate>>,
+    next_settings: Option<ReplicatedDriverSettings>,
+    retiring_device: Option<DriverDevice>,
     path: Option<FixedReplicaPath>,
     retiring_path: Option<FixedReplicaPath>,
     handler: Arc<DriverHandler>,
@@ -847,6 +943,205 @@ impl ReplicatedDriver {
         ))
     }
 
+    /// Returns the capacity of the private device currently selected by dm-linear.
+    pub(super) fn device_capacity_bytes(&self) -> u64 {
+        self.settings.ublk.capacity_bytes()
+    }
+
+    /// Returns the capacity installed in the shared replicated data path.
+    pub(super) fn path_capacity(&self) -> mantissa_volume::VolumeCapacity {
+        self.handler.route.read().descriptor.capacity()
+    }
+
+    /// Starts one larger disabled private device while retaining the active owner.
+    pub(super) fn start_larger_device(
+        &mut self,
+        settings: ReplicatedDriverSettings,
+    ) -> Result<(), DriverError> {
+        self.start_next_device(DriverDeviceMode::Start, settings)
+    }
+
+    /// Recovers one saved larger inactive device behind the shared I/O gate.
+    pub(super) fn recover_larger_device(
+        &mut self,
+        device_id: UblkDeviceId,
+        settings: ReplicatedDriverSettings,
+    ) -> Result<(), DriverError> {
+        self.start_next_device(DriverDeviceMode::Recover(device_id), settings)
+    }
+
+    /// Starts or recovers one disabled next device with exact capacity.
+    fn start_next_device(
+        &mut self,
+        mode: DriverDeviceMode,
+        settings: ReplicatedDriverSettings,
+    ) -> Result<(), DriverError> {
+        if self.next_device.is_some() {
+            if self
+                .next_settings
+                .is_some_and(|saved| saved.ublk.capacity_bytes() == settings.ublk.capacity_bytes())
+            {
+                return Ok(());
+            }
+            return Err(DriverError::AnotherCapacityDevicePending);
+        }
+        if settings.ublk.capacity_bytes() <= self.settings.ublk.capacity_bytes()
+            || self.retiring_device.is_some()
+        {
+            return Err(DriverError::AnotherCapacityDevicePending);
+        }
+        let gate = Arc::new(DriverDeviceGate::new(Arc::clone(&self.handler), false));
+        let ublk_handler: Arc<dyn BlockHandler> = gate.clone();
+        let mut device =
+            DriverDevice::prepare_start(settings.owner_id, mode, settings.ublk, ublk_handler);
+        device.start_owner()?;
+        self.next_device = Some(device);
+        self.next_device_gate = Some(gate);
+        self.next_settings = Some(settings);
+        Ok(())
+    }
+
+    /// Waits for the tracked larger device to expose its private backend path.
+    pub(super) async fn finish_larger_device_start(&mut self) -> Result<(), DriverError> {
+        if self.next_device_id.is_some() && self.next_backend_path.is_some() {
+            return Ok(());
+        }
+        let settings = self.next_settings.ok_or(DriverError::DeviceNotStarted)?;
+        let started = {
+            let device = self
+                .next_device
+                .as_mut()
+                .ok_or(DriverError::DeviceNotStarted)?;
+            device.wait_until_started(settings.operation_timeout).await
+        };
+        let (device_id, backend_path) = match started {
+            Ok(started) => started,
+            Err(start_error) => {
+                return match self.stop_larger_device().await {
+                    Ok(()) => Err(start_error),
+                    Err(cleanup_error) => Err(cleanup_error),
+                };
+            }
+        };
+        self.next_device_id = Some(device_id);
+        self.next_backend_path = Some(backend_path);
+        Ok(())
+    }
+
+    /// Returns the durable record for the tracked larger private device.
+    pub(super) fn saved_larger_device(
+        &self,
+    ) -> Result<mantissa_volume::catalog::SavedUblkDevice, DriverError> {
+        let device_id = self.next_device_id.ok_or(DriverError::DeviceNotStarted)?;
+        let settings = self.next_settings.ok_or(DriverError::DeviceNotStarted)?;
+        let attachment = self.attachment();
+        Ok(mantissa_volume::catalog::SavedUblkDevice::new(
+            device_id,
+            attachment.fence,
+            attachment.session_id,
+            settings.ublk,
+        ))
+    }
+
+    /// Returns the private path for the tracked larger device.
+    pub(super) fn larger_backend_path(&self) -> Result<&Path, DriverError> {
+        self.next_backend_path
+            .as_deref()
+            .ok_or(DriverError::DeviceNotStarted)
+    }
+
+    /// Arms the larger private device without rejecting old requests still leaving dm-linear.
+    pub(super) fn arm_larger_device(&self) -> Result<(), DriverError> {
+        if !self.is_io_paused() {
+            return Err(DriverError::Block(BlockIoError::NotServing));
+        }
+        let gate = self
+            .next_device_gate
+            .as_ref()
+            .ok_or(DriverError::DeviceNotStarted)?;
+        gate.enable();
+        Ok(())
+    }
+
+    /// Makes the larger device active after device-mapper proves its table is active.
+    pub(super) fn promote_larger_device(&mut self) -> Result<(), DriverError> {
+        if self.next_device.is_none()
+            || self.next_device_id.is_none()
+            || self.next_backend_path.is_none()
+            || self.next_settings.is_none()
+        {
+            return Err(DriverError::DeviceNotStarted);
+        }
+        let next_gate = self
+            .next_device_gate
+            .take()
+            .ok_or(DriverError::DeviceNotStarted)?;
+        if !next_gate.is_enabled() {
+            self.next_device_gate = Some(next_gate);
+            return Err(DriverError::DeviceNotStarted);
+        }
+        let next_device = self
+            .next_device
+            .take()
+            .ok_or(DriverError::DeviceNotStarted)?;
+        let next_id = self
+            .next_device_id
+            .take()
+            .ok_or(DriverError::DeviceNotStarted)?;
+        let next_path = self
+            .next_backend_path
+            .take()
+            .ok_or(DriverError::DeviceNotStarted)?;
+        let next_settings = self
+            .next_settings
+            .take()
+            .ok_or(DriverError::DeviceNotStarted)?;
+        self.device_gate.disable();
+        self.retiring_device = self.device.take();
+        self.device = Some(next_device);
+        self.device_id = Some(next_id);
+        self.backend_path = Some(next_path);
+        self.device_gate = next_gate;
+        self.settings = next_settings;
+        Ok(())
+    }
+
+    /// Stops the unreferenced old private device while retaining an unfinished wait.
+    pub(super) async fn stop_retiring_device(&mut self) -> Result<(), DriverError> {
+        let result = match self.retiring_device.as_mut() {
+            Some(device) => device.stop(self.settings.operation_timeout).await,
+            None => Ok(()),
+        };
+        if self
+            .retiring_device
+            .as_ref()
+            .is_some_and(DriverDevice::is_stopped)
+        {
+            self.retiring_device.take();
+        }
+        result
+    }
+
+    /// Stops an unactivated larger device after the old mapping remains active.
+    pub(super) async fn stop_larger_device(&mut self) -> Result<(), DriverError> {
+        let result = match self.next_device.as_mut() {
+            Some(device) => device.stop(self.settings.operation_timeout).await,
+            None => Ok(()),
+        };
+        if self
+            .next_device
+            .as_ref()
+            .is_none_or(DriverDevice::is_stopped)
+        {
+            self.next_device.take();
+            self.next_device_id = None;
+            self.next_backend_path = None;
+            self.next_device_gate = None;
+            self.next_settings = None;
+        }
+        result
+    }
+
     /// Clones the stable handler needed to flush outside the driver map.
     pub(super) fn flush_handle(&self) -> Result<DriverFlush, DriverError> {
         if !self.is_serving() {
@@ -864,15 +1159,15 @@ impl ReplicatedDriver {
         }
     }
 
-    /// Clones the small handles needed for a planned rebuild pause.
-    pub(super) fn rebuild_pause(&self) -> Result<DriverRebuildPause, DriverError> {
-        if !self.handler.can_finish_rebuild() {
+    /// Clones the small handles needed for a planned local I/O pause.
+    pub(super) fn io_pause(&self) -> Result<DriverIoPause, DriverError> {
+        if !self.handler.can_pause_io() {
             return Err(DriverError::Block(BlockIoError::NotServing));
         }
         if self.path.is_none() {
             return Err(DriverError::Block(BlockIoError::NotServing));
         }
-        Ok(DriverRebuildPause {
+        Ok(DriverIoPause {
             handler: Arc::clone(&self.handler),
         })
     }
@@ -894,7 +1189,7 @@ impl ReplicatedDriver {
     }
 
     /// Returns whether a planned replacement currently holds kernel requests.
-    pub(super) fn is_rebuild_paused(&self) -> bool {
+    pub(super) fn is_io_paused(&self) -> bool {
         matches!(
             self.handler.mode.load(Ordering::Acquire),
             DRIVER_DRAINING | DRIVER_WAITING
@@ -903,7 +1198,7 @@ impl ReplicatedDriver {
 
     /// Returns whether this device remains available through a planned pause.
     pub(super) fn is_available(&self) -> bool {
-        self.is_serving() || self.is_rebuild_paused()
+        self.is_serving() || self.is_io_paused()
     }
 
     /// Describes local handoff ownership without exposing mutable driver state.
@@ -924,33 +1219,37 @@ impl ReplicatedDriver {
             (handler.is_serving(), handler.failure())
         });
         format!(
-            "attachment={:?}, mode={mode}, in_flight={}, device={:?}, active={active:?}, \
-             retiring={retiring:?}",
+            "attachment={:?}, mode={mode}, in_flight={}, device={:?}, next_device={:?}, \
+             active={active:?}, retiring_path={retiring:?}, retiring_device={}",
             self.attachment(),
             self.handler.in_flight.load(Ordering::Acquire),
             self.device_id,
+            self.next_device_id,
+            self.retiring_device.is_some(),
         )
     }
 
     /// Checks the synchronous preconditions for installing a replacement path.
-    pub(super) fn can_install_rebuild_path(&self) -> bool {
-        self.is_rebuild_paused() && self.retiring_path.is_none()
+    pub(super) fn can_install_path(&self) -> bool {
+        self.is_io_paused() && self.retiring_path.is_none()
     }
 
     /// Swaps one ready fixed path behind the paused stable ublk handler.
-    pub(super) fn install_rebuild_path(
+    pub(super) fn install_path(
         &mut self,
         path: FixedReplicaPath,
+        descriptor: VolumeDescriptor,
         attachment: DriverAttachment,
     ) {
         let next_handler: Arc<dyn DriverPath> = path.handler();
         self.retiring_path = self.path.take();
         self.path = Some(path);
-        self.handler.install_waiting(next_handler, attachment);
+        self.handler
+            .install_waiting(next_handler, descriptor, attachment);
     }
 
     /// Resumes requests after the new fence and local record are installed.
-    pub(super) fn resume_rebuild(&self) -> Result<(), DriverError> {
+    pub(super) fn resume_io(&self) -> Result<(), DriverError> {
         self.handler.resume_current().map_err(DriverError::Block)
     }
 
@@ -967,19 +1266,28 @@ impl ReplicatedDriver {
     /// Stops new I/O and retains unfinished device cleanup for a later retry.
     pub(super) async fn stop(&mut self) -> Result<(), DriverError> {
         let data_result = self.stop_requests().await;
-        let device_result = match self.device.as_mut() {
+        let active_result = match self.device.as_mut() {
             Some(device) => device.stop(self.settings.operation_timeout).await,
             None => Ok(()),
         };
         if self.device.as_ref().is_some_and(DriverDevice::is_stopped) {
             self.device.take();
         }
-        data_result.and(device_result)
+        let next_result = self.stop_larger_device().await;
+        let retiring_result = self.stop_retiring_device().await;
+        data_result
+            .and(active_result)
+            .and(next_result)
+            .and(retiring_result)
     }
 
     /// Returns whether both the kernel device and data path reached terminal cleanup.
     pub(super) fn is_stopped(&self) -> bool {
-        self.device.is_none() && self.path.is_none() && self.retiring_path.is_none()
+        self.device.is_none()
+            && self.next_device.is_none()
+            && self.retiring_device.is_none()
+            && self.path.is_none()
+            && self.retiring_path.is_none()
     }
 
     /// Stops new requests and cancels unfinished fixed-file work.
@@ -1016,7 +1324,8 @@ impl ReplicatedDriver {
             attachment,
         ));
         let progress = handler.progress.clone();
-        let ublk_handler: Arc<dyn BlockHandler> = handler.clone();
+        let device_gate = Arc::new(DriverDeviceGate::new(Arc::clone(&handler), true));
+        let ublk_handler: Arc<dyn BlockHandler> = device_gate.clone();
         let mode = recover_id.map_or(DriverDeviceMode::Start, DriverDeviceMode::Recover);
         let device =
             DriverDevice::prepare_start(settings.owner_id, mode, settings.ublk, ublk_handler);
@@ -1024,6 +1333,13 @@ impl ReplicatedDriver {
             device: Some(device),
             device_id: None,
             backend_path: None,
+            device_gate,
+            next_device: None,
+            next_device_id: None,
+            next_backend_path: None,
+            next_device_gate: None,
+            next_settings: None,
+            retiring_device: None,
             path: Some(path),
             retiring_path: None,
             handler,
@@ -1079,6 +1395,10 @@ pub(super) enum DriverError {
     #[error("an earlier attempt failed to start the ublk device")]
     PreviousDeviceStartFailed,
 
+    /// Another private device already owns an unfinished capacity handoff.
+    #[error("another ublk capacity handoff is still pending")]
+    AnotherCapacityDevicePending,
+
     /// Creating or recovering the kernel device exceeded its deadline.
     #[error("ublk device did not start within {timeout:?}")]
     DeviceStartTimedOut { timeout: Duration },
@@ -1123,15 +1443,15 @@ mod tests {
         AppliedVolumeStateRegistry, FenceAdmission,
     };
     use mantissa_volume::{
-        DriverSessionId, VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId,
-        VolumeNodeId,
+        DriverSessionId, VolumeBlockSizes, VolumeCapacity, VolumeDescriptor, VolumeGeneration,
+        VolumeId, VolumeNodeId,
     };
     use tokio::sync::Notify;
     use uuid::Uuid;
 
     use super::{
-        DriverAttachment, DriverDevice, DriverDeviceMode, DriverError, DriverHandler, DriverPath,
-        DriverQuarantine,
+        DriverAttachment, DriverDevice, DriverDeviceGate, DriverDeviceMode, DriverError,
+        DriverHandler, DriverPath, DriverQuarantine, ReplicatedDriver, ReplicatedDriverSettings,
     };
 
     /// Small handler used to exercise admission and planned rebuild pauses.
@@ -1338,6 +1658,75 @@ mod tests {
         assert!(device.is_stopped());
     }
 
+    /// Old requests remain valid until device mapper confirms the larger backend is active.
+    #[tokio::test]
+    async fn device_gates_keep_old_requests_alive_until_larger_mapping_is_active() {
+        let path: Arc<dyn DriverPath> = Arc::new(TestHandler(6, false, None));
+        let (handler, _applied_state) = authorized_handler(path);
+        let shared = Arc::new(handler);
+        let old = Arc::new(DriverDeviceGate::new(Arc::clone(&shared), true));
+        let larger = Arc::new(DriverDeviceGate::new(Arc::clone(&shared), false));
+        let mut output = [0_u8; 4];
+
+        old.read(0, &mut output)
+            .await
+            .expect("active old device must reach the shared path");
+        assert_eq!(output, [6; 4]);
+        assert_eq!(
+            larger.read(0, &mut output).await,
+            Err(BlockIoError::NotServing)
+        );
+
+        assert!(shared.begin_io_pause().await.expect("pause active device"));
+        shared.finish_io_pause().expect("finish pause flush");
+
+        let queued_old = Arc::clone(&old);
+        let old_request = tokio::spawn(async move {
+            let mut output = [0_u8; 4];
+            queued_old.read(0, &mut output).await.map(|()| output)
+        });
+        tokio::task::yield_now().await;
+        assert!(!old_request.is_finished());
+
+        larger.enable();
+        assert!(old.is_enabled());
+        assert!(larger.is_enabled());
+        let queued_larger = Arc::clone(&larger);
+        let larger_request = tokio::spawn(async move {
+            let mut output = [0_u8; 4];
+            queued_larger.read(0, &mut output).await.map(|()| output)
+        });
+        tokio::task::yield_now().await;
+        assert!(!larger_request.is_finished());
+
+        shared.resume_current().expect("resume on larger backend");
+        assert_eq!(
+            old_request.await.expect("join queued old request"),
+            Ok([6; 4])
+        );
+        assert_eq!(
+            larger_request.await.expect("join queued larger request"),
+            Ok([6; 4])
+        );
+        old.read(0, &mut output)
+            .await
+            .expect("old requests already leaving the mapper must still finish");
+
+        // Promotion happens only after device mapper reports the larger table
+        // active. From that point the old private backend must reject I/O.
+        old.disable();
+        assert_eq!(
+            old.read(0, &mut output).await,
+            Err(BlockIoError::NotServing)
+        );
+        larger
+            .read(0, &mut output)
+            .await
+            .expect("activated larger device must reach the same shared path");
+        assert_eq!(output, [6; 4]);
+        assert_eq!(shared.progress.completed_requests(), 5);
+    }
+
     /// Terminal quarantine rejects later requests without changing ublk ownership.
     #[tokio::test]
     async fn stable_handler_quarantine_stops_admission() {
@@ -1407,22 +1796,22 @@ mod tests {
 
     /// A planned rebuild holds new requests and releases them without returning EIO.
     #[tokio::test]
-    async fn rebuild_pause_holds_new_requests_until_resume() {
+    async fn io_pause_holds_new_requests_until_resume() {
         let active: Arc<dyn DriverPath> = Arc::new(TestHandler(7, false, None));
         let (handler, _applied_state) = authorized_handler(active);
         let handler = Arc::new(handler);
         assert!(
             handler
-                .drain_for_rebuild()
+                .begin_io_pause()
                 .await
                 .expect("first pause must drain requests")
         );
         handler
-            .finish_rebuild_drain()
+            .finish_io_pause()
             .expect("finished drain must enter the waiting state");
         assert!(
             !handler
-                .drain_for_rebuild()
+                .begin_io_pause()
                 .await
                 .expect("retry must keep the completed pause")
         );
@@ -1451,16 +1840,16 @@ mod tests {
 
     /// Held requests enter the replacement path only after it is installed.
     #[tokio::test]
-    async fn rebuild_pause_routes_held_requests_to_replacement_handler() {
+    async fn io_pause_routes_held_requests_to_replacement_handler() {
         let active: Arc<dyn DriverPath> = Arc::new(TestHandler(7, false, None));
         let (handler, applied_state) = authorized_handler(active);
         let handler = Arc::new(handler);
         handler
-            .drain_for_rebuild()
+            .begin_io_pause()
             .await
             .expect("pause must drain requests");
         handler
-            .finish_rebuild_drain()
+            .finish_io_pause()
             .expect("finished drain must enter the waiting state");
 
         let reader = Arc::clone(&handler);
@@ -1476,7 +1865,11 @@ mod tests {
         assert!(!request.is_finished());
 
         let replacement: Arc<dyn DriverPath> = Arc::new(TestHandler(9, false, None));
-        handler.install_waiting(replacement, applied_state.attachment);
+        handler.install_waiting(
+            replacement,
+            applied_state.descriptor.clone(),
+            applied_state.attachment,
+        );
         handler
             .resume_current()
             .expect("replacement handler must resume");
@@ -1701,5 +2094,86 @@ mod tests {
                 .expect("retry must observe ready device"),
             expected
         );
+    }
+
+    /// A failed larger-device start is removed so the next level pass can try again.
+    #[tokio::test]
+    async fn failed_larger_device_start_clears_its_retry_slot() {
+        let path: Arc<dyn DriverPath> = Arc::new(TestHandler(0, false, None));
+        let (handler, _applied_state) = authorized_handler(path);
+        let handler = Arc::new(handler);
+        let queues = UblkQueueSettings {
+            queue_count: 1,
+            queue_depth: 1,
+            max_request_bytes: 4096,
+            memory_limit_bytes: 4096,
+        };
+        let current = descriptor();
+        let larger = current
+            .with_capacity(VolumeCapacity::new(128 << 20).expect("larger test capacity"))
+            .expect("compatible larger descriptor");
+        let current_settings = ReplicatedDriverSettings::new(
+            UblkOwnerId::new(1),
+            UblkSettings::new(&current, queues).expect("current ublk settings"),
+            Duration::from_secs(1),
+        );
+        let larger_settings = ReplicatedDriverSettings::new(
+            UblkOwnerId::new(1),
+            UblkSettings::new(&larger, queues).expect("larger ublk settings"),
+            Duration::from_secs(1),
+        );
+
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (stop_sender, stop_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = tokio::sync::oneshot::channel();
+        let owner = std::thread::spawn(move || {
+            let request: super::DeviceStopRequest = stop_receiver
+                .recv()
+                .expect("failed successor must request cleanup");
+            drop(request);
+            let _ = finished_sender.send(Ok(()));
+        });
+        let next_device = DriverDevice {
+            pending_start: None,
+            ready: Some(ready_receiver),
+            started: None,
+            start_failed: false,
+            stop_requests: Some(stop_sender),
+            stop_attempt: None,
+            finished: Some(finished_receiver),
+        };
+        ready_sender
+            .send(Err(mantissa_volume::driver::UblkError::Unavailable {
+                reason: "injected successor startup failure".to_string(),
+            }))
+            .expect("publish injected startup failure");
+
+        let progress = handler.progress.clone();
+        let mut driver = ReplicatedDriver {
+            device: None,
+            device_id: None,
+            backend_path: None,
+            device_gate: Arc::new(DriverDeviceGate::new(Arc::clone(&handler), true)),
+            next_device: Some(next_device),
+            next_device_id: None,
+            next_backend_path: None,
+            next_device_gate: Some(Arc::new(DriverDeviceGate::new(Arc::clone(&handler), false))),
+            next_settings: Some(larger_settings),
+            retiring_device: None,
+            path: None,
+            retiring_path: None,
+            handler,
+            settings: current_settings,
+            progress,
+        };
+
+        assert!(matches!(
+            driver.finish_larger_device_start().await,
+            Err(DriverError::Ublk(_))
+        ));
+        assert!(driver.next_device.is_none());
+        assert!(driver.next_device_gate.is_none());
+        assert!(driver.next_settings.is_none());
+        owner.join().expect("cleanup owner must finish");
     }
 }

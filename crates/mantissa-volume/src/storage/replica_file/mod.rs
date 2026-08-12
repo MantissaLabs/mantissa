@@ -25,12 +25,13 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
 use thiserror::Error;
 
-use crate::{FenceEpoch, OperationId, VolumeDescriptor};
+use crate::{FenceEpoch, OperationId, VolumeCapacity, VolumeDescriptor};
 
 use protocol::{
     ChangedRegionState, FileHeader, decode_changed_regions, decode_header_slot,
@@ -360,7 +361,8 @@ impl ReplicaFileRecoveryState {
 /// Current fixed-offset data and recovery metadata for one local copy.
 pub struct ReplicaFile {
     directory: PathBuf,
-    descriptor: VolumeDescriptor,
+    creation_descriptor: VolumeDescriptor,
+    served_capacity_bytes: AtomicU64,
     settings: ReplicaFileSettings,
     _directory_lock: File,
     data: Arc<File>,
@@ -409,6 +411,30 @@ struct BlockRange {
 }
 
 impl ReplicaFile {
+    /// Reads durable sparse-file coverage without taking ownership of the replica directory.
+    pub fn prepared_capacity_at(
+        directory: impl AsRef<Path>,
+        descriptor: &VolumeDescriptor,
+    ) -> Result<VolumeCapacity, ReplicaFileError> {
+        let data_path = directory.as_ref().join(DATA_FILE_NAME);
+        let file_bytes = std::fs::metadata(data_path)
+            .map_err(|source| ReplicaFileError::Io {
+                operation: "read prepared replica data length",
+                source,
+            })?
+            .len();
+        let capacity_bytes =
+            file_bytes
+                .checked_sub(FILE_DATA_OFFSET)
+                .ok_or(ReplicaFileError::WrongFileLength {
+                    actual: file_bytes,
+                    expected: FILE_DATA_OFFSET,
+                })?;
+        let capacity = VolumeCapacity::new(capacity_bytes)?;
+        descriptor.with_capacity(capacity)?;
+        Ok(capacity)
+    }
+
     /// Creates an empty sparse file and its first durable checked header.
     pub fn create(
         directory: impl AsRef<Path>,
@@ -458,7 +484,8 @@ impl ReplicaFile {
 
         Ok(Self {
             directory,
-            descriptor,
+            served_capacity_bytes: AtomicU64::new(descriptor.capacity().bytes()),
+            creation_descriptor: descriptor,
             settings,
             _directory_lock: directory_lock,
             data: Arc::new(data),
@@ -501,7 +528,7 @@ impl ReplicaFile {
                 source,
             })?
             .len();
-        if actual_bytes != expected_bytes {
+        if actual_bytes < expected_bytes {
             return Err(ReplicaFileError::WrongFileLength {
                 actual: actual_bytes,
                 expected: expected_bytes,
@@ -561,7 +588,8 @@ impl ReplicaFile {
 
         Ok(Self {
             directory,
-            descriptor,
+            served_capacity_bytes: AtomicU64::new(descriptor.capacity().bytes()),
+            creation_descriptor: header.descriptor.clone(),
             settings,
             _directory_lock: directory_lock,
             data: Arc::new(data),
@@ -571,10 +599,85 @@ impl ReplicaFile {
         })
     }
 
-    /// Returns the exact volume descriptor owned by this file.
+    /// Returns the current descriptor this open file admits for data requests.
     #[must_use]
-    pub const fn descriptor(&self) -> &VolumeDescriptor {
-        &self.descriptor
+    pub fn descriptor(&self) -> VolumeDescriptor {
+        self.creation_descriptor
+            .with_prevalidated_capacity(self.served_capacity_bytes.load(Ordering::Acquire))
+    }
+
+    /// Returns the current capacity admitted by this open file.
+    #[must_use]
+    pub fn served_capacity(&self) -> VolumeCapacity {
+        VolumeCapacity::from_validated(self.served_capacity_bytes.load(Ordering::Acquire))
+    }
+
+    /// Returns the durable sparse-file coverage available for a later Raft capacity.
+    pub fn prepared_capacity(&self) -> Result<VolumeCapacity, ReplicaFileError> {
+        let file_bytes = self
+            .data
+            .metadata()
+            .map_err(|source| ReplicaFileError::Io {
+                operation: "read prepared replica data length",
+                source,
+            })?
+            .len();
+        let capacity_bytes =
+            file_bytes
+                .checked_sub(FILE_DATA_OFFSET)
+                .ok_or(ReplicaFileError::WrongFileLength {
+                    actual: file_bytes,
+                    expected: FILE_DATA_OFFSET,
+                })?;
+        let capacity = VolumeCapacity::new(capacity_bytes)?;
+        self.creation_descriptor.with_capacity(capacity)?;
+        Ok(capacity)
+    }
+
+    /// Durably extends the sparse data file without exposing the new range.
+    pub fn prepare_capacity(&self, target: VolumeCapacity) -> Result<(), ReplicaFileError> {
+        self.creation_descriptor.with_capacity(target)?;
+        let target_bytes = FILE_DATA_OFFSET
+            .checked_add(target.bytes())
+            .ok_or(ReplicaFileError::FileLengthOverflow)?;
+        let actual_bytes = self
+            .data
+            .metadata()
+            .map_err(|source| ReplicaFileError::Io {
+                operation: "read replica data length before expansion",
+                source,
+            })?
+            .len();
+        if actual_bytes < target_bytes {
+            self.data
+                .set_len(target_bytes)
+                .map_err(|source| ReplicaFileError::Io {
+                    operation: "extend sparse replica data length",
+                    source,
+                })?;
+            self.data
+                .sync_all()
+                .map_err(|source| ReplicaFileError::Io {
+                    operation: "sync expanded replica data length",
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Publishes a durably prepared capacity after Raft commits it.
+    pub fn serve_capacity(&self, target: VolumeCapacity) -> Result<(), ReplicaFileError> {
+        self.creation_descriptor.with_capacity(target)?;
+        let prepared = self.prepared_capacity()?;
+        if prepared < target {
+            return Err(ReplicaFileError::CapacityNotPrepared {
+                prepared: prepared.bytes(),
+                requested: target.bytes(),
+            });
+        }
+        self.served_capacity_bytes
+            .fetch_max(target.bytes(), Ordering::Release);
+        Ok(())
     }
 
     /// Returns the directory containing this copy's data and recovery files.
@@ -682,7 +785,8 @@ impl ReplicaFile {
         if self.progress.lock().failed {
             return Err(ReplicaFileError::Failed);
         }
-        check_range(&self.descriptor, offset, output.len())?;
+        let descriptor = self.descriptor();
+        check_range(&descriptor, offset, output.len())?;
         let file_offset = FILE_DATA_OFFSET
             .checked_add(offset)
             .ok_or(ReplicaFileError::FileOffsetOverflow)?;
@@ -714,8 +818,9 @@ impl ReplicaFile {
         maximum_bytes: usize,
         must_be_stable: bool,
     ) -> Result<ReplicaRepairRange, ReplicaFileError> {
-        let length = checked_repair_length(&self.descriptor, offset, maximum_bytes)?;
-        let requested_range = logical_block_range(&self.descriptor, offset, length)?;
+        let descriptor = self.descriptor();
+        let length = checked_repair_length(&descriptor, offset, maximum_bytes)?;
+        let requested_range = logical_block_range(&descriptor, offset, length)?;
         let data_version = {
             let progress = self.progress.lock();
             if progress.failed {
@@ -728,11 +833,11 @@ impl ReplicaFile {
         };
         let (has_data, range_length) = self.record_local_io_result(sparse_range(
             &self.data,
-            &self.descriptor,
+            &descriptor,
             offset,
             u64::try_from(length).map_err(|_| ReplicaFileError::FileOffsetOverflow)?,
         ))?;
-        let block_range = logical_block_range_u64(&self.descriptor, offset, range_length)?;
+        let block_range = logical_block_range_u64(&descriptor, offset, range_length)?;
         let (versions, hole_version) = {
             let progress = self.progress.lock();
             if progress.failed
@@ -812,6 +917,7 @@ impl ReplicaFile {
         repair_id: OperationId,
         range: &ReplicaRepairRange,
     ) -> Result<(), ReplicaFileError> {
+        let descriptor = self.descriptor();
         let mut progress = self.progress.lock();
         if progress.repair_id != Some(repair_id) {
             return Err(ReplicaFileError::WrongRepair);
@@ -822,7 +928,7 @@ impl ReplicaFile {
                 bytes,
                 digest,
             } => {
-                check_repair_range(&self.descriptor, *offset, bytes.len())?;
+                check_repair_range(&descriptor, *offset, bytes.len())?;
                 if repair_data_digest(*offset, bytes) != *digest {
                     return Err(ReplicaFileError::WrongRepairDigest);
                 }
@@ -836,7 +942,7 @@ impl ReplicaFile {
                 length,
                 digest,
             } => {
-                check_repair_range_u64(&self.descriptor, *offset, *length)?;
+                check_repair_range_u64(&descriptor, *offset, *length)?;
                 if repair_hole_digest(*offset, *length) != *digest {
                     return Err(ReplicaFileError::WrongRepairDigest);
                 }
@@ -913,7 +1019,7 @@ impl ReplicaFile {
         install_changed_generation(
             &self.directory,
             &self.data,
-            &self.descriptor,
+            &self.creation_descriptor,
             &mut progress,
             &mut changed,
             generation,
@@ -971,7 +1077,7 @@ impl ReplicaFile {
         install_changed_generation(
             &self.directory,
             &self.data,
-            &self.descriptor,
+            &self.creation_descriptor,
             &mut progress,
             &mut changed,
             changed_region_generation,
@@ -1038,7 +1144,7 @@ impl ReplicaFile {
         install_changed_generation(
             &self.directory,
             &self.data,
-            &self.descriptor,
+            &self.creation_descriptor,
             &mut progress,
             &mut changed,
             changed_region_generation,
@@ -1145,7 +1251,7 @@ impl ReplicaFile {
             return Err(ReplicaFileError::Failed);
         }
         let header = FileHeader {
-            descriptor: self.descriptor.clone(),
+            descriptor: self.creation_descriptor.clone(),
             data_fence: progress.data_fence,
             flush_number: flush.flush_number,
             through_write_number: flush.through_write_number,
@@ -1190,7 +1296,11 @@ impl ReplicaFile {
 
     /// Reserves the exact next write and rejects overlapping active work.
     fn begin_write(&self, write: &ReplicaWrite) -> Result<bool, ReplicaFileError> {
-        if write.descriptor() != &self.descriptor {
+        if !write
+            .descriptor()
+            .has_same_storage_identity(&self.creation_descriptor)
+            || write.descriptor().capacity() > self.served_capacity()
+        {
             return Err(ReplicaFileError::WrongDescriptor);
         }
         if !self.changed.lock().complete {
@@ -1237,7 +1347,7 @@ impl ReplicaFile {
     fn write_changes(&self, write: &ReplicaWrite) -> Result<(), ReplicaFileError> {
         self.wait_for_block_turn(write)?;
         self.mark_changed_regions(write.changes())?;
-        let block_bytes = u64::from(self.descriptor.block_sizes().data_block().bytes());
+        let block_bytes = u64::from(self.creation_descriptor.block_sizes().data_block().bytes());
         let changes = write.changes();
         let mut index = 0_usize;
         while index < changes.len() {
@@ -1337,7 +1447,7 @@ impl ReplicaFile {
             .data_version
             .checked_add(1)
             .ok_or(ReplicaFileError::DataVersionExhausted)?;
-        let block_bytes = u64::from(self.descriptor.block_sizes().data_block().bytes());
+        let block_bytes = u64::from(self.creation_descriptor.block_sizes().data_block().bytes());
         let data_version = progress.data_version;
         for change in write.changes() {
             let offset = change
@@ -1410,7 +1520,7 @@ impl ReplicaFile {
 
     /// Appends and syncs each newly changed region before data reaches disk.
     fn mark_changed_regions(&self, changes: &[ReplicaBlockChange]) -> Result<(), ReplicaFileError> {
-        let block_bytes = u64::from(self.descriptor.block_sizes().data_block().bytes());
+        let block_bytes = u64::from(self.creation_descriptor.block_sizes().data_block().bytes());
         let mut changed = self.changed.lock();
         if !changed.complete {
             return Err(ReplicaFileError::RecoveryRequired);
@@ -1441,7 +1551,7 @@ impl ReplicaFile {
             .ok_or(ReplicaFileError::ChangedRegionSequenceExhausted)?;
         let regions = new_regions.into_iter().collect::<Vec<_>>();
         let record = encode_changed_regions(
-            &self.descriptor,
+            &self.descriptor(),
             changed.generation,
             sequence,
             self.settings.changed_region_bytes,
@@ -2337,6 +2447,10 @@ pub enum ReplicaFileError {
     #[error("replica file volume descriptor is invalid")]
     Protocol(#[from] crate::protocol::ProtocolError),
 
+    /// A requested or recovered capacity does not fit the fixed block layout.
+    #[error(transparent)]
+    Descriptor(#[from] crate::DescriptorError),
+
     /// Region size must be non-zero and aligned to the 4 KiB data blocks.
     #[error("changed-region size {0} must be a non-zero multiple of 4096")]
     InvalidChangedRegionBytes(u64),
@@ -2376,6 +2490,10 @@ pub enum ReplicaFileError {
     /// Existing data file does not have the exact sparse logical length.
     #[error("replica data file has length {actual}, expected {expected}")]
     WrongFileLength { actual: u64, expected: u64 },
+
+    /// The sparse data file has not durably reached a requested capacity.
+    #[error("replica data file prepares {prepared} bytes, below requested capacity {requested}")]
+    CapacityNotPrepared { prepared: u64, requested: u64 },
 
     /// Neither crash-safe header contains a valid checked record.
     #[error("replica data file has no valid header")]

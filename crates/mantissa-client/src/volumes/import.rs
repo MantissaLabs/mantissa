@@ -9,7 +9,7 @@ pub struct VolumeImportRequest {
     pub name: String,
     pub node_selector: String,
     pub path: String,
-    pub requested_bytes: Option<u64>,
+    pub initial_capacity_bytes: Option<u64>,
     pub labels: Vec<VolumeLabel>,
 }
 
@@ -29,7 +29,7 @@ pub async fn import_with_request(
         inner.set_name(&request.name);
         inner.set_node_id(node_id.as_bytes());
         inner.set_path(&request.path);
-        inner.set_requested_bytes(request.requested_bytes.unwrap_or(0));
+        inner.set_initial_capacity_bytes(request.initial_capacity_bytes.unwrap_or(0));
         let mut labels = inner.reborrow().init_labels(request.labels.len() as u32);
         for (idx, label) in request.labels.iter().enumerate() {
             let mut entry = labels.reborrow().get(idx as u32);
@@ -59,7 +59,7 @@ pub async fn import(
         name: name.to_string(),
         node_selector: node_selector.to_string(),
         path: path.to_string(),
-        requested_bytes: capacity_mb.map(super::capacity_mb_to_bytes).transpose()?,
+        initial_capacity_bytes: capacity_mb.map(super::capacity_mb_to_bytes).transpose()?,
         labels: parse_volume_labels(labels)?,
     };
     import_with_request(cfg, &request).await

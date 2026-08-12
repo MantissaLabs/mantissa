@@ -1497,6 +1497,9 @@ pub enum VolumesCommand {
     /// Restore a retained replicated volume
     Restore(VolumesRestoreArgs),
 
+    /// Expand a replicated volume to a larger total capacity
+    Expand(VolumesExpandArgs),
+
     /// Retain a volume or permanently delete its data
     Delete(VolumesDeleteArgs),
 }
@@ -1704,6 +1707,17 @@ pub struct VolumesRestoreArgs {
     /// Retained volume UUID or name to restore
     #[arg(index = 1, value_name = "ID-OR-NAME")]
     pub selector: String,
+}
+
+#[derive(Args, Debug)]
+pub struct VolumesExpandArgs {
+    /// Replicated volume UUID or name to expand
+    #[arg(index = 1, value_name = "ID-OR-NAME")]
+    pub selector: String,
+
+    /// New total capacity in MiB, not the number of MiB to add
+    #[arg(long = "capacity-mb", value_name = "MIB")]
+    pub capacity_mb: u64,
 }
 
 #[derive(Args, Debug)]
@@ -2267,6 +2281,29 @@ mod tests {
                 cmd: VolumesCommand::Delete(VolumesDeleteArgs {
                     selector,
                     delete_data: true,
+                })
+            } if selector == "database"
+        ));
+    }
+
+    /// Volume expansion takes one new total in MiB rather than an increment.
+    #[test]
+    fn volume_expand_parses_the_target_total() {
+        let expand = MantissaCli::try_parse_from([
+            "mantissa",
+            "volumes",
+            "expand",
+            "database",
+            "--capacity-mb",
+            "20480",
+        ])
+        .unwrap();
+        assert!(matches!(
+            expand.cmd,
+            Command::Volumes {
+                cmd: VolumesCommand::Expand(VolumesExpandArgs {
+                    selector,
+                    capacity_mb: 20480,
                 })
             } if selector == "database"
         ));

@@ -1638,7 +1638,7 @@ mod authorization_tests {
         VolumeNodeId::new(Uuid::from_u128(value)).expect("test node ID must be valid")
     }
 
-    /// Returns one immutable descriptor shared by authorization checks.
+    /// Returns one fixed test descriptor shared by authorization checks.
     fn descriptor() -> VolumeDescriptor {
         VolumeDescriptor::new(
             VolumeId::new(Uuid::from_u128(20)).expect("test volume ID must be valid"),

@@ -14,8 +14,8 @@ pub(crate) use mantissa::runtime::types::{
 pub(crate) use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 pub(crate) use mantissa::services::types::ServiceStatus;
 pub(crate) use mantissa::store::replicated::volumes::{
-    open_replicated_volume_group_status_store, open_replicated_volume_plan_store,
-    open_volume_node_store, open_volume_spec_store,
+    open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
+    open_replicated_volume_plan_store, open_volume_node_store, open_volume_spec_store,
 };
 pub(crate) use mantissa::task::types::TaskVolumeMount;
 pub(crate) use mantissa::volumes::registry::VolumeRegistry;
@@ -37,6 +37,7 @@ pub(crate) use std::collections::HashMap;
 pub(crate) use std::fs::{self, OpenOptions};
 pub(crate) use std::io::{Read, Seek, SeekFrom, Write};
 pub(crate) use std::net::TcpListener;
+pub(crate) use std::os::unix::fs::MetadataExt;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::sync::Arc;
 pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
@@ -249,6 +250,9 @@ pub(crate) const REPLICATED_VOLUME_TESTS_ENV: &str = "MANTISSA_RUN_REPLICATED_VO
 pub(crate) const REPLICATED_VOLUME_POSTGRES_BENCHMARK_ENV: &str =
     "MANTISSA_RUN_REPLICATED_VOLUME_POSTGRES_BENCHMARK";
 pub(crate) const REAL_REPLICATED_VOLUME_BYTES: u64 = 10 << 30;
+pub(crate) const REAL_REPLICATED_VOLUME_EXPANDED_BYTES: u64 = 12 << 30;
+pub(crate) const REAL_REPLICATED_VOLUME_BUSY_EXPANDED_BYTES: u64 = 14 << 30;
+pub(crate) const REAL_REPLICATED_VOLUME_UNAVAILABLE_EXPANSION_BYTES: u64 = 1 << 40;
 pub(crate) const PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const REPLICATED_VOLUME_TEST_NODE_COUNT: usize = 5;
 pub(crate) const TEST_REPLICA_FAILURE_GRACE_MS: u64 = 15_000;
@@ -778,6 +782,7 @@ pub(crate) fn replicated_volume_test_config_with_driver_limits(
             mount_root: node_root.join("mounts").display().to_string(),
             wipefs_path: "/usr/sbin/wipefs".to_string(),
             mkfs_ext4_path: "/usr/sbin/mkfs.ext4".to_string(),
+            resize2fs_path: "/usr/sbin/resize2fs".to_string(),
             features: vec![
                 "has_journal".to_string(),
                 "extent".to_string(),
@@ -1250,8 +1255,9 @@ pub(crate) fn replicated_volume_start_diagnostics(cluster: &[TestNode], volume_i
                     })
                     .collect::<Vec<_>>()
             });
+        let health = node.node.registry.health_monitor().snapshot();
         reports.push(format!(
-            "observer={}: plan={plan:?}, group={group:?}, nodes={states:?}",
+            "observer={}: plan={plan:?}, group={group:?}, nodes={states:?}, health={health:?}",
             node.id()
         ));
     }
@@ -2112,8 +2118,15 @@ pub(crate) async fn wait_for_replica_replacement(
                     )
                 })
                 .collect::<Vec<_>>();
+            let local = replicated_volume_local_diagnostics(cluster, volume_id).await;
+            let health = cluster
+                .iter()
+                .map(|node| (node.id(), node.node.registry.health_monitor().snapshot()))
+                .collect::<Vec<_>>();
             anyhow::bail!(
-                "replicated volume did not replace node {old_node_id}; group rows: {group_rows:#?}"
+                "replicated volume did not replace node {old_node_id}; running nodes: {:?}; \
+                 group rows: {group_rows:#?}; local: {local:#?}; health: {health:#?}",
+                cluster.iter().map(TestNode::id).collect::<Vec<_>>()
             );
         }
     }
@@ -2449,7 +2462,325 @@ pub(crate) async fn run_postgres_path_comparison(
     Ok(result_path)
 }
 
-/// Runs the complete public volume lifecycle through restarts, repairs, and lost quorum.
+/// Requests one desired total through the same Cap'n Proto method used by the CLI.
+async fn request_replicated_volume_expansion(
+    client: &volumes::Client,
+    volume_name: &str,
+    target_capacity_bytes: u64,
+    expected_changed: bool,
+) -> anyhow::Result<()> {
+    let mut request = client.expand_request();
+    request.get().set_selector(volume_name);
+    request
+        .get()
+        .set_target_capacity_bytes(target_capacity_bytes);
+    let response = tokio::time::timeout(PUBLIC_API_TIMEOUT, request.send().promise)
+        .await
+        .context("public volume expansion timed out")??;
+    let result = response
+        .get()
+        .context("public volume expansion response")?
+        .get_result()
+        .context("public volume expansion result")?;
+    if result.get_desired_capacity_bytes() != target_capacity_bytes
+        || result.get_desired_capacity_changed() != expected_changed
+    {
+        anyhow::bail!(
+            "volume expansion returned desired={} changed={} instead of desired={} changed={}",
+            result.get_desired_capacity_bytes(),
+            result.get_desired_capacity_changed(),
+            target_capacity_bytes,
+            expected_changed,
+        );
+    }
+    Ok(())
+}
+
+/// Returns the mounted filesystem's total data-block capacity.
+fn mounted_filesystem_capacity(path: &Path) -> anyhow::Result<u64> {
+    let stat = nix::sys::statvfs::statvfs(path)
+        .with_context(|| format!("read filesystem capacity for {}", path.display()))?;
+    stat.blocks()
+        .checked_mul(stat.fragment_size())
+        .context("mounted filesystem capacity overflowed")
+}
+
+/// Waits until desired state, every data copy, the mapped device, and ext4 reach one target.
+async fn wait_for_online_expansion(
+    cluster: &[TestNode],
+    volume_id: Uuid,
+    attached_node_id: Uuid,
+    host_mount: &Path,
+    previous_filesystem_capacity: u64,
+    target_capacity_bytes: u64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        poll.tick().await;
+        let converged = cluster.iter().all(|observer| {
+            let request_matches = observer
+                .node
+                .volume_registry
+                .get_capacity_request(volume_id)
+                .ok()
+                .flatten()
+                .is_some_and(|request| request.target_capacity_bytes == target_capacity_bytes);
+            let group_matches = observer
+                .node
+                .volume_registry
+                .get_group_status(volume_id)
+                .ok()
+                .flatten()
+                .is_some_and(|group| {
+                    group.replicated_capacity_bytes == target_capacity_bytes
+                        && group.copy_node_ids.len() == 3
+                        && group.copy_node_ids.iter().all(|copy| {
+                            cluster
+                                .iter()
+                                .find(|node| node.id() == *copy)
+                                .and_then(|node| {
+                                    node.node
+                                        .volume_registry
+                                        .get_node_state(volume_id, *copy)
+                                        .ok()
+                                        .flatten()
+                                })
+                                .is_some_and(|state| {
+                                    state
+                                        .reserved_capacity_bytes
+                                        .is_some_and(|bytes| bytes >= target_capacity_bytes)
+                                        && state
+                                            .prepared_capacity_bytes
+                                            .is_some_and(|bytes| bytes >= target_capacity_bytes)
+                                        && state
+                                            .served_capacity_bytes
+                                            .is_some_and(|bytes| bytes >= target_capacity_bytes)
+                                })
+                        })
+                });
+            request_matches && group_matches
+        });
+        let writer_matches = cluster
+            .iter()
+            .find(|node| node.id() == attached_node_id)
+            .and_then(|node| {
+                node.node
+                    .volume_registry
+                    .get_node_state(volume_id, attached_node_id)
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|state| {
+                state.device_capacity_bytes == Some(target_capacity_bytes)
+                    && !state.filesystem_expansion_pending
+            });
+        let filesystem_matches = mounted_filesystem_capacity(host_mount)
+            .is_ok_and(|capacity| capacity > previous_filesystem_capacity);
+        if converged && writer_matches && filesystem_matches && path_is_mounted(host_mount)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let rows = cluster
+                .iter()
+                .map(|node| {
+                    (
+                        node.id(),
+                        node.node.volume_registry.get_capacity_request(volume_id),
+                        node.node.volume_registry.get_group_status(volume_id),
+                        node.node
+                            .volume_registry
+                            .list_node_states_for_volume(volume_id),
+                    )
+                })
+                .collect::<Vec<_>>();
+            anyhow::bail!(
+                "online expansion did not converge to {target_capacity_bytes} bytes; \
+                 filesystem={:?}; rows={rows:#?}",
+                mounted_filesystem_capacity(host_mount),
+            );
+        }
+    }
+}
+
+/// Waits until every survivor sees the request while one active copy keeps Raft unchanged.
+async fn wait_for_expansion_request_while_copy_is_missing(
+    cluster: &[TestNode],
+    volume_id: Uuid,
+    missing_node_id: Uuid,
+    initial_capacity_bytes: u64,
+    target_capacity_bytes: u64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        poll.tick().await;
+        let mut ready = true;
+        for observer in cluster {
+            let request_matches = observer
+                .node
+                .volume_registry
+                .get_capacity_request(volume_id)?
+                .is_some_and(|request| request.target_capacity_bytes == target_capacity_bytes);
+            let Some(group) = observer.node.volume_registry.get_group_status(volume_id)? else {
+                ready = false;
+                continue;
+            };
+            if group.replicated_capacity_bytes != initial_capacity_bytes {
+                anyhow::bail!(
+                    "Raft expanded to {} bytes while active copy {missing_node_id} was unavailable",
+                    group.replicated_capacity_bytes
+                );
+            }
+            ready &= request_matches;
+        }
+        if ready {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "capacity request did not converge while copy {missing_node_id} blocked expansion: {}",
+                replicated_volume_start_diagnostics(cluster, volume_id)
+            );
+        }
+    }
+}
+
+/// Proves one unavailable active copy blocks expansion until that same copy restarts.
+async fn expand_after_missing_copy_restarts(
+    cluster: &mut Vec<TestNode>,
+    states: &[ReplicatedVolumeTestNodeState],
+    volume_id: Uuid,
+    attached_node_id: Uuid,
+    host_mount: &Path,
+) -> anyhow::Result<()> {
+    let filesystem_capacity = mounted_filesystem_capacity(host_mount)?;
+    let copies = observed_active_replicas(cluster, volume_id)?;
+    let missing_node_id = copies
+        .iter()
+        .copied()
+        .find(|node_id| *node_id != attached_node_id)
+        .context("online expansion has no follower to stop")?;
+    shutdown_replicated_volume_test_node(cluster, missing_node_id, Duration::from_secs(10))
+        .await
+        .context("stop one copy before online expansion")?;
+    let client = cluster
+        .first()
+        .context("online expansion has no public API node")?
+        .node
+        .volumes_client
+        .clone();
+    request_replicated_volume_expansion(
+        &client,
+        "real-replicated",
+        REAL_REPLICATED_VOLUME_EXPANDED_BYTES,
+        true,
+    )
+    .await?;
+    request_replicated_volume_expansion(
+        &client,
+        "real-replicated",
+        REAL_REPLICATED_VOLUME_EXPANDED_BYTES,
+        false,
+    )
+    .await?;
+    wait_for_expansion_request_while_copy_is_missing(
+        cluster,
+        volume_id,
+        missing_node_id,
+        REAL_REPLICATED_VOLUME_BYTES,
+        REAL_REPLICATED_VOLUME_EXPANDED_BYTES,
+        Duration::from_secs(10),
+    )
+    .await?;
+    restart_replicated_volume_test_node(cluster, states, missing_node_id)
+        .await
+        .context("restart missing copy to resume online expansion")?;
+    wait_for_online_expansion(
+        cluster,
+        volume_id,
+        attached_node_id,
+        host_mount,
+        filesystem_capacity,
+        REAL_REPLICATED_VOLUME_EXPANDED_BYTES,
+        Duration::from_secs(120),
+    )
+    .await
+}
+
+/// Expands one healthy mounted volume while checking stable identity and continuous writes.
+async fn expand_attached_volume_during_io(
+    cluster: &[TestNode],
+    volume_id: Uuid,
+    task_id: Uuid,
+    attached_node_id: Uuid,
+    host_mount: &Path,
+    target_capacity_bytes: u64,
+) -> anyhow::Result<()> {
+    let before = fs::metadata(host_mount)
+        .with_context(|| format!("inspect mounted volume {}", host_mount.display()))?;
+    let mount_identity = (before.dev(), before.ino());
+    let filesystem_capacity = mounted_filesystem_capacity(host_mount)?;
+    let busy_path = host_mount.join("online-expansion-writes.bin");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let (started_tx, started_rx) = oneshot::channel();
+    let writer = tokio::task::spawn_blocking(move || {
+        keep_replicated_volume_busy(&busy_path, started_tx, &writer_stop)
+    });
+    started_rx
+        .await
+        .context("volume writer stopped before online expansion")?;
+    let expansion = async {
+        let client = &cluster
+            .first()
+            .context("online expansion has no public API node")?
+            .node
+            .volumes_client;
+        request_replicated_volume_expansion(client, "real-replicated", target_capacity_bytes, true)
+            .await?;
+        wait_for_online_expansion(
+            cluster,
+            volume_id,
+            attached_node_id,
+            host_mount,
+            filesystem_capacity,
+            target_capacity_bytes,
+            Duration::from_secs(120),
+        )
+        .await
+    }
+    .await;
+    stop.store(true, Ordering::Release);
+    let writer_result = join_volume_writer(writer).await;
+    expansion?;
+    let writer_result = writer_result.context("write during online volume expansion")?;
+    if writer_result.rounds == 0 {
+        anyhow::bail!("online expansion writer completed no durable rounds");
+    }
+
+    let after = fs::metadata(host_mount)
+        .with_context(|| format!("inspect expanded mount {}", host_mount.display()))?;
+    if (after.dev(), after.ino()) != mount_identity {
+        anyhow::bail!("online expansion changed the mounted filesystem identity");
+    }
+    let writer_state = cluster
+        .iter()
+        .find(|node| node.id() == attached_node_id)
+        .context("expanded volume writer is not running")?
+        .node
+        .volume_registry
+        .get_node_state(volume_id, attached_node_id)?
+        .context("expanded volume has no writer status")?;
+    if !writer_state.published_task_ids.contains(&task_id) {
+        anyhow::bail!("online expansion lost the task using the mounted volume");
+    }
+    Ok(())
+}
+
+/// Runs the complete public volume lifecycle through expansion, repairs, and lost quorum.
 pub(crate) async fn run_replicated_volume_public_flow(
     cluster: &mut Vec<TestNode>,
     states: &[ReplicatedVolumeTestNodeState],
@@ -2547,6 +2878,30 @@ pub(crate) async fn run_replicated_volume_public_flow(
         }
     }
 
+    expand_after_missing_copy_restarts(cluster, states, volume_id, attached_node_id, &host_mount)
+        .await
+        .context("resume one blocked expansion after its missing copy restarts")?;
+    expand_attached_volume_during_io(
+        cluster,
+        volume_id,
+        task_id,
+        attached_node_id,
+        &host_mount,
+        REAL_REPLICATED_VOLUME_BUSY_EXPANDED_BYTES,
+    )
+    .await
+    .context("expand the mounted replicated volume under continuous I/O")?;
+    check_synced_probe(
+        host_mount.join("public-api-probe.txt"),
+        b"replicated volume public API test",
+    )
+    .await?;
+    write_synced_probe(
+        host_mount.join("expanded-volume-probe.txt"),
+        b"write after online volume expansion",
+    )
+    .await?;
+
     let attachment_update = cluster
         .iter()
         .find(|node| node.id() == attached_node_id)
@@ -2573,6 +2928,11 @@ pub(crate) async fn run_replicated_volume_public_flow(
     check_synced_probe(
         host_mount.join("public-api-probe.txt"),
         b"replicated volume public API test",
+    )
+    .await?;
+    check_synced_probe(
+        host_mount.join("expanded-volume-probe.txt"),
+        b"write after online volume expansion",
     )
     .await?;
 
@@ -2926,6 +3286,123 @@ pub(crate) async fn run_replicated_volume_public_flow(
     Ok(())
 }
 
+/// Proves an impossible reservation leaves the mounted current capacity usable.
+pub(crate) async fn run_insufficient_space_expansion_flow(
+    cluster: &[TestNode],
+) -> anyhow::Result<()> {
+    let volume_id = create_replicated_volume_result(
+        &cluster[0].node.volumes_client,
+        "insufficient-space-expand",
+        REAL_REPLICATED_VOLUME_BYTES,
+    )
+    .await?;
+    let _task_id = start_volume_task_via_public_api(
+        &cluster[0].node.task_client,
+        volume_id,
+        "insufficient-space-expand",
+        "/var/lib/data",
+    )
+    .await?;
+    let (attached_node_id, host_mount) =
+        wait_for_attached_volume(cluster, volume_id, Duration::from_secs(90)).await?;
+    write_synced_probe(
+        host_mount.join("before-insufficient-expansion.txt"),
+        b"current capacity remains writable",
+    )
+    .await?;
+    let initial_filesystem_capacity = mounted_filesystem_capacity(&host_mount)?;
+    let busy_path = host_mount.join("insufficient-expansion-writes.bin");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let (started_tx, started_rx) = oneshot::channel();
+    let writer = tokio::task::spawn_blocking(move || {
+        keep_replicated_volume_busy(&busy_path, started_tx, &writer_stop)
+    });
+    started_rx
+        .await
+        .context("volume writer stopped before insufficient-space expansion")?;
+
+    let check = async {
+        request_replicated_volume_expansion(
+            &cluster[0].node.volumes_client,
+            "insufficient-space-expand",
+            REAL_REPLICATED_VOLUME_UNAVAILABLE_EXPANSION_BYTES,
+            true,
+        )
+        .await?;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut poll = tokio::time::interval(Duration::from_millis(100));
+        let request_seen_everywhere = loop {
+            poll.tick().await;
+            let request_seen_everywhere = cluster.iter().all(|node| {
+                node.node
+                    .volume_registry
+                    .get_capacity_request(volume_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|request| {
+                        request.target_capacity_bytes
+                            == REAL_REPLICATED_VOLUME_UNAVAILABLE_EXPANSION_BYTES
+                    })
+            });
+            for node in cluster {
+                if let Some(group) = node.node.volume_registry.get_group_status(volume_id)?
+                    && group.replicated_capacity_bytes != REAL_REPLICATED_VOLUME_BYTES
+                {
+                    anyhow::bail!(
+                        "insufficient-space expansion changed Raft capacity to {} bytes",
+                        group.replicated_capacity_bytes
+                    );
+                }
+            }
+            if Instant::now() >= deadline {
+                break request_seen_everywhere;
+            }
+        };
+        if !request_seen_everywhere {
+            anyhow::bail!("insufficient-space desired capacity did not converge");
+        }
+
+        let attached = cluster
+            .iter()
+            .find(|node| node.id() == attached_node_id)
+            .context("insufficient-space writer stopped unexpectedly")?;
+        let writer_state = attached
+            .node
+            .volume_registry
+            .get_node_state(volume_id, attached_node_id)?
+            .context("insufficient-space writer has no local status")?;
+        if writer_state.served_capacity_bytes != Some(REAL_REPLICATED_VOLUME_BYTES)
+            || writer_state.device_capacity_bytes != Some(REAL_REPLICATED_VOLUME_BYTES)
+            || mounted_filesystem_capacity(&host_mount)? != initial_filesystem_capacity
+        {
+            anyhow::bail!("insufficient-space expansion changed a usable local capacity");
+        }
+        let mut request = attached.node.volumes_client.get_status_request();
+        request.get().set_selector("insufficient-space-expand");
+        let response = request.send().promise.await?;
+        let status = response.get()?.get_volume()?;
+        let message = status.get_state_message()?.to_str()?;
+        if !message.starts_with("Expanding:") {
+            anyhow::bail!("insufficient-space blocker is not visible in status: {message:?}");
+        }
+        Ok(())
+    }
+    .await;
+    stop.store(true, Ordering::Release);
+    let writer_result = join_volume_writer(writer).await;
+    check?;
+    let writer_result = writer_result.context("write during insufficient-space expansion")?;
+    if writer_result.rounds == 0 {
+        anyhow::bail!("insufficient-space expansion writer completed no durable rounds");
+    }
+    check_synced_probe(
+        host_mount.join("before-insufficient-expansion.txt"),
+        b"current capacity remains writable",
+    )
+    .await
+}
+
 pub(crate) async fn create_managed_volume_with(
     client: &volumes::Client,
     name: &str,
@@ -2946,7 +3423,7 @@ pub(crate) async fn create_managed_volume_with(
         inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(binding_mode);
         inner.set_reclaim_policy(reclaim_policy);
-        inner.set_requested_bytes(0);
+        inner.set_initial_capacity_bytes(0);
         inner.set_bound_node_id(&[]);
     }
 
@@ -3038,7 +3515,7 @@ pub(crate) async fn create_replicated_volume_with_reclaim_result(
         inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(mantissa_protocol::volumes::VolumeBindingMode::WaitForFirstConsumer);
         inner.set_reclaim_policy(reclaim_policy);
-        inner.set_requested_bytes(capacity_bytes);
+        inner.set_initial_capacity_bytes(capacity_bytes);
         inner.set_bound_node_id(&[]);
     }
 
@@ -3077,7 +3554,7 @@ pub(crate) async fn create_immediate_managed_volume_on_node(
         inner.set_access_mode(mantissa_protocol::volumes::VolumeAccessMode::ReadWriteOnce);
         inner.set_binding_mode(mantissa_protocol::volumes::VolumeBindingMode::Immediate);
         inner.set_reclaim_policy(reclaim_policy);
-        inner.set_requested_bytes(0);
+        inner.set_initial_capacity_bytes(0);
         inner.set_bound_node_id(node_id.as_bytes());
     }
 
@@ -3103,7 +3580,7 @@ pub(crate) async fn import_local_volume(
         inner.set_name(name);
         inner.set_node_id(node_id.as_bytes());
         inner.set_path(path);
-        inner.set_requested_bytes(0);
+        inner.set_initial_capacity_bytes(0);
     }
 
     let response = request.send().promise.await.expect("import volume send");
