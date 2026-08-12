@@ -1,7 +1,7 @@
 use crate::output;
 use crate::volumes::{
     format_bytes,
-    inspect::{format_task_ids, render_replication},
+    inspect::{format_bound_node, format_task_ids, render_replication},
 };
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
@@ -27,11 +27,7 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
         "  Desired disposition: {}",
         volume.spec.desired_disposition
     )?;
-    writeln!(
-        &mut rendered,
-        "  Bound node: {}",
-        volume.spec.bound_node_name.as_deref().unwrap_or("-")
-    )?;
+    writeln!(&mut rendered, "  Bound node: {}", format_bound_node(volume))?;
     if matches!(
         volume.spec.driver,
         mantissa_client::volumes::VolumeDriver::Replicated

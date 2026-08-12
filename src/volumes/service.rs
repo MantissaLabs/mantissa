@@ -966,17 +966,44 @@ fn write_volume_summary(
         }
     };
     builder.set_status(observed_status.to_proto());
+    let (bound_node_id, bound_node_name) = summary_bound_node(spec, node_states, group_status);
     builder.set_bound_node_id(
-        spec.bound_node_id
+        bound_node_id
             .map_or_else(Vec::new, |id| id.as_bytes().to_vec())
             .as_slice(),
     );
-    builder.set_bound_node_name(spec.bound_node_name.as_deref().unwrap_or(""));
+    builder.set_bound_node_name(bound_node_name.as_deref().unwrap_or(""));
     builder.set_initial_capacity_bytes(spec.initial_capacity_bytes.unwrap_or(0));
     builder.set_in_use(in_use);
     builder.set_reason(public.message.as_deref().unwrap_or(""));
     builder.set_updated_at(&spec.updated_at);
     builder.set_state(public.state);
+}
+
+/// Selects the fixed local node or the replicated writer for a summary row.
+fn summary_bound_node(
+    spec: &VolumeSpecValue,
+    node_states: &[VolumeNodeStateValue],
+    group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+) -> (Option<Uuid>, Option<String>) {
+    if !spec.driver.is_replicated() {
+        return (spec.bound_node_id, spec.bound_node_name.clone());
+    }
+
+    let Some(node_id) = group_status.and_then(|status| status.attached_node_id) else {
+        return (None, None);
+    };
+    let node_name = node_states
+        .iter()
+        .find(|state| state.node_id == node_id)
+        .map(|state| state.node_name.clone())
+        .or_else(|| {
+            (spec.bound_node_id == Some(node_id))
+                .then(|| spec.bound_node_name.clone())
+                .flatten()
+        })
+        .unwrap_or_else(|| node_id.to_string());
+    (Some(node_id), Some(node_name))
 }
 
 /// Current volume state and its optional live explanation.
@@ -2145,6 +2172,100 @@ mod tests {
         });
         spec.plan_coordinator_node_id = Some(Uuid::from_u128(70));
         spec
+    }
+
+    /// Replicated summaries report only the writer currently attached by Raft.
+    #[test]
+    fn replicated_summary_does_not_report_the_last_scheduler_binding() {
+        let mut spec = sample_replicated_spec();
+        let previous_node_id = Uuid::from_u128(7);
+        let attached_node_id = Uuid::from_u128(8);
+        spec.bound_node_id = Some(previous_node_id);
+        spec.bound_node_name = Some("previous-node".to_string());
+        let mut group = ReplicatedVolumeGroupStatusValue::new(
+            spec.id,
+            spec.volume_epoch,
+            Uuid::from_u128(9),
+            Uuid::from_u128(10),
+            VolumeStatus::Ready,
+            1,
+        );
+
+        let node_health = HashMap::new();
+        let mut detached_message = capnp::message::Builder::new_default();
+        write_volume_summary(
+            detached_message.init_root::<volume_summary::Builder<'_>>(),
+            &spec,
+            &[],
+            None,
+            Some(&group),
+            &node_health,
+        );
+        let detached = detached_message
+            .get_root_as_reader::<volume_summary::Reader<'_>>()
+            .expect("detached summary should be readable");
+        assert!(
+            detached
+                .get_bound_node_id()
+                .expect("bound node id should be readable")
+                .is_empty()
+        );
+        assert_eq!(
+            detached
+                .get_bound_node_name()
+                .expect("bound node name should be readable")
+                .to_str()
+                .expect("bound node name should be UTF-8"),
+            ""
+        );
+
+        group.status = VolumeStatus::InUse;
+        group.attached_node_id = Some(attached_node_id);
+        let attached_state = VolumeNodeStateValue::new(
+            spec.id,
+            attached_node_id,
+            "attached-node",
+            None,
+            VolumeNodeState::Ready,
+            spec.initial_capacity_bytes,
+            spec.volume_epoch,
+        );
+        let mut attached_message = capnp::message::Builder::new_default();
+        write_volume_summary(
+            attached_message.init_root::<volume_summary::Builder<'_>>(),
+            &spec,
+            &[attached_state],
+            None,
+            Some(&group),
+            &node_health,
+        );
+        let attached = attached_message
+            .get_root_as_reader::<volume_summary::Reader<'_>>()
+            .expect("attached summary should be readable");
+        assert_eq!(
+            attached
+                .get_bound_node_id()
+                .expect("bound node id should be readable"),
+            attached_node_id.as_bytes()
+        );
+        assert_eq!(
+            attached
+                .get_bound_node_name()
+                .expect("bound node name should be readable")
+                .to_str()
+                .expect("bound node name should be UTF-8"),
+            "attached-node"
+        );
+    }
+
+    /// Local summaries keep reporting the node that owns their filesystem path.
+    #[test]
+    fn local_summary_keeps_its_fixed_bound_node() {
+        let spec = sample_volume_spec();
+        assert_eq!(
+            summary_bound_node(&spec, &[], None),
+            (spec.bound_node_id, spec.bound_node_name.clone())
+        );
     }
 
     /// Inspect includes live filesystem space only when the writer query succeeded.

@@ -39,11 +39,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         "  Desired disposition: {}",
         volume.spec.desired_disposition
     )?;
-    writeln!(
-        &mut rendered,
-        "  Bound node: {}",
-        volume.spec.bound_node_name.as_deref().unwrap_or("-")
-    )?;
+    writeln!(&mut rendered, "  Bound node: {}", format_bound_node(volume))?;
     if matches!(
         volume.spec.driver,
         mantissa_client::volumes::VolumeDriver::Replicated
@@ -156,6 +152,34 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
     }
     render_replication(&mut rendered, volume)?;
     Ok(rendered)
+}
+
+/// Formats the fixed local binding or current replicated-volume attachment.
+pub(super) fn format_bound_node(volume: &VolumeInspect) -> String {
+    if !matches!(
+        volume.spec.driver,
+        mantissa_client::volumes::VolumeDriver::Replicated
+    ) {
+        return volume
+            .spec
+            .bound_node_name
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+    }
+
+    let Some(node_id) = volume
+        .group_status
+        .as_ref()
+        .and_then(|status| status.attached_node_id)
+    else {
+        return "-".to_string();
+    };
+    volume
+        .node_states
+        .iter()
+        .find(|state| state.node_id == node_id)
+        .map(|state| state.node_name.clone())
+        .unwrap_or_else(|| node_id.to_string())
 }
 
 /// Adds immutable replica placement and observed Raft status to inspect output.
