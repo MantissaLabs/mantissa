@@ -1336,12 +1336,23 @@ impl ReplicatedVolumeRuntime {
         &self,
         key: ReplicaKey,
     ) -> Result<Option<VolumeControlState>> {
+        Ok(self
+            .poll_local_quorum_group_state(key)
+            .await?
+            .map(|state| state.control_state))
+    }
+
+    /// Wakes saved voters and returns bounded control state and membership on the leader.
+    pub(crate) async fn poll_local_quorum_group_state(
+        &self,
+        key: ReplicaKey,
+    ) -> Result<Option<LeaderVolumeGroupState>> {
         self.ensure_generation_desired(key)?;
         let group = self.activate_with_voters(key).await?;
         if group.metrics().leader != Some(self.node_id) {
             return Ok(None);
         }
-        let state = match tokio::time::timeout(
+        let control_state = match tokio::time::timeout(
             RECONCILE_RAFT_ATTEMPT_TIMEOUT,
             group.leader_state(self.operation_timeout),
         )
@@ -1353,7 +1364,14 @@ impl ReplicatedVolumeRuntime {
         if let Some(record) = self.replicas.replica(key)? {
             self.ensure_local_gate(&record).await?;
         }
-        Ok(Some(state))
+        Ok(Some(LeaderVolumeGroupState {
+            control_state,
+            membership: RaftMembershipSnapshot {
+                voters: group.voter_node_ids(),
+                members: group.member_node_ids(),
+                is_joint: group.membership_is_joint(),
+            },
+        }))
     }
 
     /// Reads one running leader's applied state without requiring a live quorum.

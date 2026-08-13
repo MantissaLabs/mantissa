@@ -1377,11 +1377,33 @@ impl ReplicatedVolumeController {
     ) -> Result<()> {
         let descriptor = plan.descriptor.to_storage()?;
         let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
-        let Some(current) = self
-            .runtime
-            .poll_running_local_leader_observation(key)
-            .await?
-        else {
+        let group_id = compute_replicated_volume_group_id(
+            plan.descriptor.volume_id,
+            plan.descriptor.generation,
+        );
+        let local = self.runtime.local_status(key).await?;
+        let local_control_state = self.runtime.applied_state(key)?;
+        let public_status = self.registry.get_group_status(spec.id)?;
+        let public_status_is_behind = local_control_state
+            .as_ref()
+            .zip(local.applied_log_index)
+            .is_some_and(|(state, applied_log_index)| {
+                group_status_is_behind_local_state(
+                    public_status.as_ref(),
+                    spec.volume_epoch,
+                    group_id,
+                    state.revision(),
+                    applied_log_index,
+                )
+            });
+        let current = if public_status_is_behind {
+            self.runtime.poll_local_quorum_group_state(key).await?
+        } else {
+            self.runtime
+                .poll_running_local_leader_observation(key)
+                .await?
+        };
+        let Some(current) = current else {
             return Ok(());
         };
         let control_state = current.control_state;
@@ -1398,10 +1420,6 @@ impl ReplicatedVolumeController {
             VolumeDisposition::Live => VolumeStatus::Ready,
             VolumeDisposition::Retained => VolumeStatus::Retained,
         };
-        let group_id = compute_replicated_volume_group_id(
-            plan.descriptor.volume_id,
-            plan.descriptor.generation,
-        );
         let mut observation = ReplicatedVolumeGroupStatusValue::new(
             spec.id,
             spec.volume_epoch,
@@ -1646,6 +1664,25 @@ fn same_group_observation(
         && left.replacement_old_node_id == right.replacement_old_node_id
         && left.replacement_new_node_id == right.replacement_new_node_id
         && left.degraded == right.degraded
+}
+
+/// Returns whether durable local progress is newer than the selected public report.
+fn group_status_is_behind_local_state(
+    public: Option<&ReplicatedVolumeGroupStatusValue>,
+    volume_epoch: u64,
+    group_id: Uuid,
+    control_revision: u64,
+    applied_log_index: u64,
+) -> bool {
+    let Some(public) = public else {
+        return true;
+    };
+    if public.volume_epoch != volume_epoch {
+        return public.volume_epoch < volume_epoch;
+    }
+    public.group_id != group_id
+        || public.control_revision < control_revision
+        || public.committed_index < applied_log_index
 }
 
 /// Uses public state only to trigger a linearizable former-member inspection.
@@ -2636,5 +2673,62 @@ mod tests {
         assert!(same_group_observation(&previous, &current));
         current.committed_index += 1;
         assert!(!same_group_observation(&previous, &current));
+    }
+
+    /// Public progress must wake voters only until it reaches durable local progress.
+    #[test]
+    fn public_group_status_lag_requires_raft_wake() {
+        let volume_id = Uuid::from_u128(10);
+        let group_id = Uuid::from_u128(11);
+        let mut public = ReplicatedVolumeGroupStatusValue::new(
+            volume_id,
+            1,
+            group_id,
+            Uuid::from_u128(1),
+            VolumeStatus::Ready,
+            37,
+        );
+        public.control_revision = 26;
+
+        assert!(group_status_is_behind_local_state(
+            None, 1, group_id, 26, 37
+        ));
+        assert!(!group_status_is_behind_local_state(
+            Some(&public),
+            1,
+            group_id,
+            26,
+            37,
+        ));
+
+        let mut stale_revision = public.clone();
+        stale_revision.control_revision = 25;
+        assert!(group_status_is_behind_local_state(
+            Some(&stale_revision),
+            1,
+            group_id,
+            26,
+            37,
+        ));
+
+        let mut stale_membership_index = public.clone();
+        stale_membership_index.committed_index = 36;
+        assert!(group_status_is_behind_local_state(
+            Some(&stale_membership_index),
+            1,
+            group_id,
+            26,
+            37,
+        ));
+
+        public.control_revision = 27;
+        public.committed_index = 38;
+        assert!(!group_status_is_behind_local_state(
+            Some(&public),
+            1,
+            group_id,
+            26,
+            37,
+        ));
     }
 }
