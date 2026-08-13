@@ -3,6 +3,7 @@ mod commit;
 mod membership;
 mod progress;
 mod request;
+mod split_validation;
 
 pub(super) const COMMIT_PRECONDITION_FAILURE_PREFIX: &str =
     "cluster operation commit precondition failed";

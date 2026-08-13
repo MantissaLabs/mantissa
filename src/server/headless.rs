@@ -787,6 +787,23 @@ impl HeadlessNode {
         }
     }
 
+    /// Attempts one read-only replica RPC for cluster-view transport tests.
+    #[doc(hidden)]
+    pub async fn inspect_replicated_volume_replica_for_test(
+        &self,
+        node_id: Uuid,
+        descriptor: mantissa_volume::VolumeDescriptor,
+    ) -> anyhow::Result<()> {
+        let runtime = self
+            .replicated_volumes
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("replicated-volume runtime is disabled"))?;
+        runtime
+            .inspect_replica_on(node_id, descriptor)
+            .await
+            .map(|_| ())
+    }
+
     /// Shut down the full headless runtime before dropping the node.
     ///
     /// Restart tests use this instead of plain `stop()` when they need to

@@ -171,6 +171,7 @@ async fn test_cluster_registry(actor: Uuid) -> Registry {
         Arc::new(noise_keys),
         actor,
         mantissa_health::HealthMonitor::new(actor),
+        mantissa::cluster::ClusterViewState::legacy_default(),
     )
 }
 

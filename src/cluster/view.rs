@@ -1,8 +1,9 @@
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 /// Stable lineage identifier for a cluster across view transitions.
@@ -115,17 +116,35 @@ impl fmt::Display for ClusterViewId {
     }
 }
 
-/// Mutable process-local holder for the currently active `ClusterViewId`.
-#[derive(Clone, Debug)]
+/// One process-local cluster view and the nodes outside it.
+#[derive(Debug)]
+struct CurrentClusterView {
+    active_view: ClusterViewId,
+    out_of_view_node_ids: HashSet<Uuid>,
+}
+
+/// Mutable process-local state used to scope cluster work and peer traffic.
+#[derive(Clone)]
 pub struct ClusterViewState {
-    active: Arc<Mutex<ClusterViewId>>,
+    current: Arc<ArcSwap<CurrentClusterView>>,
 }
 
 impl ClusterViewState {
-    /// Creates a new state holder initialized with `active`.
-    pub fn new(active: ClusterViewId) -> Self {
+    /// Creates one state with no nodes assigned outside the active view.
+    pub fn new(active_view: ClusterViewId) -> Self {
+        Self::with_out_of_view_nodes(active_view, HashSet::new())
+    }
+
+    /// Restores one active view and the exact nodes outside it.
+    pub fn with_out_of_view_nodes(
+        active_view: ClusterViewId,
+        out_of_view_node_ids: HashSet<Uuid>,
+    ) -> Self {
         Self {
-            active: Arc::new(Mutex::new(active)),
+            current: Arc::new(ArcSwap::from_pointee(CurrentClusterView {
+                active_view,
+                out_of_view_node_ids,
+            })),
         }
     }
 
@@ -136,16 +155,43 @@ impl ClusterViewState {
 
     /// Returns the currently active cluster view.
     pub fn active_view(&self) -> ClusterViewId {
-        *self.active.lock()
+        self.current.load().active_view
     }
 
-    /// Replaces the active cluster view and returns the previous value.
-    #[allow(dead_code)]
-    pub fn set_active_view(&self, next: ClusterViewId) -> ClusterViewId {
-        let mut guard = self.active.lock();
-        let prev = *guard;
-        *guard = next;
-        prev
+    /// Returns whether one node may participate in work for the active view.
+    pub fn includes_node(&self, node_id: &Uuid) -> bool {
+        !self.current.load().out_of_view_node_ids.contains(node_id)
+    }
+
+    /// Returns a stable copy of nodes outside the active cluster view.
+    pub fn out_of_view_node_ids(&self) -> HashSet<Uuid> {
+        self.current.load().out_of_view_node_ids.clone()
+    }
+
+    /// Installs one view and its node boundary atomically, returning the prior view.
+    pub fn install(
+        &self,
+        active_view: ClusterViewId,
+        out_of_view_node_ids: HashSet<Uuid>,
+    ) -> ClusterViewId {
+        self.current
+            .swap(Arc::new(CurrentClusterView {
+                active_view,
+                out_of_view_node_ids,
+            }))
+            .active_view
+    }
+}
+
+impl fmt::Debug for ClusterViewState {
+    /// Formats the current view without exposing synchronization internals.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let current = self.current.load();
+        formatter
+            .debug_struct("ClusterViewState")
+            .field("active_view", &current.active_view)
+            .field("out_of_view_node_ids", &current.out_of_view_node_ids)
+            .finish()
     }
 }
 
@@ -158,6 +204,7 @@ impl Default for ClusterViewState {
 #[cfg(test)]
 mod tests {
     use super::{ClusterId, ClusterViewId, ClusterViewState};
+    use std::collections::HashSet;
     use uuid::Uuid;
 
     /// `ClusterId` should preserve UUID round-trips for interoperability.
@@ -171,12 +218,15 @@ mod tests {
 
     /// `ClusterViewState` updates should return the old view and expose the new one.
     #[test]
-    fn cluster_view_state_swap() {
+    fn cluster_view_state_install_is_atomic() {
         let state = ClusterViewState::legacy_default();
         let original = state.active_view();
         let next = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 7);
-        let previous = state.set_active_view(next);
+        let sibling = Uuid::new_v4();
+        let previous = state.install(next, HashSet::from([sibling]));
         assert_eq!(previous, original);
         assert_eq!(state.active_view(), next);
+        assert!(!state.includes_node(&sibling));
+        assert_eq!(state.out_of_view_node_ids(), HashSet::from([sibling]));
     }
 }

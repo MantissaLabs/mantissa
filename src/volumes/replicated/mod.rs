@@ -2,6 +2,7 @@ mod controller;
 mod planner;
 mod rpc;
 mod runtime;
+mod split_validation;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ pub use planner::ReplicatedVolumePlanner;
 pub(crate) use runtime::PreparedStorage;
 pub use runtime::ReplicatedVolumeRuntime;
 pub(crate) use runtime::WriterFilesystemSpace;
+pub(crate) use split_validation::{ReplicatedVolumeSplitValidator, VolumeMembershipChangeBlocker};
 
 use crate::topology::peers::{NodeReadinessState, PeerValue};
 use mantissa_health::Status as HealthStatus;

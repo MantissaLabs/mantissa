@@ -434,6 +434,18 @@ where
             .collect()
     }
 
+    /// Returns whether the current membership contains more than one voter configuration.
+    pub fn membership_is_joint(&self) -> bool {
+        let receiver = self.raft.metrics();
+        receiver
+            .borrow()
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .len()
+            != 1
+    }
+
     /// Waits until this member observes any current leader.
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<A::NodeId, WaitError> {
         let metrics = self

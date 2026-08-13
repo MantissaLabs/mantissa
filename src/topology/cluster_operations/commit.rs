@@ -20,10 +20,6 @@ use mantissa_health::Status as HealthStatus;
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-struct PeerScopeParticipant {
-    topology: Topology,
-}
-
 struct SplitSecretMasterKeyParticipant {
     topology: Topology,
 }
@@ -50,7 +46,7 @@ impl ClusterTransitionParticipant for SplitSecretMasterKeyParticipant {
         }
 
         if !transition
-            .retained_node_ids
+            .local_view_node_ids
             .contains(&self.topology.local.node.id)
         {
             return Err(capnp::Error::failed(format!(
@@ -79,7 +75,7 @@ impl ClusterTransitionParticipant for SplitSecretMasterKeyParticipant {
             .add_detail("generation", record.generation().to_string())
             .add_detail(
                 "recipient_count",
-                transition.retained_node_ids.len().to_string(),
+                transition.local_view_node_ids.len().to_string(),
             )
             .add_detail("derived", derived.to_string());
         Ok(report)
@@ -93,7 +89,7 @@ impl SplitSecretMasterKeyParticipant {
         transition: &ClusterTransition,
     ) -> Result<uuid::Uuid, capnp::Error> {
         transition
-            .retained_node_ids
+            .local_view_node_ids
             .iter()
             .copied()
             .min()
@@ -779,22 +775,12 @@ fn master_key_recipient_for_node(
     })
 }
 
-#[async_trait(?Send)]
-impl ClusterTransitionParticipant for PeerScopeParticipant {
-    /// Returns the participant identifier used by transition diagnostics.
-    fn name(&self) -> &'static str {
-        "peer_scope"
-    }
-
-    /// Updates peer-session scope for a split or merge transition.
-    ///
-    /// Split commits fence ordinary peer activity while retaining the authentication material
-    /// needed by the cluster-wide metadata plane. Merge commits clear that partition fence.
-    async fn on_commit(
+impl Topology {
+    /// Returns nodes that leave this process's cluster view after the transition.
+    pub(in crate::topology) fn out_of_view_node_ids_for_transition(
         &self,
         transition: &ClusterTransition,
-    ) -> Result<ClusterParticipantReport, capnp::Error> {
-        let mut report = ClusterParticipantReport::new(self.name());
+    ) -> Result<HashSet<uuid::Uuid>, capnp::Error> {
         if transition.is_split() {
             let local_target_index = transition.local_split_target_index.ok_or_else(|| {
                 capnp::Error::failed(format!(
@@ -803,48 +789,17 @@ impl ClusterTransitionParticipant for PeerScopeParticipant {
                 ))
             })?;
 
-            if !transition
-                .retained_node_ids
-                .contains(&self.topology.local.node.id)
-            {
+            if !transition.local_view_node_ids.contains(&self.local.node.id) {
                 return Err(capnp::Error::failed(format!(
                     "split operation {} local target {} does not retain local node {}",
-                    transition.operation_id, local_target_index, self.topology.local.node.id
+                    transition.operation_id, local_target_index, self.local.node.id
                 )));
             }
 
-            self.topology
-                .set_excluded_peers(transition.evicted_node_ids.clone())
-                .await;
-            self.topology
-                .deps
-                .registry
-                .set_excluded_peers(transition.evicted_node_ids.clone());
-
-            report = report
-                .add_detail("local_target_index", local_target_index.to_string())
-                .add_detail(
-                    "retained_count",
-                    transition.retained_node_ids.len().to_string(),
-                )
-                .add_detail(
-                    "evicted_count",
-                    transition.evicted_node_ids.len().to_string(),
-                )
-                .add_detail("global_auth_retained", "true");
-            return Ok(report);
+            return Ok(transition.out_of_view_node_ids.clone());
         }
 
-        if transition.is_merge() {
-            self.topology.set_excluded_peers(HashSet::new()).await;
-            self.topology
-                .deps
-                .registry
-                .set_excluded_peers(HashSet::new());
-            report = report.add_detail("excluded_peers_reset", "true");
-        }
-
-        Ok(report)
+        Ok(HashSet::new())
     }
 }
 
@@ -877,7 +832,7 @@ impl ClusterTransitionParticipant for SplitTaskRuntimeParticipant {
         {
             let removed = self
                 .workloads
-                .purge_local_for_nodes(&transition.evicted_node_ids)
+                .purge_local_for_nodes(&transition.out_of_view_node_ids)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
             self.service_reconcile_trigger
@@ -1005,9 +960,6 @@ impl Topology {
                 topology: self.clone(),
             }),
             Box::new(MergeSecretMasterKeyParticipant {
-                topology: self.clone(),
-            }),
-            Box::new(PeerScopeParticipant {
                 topology: self.clone(),
             }),
             Box::new(SplitTaskRuntimeParticipant {

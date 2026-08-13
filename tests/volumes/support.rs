@@ -824,9 +824,25 @@ pub(crate) async fn start_replicated_volume_test_cluster_with_driver_limits(
     driver_limits: ReplicatedVolumeTestDriverLimits,
     storage_limits: ReplicatedVolumeTestStorageLimits,
 ) -> anyhow::Result<(Vec<TestNode>, Vec<ReplicatedVolumeTestNodeState>)> {
-    let mut cluster = Vec::with_capacity(REPLICATED_VOLUME_TEST_NODE_COUNT);
-    let mut states = Vec::with_capacity(REPLICATED_VOLUME_TEST_NODE_COUNT);
-    for index in 0..REPLICATED_VOLUME_TEST_NODE_COUNT {
+    start_replicated_volume_test_cluster_with_node_count(
+        root,
+        REPLICATED_VOLUME_TEST_NODE_COUNT,
+        driver_limits,
+        storage_limits,
+    )
+    .await
+}
+
+/// Starts an exact number of real storage runtimes for topology tests.
+pub(crate) async fn start_replicated_volume_test_cluster_with_node_count(
+    root: &Path,
+    node_count: usize,
+    driver_limits: ReplicatedVolumeTestDriverLimits,
+    storage_limits: ReplicatedVolumeTestStorageLimits,
+) -> anyhow::Result<(Vec<TestNode>, Vec<ReplicatedVolumeTestNodeState>)> {
+    let mut cluster = Vec::with_capacity(node_count);
+    let mut states = Vec::with_capacity(node_count);
+    for index in 0..node_count {
         let node_root = root.join(format!("node-{index}"));
         fs::create_dir_all(node_root.join("replicas"))
             .with_context(|| format!("create replica pool for node {index}"))?;
@@ -875,12 +891,8 @@ pub(crate) async fn start_replicated_volume_test_cluster_with_driver_limits(
         cluster.push(node);
         states.push(state);
     }
-    if let Err(error) = TestNode::wait_cluster_ready_all(
-        &cluster,
-        REPLICATED_VOLUME_TEST_NODE_COUNT,
-        Duration::from_secs(15),
-    )
-    .await
+    if let Err(error) =
+        TestNode::wait_cluster_ready_all(&cluster, node_count, Duration::from_secs(15)).await
     {
         let _ = shutdown_replicated_volume_test_cluster(cluster).await;
         return Err(anyhow::Error::msg(error));
@@ -1001,6 +1013,78 @@ pub(crate) async fn restart_replicated_volume_test_node(
         anyhow::bail!("restarted storage node did not reconnect to its known peers");
     }
     Ok(())
+}
+
+/// Restarts every node in one split child and waits only for its permitted peers.
+pub(crate) async fn restart_replicated_volume_test_view(
+    cluster: &mut Vec<TestNode>,
+    states: &[ReplicatedVolumeTestNodeState],
+    view_node_ids: &[Uuid],
+    expected_view: mantissa::cluster::ClusterViewId,
+) -> anyhow::Result<()> {
+    for node_id in view_node_ids {
+        shutdown_replicated_volume_test_node(cluster, *node_id, Duration::from_secs(15))
+            .await
+            .with_context(|| format!("shut down split-child node {node_id}"))?;
+    }
+
+    for node_id in view_node_ids {
+        let state = states
+            .iter()
+            .find(|state| state.node_id == *node_id)
+            .context("saved test state does not contain a split-child node")?;
+        wait_for_test_volume_database_release(
+            &state.node_root.join("replicated-volumes.redb"),
+            Duration::from_secs(5),
+        )
+        .await
+        .with_context(|| format!("wait for split-child node {node_id} database release"))?;
+        cluster.push(
+            state
+                .start()
+                .await
+                .with_context(|| format!("restart split-child node {node_id}"))?,
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let mut ready = true;
+        for node_id in view_node_ids {
+            let Some(node) = cluster.iter().find(|node| node.id() == *node_id) else {
+                ready = false;
+                continue;
+            };
+            if crate::common::convergence::current_cluster_view(&node.topology()).await
+                != expected_view
+                || node.node.registry.connect_known_peers(true).await.is_err()
+            {
+                ready = false;
+                continue;
+            }
+            for peer_id in view_node_ids {
+                if peer_id != node_id
+                    && node
+                        .node
+                        .registry
+                        .cached_session_for(*peer_id)
+                        .await
+                        .is_none()
+                {
+                    ready = false;
+                }
+            }
+        }
+        if ready {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "restarted split child did not restore view {expected_view} and its peer sessions"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Waits for stopped in-process RPC sessions to release a test node's volume database.

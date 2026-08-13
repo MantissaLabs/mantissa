@@ -23,7 +23,7 @@ use crate::sync::{SyncRunner, SyncTraceContext};
 use crate::token::TokenStore;
 use crate::topology::peers::{PeerMembership, PeerSchedulingState, PeerValue, WireGuardPeerValue};
 use crate::volumes::VolumeRegistry;
-use crate::volumes::replicated::ReplicatedVolumeSupport;
+use crate::volumes::replicated::{ReplicatedVolumeSplitValidator, ReplicatedVolumeSupport};
 use crate::workload::WorkloadRegistry;
 use ::mantissa_health::HealthMonitor;
 use async_channel::{Receiver, Sender};
@@ -185,6 +185,7 @@ pub struct TopologyDependencies {
     pub service_registry: ServiceRegistry,
     pub service_reconcile_trigger: ServiceReconcileTrigger,
     pub volume_registry: VolumeRegistry,
+    pub(crate) replicated_volume_split_validator: ReplicatedVolumeSplitValidator,
     pub scheduler: Rc<Scheduler>,
     pub sync: SyncRunner,
     pub health_monitor: Arc<HealthMonitor>,
@@ -228,7 +229,6 @@ impl Topology {
                 gossip: runtime::GossipState::new(gossip_receiver, gossip_sender),
                 peer_snapshot_cache: Arc::new(tokio::sync::Mutex::new(PeerSnapshotCache::new())),
                 gossip_warm_set: Arc::new(tokio::sync::Mutex::new(GossipWarmSetState::default())),
-                excluded_peers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
                 immediate_sync: ImmediateSyncState::new(),
                 sync: runtime::SyncLoopState::new(DEFAULT_SYNC_INTERVAL, DEFAULT_SYNC_FANOUT),
                 sync_cursor: Arc::new(Mutex::new(0)),
@@ -282,10 +282,13 @@ impl Topology {
         self.local.root_schema.info()
     }
 
-    /// Replaces the active cluster view identifier and returns the previous value.
-    #[allow(dead_code)]
-    pub fn set_active_cluster_view(&self, next: ClusterViewId) -> ClusterViewId {
-        let previous = self.local.cluster_view.set_active_view(next);
+    /// Installs one active view and the nodes outside it.
+    pub fn install_cluster_view(
+        &self,
+        next: ClusterViewId,
+        out_of_view_node_ids: HashSet<Uuid>,
+    ) -> ClusterViewId {
+        let previous = self.local.cluster_view.install(next, out_of_view_node_ids);
         if previous == next {
             debug!(
                 target: "cluster_view",
@@ -304,16 +307,8 @@ impl Topology {
         previous
     }
 
-    /// Returns a snapshot of peers currently excluded from active control-plane loops.
-    pub async fn excluded_peers_snapshot(&self) -> HashSet<Uuid> {
-        self.runtime.excluded_peers.lock().await.clone()
-    }
-
-    /// Replaces the excluded-peer set used to scope active control-plane loops.
-    pub async fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
-        let mut guard = self.runtime.excluded_peers.lock().await;
-        if *guard != excluded {
-            *guard = excluded;
-        }
+    /// Returns nodes assigned outside the current active cluster view.
+    pub fn out_of_view_node_ids(&self) -> HashSet<Uuid> {
+        self.local.cluster_view.out_of_view_node_ids()
     }
 }

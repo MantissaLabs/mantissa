@@ -451,6 +451,7 @@ mod tests {
         peers.rebuild_mst_from_disk().await.expect("rebuild peers");
         let sessions =
             LocalSessionStore::open(db, noise_keys.as_ref()).expect("open local sessions");
+        let cluster_view = ClusterViewState::new(ClusterViewId::legacy_default());
         let registry = Registry::new(
             peers,
             sessions,
@@ -458,8 +459,8 @@ mod tests {
             noise_keys.clone(),
             local_node_id,
             mantissa_health::HealthMonitor::new(local_node_id),
+            cluster_view.clone(),
         );
-        let cluster_view = ClusterViewState::new(ClusterViewId::legacy_default());
         let reconciler = SecretMasterKeyReconciler::new(
             local_node_id,
             noise_keys.clone(),

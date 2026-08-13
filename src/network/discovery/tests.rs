@@ -704,6 +704,7 @@ async fn test_cluster_registry(actor: Uuid) -> Registry {
         Arc::new(noise_keys),
         actor,
         HealthMonitor::new(actor),
+        crate::cluster::ClusterViewState::legacy_default(),
     )
 }
 

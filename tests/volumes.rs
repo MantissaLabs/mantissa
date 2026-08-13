@@ -13,6 +13,8 @@ mod postgres;
 mod recovery;
 #[path = "volumes/restart.rs"]
 mod restart;
+#[path = "volumes/split.rs"]
+mod split;
 #[path = "volumes/support.rs"]
 mod support;
 #[path = "volumes/sync.rs"]

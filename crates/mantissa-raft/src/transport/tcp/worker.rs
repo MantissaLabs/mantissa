@@ -364,6 +364,18 @@ where
         }))
     };
     let mut connection = peer_connection.lock().await;
+    let Some(peer) = context.shared.peers.peer(&target) else {
+        connection.client = None;
+        connection.last_failed_attempt = None;
+        connection.failed_attempts = 0;
+        return Err(TransportError::UnknownPeer);
+    };
+    if peer.node_id != target {
+        connection.client = None;
+        connection.last_failed_attempt = None;
+        connection.failed_attempts = 0;
+        return Err(TransportError::WrongPeer);
+    }
     if let Some(clients) = connection
         .client
         .as_ref()
@@ -383,14 +395,6 @@ where
         if let Some(remaining) = delay.checked_sub(last_failed_attempt.elapsed()) {
             tokio::time::sleep(remaining).await;
         }
-    }
-    let peer = context
-        .shared
-        .peers
-        .peer(&target)
-        .ok_or(TransportError::UnknownPeer)?;
-    if peer.node_id != target {
-        return Err(TransportError::WrongPeer);
     }
     context.shared.metrics.connection_attempted();
     let result = connect_peer(Rc::clone(&context), peer).await;
@@ -873,6 +877,11 @@ where
         _params: raft_transport::GetRaftParams,
         mut results: raft_transport::GetRaftResults,
     ) -> Result<(), capnp::Error> {
+        if self.shared.peers.peer(&self.peer).is_none() {
+            return Err(capnp::Error::failed(
+                TransportError::UnknownPeer.to_string(),
+            ));
+        }
         let client: raft::Client = capnp_rpc::new_client(RaftServer {
             peer: self.peer.clone(),
             shared: Arc::clone(&self.shared),
@@ -887,6 +896,11 @@ where
         _params: raft_transport::GetApplicationParams,
         mut results: raft_transport::GetApplicationResults,
     ) -> Result<(), capnp::Error> {
+        if self.shared.peers.peer(&self.peer).is_none() {
+            return Err(capnp::Error::failed(
+                TransportError::UnknownPeer.to_string(),
+            ));
+        }
         let application =
             self.shared.application.as_ref().ok_or_else(|| {
                 capnp::Error::failed("no application service is registered".into())

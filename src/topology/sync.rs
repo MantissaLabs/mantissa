@@ -155,10 +155,11 @@ impl Topology {
             Some(snapshot) => snapshot,
             None => return Vec::new(),
         };
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
         let mut population = Vec::with_capacity(snapshot.entries.len());
         for entry in snapshot.entries.iter() {
-            if entry.peer_id == self.local.node.id || excluded_peers.contains(&entry.peer_id) {
+            if entry.peer_id == self.local.node.id || out_of_view_node_ids.contains(&entry.peer_id)
+            {
                 continue;
             }
             let value = entry.value.as_ref();
@@ -250,7 +251,7 @@ impl Topology {
         let peers = snapshot.entries.clone();
         let sync_fanout = self.runtime.sync.fanout();
         let cluster_view = self.active_cluster_view();
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
         let entries = peers.as_ref();
         if entries.is_empty() {
             return;
@@ -258,7 +259,8 @@ impl Topology {
         let in_scope_peer_count = entries
             .iter()
             .filter(|entry| {
-                entry.peer_id != self.local.node.id && !excluded_peers.contains(&entry.peer_id)
+                entry.peer_id != self.local.node.id
+                    && !out_of_view_node_ids.contains(&entry.peer_id)
             })
             .count();
         if in_scope_peer_count == 0 {
@@ -280,7 +282,7 @@ impl Topology {
         let sync_parallelism = sync_parallelism_from_env(DEFAULT_SYNC_PARALLELISM);
         let mut inflight = FuturesUnordered::new();
         for entry in selected_entries {
-            if excluded_peers.contains(&entry.peer_id) {
+            if out_of_view_node_ids.contains(&entry.peer_id) {
                 continue;
             }
             inflight.push(self.sync_with_peer(entry, cluster_view));
@@ -297,7 +299,7 @@ impl Topology {
             workload_repair_entries.len(),
         );
         for entry in workload_repair_entries {
-            if excluded_peers.contains(&entry.peer_id) {
+            if out_of_view_node_ids.contains(&entry.peer_id) {
                 continue;
             }
             self.sync_workloads_with_peer(entry, cluster_view).await;
@@ -872,7 +874,7 @@ impl GossipContext for Topology {
 
     /// Returns peer handles for the global metadata gossip plane.
     ///
-    /// Unlike the default `PeerProvider` path this intentionally keeps split-excluded peers
+    /// Unlike the default `PeerProvider` path this intentionally keeps out-of-view peers
     /// so selected low-rate metadata events can cross view boundaries.
     async fn get_peers_unscoped(&self) -> Vec<PeerHandle> {
         if !self.local_allows_outbound_cluster_traffic() {

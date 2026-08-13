@@ -97,10 +97,17 @@ If commit preconditions no longer match local state, the operation is marked
 `Aborted`.
 
 These stages are local crash-recovery bookkeeping, not acknowledgements from
-other nodes and not a distributed commit barrier. The operation's source,
-targets, assignments, and policies are immutable intent. Any node that sees
-that intent applies its own assignment idempotently and an offline node does
-not block other participants: it applies the same intent when it returns.
+other nodes and not a general distributed commit barrier. The operation's
+source, targets, assignments, and policies are immutable intent. Any node that
+sees that intent applies its own assignment idempotently.
+
+A split involving replicated volumes has one stricter precondition. Every
+source node must first receive the split record and converge its volume
+metadata. The assignments must also match the current source node-count record.
+This prevents an offline or recently joined source node from being omitted and
+hiding a Raft group that the proposed assignments would divide. If a source
+node is unavailable, the split aborts and can be submitted again after the node
+returns or is removed from the source view.
 
 The requester persists transition key material before new intent whenever it
 can author that material. It then gossips only an availability hint. Receivers
@@ -165,6 +172,38 @@ Network policy:
   become partition-local.
 - `preserve`: keep network runtime rows as-is.
 
+### Replicated Volumes
+
+A split may proceed only when each replicated-volume Raft group fits entirely
+inside one target view. For example, a six-node cluster can be divided into
+`{1, 2, 3}` and `{4, 5, 6}` when a volume's current members are `{1, 2, 3}`.
+The same split is rejected when that volume's members are `{1, 2, 6}`.
+
+Mantissa reads current membership from the Raft leader. It does not rely on the
+original volume plan because replica replacement can move a group to different
+nodes. Before accepting the split, Mantissa requires all of these facts:
+
+- exactly three Raft voters and no learners;
+- no joint Raft membership change;
+- the three data copies equal the three voters;
+- no replica replacement or recovery is active; and
+- every group member is assigned to the same target view.
+
+The `Proposed` split record temporarily stops new volume provisioning and Raft
+membership changes. Mantissa then converges the operation record and all volume
+metadata across every active source node, reads every group twice, and requires
+the membership to remain unchanged. A per-volume lock makes the first read wait
+for membership work that started before `Proposed` converged; later membership
+work sees the split row and fails. Explicit assignments must include every
+active source node, match the current source node count, and include no node
+outside that view. Reads, writes, flushes, and ordinary attachment cleanup may
+continue during this check.
+
+Failure to prove these conditions aborts the split with a reason. The volume is
+not changed, and replica repair resumes after the aborted record converges. The
+operator can retry after provisioning, replacement, recovery, cleanup, or a
+source-node outage has finished.
+
 ### Split Commit Effects
 
 When a split commits locally, Mantissa:
@@ -212,7 +251,7 @@ so an offline original issuer does not become a completion barrier.
 Commit-time side effects are organized as transition participants. Today that
 includes:
 
-- split peer-scope updates,
+- split cluster-view boundaries,
 - split task runtime pruning,
 - split network runtime pruning,
 - merge-time service rebalance nudges.
@@ -243,14 +282,16 @@ not become ambiguous mid-transition.
 
 ## Startup Recovery
 
-Startup performs three recovery steps:
+Startup performs these recovery steps:
 
-1. restore cluster lineage names from durable operation history,
-2. replay any non-finalized cluster operations,
-3. restore split peer scope from durable history.
+1. restore the active cluster view;
+2. restore the excluded peers saved atomically with that active view before
+   replicated storage accepts connections;
+3. restore cluster lineage names; and
+4. replay any non-finalized cluster operations.
 
-That means a node restart should come back with the same active view and peer
-scope that the durable topology history implies.
+That means a restarted node cannot briefly reconnect its Raft or replica-data
+transport to nodes in the other split child.
 
 ## Master-Key Retention and GC
 

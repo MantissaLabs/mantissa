@@ -581,6 +581,7 @@ mod tests {
             Arc::new(noise_keys),
             actor,
             HealthMonitor::new(actor),
+            crate::cluster::ClusterViewState::legacy_default(),
         );
 
         let scheduler =

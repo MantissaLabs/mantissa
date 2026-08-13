@@ -41,7 +41,8 @@ use crate::task::service::TaskService;
 use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, TopologyStorage};
 use crate::volumes::replicated::{
     ReplicatedVolumeController, ReplicatedVolumePlanner, ReplicatedVolumeRuntime,
-    ReplicatedVolumeSupport, desired_replica_generations,
+    ReplicatedVolumeSplitValidator, ReplicatedVolumeSupport, VolumeMembershipChangeBlocker,
+    desired_replica_generations,
 };
 use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
 use crate::workload::WorkloadRegistry;
@@ -394,6 +395,15 @@ struct RuntimeTaskOptions {
     store_gc_config: Option<config::RuntimeStoreGcConfig>,
 }
 
+/// Replicated-volume and cluster-view state prepared before subsystem wiring.
+struct ReplicatedVolumeBootstrapInputs {
+    runtime: Option<Arc<ReplicatedVolumeRuntime>>,
+    cluster_view: ClusterViewState,
+    volume_registry: VolumeRegistry,
+    membership_change_blocker: VolumeMembershipChangeBlocker,
+    split_validator: ReplicatedVolumeSplitValidator,
+}
+
 /// Boots the full server runtime from an initialized bootstrap context.
 ///
 /// This is the shared startup pipeline used by both the daemon and headless
@@ -403,20 +413,41 @@ pub async fn boot(
     options: BootstrapOptions,
 ) -> BootstrapResult<BootedRuntime> {
     let stores = BootstrapStores::open(&ctx, &options).await?;
+    let cluster_view = stores.restore_cluster_view_state()?;
+    let volume_registry = VolumeRegistry::new(
+        stores.volumes.clone(),
+        stores.volume_nodes.clone(),
+        stores.volume_plans.clone(),
+        stores.volume_group_statuses.clone(),
+        stores.volume_capacity_requests.clone(),
+    );
+    let membership_change_blocker =
+        VolumeMembershipChangeBlocker::new(stores.cluster_operations.clone(), cluster_view.clone());
     let replicated_volumes = open_replicated_volumes(
         &ctx,
         &stores,
         options.replicated_volumes.clone(),
         options.advertise_override.as_deref(),
+        cluster_view.clone(),
+        membership_change_blocker.clone(),
+        volume_registry.clone(),
     )
     .await?;
+    let split_validator =
+        ReplicatedVolumeSplitValidator::new(volume_registry.clone(), replicated_volumes.clone());
     // This async assembly path carries a large future state machine during
     // headless startup. Boxing it keeps current-thread test stacks bounded.
     let built = Box::pin(build_runtime_components(
         &ctx,
         &stores,
         &options,
-        replicated_volumes.clone(),
+        ReplicatedVolumeBootstrapInputs {
+            runtime: replicated_volumes.clone(),
+            cluster_view,
+            volume_registry,
+            membership_change_blocker,
+            split_validator,
+        },
     ))
     .await;
     let (components, actors, gossip_rx, gossip_dedupe) = match built {
@@ -462,6 +493,9 @@ async fn open_replicated_volumes(
     stores: &BootstrapStores,
     startup: ReplicatedVolumeStartup,
     advertise_override: Option<&str>,
+    cluster_view: ClusterViewState,
+    membership_change_blocker: VolumeMembershipChangeBlocker,
+    desired_registry: VolumeRegistry,
 ) -> BootstrapResult<Option<Arc<ReplicatedVolumeRuntime>>> {
     let (config, automatic) = match startup {
         ReplicatedVolumeStartup::Disabled => return Ok(None),
@@ -523,6 +557,8 @@ async fn open_replicated_volumes(
         ctx.self_id,
         Arc::clone(&ctx.noise_keys),
         stores.peers.clone(),
+        cluster_view,
+        membership_change_blocker,
     );
     let storage = tokio::time::timeout(open_timeout, open)
         .await
@@ -533,13 +569,6 @@ async fn open_replicated_volumes(
             )
         })??;
 
-    let desired_registry = VolumeRegistry::new(
-        stores.volumes.clone(),
-        stores.volume_nodes.clone(),
-        stores.volume_plans.clone(),
-        stores.volume_group_statuses.clone(),
-        stores.volume_capacity_requests.clone(),
-    );
     let desired_specs = desired_registry.list_reconcilable_specs_including_deleting()?;
     storage.replace_desired_generations(desired_replica_generations(&desired_specs));
 
@@ -588,12 +617,32 @@ async fn open_replicated_volume_runtime(
     node_id: uuid::Uuid,
     noise_keys: Arc<mantissa_net::noise::NoiseKeys>,
     peers: crate::store::replicated::peers::PeersStore,
+    cluster_view: ClusterViewState,
+    membership_change_blocker: VolumeMembershipChangeBlocker,
 ) -> anyhow::Result<Arc<ReplicatedVolumeRuntime>> {
     match prepared {
         Some(prepared) => {
-            ReplicatedVolumeRuntime::open_prepared(prepared, node_id, noise_keys, peers).await
+            ReplicatedVolumeRuntime::open_prepared(
+                prepared,
+                node_id,
+                noise_keys,
+                peers,
+                cluster_view,
+                membership_change_blocker,
+            )
+            .await
         }
-        None => ReplicatedVolumeRuntime::open(config, node_id, noise_keys, peers).await,
+        None => {
+            ReplicatedVolumeRuntime::open(
+                config,
+                node_id,
+                noise_keys,
+                peers,
+                cluster_view,
+                membership_change_blocker,
+            )
+            .await
+        }
     }
 }
 
@@ -650,13 +699,20 @@ async fn build_runtime_components(
     ctx: &BootstrapContext,
     stores: &BootstrapStores,
     options: &BootstrapOptions,
-    replicated_volumes: Option<Arc<ReplicatedVolumeRuntime>>,
+    replicated_volume_inputs: ReplicatedVolumeBootstrapInputs,
 ) -> BootstrapResult<(
     RuntimeComponents,
     RuntimeActors,
     Receiver<Message>,
     DedupeStateHandle,
 )> {
+    let ReplicatedVolumeBootstrapInputs {
+        runtime: replicated_volumes,
+        cluster_view,
+        volume_registry,
+        membership_change_blocker,
+        split_validator,
+    } = replicated_volume_inputs;
     let channels = RuntimeChannels::new(options.gossip_channel_capacity);
     let gossip_routes = channels.routes();
     let RuntimeChannels {
@@ -675,7 +731,6 @@ async fn build_runtime_components(
         ..
     } = channels;
 
-    let cluster_view = stores.restore_active_view()?;
     let root_schema = stores.restore_root_schema_state(&ctx.db, options.root_schema_override)?;
     let replicated_volume_support = match replicated_volumes.as_ref() {
         Some(storage) => storage.support(root_schema.publication_generation())?,
@@ -720,15 +775,8 @@ async fn build_runtime_components(
     let workload_registry = WorkloadRegistry::new(stores.workloads.clone());
     let service_registry = services::ServiceRegistry::new(stores.services.clone());
     let service_reconcile_trigger = ServiceReconcileTrigger::new();
-    let volume_registry = VolumeRegistry::new(
-        stores.volumes.clone(),
-        stores.volume_nodes.clone(),
-        stores.volume_plans.clone(),
-        stores.volume_group_statuses.clone(),
-        stores.volume_capacity_requests.clone(),
-    );
     let ingress_pool_registry = IngressPoolRegistry::new(stores.ingress_pools.clone());
-    let registry = build_registry(ctx, stores, health_monitor.clone());
+    let registry = build_registry(ctx, stores, health_monitor.clone(), cluster_view.clone());
     let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
     let runtime_set = build_runtime_set(options).await?;
     let runtime_support = runtime_set.advertised_support();
@@ -746,6 +794,7 @@ async fn build_runtime_components(
             service_registry: service_registry.clone(),
             service_reconcile_trigger: service_reconcile_trigger.clone(),
             volume_registry: volume_registry.clone(),
+            replicated_volume_split_validator: split_validator,
             scheduler: scheduler.clone(),
             sync: sync_runner.clone(),
             health_monitor: health_monitor.clone(),
@@ -799,7 +848,8 @@ async fn build_runtime_components(
     );
     let replicated_volume_planner = ReplicatedVolumePlanner::new(
         volume_registry.clone(),
-        stores.peers.clone(),
+        registry.clone(),
+        membership_change_blocker.clone(),
         registry.health_monitor(),
         gossip_tx.clone(),
         ctx.self_id,
@@ -807,7 +857,8 @@ async fn build_runtime_components(
     let replicated_volume_controller = replicated_volumes.as_ref().map(|runtime| {
         ReplicatedVolumeController::new(
             volume_registry.clone(),
-            stores.peers.clone(),
+            registry.clone(),
+            membership_change_blocker,
             registry.health_monitor(),
             gossip_tx.clone(),
             Arc::clone(runtime),
@@ -1123,6 +1174,7 @@ fn build_registry(
     ctx: &BootstrapContext,
     stores: &BootstrapStores,
     health_monitor: Arc<mantissa_health::HealthMonitor>,
+    cluster_view: ClusterViewState,
 ) -> Registry {
     Registry::new(
         stores.peers.clone(),
@@ -1131,6 +1183,7 @@ fn build_registry(
         ctx.noise_keys.clone(),
         ctx.self_id,
         health_monitor,
+        cluster_view,
     )
 }
 
@@ -1217,15 +1270,6 @@ async fn restore_topology_derived_state(topology: &Topology) -> BootstrapResult<
             target: "cluster_view",
             replayed,
             "replayed pending cluster operations during startup"
-        );
-    }
-
-    let restored_scope = topology.restore_peer_scope_from_operation_history().await?;
-    if restored_scope > 0 {
-        info!(
-            target: "cluster_view",
-            restored_scope,
-            "restored split peer scope during startup"
         );
     }
 

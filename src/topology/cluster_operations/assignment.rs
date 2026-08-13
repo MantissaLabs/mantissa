@@ -164,12 +164,12 @@ impl Topology {
                 .collect();
         }
 
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
         let mut values = candidates
             .into_values()
             .filter(|candidate| {
                 candidate.node_id == self.local.node.id
-                    || !excluded_peers.contains(&candidate.node_id)
+                    || !out_of_view_node_ids.contains(&candidate.node_id)
             })
             .collect::<Vec<_>>();
         values.sort_by_key(|candidate| candidate.node_id);

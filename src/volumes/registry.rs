@@ -269,11 +269,27 @@ impl VolumeRegistry {
 
     /// Lists every canonical node-state row known in the replicated store.
     pub fn list_node_states(&self) -> Result<Vec<VolumeNodeStateValue>> {
-        let live_specs: HashMap<Uuid, VolumeSpecValue> = self
-            .list_specs()?
+        self.load_node_states_for_specs(self.list_specs()?)
+    }
+
+    /// Lists canonical node states for live and deleting volume generations.
+    pub(crate) fn list_node_states_including_deleting(&self) -> Result<Vec<VolumeNodeStateValue>> {
+        self.load_node_states_for_specs(self.list_specs_including_deleting()?)
+    }
+
+    /// Loads node states with plans resolved once per volume rather than once per row.
+    fn load_node_states_for_specs(
+        &self,
+        specs: Vec<VolumeSpecValue>,
+    ) -> Result<Vec<VolumeNodeStateValue>> {
+        let plans = specs
+            .iter()
+            .map(|spec| Ok((spec.id, self.get_plan_for_spec(spec)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        let specs = specs
             .into_iter()
             .map(|spec| (spec.id, spec))
-            .collect();
+            .collect::<HashMap<_, _>>();
         let (entries, _) = self
             .nodes
             .load_all()
@@ -284,11 +300,11 @@ impl VolumeRegistry {
             if let Some(spec) = snapshot
                 .as_slice()
                 .iter()
-                .find_map(|value| live_specs.get(&value.volume_id))
+                .find_map(|value| specs.get(&value.volume_id))
                 && let Some(value) = select_best_volume_node_state_for_spec(
                     snapshot.as_slice(),
                     spec,
-                    self.get_plan_for_spec(spec)?.as_ref(),
+                    plans.get(&spec.id).and_then(Option::as_ref),
                 )
             {
                 states.push(value);
@@ -663,6 +679,67 @@ impl VolumeRegistry {
             self.record_change();
         }
         Ok(())
+    }
+
+    /// Returns every volume generation that still owns replicated-volume metadata.
+    pub(crate) fn replicated_volume_generations_with_records(
+        &self,
+    ) -> Result<HashSet<(Uuid, u64)>> {
+        let mut generations = HashSet::new();
+        let (nodes, _) = self
+            .nodes
+            .load_all()
+            .map_err(|error| anyhow!("volume node-state load_all failed: {error}"))?;
+        for (_, values) in nodes {
+            generations.extend(
+                values
+                    .as_slice()
+                    .iter()
+                    .filter(|value| value.group_id.is_some())
+                    .map(|value| (value.volume_id, value.volume_epoch)),
+            );
+        }
+
+        let (statuses, _) = self
+            .group_statuses
+            .load_all()
+            .map_err(|error| anyhow!("replicated volume group status load_all failed: {error}"))?;
+        for (_, values) in statuses {
+            generations.extend(
+                values
+                    .as_slice()
+                    .iter()
+                    .map(|value| (value.volume_id, value.volume_epoch)),
+            );
+        }
+
+        let (plans, _) = self
+            .plans
+            .load_all()
+            .map_err(|error| anyhow!("replicated volume plan load_all failed: {error}"))?;
+        for (_, values) in plans {
+            generations.extend(
+                values
+                    .as_slice()
+                    .iter()
+                    .map(|value| (value.volume_id, value.volume_epoch)),
+            );
+        }
+
+        let (capacity_requests, _) = self
+            .capacity_requests
+            .load_all()
+            .map_err(|error| anyhow!("volume capacity request load_all failed: {error}"))?;
+        for (_, values) in capacity_requests {
+            generations.extend(
+                values
+                    .as_slice()
+                    .iter()
+                    .map(|value| (value.volume_id, value.volume_epoch)),
+            );
+        }
+
+        Ok(generations)
     }
 
     /// Wakes local controllers and workload starts after one store write succeeds.
@@ -1261,6 +1338,12 @@ mod tests {
             .expect("save node observation before spec and plan");
         assert!(
             test.registry
+                .replicated_volume_generations_with_records()
+                .expect("list replicated-volume record generations")
+                .contains(&(request.id, request.volume_epoch))
+        );
+        assert!(
+            test.registry
                 .get_group_status(request.id)
                 .expect("read status before spec and plan")
                 .is_none()
@@ -1303,7 +1386,40 @@ mod tests {
             test.registry
                 .get_node_state(request.id, nodes[0])
                 .expect("read converged node state"),
-            Some(node)
+            Some(node.clone())
+        );
+        assert_eq!(
+            test.registry
+                .list_node_states_including_deleting()
+                .expect("list converged node states"),
+            vec![node]
+        );
+    }
+
+    /// Local-volume node rows are not replicated-volume split evidence.
+    #[tokio::test]
+    async fn replicated_record_generations_ignore_local_volume_rows() {
+        let test = test_registry().await;
+        let volume_id = Uuid::new_v4();
+        let node = VolumeNodeStateValue::new(
+            volume_id,
+            Uuid::new_v4(),
+            "local-node",
+            Some("/var/lib/mantissa/volumes/local".to_string()),
+            VolumeNodeState::Ready,
+            Some(4096),
+            1,
+        );
+        test.registry
+            .upsert_node_state(node)
+            .await
+            .expect("save local-volume node row");
+
+        assert!(
+            test.registry
+                .replicated_volume_generations_with_records()
+                .expect("list replicated-volume record generations")
+                .is_empty()
         );
     }
 

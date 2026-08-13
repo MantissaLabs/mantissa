@@ -1111,6 +1111,7 @@ async fn setup_manager_with_forwarding(
         noise_keys.clone(),
         actor,
         HealthMonitor::new(actor),
+        crate::cluster::ClusterViewState::legacy_default(),
     );
 
     let scheduler = Rc::new(

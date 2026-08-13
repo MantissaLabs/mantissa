@@ -152,6 +152,9 @@ where
 {
     /// Returns the running handler for one group.
     async fn group_handler(&self, group_id: &GID) -> Result<Arc<OpenRaftHandler<A>>, capnp::Error> {
+        if self.shared.peers.peer(&self.peer).is_none() {
+            return Err(capnp_error(TransportError::UnknownPeer));
+        }
         self.shared
             .handlers
             .read()
@@ -374,6 +377,9 @@ where
         params: raft::StartGroupParams,
         _results: raft::StartGroupResults,
     ) -> Result<(), capnp::Error> {
+        if self.shared.peers.peer(&self.peer).is_none() {
+            return Err(capnp_error(TransportError::UnknownPeer));
+        }
         let group_id = read_group_id(
             params.get()?.get_group_id()?,
             self.shared.group_ids.as_ref(),

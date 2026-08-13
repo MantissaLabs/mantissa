@@ -53,8 +53,10 @@ interface ReplicatedVolumeStorage {
   # Ensure learner, final voters, or cancellation cleanup for one replacement.
 
   inspectQuorumState @5 (request :ReplicaStatusRequest)
-      -> (state :VolumeControlSnapshot, voterNodeIds :List(Data));
-  # Read linearizable control state and current membership from the elected leader.
+      -> (state :VolumeControlSnapshot, voterNodeIds :List(Data),
+          memberNodeIds :List(Data), membershipIsJoint :Bool);
+  # Read linearizable control state, committed voters, all members, and joint status
+  # from the elected leader.
 
   inspectFilesystemSpace @6 (request :ReplicaStatusRequest)
       -> (space :VolumeFilesystemSpace);

@@ -27,8 +27,8 @@ use mantissa_volume::{
 use uuid::Uuid;
 
 use super::runtime::{
-    LeaderVolumeGroupState, LocalReplicaStatus, ReplacementMembershipGoal, ReplicaCapacityStatus,
-    ReplicatedVolumeRuntime, WriterFilesystemSpace,
+    LeaderVolumeGroupState, LocalReplicaStatus, RaftMembershipSnapshot, ReplacementMembershipGoal,
+    ReplicaCapacityStatus, ReplicatedVolumeRuntime, WriterFilesystemSpace,
 };
 
 /// Creates authenticated storage services after the runtime is fully owned.
@@ -95,9 +95,13 @@ struct StorageServer {
 impl StorageServer {
     /// Upgrades runtime ownership only for one bounded request.
     fn runtime(&self) -> Result<Arc<ReplicatedVolumeRuntime>, capnp::Error> {
-        self.runtime
-            .upgrade()
-            .ok_or_else(|| capnp::Error::failed("replicated-volume runtime is unavailable".into()))
+        let runtime = self.runtime.upgrade().ok_or_else(|| {
+            capnp::Error::failed("replicated-volume runtime is unavailable".into())
+        })?;
+        runtime
+            .ensure_peer_in_active_view(self.peer)
+            .map_err(capnp_error)?;
+        Ok(runtime)
     }
 }
 
@@ -295,10 +299,19 @@ impl replicated_volume_storage::Server for StorageServer {
         write_control_state(results.get().init_state(), &observation.control_state);
         write_node_ids(
             results.get().init_voter_node_ids(
-                u32::try_from(observation.voter_node_ids.len()).map_err(capnp_error)?,
+                u32::try_from(observation.membership.voters.len()).map_err(capnp_error)?,
             ),
-            &observation.voter_node_ids,
+            &observation.membership.voters,
         );
+        write_node_ids(
+            results.get().init_member_node_ids(
+                u32::try_from(observation.membership.members.len()).map_err(capnp_error)?,
+            ),
+            &observation.membership.members,
+        );
+        results
+            .get()
+            .set_membership_is_joint(observation.membership.is_joint);
         Ok(())
     }
 
@@ -578,7 +591,11 @@ impl ReplicatedVolumeRuntime {
                     control_state: read_control_state(response.get_state()?).map_err(|error| {
                         capnp::Error::failed(format!("decode current control state: {error}"))
                     })?,
-                    voter_node_ids: read_node_ids(response.get_voter_node_ids()?, maximum_nodes)?,
+                    membership: RaftMembershipSnapshot {
+                        voters: read_node_ids(response.get_voter_node_ids()?, maximum_nodes)?,
+                        members: read_node_ids(response.get_member_node_ids()?, maximum_nodes)?,
+                        is_joint: response.get_membership_is_joint(),
+                    },
                 })
             })
         })

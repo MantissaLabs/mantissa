@@ -33,12 +33,12 @@ impl ClusterTransitionParticipant for SplitNetworkRuntimeParticipant {
         if transition.is_split() && transition.split_network_policy == SplitNetworkPolicy::Isolate {
             let removed_peer_states = self
                 .registry
-                .purge_local_peer_states_for_peers(&transition.evicted_node_ids)
+                .purge_local_peer_states_for_peers(&transition.out_of_view_node_ids)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
             let removed_attachments = self
                 .registry
-                .purge_local_attachments_for_nodes(&transition.evicted_node_ids)
+                .purge_local_attachments_for_nodes(&transition.out_of_view_node_ids)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
             report = report

@@ -28,9 +28,10 @@ use super::runtime::{
     LeaderVolumeGroupState, ReplacementMembershipGoal, ReplicaCapacityStatus,
     ReplicatedVolumeRuntime,
 };
+use super::split_validation::VolumeMembershipChangeBlocker;
 use super::storage_peer_is_ready;
 use crate::gossip::Message;
-use crate::store::replicated::peers::PeersStore;
+use crate::registry::Registry;
 use crate::topology::peers::PeerValue;
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::{
@@ -45,7 +46,8 @@ const RECONCILE_TICK_SECS: u64 = 2;
 #[derive(Clone)]
 pub struct ReplicatedVolumeController {
     registry: VolumeRegistry,
-    peers: PeersStore,
+    cluster_registry: Registry,
+    membership_change_blocker: VolumeMembershipChangeBlocker,
     health_monitor: Arc<HealthMonitor>,
     gossip_tx: async_channel::Sender<Message>,
     runtime: Arc<ReplicatedVolumeRuntime>,
@@ -69,9 +71,10 @@ enum VolumeBootstrapCheck {
 
 impl ReplicatedVolumeController {
     /// Builds the node-local reconciler around a recovered storage runtime.
-    pub fn new(
+    pub(crate) fn new(
         registry: VolumeRegistry,
-        peers: PeersStore,
+        cluster_registry: Registry,
+        membership_change_blocker: VolumeMembershipChangeBlocker,
         health_monitor: Arc<HealthMonitor>,
         gossip_tx: async_channel::Sender<Message>,
         runtime: Arc<ReplicatedVolumeRuntime>,
@@ -79,7 +82,8 @@ impl ReplicatedVolumeController {
         let repair_failure_grace = runtime.repair_failure_grace();
         Self {
             registry,
-            peers,
+            cluster_registry,
+            membership_change_blocker,
             health_monitor,
             gossip_tx,
             runtime,
@@ -788,6 +792,7 @@ impl ReplicatedVolumeController {
             return Ok(());
         };
         if state.descriptor().is_none() {
+            self.membership_change_blocker.ensure_changes_allowed()?;
             let initial_copies = plan
                 .replica_node_ids
                 .into_iter()
@@ -1184,12 +1189,10 @@ impl ReplicatedVolumeController {
 
     /// Loads the latest selected peer rows once for one operational decision.
     fn storage_peers(&self) -> Result<HashMap<Uuid, PeerValue>> {
-        let (rows, _) = self.peers.load_all_regs()?;
-        Ok(rows
+        Ok(self
+            .cluster_registry
+            .peer_values_snapshot()?
             .into_iter()
-            .filter_map(|(key, register)| {
-                PeerValue::select_reg(&register).map(|peer| (key.to_uuid(), peer))
-            })
             .collect())
     }
 
@@ -1425,7 +1428,7 @@ impl ReplicatedVolumeController {
                 .collect();
             observation.degraded = data.copies.len() < 3 || data.recovery.is_some();
         }
-        observation.voter_node_ids = current.voter_node_ids.into_iter().collect();
+        observation.voter_node_ids = current.membership.voters.into_iter().collect();
         if let Some(replacement) = control_state.replacement() {
             observation.replacement_id = Some(*replacement.id.as_uuid());
             observation.replacement_old_node_id =
@@ -1939,7 +1942,7 @@ fn control_state_excludes_local_copy(
             });
     Ok(!data.copies.contains(&local)
         && !replacement_protects_local
-        && !observation.voter_node_ids.contains(&local_node_id))
+        && !observation.membership.voters.contains(&local_node_id))
 }
 
 #[cfg(test)]
@@ -2156,6 +2159,21 @@ mod tests {
                 expected_writer: None,
             }))
             .state
+    }
+
+    /// Builds one stable Raft observation for control-state retirement tests.
+    fn leader_group_state(
+        control_state: VolumeControlState,
+        voter_node_ids: BTreeSet<Uuid>,
+    ) -> LeaderVolumeGroupState {
+        LeaderVolumeGroupState {
+            control_state,
+            membership: super::super::runtime::RaftMembershipSnapshot {
+                members: voter_node_ids.clone(),
+                voters: voter_node_ids,
+                is_joint: false,
+            },
+        }
     }
 
     /// A missing observation must remain continuous for the complete grace period.
@@ -2454,14 +2472,10 @@ mod tests {
         let state = control_state_after_replacement();
         assert!(
             control_state_excludes_local_copy(
-                &LeaderVolumeGroupState {
-                    control_state: state.clone(),
-                    voter_node_ids: BTreeSet::from([
-                        Uuid::from_u128(1),
-                        Uuid::from_u128(2),
-                        Uuid::from_u128(4),
-                    ]),
-                },
+                &leader_group_state(
+                    state.clone(),
+                    BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(4),]),
+                ),
                 old_node_id,
                 Some(&bootstrap_origin()),
             )
@@ -2469,14 +2483,10 @@ mod tests {
         );
         assert!(
             !control_state_excludes_local_copy(
-                &LeaderVolumeGroupState {
-                    control_state: state,
-                    voter_node_ids: BTreeSet::from([
-                        Uuid::from_u128(1),
-                        Uuid::from_u128(2),
-                        old_node_id,
-                    ]),
-                },
+                &leader_group_state(
+                    state,
+                    BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2), old_node_id,]),
+                ),
                 old_node_id,
                 Some(&bootstrap_origin()),
             )
@@ -2538,14 +2548,10 @@ mod tests {
 
         assert!(
             !control_state_excludes_local_copy(
-                &LeaderVolumeGroupState {
-                    control_state: initialized_control_state(),
-                    voter_node_ids: BTreeSet::from([
-                        Uuid::from_u128(1),
-                        Uuid::from_u128(2),
-                        local_node_id,
-                    ]),
-                },
+                &leader_group_state(
+                    initialized_control_state(),
+                    BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2), local_node_id,]),
+                ),
                 local_node_id,
                 Some(&bootstrap_origin()),
             )
@@ -2579,14 +2585,10 @@ mod tests {
             .state;
         assert!(
             !control_state_excludes_local_copy(
-                &LeaderVolumeGroupState {
-                    control_state: replacing.clone(),
-                    voter_node_ids: BTreeSet::from([
-                        Uuid::from_u128(1),
-                        Uuid::from_u128(2),
-                        Uuid::from_u128(3),
-                    ]),
-                },
+                &leader_group_state(
+                    replacing.clone(),
+                    BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3),]),
+                ),
                 *target.as_uuid(),
                 Some(&replacement_origin(20)),
             )
@@ -2594,14 +2596,10 @@ mod tests {
         );
         assert!(
             !control_state_excludes_local_copy(
-                &LeaderVolumeGroupState {
-                    control_state: replacing.clone(),
-                    voter_node_ids: BTreeSet::from([
-                        Uuid::from_u128(1),
-                        Uuid::from_u128(2),
-                        Uuid::from_u128(3),
-                    ]),
-                },
+                &leader_group_state(
+                    replacing.clone(),
+                    BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3),]),
+                ),
                 *target.as_uuid(),
                 None,
             )
@@ -2609,14 +2607,10 @@ mod tests {
         );
         assert!(
             control_state_excludes_local_copy(
-                &LeaderVolumeGroupState {
-                    control_state: replacing,
-                    voter_node_ids: BTreeSet::from([
-                        Uuid::from_u128(1),
-                        Uuid::from_u128(2),
-                        Uuid::from_u128(3),
-                    ]),
-                },
+                &leader_group_state(
+                    replacing,
+                    BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3),]),
+                ),
                 *target.as_uuid(),
                 Some(&replacement_origin(21)),
             )

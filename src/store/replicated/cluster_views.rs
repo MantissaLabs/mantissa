@@ -13,6 +13,7 @@ use mantissa_store::table_set::TableSet;
 use mantissa_store::uuid_key::UuidKey;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -26,6 +27,10 @@ const T_ACTIVE_CLUSTER_VIEW: TableDefinition<&'static str, &'static [u8]> =
 /// Redb table storing the operation that installed the current active cluster view.
 const T_ACTIVE_CLUSTER_TRANSITION: TableDefinition<&'static str, &'static [u8]> =
     TableDefinition::new("active_cluster_transition");
+
+/// Redb table storing nodes assigned outside the locally active cluster view.
+const T_OUT_OF_VIEW_NODES: TableDefinition<&'static str, &'static [u8]> =
+    TableDefinition::new("out_of_view_nodes");
 
 /// Redb table storing source views whose replicated retirement still needs publication.
 const T_PENDING_VIEW_RETIREMENTS: TableDefinition<&'static [u8], &'static [u8]> =
@@ -53,6 +58,13 @@ pub type ClusterViewDomainStoreInner = CrdtMstStore<
 
 /// Shared handle to the cluster-view metadata domain store.
 pub type ClusterViewDomainStore = Arc<ClusterViewDomainStoreInner>;
+
+/// Local cluster-view boundary restored before network traffic is accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedClusterView {
+    pub active_view: Option<ClusterViewId>,
+    pub out_of_view_node_ids: HashSet<Uuid>,
+}
 
 /// Conflict-resolved cluster lineage name record.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -375,6 +387,39 @@ fn decode_active_cluster_view(bytes: &[u8]) -> io::Result<ClusterViewId> {
     ClusterViewId::from_capnp(view).map_err(io::Error::other)
 }
 
+/// Encodes out-of-view node UUIDs in stable byte order for the local singleton row.
+fn encode_out_of_view_node_ids(node_ids: &HashSet<Uuid>) -> Vec<u8> {
+    let mut node_ids = node_ids.iter().copied().collect::<Vec<_>>();
+    node_ids.sort_unstable();
+    let mut encoded = Vec::with_capacity(node_ids.len().saturating_mul(16));
+    for node_id in node_ids {
+        encoded.extend_from_slice(node_id.as_bytes());
+    }
+    encoded
+}
+
+/// Decodes the sibling-view node set and rejects truncated or duplicate UUIDs.
+fn decode_out_of_view_node_ids(bytes: &[u8]) -> io::Result<HashSet<Uuid>> {
+    let mut chunks = bytes.chunks_exact(16);
+    let mut peer_ids = HashSet::with_capacity(chunks.len());
+    for chunk in &mut chunks {
+        let node_id = Uuid::from_slice(chunk).map_err(into_io)?;
+        if !peer_ids.insert(node_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate out-of-view node {node_id}"),
+            ));
+        }
+    }
+    if !chunks.remainder().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "out-of-view node data is not a sequence of UUIDs",
+        ));
+    }
+    Ok(peer_ids)
+}
+
 /// Decodes one required UUID from a store `Data` field.
 fn read_uuid_data(data: capnp::data::Reader<'_>, field: &str) -> Result<Uuid, capnp::Error> {
     let bytes = data.to_owned();
@@ -409,6 +454,7 @@ impl ClusterViewStore {
             let _ = tx
                 .open_table(T_ACTIVE_CLUSTER_TRANSITION)
                 .map_err(into_io)?;
+            let _ = tx.open_table(T_OUT_OF_VIEW_NODES).map_err(into_io)?;
             let _ = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
             Ok(())
         })?;
@@ -511,17 +557,24 @@ impl ClusterViewStore {
         self.cluster_view_domain.clone()
     }
 
-    /// Loads the persisted active cluster view, if one has been stored.
-    pub fn read_active_view(&self) -> io::Result<Option<ClusterViewId>> {
+    /// Loads the active view and its node boundary from one Redb snapshot.
+    pub fn read_persisted_cluster_view(&self) -> io::Result<PersistedClusterView> {
         with_read_tx(&self.db, |tx| {
-            let table = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
-            let payload = table.get(ACTIVE_VIEW_KEY).map_err(into_io)?;
-            let Some(payload) = payload else {
-                return Ok(None);
+            let active_views = tx.open_table(T_ACTIVE_CLUSTER_VIEW).map_err(into_io)?;
+            let active_view = match active_views.get(ACTIVE_VIEW_KEY).map_err(into_io)? {
+                Some(payload) => Some(decode_active_cluster_view(payload.value())?),
+                None => None,
             };
-
-            let view = decode_active_cluster_view(payload.value())?;
-            Ok(Some(view))
+            let out_of_view_nodes = tx.open_table(T_OUT_OF_VIEW_NODES).map_err(into_io)?;
+            let out_of_view_node_ids =
+                match out_of_view_nodes.get(ACTIVE_VIEW_KEY).map_err(into_io)? {
+                    Some(payload) => decode_out_of_view_node_ids(payload.value())?,
+                    None => HashSet::new(),
+                };
+            Ok(PersistedClusterView {
+                active_view,
+                out_of_view_node_ids,
+            })
         })
     }
 
@@ -530,10 +583,10 @@ impl ClusterViewStore {
     /// Clearing the operation marker prevents an earlier split from claiming an unrelated view
     /// installation during crash recovery.
     pub fn write_active_view(&self, view: ClusterViewId) -> io::Result<()> {
-        self.write_active_view_state(view, &[], None)
+        self.write_active_view_state(view, &[], None, &HashSet::new())
     }
 
-    /// Persists a transition's active view, operation identity, and retired sources atomically.
+    /// Persists a transition's view, out-of-view nodes, identity, and retirements atomically.
     ///
     /// The operation identity proves which split installed the target view. Pending retirement
     /// rows close the separate crash window before replicated retirement publication completes.
@@ -542,8 +595,14 @@ impl ClusterViewStore {
         operation_id: Uuid,
         view: ClusterViewId,
         retired_views: &[ClusterViewId],
+        out_of_view_node_ids: &HashSet<Uuid>,
     ) -> io::Result<()> {
-        self.write_active_view_state(view, retired_views, Some(operation_id))
+        self.write_active_view_state(
+            view,
+            retired_views,
+            Some(operation_id),
+            out_of_view_node_ids,
+        )
     }
 
     /// Returns whether one operation atomically installed the current active view.
@@ -583,9 +642,11 @@ impl ClusterViewStore {
         view: ClusterViewId,
         retired_views: &[ClusterViewId],
         operation_id: Option<Uuid>,
+        out_of_view_node_ids: &HashSet<Uuid>,
     ) -> io::Result<()> {
         let payload = encode_active_cluster_view(view)?;
         let operation_payload = operation_id.map(|id| id.as_bytes().to_vec());
+        let out_of_view_nodes_payload = encode_out_of_view_node_ids(out_of_view_node_ids);
         let mut retirement_payloads = retired_views
             .iter()
             .copied()
@@ -613,6 +674,12 @@ impl ClusterViewStore {
                 } else {
                     let _ = transition.remove(ACTIVE_VIEW_KEY).map_err(into_io)?;
                 }
+            }
+            {
+                let mut out_of_view = tx.open_table(T_OUT_OF_VIEW_NODES).map_err(into_io)?;
+                out_of_view
+                    .insert(ACTIVE_VIEW_KEY, out_of_view_nodes_payload.as_slice())
+                    .map_err(into_io)?;
             }
             {
                 let mut pending = tx.open_table(T_PENDING_VIEW_RETIREMENTS).map_err(into_io)?;
@@ -958,19 +1025,25 @@ mod tests {
         let source_a = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
         let source_b = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 2);
         let target = source_b;
+        let out_of_view_node_ids = HashSet::from([Uuid::new_v4(), Uuid::new_v4()]);
 
         {
             let store = ClusterViewStore::new(db.clone(), actor).expect("open cluster-view store");
             store
-                .install_cluster_transition(operation_id, target, &[source_a, source_b, source_a])
+                .install_cluster_transition(
+                    operation_id,
+                    target,
+                    &[source_a, source_b, source_a],
+                    &out_of_view_node_ids,
+                )
                 .expect("install active view");
         }
 
         let store = ClusterViewStore::new(db, actor).expect("reopen cluster-view store");
-        assert_eq!(
-            store.read_active_view().expect("read active view"),
-            Some(target)
-        );
+        let persisted = store
+            .read_persisted_cluster_view()
+            .expect("read persisted cluster view");
+        assert_eq!(persisted.active_view, Some(target));
         assert!(
             store
                 .active_view_was_installed_by(operation_id, target)
@@ -981,6 +1054,7 @@ mod tests {
                 .active_view_was_installed_by(Uuid::new_v4(), target)
                 .expect("reject another transition")
         );
+        assert_eq!(persisted.out_of_view_node_ids, out_of_view_node_ids);
         assert_eq!(
             store
                 .pending_view_retirements()
@@ -996,6 +1070,13 @@ mod tests {
             !store
                 .active_view_was_installed_by(operation_id, target)
                 .expect("read cleared transition")
+        );
+        assert!(
+            store
+                .read_persisted_cluster_view()
+                .expect("read cleared cluster view")
+                .out_of_view_node_ids
+                .is_empty()
         );
 
         store
@@ -1149,7 +1230,10 @@ mod tests {
             .expect("rebuild cluster-view metadata MST");
 
         assert_eq!(
-            store.read_active_view().expect("read active view"),
+            store
+                .read_persisted_cluster_view()
+                .expect("read persisted cluster view")
+                .active_view,
             Some(active_view)
         );
         let metadata = store

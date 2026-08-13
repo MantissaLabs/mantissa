@@ -114,6 +114,17 @@ impl SyncRunner {
         self.gc_progress.clone()
     }
 
+    /// Reads one local semantic root for a caller that must prove exact convergence.
+    pub async fn root_digest(
+        &self,
+        domain: Domain,
+        root_schema_version: u32,
+    ) -> mantissa_store::Result<[u8; 16]> {
+        self.stores
+            .root_digest_at_version(domain, root_schema_version)
+            .await
+    }
+
     /// Runs anti-entropy for every replicated domain against one peer.
     pub async fn sync_all_domains(
         &self,

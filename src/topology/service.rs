@@ -561,18 +561,19 @@ impl Topology {
         }
     }
 
-    /// Returns active peer ids that are currently in this node's local control-plane scope.
+    /// Returns active peer IDs assigned to this node's cluster view.
     async fn scoped_active_peer_ids(&self) -> Vec<Uuid> {
         let Some(snapshot) = self.peer_snapshot().await else {
             return Vec::new();
         };
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
         snapshot
             .entries
             .iter()
             .filter_map(|entry| {
-                (entry.peer_id != self.local.node.id && !excluded_peers.contains(&entry.peer_id))
-                    .then_some(entry.peer_id)
+                (entry.peer_id != self.local.node.id
+                    && !out_of_view_node_ids.contains(&entry.peer_id))
+                .then_some(entry.peer_id)
             })
             .collect::<Vec<_>>()
     }
@@ -999,12 +1000,12 @@ impl topology::Server for Topology {
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         let local_view = self.active_cluster_view();
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
         let mut scoped_nodes = Vec::<ListedNodeRow>::with_capacity(actives.len());
 
         for (k, reg) in actives.into_iter() {
             let id = k.to_uuid();
-            if excluded_peers.contains(&id) {
+            if out_of_view_node_ids.contains(&id) {
                 continue;
             }
             let candidate_view = if id == self.local.node.id {
@@ -1419,6 +1420,14 @@ impl topology::Server for Topology {
             detail_targets,
             split_assignments,
         });
+        if source_view == self.active_cluster_view() {
+            self.split_source_node_ids(&operation)?;
+            self.deps
+                .replicated_volume_split_validator
+                .check_before_submit(&operation)
+                .await
+                .map_err(|error| capnp::Error::failed(format!("{error:#}")))?;
+        }
         self.persist_and_dispatch_operation(&mut operation).await?;
 
         info!(
@@ -1458,7 +1467,7 @@ impl topology::Server for Topology {
         mut results: topology::ListClusterViewsResults,
     ) -> Result<(), capnp::Error> {
         let local_view = self.active_cluster_view();
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
         let operations = self.load_cluster_operations()?;
         let local_node_count = self.local_cluster_view_member_count().await?;
         let cluster_metadata_rows = self
@@ -1493,7 +1502,7 @@ impl topology::Server for Topology {
             if peer_id == self.local.node.id {
                 continue;
             }
-            if excluded_peers.contains(&peer_id) {
+            if out_of_view_node_ids.contains(&peer_id) {
                 continue;
             }
             let Some(_selected) = PeerValue::select_reg(&reg).filter(|value| value.is_active())

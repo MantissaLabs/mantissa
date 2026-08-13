@@ -56,7 +56,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::rpc::StorageServiceFactory;
+use super::split_validation::VolumeMembershipChangeBlocker;
 use super::{REPLICATED_VOLUME_FORMAT_VERSION, ReplicatedVolumeSupport};
+use crate::cluster::ClusterViewState;
 use crate::config::{CheckedReplicatedVolumeConfig, ReplicatedVolumeConfig};
 use crate::store::path::open_state_database;
 use crate::store::replicated::peers::PeersStore;
@@ -73,6 +75,8 @@ mod group;
 mod local_singleflight;
 #[path = "runtime/maintenance.rs"]
 mod maintenance;
+#[path = "runtime/membership_lock.rs"]
+mod membership_lock;
 #[path = "runtime/peers.rs"]
 mod peers;
 
@@ -81,6 +85,7 @@ use driver::{DriverAttachment, DriverQuarantine, ReplicatedDriver, ReplicatedDri
 use group::VolumeGroupStarter;
 use local_singleflight::VolumeSingleflightMap;
 use maintenance::MaintenanceManager;
+use membership_lock::VolumeMembershipLocks;
 use peers::StoragePeerDirectory;
 
 type VolumeApplication = mantissa_volume::state_machine::VolumeControlApplication<
@@ -248,10 +253,19 @@ pub(crate) enum ReplacementMembershipGoal {
     Absent { rollback_voters: BTreeSet<Uuid> },
 }
 
-/// Volume control state and membership returned by a running leader.
+/// Volume control state and complete membership returned by a running leader.
+#[derive(Clone, Debug)]
 pub(crate) struct LeaderVolumeGroupState {
     pub(crate) control_state: VolumeControlState,
-    pub(crate) voter_node_ids: BTreeSet<Uuid>,
+    pub(crate) membership: RaftMembershipSnapshot,
+}
+
+/// Voters, learners, and joint-consensus state read from one Raft group.
+#[derive(Clone, Debug)]
+pub(crate) struct RaftMembershipSnapshot {
+    pub(crate) voters: BTreeSet<Uuid>,
+    pub(crate) members: BTreeSet<Uuid>,
+    pub(crate) is_joint: bool,
 }
 
 /// Live filesystem space measured on the node serving the mounted writer.
@@ -268,6 +282,9 @@ pub struct ReplicatedVolumeRuntime {
     replicas: ReplicaCatalog,
     groups: Arc<VolumeGroups>,
     transport: Arc<VolumeTransport>,
+    membership_change_blocker: VolumeMembershipChangeBlocker,
+    volume_membership_locks: VolumeMembershipLocks,
+    cluster_view: ClusterViewState,
     applied_volume_states: Arc<AppliedVolumeStateRegistry>,
     desired_generations: Arc<RwLock<HashSet<ReplicaKey>>>,
     gates: RwLock<BTreeMap<ReplicaKey, Arc<FenceAdmission>>>,
@@ -345,9 +362,19 @@ impl ReplicatedVolumeRuntime {
         node_id: Uuid,
         noise_keys: Arc<mantissa_net::noise::NoiseKeys>,
         peers: PeersStore,
+        cluster_view: ClusterViewState,
+        membership_change_blocker: VolumeMembershipChangeBlocker,
     ) -> Result<Arc<Self>> {
         let prepared = Self::prepare_host(&config, node_id).await?;
-        Self::open_prepared(prepared, node_id, noise_keys, peers).await
+        Self::open_prepared(
+            prepared,
+            node_id,
+            noise_keys,
+            peers,
+            cluster_view,
+            membership_change_blocker,
+        )
+        .await
     }
 
     /// Opens catalogs, volume Raft groups, and bounded local workers.
@@ -356,6 +383,8 @@ impl ReplicatedVolumeRuntime {
         node_id: Uuid,
         noise_keys: Arc<mantissa_net::noise::NoiseKeys>,
         peers: PeersStore,
+        cluster_view: ClusterViewState,
+        membership_change_blocker: VolumeMembershipChangeBlocker,
     ) -> Result<Arc<Self>> {
         let PreparedStorage {
             checked,
@@ -403,7 +432,7 @@ impl ReplicatedVolumeRuntime {
         let incoming = Arc::new(IncomingVolumeGroupStarter::new(Arc::clone(
             &desired_generations,
         )));
-        let peer_directory = Arc::new(StoragePeerDirectory::new(peers));
+        let peer_directory = Arc::new(StoragePeerDirectory::new(peers, cluster_view.clone()));
         let transport_settings = TcpTransportSettings::new(
             node_id,
             checked.listen_address,
@@ -464,6 +493,9 @@ impl ReplicatedVolumeRuntime {
             replicas,
             groups,
             transport,
+            membership_change_blocker,
+            volume_membership_locks: VolumeMembershipLocks::default(),
+            cluster_view,
             applied_volume_states,
             desired_generations,
             gates: RwLock::new(BTreeMap::new()),
@@ -636,10 +668,39 @@ impl ReplicatedVolumeRuntime {
         self.repair_failure_grace
     }
 
+    /// Returns the configured bound for one replicated-storage operation.
+    #[must_use]
+    pub(crate) const fn operation_timeout(&self) -> Duration {
+        self.operation_timeout
+    }
+
+    /// Returns the shared membership lock for one volume without retaining idle entries.
+    fn volume_membership_lock(&self, key: ReplicaKey) -> Arc<tokio::sync::RwLock<()>> {
+        self.volume_membership_locks.for_volume(key)
+    }
+
+    /// Holds one volume's membership work after a final durable split check.
+    async fn lock_raft_membership_change(
+        &self,
+        key: ReplicaKey,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let change = self.volume_membership_lock(key).read_owned().await;
+        self.membership_change_blocker.ensure_changes_allowed()?;
+        Ok(change)
+    }
+
     /// Returns the transport protocol limits used by narrow storage RPCs.
     #[must_use]
     pub(crate) const fn protocol_limits(&self) -> mantissa_raft::protocol::ProtocolLimits {
         self.protocol_limits
+    }
+
+    /// Rejects an authenticated storage peer after a committed split excludes it.
+    pub(super) fn ensure_peer_in_active_view(&self, peer: Uuid) -> Result<()> {
+        if !self.cluster_view.includes_node(&peer) {
+            anyhow::bail!("storage peer {peer} is outside the current cluster view");
+        }
+        Ok(())
     }
 
     /// Runs one narrow application RPC through the runtime-owned transport.
@@ -840,6 +901,7 @@ impl ReplicatedVolumeRuntime {
         bootstrap_id: mantissa_volume::OperationId,
         voters: BTreeSet<Uuid>,
     ) -> Result<LocalReplicaStatus> {
+        self.membership_change_blocker.ensure_changes_allowed()?;
         if self.is_stopping() {
             anyhow::bail!("replicated-volume runtime is stopping");
         }
@@ -944,6 +1006,7 @@ impl ReplicatedVolumeRuntime {
         key: ReplicaKey,
         voters: BTreeSet<Uuid>,
     ) -> Result<()> {
+        let _membership_change = self.lock_raft_membership_change(key).await?;
         self.ensure_generation_desired(key)?;
         // OpenRaft starts an election as part of initializing a pristine
         // group. The replica ensure phase has saved the group on each voter
@@ -972,6 +1035,7 @@ impl ReplicatedVolumeRuntime {
         replacement_id: mantissa_volume::ReplacementId,
         voters: BTreeSet<Uuid>,
     ) -> Result<LocalReplicaStatus> {
+        self.membership_change_blocker.ensure_changes_allowed()?;
         if self.is_stopping() {
             anyhow::bail!("replicated-volume runtime is stopping");
         }
@@ -1320,7 +1384,11 @@ impl ReplicatedVolumeRuntime {
         }
         Ok(Some(LeaderVolumeGroupState {
             control_state,
-            voter_node_ids: group.voter_node_ids(),
+            membership: RaftMembershipSnapshot {
+                voters: group.voter_node_ids(),
+                members: group.member_node_ids(),
+                is_joint: group.membership_is_joint(),
+            },
         }))
     }
 
@@ -1329,6 +1397,11 @@ impl ReplicatedVolumeRuntime {
         &self,
         key: ReplicaKey,
     ) -> Result<LeaderVolumeGroupState> {
+        // The exclusive side returns a snapshot that cannot overlap a local
+        // membership change. During split validation, the Proposed row has
+        // already converged: this waits for older calls, while later calls
+        // fail their durable split check.
+        let _membership_changes = self.volume_membership_lock(key).write_owned().await;
         self.ensure_generation_desired(key)?;
         let group = self.groups.activate(&key).await?;
         if group.metrics().leader != Some(self.node_id) {
@@ -1340,7 +1413,11 @@ impl ReplicatedVolumeRuntime {
         }
         Ok(LeaderVolumeGroupState {
             control_state,
-            voter_node_ids: group.voter_node_ids(),
+            membership: RaftMembershipSnapshot {
+                voters: group.voter_node_ids(),
+                members: group.member_node_ids(),
+                is_joint: group.membership_is_joint(),
+            },
         })
     }
 
@@ -1350,6 +1427,11 @@ impl ReplicatedVolumeRuntime {
         key: ReplicaKey,
         command: VolumeCommand,
     ) -> Result<VolumeCommandResponse> {
+        let _membership_change = if split_blocks_command(&command) {
+            Some(self.lock_raft_membership_change(key).await?)
+        } else {
+            None
+        };
         self.ensure_generation_desired(key)?;
         let group = self.groups.activate(&key).await?;
         if group.metrics().leader != Some(self.node_id) {
@@ -1373,6 +1455,11 @@ impl ReplicatedVolumeRuntime {
         key: ReplicaKey,
         command: VolumeCommand,
     ) -> Result<VolumeCommandResponse> {
+        let _membership_change = if split_blocks_command(&command) {
+            Some(self.lock_raft_membership_change(key).await?)
+        } else {
+            None
+        };
         self.ensure_generation_desired(key)?;
         let group = self.groups.activate(&key).await?;
         if group.metrics().leader != Some(self.node_id) {
@@ -1394,6 +1481,11 @@ impl ReplicatedVolumeRuntime {
         key: ReplicaKey,
         command: VolumeCommand,
     ) -> Result<VolumeCommandResponse> {
+        let _membership_change = if split_blocks_command(&command) {
+            Some(self.lock_raft_membership_change(key).await?)
+        } else {
+            None
+        };
         self.ensure_generation_desired(key)?;
         let descriptor = self
             .replicas
@@ -1475,6 +1567,7 @@ impl ReplicatedVolumeRuntime {
         coordinator_node_id: Uuid,
         goal: ReplacementMembershipGoal,
     ) -> Result<BTreeSet<Uuid>> {
+        let _membership_change = self.lock_raft_membership_change(key).await?;
         self.ensure_generation_desired(key)?;
         let group = self.groups.activate(&key).await?;
         if group.metrics().leader != Some(self.node_id) {
@@ -1557,6 +1650,7 @@ impl ReplicatedVolumeRuntime {
         expected_revision: u64,
         expected_voters: BTreeSet<Uuid>,
     ) -> Result<BTreeSet<Uuid>> {
+        let _membership_change = self.lock_raft_membership_change(key).await?;
         self.ensure_generation_desired(key)?;
         let group = self.groups.activate(&key).await?;
         if group.metrics().leader != Some(self.node_id) {
@@ -4921,6 +5015,19 @@ impl ReplicatedVolumeRuntime {
             }
         }
     }
+}
+
+/// Returns whether one command initializes, changes, or interrupts copy or Raft membership.
+fn split_blocks_command(command: &VolumeCommand) -> bool {
+    matches!(
+        command,
+        VolumeCommand::Initialize(_)
+            | VolumeCommand::SetDisposition(_)
+            | VolumeCommand::BeginRecovery(_)
+            | VolumeCommand::BeginReplacement(_)
+            | VolumeCommand::CancelReplacement(_)
+            | VolumeCommand::AdoptReplacement(_)
+    )
 }
 
 /// Creates or verifies the fixed file and makes local readiness durable.

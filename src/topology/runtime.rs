@@ -722,9 +722,6 @@ pub(super) struct TopologyRuntime {
     /// Bounded warm peer set used by view-scoped gossip to reuse transport state.
     pub(super) gossip_warm_set: Arc<AsyncMutex<GossipWarmSetState>>,
 
-    /// Peer ids currently excluded from active control-plane loops for the local cluster view.
-    pub(super) excluded_peers: Arc<AsyncMutex<HashSet<Uuid>>>,
-
     /// Coalescing state for immediate sync requests triggered by topology events.
     pub(super) immediate_sync: ImmediateSyncState,
 

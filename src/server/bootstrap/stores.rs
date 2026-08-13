@@ -222,24 +222,29 @@ impl BootstrapStores {
         })
     }
 
-    /// Restores the last committed active cluster view from disk.
+    /// Restores the last committed cluster view and its sibling-view nodes.
     ///
     /// The runtime uses this to rebuild cluster-scoped services before any
     /// network traffic is accepted.
-    pub(super) fn restore_active_view(&self) -> BootstrapResult<ClusterViewState> {
-        let persisted_active_view = self
+    pub(super) fn restore_cluster_view_state(&self) -> BootstrapResult<ClusterViewState> {
+        let persisted = self
             .cluster_view
-            .read_active_view()
-            .map_err(|error| store_error("read persisted active cluster view", error))?;
-        let active_view = persisted_active_view.unwrap_or_else(ClusterViewId::legacy_default);
-        if persisted_active_view.is_some() {
+            .read_persisted_cluster_view()
+            .map_err(|error| store_error("read persisted cluster view", error))?;
+        let active_view = persisted
+            .active_view
+            .unwrap_or_else(ClusterViewId::legacy_default);
+        if persisted.active_view.is_some() {
             info!(
                 target: "cluster_view",
                 active_view = %active_view,
                 "restored persisted active cluster view during startup"
             );
         }
-        Ok(ClusterViewState::new(active_view))
+        Ok(ClusterViewState::with_out_of_view_nodes(
+            active_view,
+            persisted.out_of_view_node_ids,
+        ))
     }
 
     /// Builds the local semantic root schema support range advertised at startup.

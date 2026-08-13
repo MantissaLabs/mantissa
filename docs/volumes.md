@@ -147,6 +147,13 @@ fails, Mantissa can attach the volume on another replica node after Raft has a
 quorum and the previous writer is fenced. A draining node is not selected for
 new replica placement.
 
+Cluster splitting keeps every replicated volume inside one resulting cluster
+view. Mantissa checks the current Raft voters and data copies before committing
+the split. A volume that is provisioning, replacing a replica, recovering, or
+divided by the proposed node assignments causes the split to fail safely. After
+a split commits, planning, repair, Raft traffic, and replica-data traffic use
+only nodes in the local resulting view.
+
 When a required volume is unavailable, Mantissa marks the workload
 `VolumeUnavailable`. Services wait for storage recovery instead of starting a
 container without its data.

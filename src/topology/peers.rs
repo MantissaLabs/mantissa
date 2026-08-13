@@ -902,13 +902,13 @@ impl PeerProvider for Topology {
             Some(s) => s,
             None => return Vec::new(),
         };
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
 
         let peers = snapshot.entries.clone();
         let mut out = Vec::with_capacity(peers.len());
 
         for entry in peers.iter() {
-            if excluded_peers.contains(&entry.peer_id) {
+            if out_of_view_node_ids.contains(&entry.peer_id) {
                 continue;
             }
             let value = entry.value.as_ref();

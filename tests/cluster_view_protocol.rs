@@ -1425,10 +1425,6 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
     let remote_view = ClusterViewId::new(ClusterId::from_uuid(Uuid::new_v4()), 1);
 
     let cluster_view_store = ClusterViewStore::new(db.clone(), self_id).expect("open view store");
-    cluster_view_store
-        .write_active_view(local_view)
-        .expect("persist local active view");
-
     let operation_store = open_test_operation_store(db.clone());
     let split = ClusterOperationRecord {
         id: Uuid::new_v4(),
@@ -1462,6 +1458,14 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
         details: "startup split scope restore".to_string(),
     };
     persist_test_operation(&operation_store, &split).await;
+    cluster_view_store
+        .install_cluster_transition(
+            split.id,
+            local_view,
+            &[source_view],
+            &std::collections::HashSet::from([peer_a, peer_b]),
+        )
+        .expect("persist local split view and peer boundary");
 
     let peers = open_peers_store(db.clone(), self_id).expect("open peers store");
     let peer_value = |address: &str, hostname: &str| PeerValue {
@@ -1868,6 +1872,7 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
     let db = Arc::new(redb::Database::create(db_path).expect("create redb"));
     let operation_store = open_test_operation_store(db.clone());
     let node_id = Uuid::new_v4();
+    let sibling_node_id = Uuid::new_v4();
     let view_store = ClusterViewStore::new(db.clone(), node_id).expect("open cluster view store");
     let source_view = ClusterViewId::legacy_default();
     let split_target_a = ClusterViewId::new(
@@ -1889,10 +1894,16 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
         source_views: vec![source_view],
         target_views: vec![split_target_a, split_target_b],
         target_cluster_names: Vec::new(),
-        split_assignments: vec![SplitNodeAssignment {
-            node_id,
-            target_index: 1,
-        }],
+        split_assignments: vec![
+            SplitNodeAssignment {
+                node_id: sibling_node_id,
+                target_index: 0,
+            },
+            SplitNodeAssignment {
+                node_id,
+                target_index: 1,
+            },
+        ],
         split_service_policy: Default::default(),
         split_network_policy: Default::default(),
         merge_service_policy: Default::default(),
@@ -1902,7 +1913,12 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
 
     persist_test_operation(&operation_store, &operation).await;
     view_store
-        .install_cluster_transition(operation.id, split_target_b, &[source_view])
+        .install_cluster_transition(
+            operation.id,
+            split_target_b,
+            &[source_view],
+            &std::collections::HashSet::from([sibling_node_id]),
+        )
         .expect("persist split target and pending source retirement");
 
     let node = HeadlessNode::new_with(
@@ -1933,6 +1949,11 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
     assert_eq!(
         active_view, split_target_b,
         "startup must restore persisted split target view"
+    );
+    assert_eq!(
+        node.registry.out_of_view_node_ids(),
+        std::collections::HashSet::from([sibling_node_id]),
+        "startup must restore the peer fence saved with the active view"
     );
     wait_for_operation_stage(
         &node.topology_client,
@@ -1993,7 +2014,12 @@ local_test!(cluster_view_startup_rejects_unrelated_split_target, {
 
     persist_test_operation(&operation_store, &operation).await;
     view_store
-        .install_cluster_transition(Uuid::new_v4(), target_view, &[source_view])
+        .install_cluster_transition(
+            Uuid::new_v4(),
+            target_view,
+            &[source_view],
+            &std::collections::HashSet::new(),
+        )
         .expect("persist target for another operation");
 
     let node = HeadlessNode::new_with(
@@ -3859,12 +3885,12 @@ local_test!(cluster_view_blocks_operation_after_dependency_aborts, {
     let node = TestNode::new_with_tick_ms(100).await;
     let source_view = current_cluster_view(&node.topology()).await;
 
-    // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
+    // A prepared split is kept active until the test aborts it explicitly.
     let active_operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
         submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Split,
-        stage: StoredOperationStage::Proposed,
+        stage: StoredOperationStage::Prepared,
         dry_run: false,
         created_at_unix_ms: 1,
         dependency_operation_ids: Vec::new(),
@@ -3955,7 +3981,7 @@ local_test!(
             id: Uuid::from_u128(0xA11CE),
             submitted_by_node_id: node.id(),
             kind: StoredOperationKind::Split,
-            stage: StoredOperationStage::Proposed,
+            stage: StoredOperationStage::Prepared,
             dry_run: false,
             created_at_unix_ms: 1,
             dependency_operation_ids: Vec::new(),
@@ -4321,12 +4347,12 @@ local_test!(cluster_view_defers_learned_operation_while_other_active, {
     let node = TestNode::new_with_tick_ms(100).await;
     let source_view = current_cluster_view(&node.topology()).await;
 
-    // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
+    // A prepared split keeps later learned work in the operation queue.
     let active_operation = ClusterOperationRecord {
         id: Uuid::new_v4(),
         submitted_by_node_id: node.id(),
         kind: StoredOperationKind::Split,
-        stage: StoredOperationStage::Proposed,
+        stage: StoredOperationStage::Prepared,
         dry_run: false,
         created_at_unix_ms: 1,
         dependency_operation_ids: Vec::new(),
@@ -4423,12 +4449,12 @@ local_test!(cluster_view_rejects_join_while_split_in_progress, {
     let joiner = TestNode::new_tcp_with_tick_ms(100).await;
     let source_view = current_cluster_view(&anchor.topology()).await;
 
-    // Intentionally malformed split operation: missing split assignments keeps it stuck in Prepared.
+    // A prepared split closes peer admission until the transition finishes.
     let active_split = ClusterOperationRecord {
         id: Uuid::new_v4(),
         submitted_by_node_id: anchor.id(),
         kind: StoredOperationKind::Split,
-        stage: StoredOperationStage::Proposed,
+        stage: StoredOperationStage::Prepared,
         dry_run: false,
         created_at_unix_ms: 1,
         dependency_operation_ids: Vec::new(),

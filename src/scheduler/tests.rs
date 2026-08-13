@@ -94,6 +94,7 @@ async fn make_scheduler() -> (Scheduler, tempfile::TempDir) {
         Arc::new(noise_keys),
         actor,
         health_monitor,
+        crate::cluster::ClusterViewState::legacy_default(),
     );
 
     let scheduler = Scheduler::new(scheduler_store, registry, actor).expect("scheduler init");

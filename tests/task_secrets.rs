@@ -415,6 +415,7 @@ async fn setup_workload_manager() -> TestHarness {
         noise_keys.clone(),
         actor,
         ::mantissa_health::HealthMonitor::new(actor),
+        mantissa::cluster::ClusterViewState::legacy_default(),
     );
 
     let scheduler = Rc::new(

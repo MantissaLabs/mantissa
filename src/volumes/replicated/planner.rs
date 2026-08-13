@@ -10,10 +10,10 @@ use tokio::time::interval;
 use tracing::warn;
 use uuid::Uuid;
 
+use super::split_validation::VolumeMembershipChangeBlocker;
 use super::storage_peer_is_ready;
 use crate::gossip::Message;
-use crate::store::replicated::peers::PeersStore;
-use crate::topology::peers::PeerValue;
+use crate::registry::Registry;
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::{
     ReplicatedVolumePlan, SavedVolumeDescriptor, VolumeDriver, VolumeEvent, VolumeSpecValue,
@@ -26,7 +26,8 @@ const PLAN_RECONCILE_TICK_SECS: u64 = 2;
 #[derive(Clone)]
 pub struct ReplicatedVolumePlanner {
     registry: VolumeRegistry,
-    peers: PeersStore,
+    cluster_registry: Registry,
+    membership_change_blocker: VolumeMembershipChangeBlocker,
     health_monitor: Arc<HealthMonitor>,
     gossip_tx: async_channel::Sender<Message>,
     node_id: Uuid,
@@ -34,16 +35,18 @@ pub struct ReplicatedVolumePlanner {
 
 impl ReplicatedVolumePlanner {
     /// Builds the metadata planner that runs even when this node stores no replicas.
-    pub fn new(
+    pub(crate) fn new(
         registry: VolumeRegistry,
-        peers: PeersStore,
+        cluster_registry: Registry,
+        membership_change_blocker: VolumeMembershipChangeBlocker,
         health_monitor: Arc<HealthMonitor>,
         gossip_tx: async_channel::Sender<Message>,
         node_id: Uuid,
     ) -> Self {
         Self {
             registry,
-            peers,
+            cluster_registry,
+            membership_change_blocker,
             health_monitor,
             gossip_tx,
             node_id,
@@ -90,6 +93,7 @@ impl ReplicatedVolumePlanner {
         if self.registry.get_plan(spec.id)?.is_some() {
             return Ok(());
         }
+        self.membership_change_blocker.ensure_changes_allowed()?;
         let plan = self.create_plan(spec)?;
         self.registry.upsert_plan(plan.clone()).await?;
         self.gossip_tx
@@ -130,14 +134,9 @@ impl ReplicatedVolumePlanner {
     ) -> Result<[Uuid; 3]> {
         let required_bytes = ReplicaSpace::for_capacity(capacity)?.total_bytes()?;
         let health = self.health_monitor.snapshot();
-        let (rows, _) = self.peers.load_all_regs()?;
         let mut candidates = Vec::new();
         let mut workload_ready = false;
-        for (key, register) in rows {
-            let node_id = key.to_uuid();
-            let Some(peer) = PeerValue::select_reg(&register) else {
-                continue;
-            };
+        for (node_id, peer) in self.cluster_registry.peer_values_snapshot()? {
             if !storage_peer_is_ready(node_id, &peer, &health)
                 || peer.scheduling.drain_requested
                 || !peer.replicated_volumes.accepts_replicas
@@ -169,8 +168,10 @@ impl ReplicatedVolumePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::RootSchemaInfo;
+    use crate::cluster::{ClusterViewState, RootSchemaInfo};
     use crate::runtime::types::RuntimeSupportProfile;
+    use crate::store::local::LocalSessionStore;
+    use crate::store::replicated::cluster_operations::ClusterOperationStore;
     use crate::store::replicated::peers::open_peers_store;
     use crate::store::replicated::volumes::{
         open_replicated_volume_capacity_request_store, open_replicated_volume_group_status_store,
@@ -182,6 +183,8 @@ mod tests {
         FilesystemOwnership, ReplicatedVolumeSpec, VolumeAccessMode, VolumeBindingMode,
         VolumeReclaimPolicy, VolumeSpecDraft,
     };
+    use ed25519_dalek::SigningKey;
+    use mantissa_net::noise::NoiseKeys;
     use mantissa_store::uuid_key::UuidKey;
 
     /// Builds one active peer that can accept a replica of the test volume.
@@ -224,6 +227,7 @@ mod tests {
         let workload = Uuid::from_u128(2);
         let rebound = Uuid::from_u128(3);
         let third = Uuid::from_u128(4);
+        let fourth = Uuid::from_u128(5);
         let peers = open_peers_store(db.clone(), coordinator).expect("open planner peer store");
         let specs = open_volume_spec_store(db.clone(), coordinator).expect("open planner specs");
         let nodes = open_volume_node_store(db.clone(), coordinator).expect("open planner nodes");
@@ -231,8 +235,9 @@ mod tests {
             open_replicated_volume_plan_store(db.clone(), coordinator).expect("open planner plans");
         let statuses = open_replicated_volume_group_status_store(db.clone(), coordinator)
             .expect("open planner statuses");
-        let capacity_requests = open_replicated_volume_capacity_request_store(db, coordinator)
-            .expect("open planner capacity requests");
+        let capacity_requests =
+            open_replicated_volume_capacity_request_store(db.clone(), coordinator)
+                .expect("open planner capacity requests");
         peers
             .rebuild_mst_from_disk()
             .await
@@ -257,7 +262,7 @@ mod tests {
             .rebuild_mst_from_disk()
             .await
             .expect("rebuild planner capacity request store");
-        for (ordinal, node_id) in [workload, rebound, third].into_iter().enumerate() {
+        for (ordinal, node_id) in [workload, rebound, third, fourth].into_iter().enumerate() {
             peers
                 .upsert(
                     &UuidKey::from(node_id),
@@ -268,6 +273,23 @@ mod tests {
         }
 
         let registry = VolumeRegistry::new(specs, nodes, plans, statuses, capacity_requests);
+        let noise_keys = NoiseKeys::from_private_bytes([0x31; 32]);
+        let sessions =
+            LocalSessionStore::open(db.clone(), &noise_keys).expect("open planner session store");
+        let cluster_view = ClusterViewState::legacy_default();
+        let cluster_registry = Registry::new(
+            peers.clone(),
+            sessions,
+            SigningKey::from_bytes(&[0x32; 32]),
+            Arc::new(noise_keys),
+            coordinator,
+            HealthMonitor::new(coordinator),
+            cluster_view.clone(),
+        );
+        let membership_change_blocker = VolumeMembershipChangeBlocker::new(
+            ClusterOperationStore::new(db, coordinator).expect("open cluster operation store"),
+            ClusterViewState::legacy_default(),
+        );
         let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
             name: "coordinator-window".to_string(),
             driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
@@ -293,7 +315,8 @@ mod tests {
         let (non_owner_tx, _non_owner_rx) = async_channel::bounded(4);
         let non_owner = ReplicatedVolumePlanner::new(
             registry.clone(),
-            peers.clone(),
+            cluster_registry.clone(),
+            membership_change_blocker.clone(),
             HealthMonitor::new(rebound),
             non_owner_tx,
             rebound,
@@ -305,7 +328,8 @@ mod tests {
         drop(closed_rx);
         let owner = ReplicatedVolumePlanner::new(
             registry.clone(),
-            peers,
+            cluster_registry,
+            membership_change_blocker,
             HealthMonitor::new(coordinator),
             closed_tx,
             coordinator,
@@ -336,5 +360,42 @@ mod tests {
                 .expect("read stable plan"),
             Some(saved)
         );
+
+        cluster_view.install(
+            cluster_view.active_view(),
+            std::collections::HashSet::from([third]),
+        );
+        let mut out_of_view_candidate_spec = VolumeSpecValue::new(VolumeSpecDraft {
+            name: "out-of-view-replica-candidate".to_string(),
+            driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
+                ownership: FilesystemOwnership::Daemon,
+                filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Ext4,
+            }),
+            access_mode: VolumeAccessMode::ReadWriteOnce,
+            binding_mode: VolumeBindingMode::WaitForFirstConsumer,
+            reclaim_policy: VolumeReclaimPolicy::Delete,
+            initial_capacity_bytes: Some(64 * 1024 * 1024),
+            labels: Vec::new(),
+            bound_node_id: None,
+            bound_node_name: None,
+        });
+        out_of_view_candidate_spec.plan_coordinator_node_id = Some(coordinator);
+        out_of_view_candidate_spec
+            .move_binding(workload, "workload".to_string(), Uuid::from_u128(12))
+            .expect("bind out-of-view-candidate test volume");
+        registry
+            .upsert_spec(out_of_view_candidate_spec.clone())
+            .await
+            .expect("save out-of-view-candidate test volume");
+        owner
+            .reconcile()
+            .await
+            .expect("create plan without out-of-view candidate");
+        let candidate_plan = registry
+            .get_plan(out_of_view_candidate_spec.id)
+            .expect("read out-of-view-candidate plan")
+            .expect("out-of-view-candidate plan exists");
+        assert!(!candidate_plan.replica_node_ids.contains(&third));
+        assert!(candidate_plan.replica_node_ids.contains(&fourth));
     }
 }

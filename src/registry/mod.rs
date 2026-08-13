@@ -1,4 +1,4 @@
-use crate::cluster::ClusterViewId;
+use crate::cluster::{ClusterViewId, ClusterViewState};
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::server::session_bootstrap::{SessionBootstrapRejection, SessionBootstrapRejectionCode};
 use crate::store::local::LocalSessionStore;
@@ -118,7 +118,7 @@ pub struct Registry {
     noise_keys: Arc<NoiseKeys>,
     node_id: Uuid,
     health_monitor: Arc<HealthMonitor>,
-    excluded_peers: Arc<SyncRwLock<HashSet<Uuid>>>,
+    cluster_view: ClusterViewState,
     peer_snapshot_cache: Arc<SyncRwLock<PeerStoreSnapshotCache>>,
 }
 
@@ -126,6 +126,20 @@ pub struct Registry {
 enum SessionStrategy {
     TicketOnly,
     TicketThenCredential,
+}
+
+/// Selects whether a peer lookup follows or bypasses the local cluster view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerViewScope {
+    CurrentView,
+    AnyKnownView,
+}
+
+impl PeerViewScope {
+    /// Returns whether this lookup may use a node outside the local view.
+    fn includes_out_of_view_nodes(self) -> bool {
+        self == Self::AnyKnownView
+    }
 }
 
 enum TicketSessionBootstrapResult {
@@ -144,8 +158,8 @@ enum SessionBootstrapRetryScope {
 
 impl SessionBootstrapRetryScope {
     /// Selects the retry scope matching one session lookup's split-boundary policy.
-    fn from_allow_excluded(allow_excluded: bool) -> Self {
-        if allow_excluded {
+    fn from_peer_view_scope(peer_view_scope: PeerViewScope) -> Self {
+        if peer_view_scope.includes_out_of_view_nodes() {
             Self::CrossView
         } else {
             Self::ActiveView
@@ -153,15 +167,14 @@ impl SessionBootstrapRetryScope {
     }
 }
 
-/// Classifies session bootstrap backoff by the kind of convergence race it
-/// represents, so cross-view metadata sync is not starved by active-view misses.
+/// Defines which view callers one session-bootstrap rejection may delay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionBootstrapBackoffKind {
-    PeerMembership,
-    PeerAuthority,
+enum SessionBootstrapBackoffScope {
+    ActiveViewOnly,
+    AllViews,
 }
 
-impl SessionBootstrapBackoffKind {
+impl SessionBootstrapBackoffScope {
     /// Converts one typed session-bootstrap rejection into the retry gate it should update.
     fn from_rejection(rejection: &SessionBootstrapRejection) -> Option<Self> {
         if !rejection.requires_retry_backoff() {
@@ -169,11 +182,11 @@ impl SessionBootstrapBackoffKind {
         }
         match rejection.code {
             SessionBootstrapRejectionCode::UnknownSessionTicket => None,
-            SessionBootstrapRejectionCode::PeerNotRegistered => Some(Self::PeerMembership),
+            SessionBootstrapRejectionCode::PeerNotRegistered => Some(Self::ActiveViewOnly),
             SessionBootstrapRejectionCode::LocalNodeInactive
             | SessionBootstrapRejectionCode::CredentialInvalid
             | SessionBootstrapRejectionCode::IssuerMismatch
-            | SessionBootstrapRejectionCode::IssuerUnknown => Some(Self::PeerAuthority),
+            | SessionBootstrapRejectionCode::IssuerUnknown => Some(Self::AllViews),
         }
     }
 
@@ -181,7 +194,7 @@ impl SessionBootstrapBackoffKind {
     fn applies_to(self, scope: SessionBootstrapRetryScope) -> bool {
         !matches!(
             (self, scope),
-            (Self::PeerMembership, SessionBootstrapRetryScope::CrossView)
+            (Self::ActiveViewOnly, SessionBootstrapRetryScope::CrossView)
         )
     }
 }
@@ -194,7 +207,7 @@ struct PeerReconnectState {
 
 #[derive(Clone, Copy, Debug)]
 struct PeerRetryBackoff {
-    kind: SessionBootstrapBackoffKind,
+    scope: SessionBootstrapBackoffScope,
     consecutive_failures: u32,
     next_attempt_at: Instant,
 }
@@ -234,17 +247,17 @@ impl PeerRetryBackoff {
     fn on_failure(
         previous: Option<Self>,
         now: Instant,
-        kind: SessionBootstrapBackoffKind,
+        scope: SessionBootstrapBackoffScope,
     ) -> (Self, Duration) {
         let failures = previous
-            .filter(|state| state.kind == kind)
+            .filter(|state| state.scope == scope)
             .map(|state| state.consecutive_failures)
             .unwrap_or(0)
             .saturating_add(1);
         let delay = peer_retry_delay(failures);
         (
             Self {
-                kind,
+                scope,
                 consecutive_failures: failures,
                 next_attempt_at: now + delay,
             },
@@ -254,7 +267,7 @@ impl PeerRetryBackoff {
 
     /// Returns whether the retry budget allows a new attempt at `now`.
     fn allows_attempt(self, now: Instant, scope: SessionBootstrapRetryScope) -> bool {
-        !self.kind.applies_to(scope) || now >= self.next_attempt_at
+        !self.scope.applies_to(scope) || now >= self.next_attempt_at
     }
 }
 
@@ -280,6 +293,7 @@ impl Registry {
         noise_keys: Arc<NoiseKeys>,
         node_id: Uuid,
         health_monitor: Arc<HealthMonitor>,
+        cluster_view: ClusterViewState,
     ) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -295,7 +309,7 @@ impl Registry {
             noise_keys,
             node_id,
             health_monitor,
-            excluded_peers: Arc::new(SyncRwLock::new(HashSet::new())),
+            cluster_view,
             peer_snapshot_cache: Arc::new(SyncRwLock::new(PeerStoreSnapshotCache::new())),
         }
     }
@@ -478,7 +492,7 @@ impl Registry {
             self.clear().await;
             return None;
         }
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return None;
         }
         if !self.peer_has_active_membership(peer_id) {
@@ -495,30 +509,32 @@ impl Registry {
     }
 
     pub async fn refresh_peer_handle(&self, peer_id: Uuid) -> Option<server::Client> {
-        self.refresh_peer_handle_inner(peer_id, false).await
+        self.refresh_peer_handle_inner(peer_id, PeerViewScope::CurrentView)
+            .await
     }
 
     async fn refresh_peer_handle_unscoped(&self, peer_id: Uuid) -> Option<server::Client> {
-        self.refresh_peer_handle_inner(peer_id, true).await
+        self.refresh_peer_handle_inner(peer_id, PeerViewScope::AnyKnownView)
+            .await
     }
 
     async fn refresh_peer_handle_inner(
         &self,
         peer_id: Uuid,
-        allow_excluded: bool,
+        peer_view_scope: PeerViewScope,
     ) -> Option<server::Client> {
         if !self.local_allows_outbound_peer_connections() {
             self.clear().await;
             return None;
         }
-        if !allow_excluded && self.peer_is_excluded(peer_id) {
+        if peer_view_scope == PeerViewScope::CurrentView && self.node_is_out_of_view(peer_id) {
             return None;
         }
         if !self.peer_has_active_membership(peer_id) {
             self.remove_peer(peer_id).await;
             return None;
         }
-        let peer = if allow_excluded {
+        let peer = if peer_view_scope.includes_out_of_view_nodes() {
             self.peer_latest_value_unscoped(peer_id)?
         } else {
             self.peer_latest_value(peer_id)?
@@ -585,7 +601,7 @@ impl Registry {
             if *peer_id == self.node_id {
                 continue;
             }
-            if self.peer_is_excluded(*peer_id) {
+            if self.node_is_out_of_view(*peer_id) {
                 continue;
             }
             ids.push(*peer_id);
@@ -594,7 +610,7 @@ impl Registry {
         Ok(ids)
     }
 
-    /// Returns active remote peers without applying the local cluster-view exclusion fence.
+    /// Returns active remote peers even when they are outside the local cluster view.
     ///
     /// Only the low-rate cluster-wide metadata and GC planes should use this population. Normal
     /// scheduling, health, and workload paths must continue using [`Self::known_peers`].
@@ -611,7 +627,7 @@ impl Registry {
 
     /// Returns the last recorded hostname for the provided `peer_id`, if available.
     pub fn peer_hostname(&self, peer_id: Uuid) -> Option<String> {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return None;
         }
         self.peer_latest_value(peer_id)
@@ -619,7 +635,7 @@ impl Registry {
     }
 
     pub fn peer_address(&self, peer_id: Uuid) -> Option<String> {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return None;
         }
         self.peer_latest_value(peer_id)
@@ -628,7 +644,7 @@ impl Registry {
 
     /// Returns the last recorded scheduler-visible platform OS for the provided `peer_id`.
     pub fn peer_platform_os(&self, peer_id: Uuid) -> Option<String> {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return None;
         }
         self.peer_latest_value(peer_id)
@@ -637,7 +653,7 @@ impl Registry {
 
     /// Returns the last recorded scheduler-visible platform architecture for the provided `peer_id`.
     pub fn peer_platform_arch(&self, peer_id: Uuid) -> Option<String> {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return None;
         }
         self.peer_latest_value(peer_id)
@@ -647,7 +663,7 @@ impl Registry {
     /// Returns the last recorded WireGuard underlay configuration for the provided `peer_id`, if
     /// available.
     pub fn peer_wireguard(&self, peer_id: Uuid) -> Option<WireGuardPeerValue> {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return None;
         }
         self.peer_latest_value(peer_id)
@@ -680,7 +696,7 @@ impl Registry {
 
     /// Returns true when the provided node remains eligible for new placements.
     pub fn peer_schedulable(&self, peer_id: Uuid) -> bool {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return false;
         }
 
@@ -695,7 +711,7 @@ impl Registry {
         peer_id: Uuid,
         execution_platform: ExecutionPlatform,
     ) -> bool {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return false;
         }
 
@@ -719,7 +735,7 @@ impl Registry {
         isolation_profile: Option<&str>,
         feature_flags: &[String],
     ) -> bool {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return false;
         }
 
@@ -742,7 +758,7 @@ impl Registry {
             })
     }
 
-    /// Returns the converged peer value without applying excluded-peer or active-member filtering.
+    /// Returns the converged peer value without local-view or active-member filtering.
     pub fn peer_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
         self.peer_selected_value_unscoped(peer_id)
     }
@@ -751,9 +767,9 @@ impl Registry {
     ///
     /// Split peers remain active in the global metadata plane, but are unavailable to local
     /// schedulers and runtime cleanup. Preserve `None` for genuinely unknown peers so callers can
-    /// distinguish propagation lag from an explicit leave or local-view exclusion.
+    /// distinguish propagation lag from an explicit leave or local-view boundary.
     pub fn peer_active_in_local_view(&self, peer_id: Uuid) -> Option<bool> {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return Some(false);
         }
 
@@ -766,14 +782,14 @@ impl Registry {
         self.health_monitor.clone()
     }
 
-    /// Replaces the current out-of-scope peer set used to scope scheduling and dataplane lookups.
-    pub fn set_excluded_peers(&self, excluded: HashSet<Uuid>) {
-        *self.excluded_peers.write() = excluded;
+    /// Returns whether one node is assigned outside the active cluster view.
+    fn node_is_out_of_view(&self, node_id: Uuid) -> bool {
+        !self.cluster_view.includes_node(&node_id)
     }
 
-    /// Returns true when the peer should be ignored for control-plane and dataplane operations.
-    fn peer_is_excluded(&self, peer_id: Uuid) -> bool {
-        self.excluded_peers.read().contains(&peer_id)
+    /// Returns the nodes assigned outside this registry's active cluster view.
+    pub fn out_of_view_node_ids(&self) -> HashSet<Uuid> {
+        self.cluster_view.out_of_view_node_ids()
     }
 
     /// Acquires a read guard for peer store projections.
@@ -838,7 +854,7 @@ impl Registry {
 
         let mut out = Vec::with_capacity(cache.active_peer_values.len());
         for (peer_id, value) in &cache.active_peer_values {
-            if self.peer_is_excluded(*peer_id) {
+            if self.node_is_out_of_view(*peer_id) {
                 continue;
             }
             out.push((*peer_id, value.clone()));
@@ -924,18 +940,28 @@ impl Registry {
     }
 
     pub async fn session_for_peer(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
-        self.resolve_session(peer_id, SessionStrategy::TicketThenCredential, false, false)
-            .await
+        self.resolve_session(
+            peer_id,
+            SessionStrategy::TicketThenCredential,
+            PeerViewScope::CurrentView,
+            false,
+        )
+        .await
     }
 
     /// Returns the currently cached session for a peer without triggering reconnects or
     /// credential bootstrap flows.
     pub async fn cached_session_for(&self, peer_id: Uuid) -> Option<cluster_session::Client> {
-        self.resolve_session(peer_id, SessionStrategy::TicketThenCredential, false, true)
-            .await
+        self.resolve_session(
+            peer_id,
+            SessionStrategy::TicketThenCredential,
+            PeerViewScope::CurrentView,
+            true,
+        )
+        .await
     }
 
-    /// Returns a session for a peer while ignoring split-time exclusion scope.
+    /// Returns a session for a node outside the local view during split handoff.
     ///
     /// This is reserved for cluster-wide gossip and Sync flows that must repair transition
     /// metadata across split partitions without reopening ordinary view-scoped traffic.
@@ -943,8 +969,13 @@ impl Registry {
         &self,
         peer_id: Uuid,
     ) -> Option<cluster_session::Client> {
-        self.resolve_session(peer_id, SessionStrategy::TicketThenCredential, true, false)
-            .await
+        self.resolve_session(
+            peer_id,
+            SessionStrategy::TicketThenCredential,
+            PeerViewScope::AnyKnownView,
+            false,
+        )
+        .await
     }
 
     pub async fn scheduler_session_via_handle(
@@ -952,7 +983,9 @@ impl Registry {
         client: &server::Client,
         peer_id: Uuid,
     ) -> Option<cluster_session::Client> {
-        let entry = self.session_entry(peer_id, false, true).await?;
+        let entry = self
+            .session_entry(peer_id, PeerViewScope::CurrentView, true)
+            .await?;
         if let Some(session) = self.cached_session(&entry).await {
             return Some(session);
         }
@@ -1007,7 +1040,7 @@ impl Registry {
             if peer_id == self.node_id {
                 continue;
             }
-            if self.peer_is_excluded(peer_id) {
+            if self.node_is_out_of_view(peer_id) {
                 continue;
             }
 
@@ -1169,7 +1202,10 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<sync::Client>, capnp::Error> {
-        let Some(entry) = self.session_entry(peer_id, false, false).await else {
+        let Some(entry) = self
+            .session_entry(peer_id, PeerViewScope::CurrentView, false)
+            .await
+        else {
             return Ok(None);
         };
 
@@ -1204,7 +1240,7 @@ impl Registry {
                 peer_id,
                 &entry,
                 SessionStrategy::TicketThenCredential,
-                false,
+                PeerViewScope::CurrentView,
             )
             .await
         else {
@@ -1246,7 +1282,7 @@ impl Registry {
         }
     }
 
-    /// Resolves the Sync capability while bypassing split exclusion scope and view filtering.
+    /// Resolves Sync for a node outside the local view during split handoff.
     ///
     /// Returns both the capability and the peer's currently active cluster view so callers can
     /// perform unscoped metadata anti-entropy against the peer-selected view.
@@ -1254,7 +1290,10 @@ impl Registry {
         &self,
         peer_id: Uuid,
     ) -> Result<Option<(sync::Client, ClusterViewId)>, capnp::Error> {
-        let Some(entry) = self.session_entry(peer_id, true, false).await else {
+        let Some(entry) = self
+            .session_entry(peer_id, PeerViewScope::AnyKnownView, false)
+            .await
+        else {
             return Ok(None);
         };
 
@@ -1280,7 +1319,12 @@ impl Registry {
         }
 
         let Some(session) = self
-            .ensure_session_scoped(peer_id, &entry, SessionStrategy::TicketThenCredential, true)
+            .ensure_session_scoped(
+                peer_id,
+                &entry,
+                SessionStrategy::TicketThenCredential,
+                PeerViewScope::AnyKnownView,
+            )
             .await
         else {
             return Ok(None);
@@ -1323,7 +1367,10 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<health::health::Client>, capnp::Error> {
-        let Some(entry) = self.session_entry(peer_id, false, false).await else {
+        let Some(entry) = self
+            .session_entry(peer_id, PeerViewScope::CurrentView, false)
+            .await
+        else {
             return Ok(None);
         };
 
@@ -1357,7 +1404,7 @@ impl Registry {
                 peer_id,
                 &entry,
                 SessionStrategy::TicketThenCredential,
-                false,
+                PeerViewScope::CurrentView,
             )
             .await
         else {
@@ -1404,7 +1451,10 @@ impl Registry {
         peer_id: Uuid,
         expected_view: ClusterViewId,
     ) -> Result<Option<GossipClient>, capnp::Error> {
-        let Some(entry) = self.session_entry(peer_id, false, false).await else {
+        let Some(entry) = self
+            .session_entry(peer_id, PeerViewScope::CurrentView, false)
+            .await
+        else {
             return Ok(None);
         };
 
@@ -1438,7 +1488,7 @@ impl Registry {
                 peer_id,
                 &entry,
                 SessionStrategy::TicketThenCredential,
-                false,
+                PeerViewScope::CurrentView,
             )
             .await
         else {
@@ -1488,7 +1538,10 @@ impl Registry {
         &self,
         peer_id: Uuid,
     ) -> Result<Option<GossipClient>, capnp::Error> {
-        let Some(entry) = self.session_entry(peer_id, true, false).await else {
+        let Some(entry) = self
+            .session_entry(peer_id, PeerViewScope::AnyKnownView, false)
+            .await
+        else {
             return Ok(None);
         };
 
@@ -1501,7 +1554,12 @@ impl Registry {
         }
 
         let Some(session) = self
-            .ensure_session_scoped(peer_id, &entry, SessionStrategy::TicketThenCredential, true)
+            .ensure_session_scoped(
+                peer_id,
+                &entry,
+                SessionStrategy::TicketThenCredential,
+                PeerViewScope::AnyKnownView,
+            )
             .await
         else {
             return Ok(None);
@@ -1561,18 +1619,18 @@ impl Registry {
         state.replace_session(session);
     }
 
-    /// Resolves a cache entry for session acquisition while honoring scoped split exclusions.
+    /// Resolves a cache entry with or without the local cluster-view boundary.
     async fn session_entry(
         &self,
         peer_id: Uuid,
-        allow_excluded: bool,
+        peer_view_scope: PeerViewScope,
         require_existing: bool,
     ) -> Option<PeerEntry> {
         if !self.local_allows_outbound_peer_connections() {
             self.clear().await;
             return None;
         }
-        if !allow_excluded && self.peer_is_excluded(peer_id) {
+        if peer_view_scope == PeerViewScope::CurrentView && self.node_is_out_of_view(peer_id) {
             return None;
         }
         if !self.peer_has_active_membership(peer_id) {
@@ -1592,16 +1650,16 @@ impl Registry {
         &self,
         peer_id: Uuid,
         strategy: SessionStrategy,
-        allow_excluded: bool,
+        peer_view_scope: PeerViewScope,
         cached_only: bool,
     ) -> Option<cluster_session::Client> {
         let entry = self
-            .session_entry(peer_id, allow_excluded, cached_only)
+            .session_entry(peer_id, peer_view_scope, cached_only)
             .await?;
         if cached_only {
             return self.cached_session(&entry).await;
         }
-        self.ensure_session_scoped(peer_id, &entry, strategy, allow_excluded)
+        self.ensure_session_scoped(peer_id, &entry, strategy, peer_view_scope)
             .await
     }
 
@@ -1611,7 +1669,7 @@ impl Registry {
         peer_id: Uuid,
         entry: &PeerEntry,
         strategy: SessionStrategy,
-        allow_excluded: bool,
+        peer_view_scope: PeerViewScope,
     ) -> Option<cluster_session::Client> {
         if !self.peer_has_active_membership(peer_id) {
             self.remove_peer(peer_id).await;
@@ -1626,7 +1684,7 @@ impl Registry {
         }
 
         let now = Instant::now();
-        let retry_scope = SessionBootstrapRetryScope::from_allow_excluded(allow_excluded);
+        let retry_scope = SessionBootstrapRetryScope::from_peer_view_scope(peer_view_scope);
         if !self
             .session_bootstrap_attempt_allowed(peer_id, now, retry_scope)
             .await
@@ -1656,7 +1714,7 @@ impl Registry {
             state.server = None;
         }
 
-        let refreshed = if allow_excluded {
+        let refreshed = if peer_view_scope.includes_out_of_view_nodes() {
             self.refresh_peer_handle_unscoped(peer_id).await?
         } else {
             self.refresh_peer_handle(peer_id).await?
@@ -1766,11 +1824,11 @@ impl Registry {
         &self,
         peer_id: Uuid,
         now: Instant,
-        kind: SessionBootstrapBackoffKind,
+        scope: SessionBootstrapBackoffScope,
     ) -> (Duration, u32) {
         let mut states = self.session_bootstrap_backoff.lock().await;
         let previous = states.get(&peer_id).copied();
-        let (next_state, delay) = PeerRetryBackoff::on_failure(previous, now, kind);
+        let (next_state, delay) = PeerRetryBackoff::on_failure(previous, now, scope);
         let streak = next_state.consecutive_failures;
         states.insert(peer_id, next_state);
         (delay, streak)
@@ -2154,11 +2212,11 @@ impl Registry {
             error!(target: "sync", "session bootstrap rejected: {summary}");
         }
         self.remove_rejected_session_ticket(peer_id, rejection);
-        if let Some(kind) = SessionBootstrapBackoffKind::from_rejection(rejection)
-            && kind.applies_to(retry_scope)
+        if let Some(backoff_scope) = SessionBootstrapBackoffScope::from_rejection(rejection)
+            && backoff_scope.applies_to(retry_scope)
         {
             let (delay, streak) = self
-                .record_session_bootstrap_backoff(peer_id, Instant::now(), kind)
+                .record_session_bootstrap_backoff(peer_id, Instant::now(), backoff_scope)
                 .await;
             if Self::should_emit_diag_sample(streak as u64) {
                 debug!(
@@ -2282,13 +2340,13 @@ impl Registry {
     }
 
     fn peer_latest_value(&self, peer_id: Uuid) -> Option<PeerValue> {
-        if self.peer_is_excluded(peer_id) {
+        if self.node_is_out_of_view(peer_id) {
             return None;
         }
         self.peer_latest_value_unscoped(peer_id)
     }
 
-    /// Returns the active selected peer value without applying excluded-peer scoping.
+    /// Returns the active selected peer value without the local cluster-view boundary.
     fn peer_latest_value_unscoped(&self, peer_id: Uuid) -> Option<PeerValue> {
         self.peer_selected_value_unscoped(peer_id)
             .filter(|value| value.is_active())
@@ -2366,14 +2424,15 @@ mod tests {
                 Arc::new(noise_keys),
                 local_id,
                 HealthMonitor::new(local_id),
+                ClusterViewState::legacy_default(),
             ),
             dir,
         )
     }
 
-    /// View exclusions must not hide peers from the cluster-wide metadata population.
+    /// The cluster-wide metadata population must include nodes outside the local view.
     #[tokio::test]
-    async fn known_peers_unscoped_retains_split_exclusions() {
+    async fn known_peers_unscoped_includes_out_of_view_nodes() {
         let (registry, _dir) = registry_for_test(0x31);
         let peer_id = Uuid::new_v4();
         registry
@@ -2384,7 +2443,10 @@ mod tests {
             )
             .await
             .expect("insert active peer");
-        registry.set_excluded_peers(HashSet::from([peer_id]));
+        registry.cluster_view.install(
+            registry.cluster_view.active_view(),
+            HashSet::from([peer_id]),
+        );
 
         assert!(registry.known_peers().expect("scoped peers").is_empty());
         assert_eq!(registry.peer_active_in_local_view(peer_id), Some(false));
@@ -2414,6 +2476,7 @@ mod tests {
             Arc::new(noise_keys),
             local_id,
             HealthMonitor::new(local_id),
+            ClusterViewState::legacy_default(),
         );
 
         peers
@@ -2479,6 +2542,7 @@ mod tests {
             Arc::new(noise_keys),
             local_id,
             HealthMonitor::new(local_id),
+            ClusterViewState::legacy_default(),
         );
 
         peers
@@ -2490,7 +2554,12 @@ mod tests {
             .expect("insert left peer");
 
         assert!(!registry.peer_has_active_membership(peer_id));
-        assert!(registry.session_entry(peer_id, true, false).await.is_none());
+        assert!(
+            registry
+                .session_entry(peer_id, PeerViewScope::AnyKnownView, false)
+                .await
+                .is_none()
+        );
     }
 
     /// Left rows must clear cached peer entries before any capability can be reused.
@@ -2514,6 +2583,7 @@ mod tests {
             Arc::new(noise_keys),
             local_id,
             HealthMonitor::new(local_id),
+            ClusterViewState::legacy_default(),
         );
 
         peers
@@ -2537,7 +2607,12 @@ mod tests {
             .await
             .expect("insert left peer");
 
-        assert!(registry.session_entry(peer_id, true, false).await.is_none());
+        assert!(
+            registry
+                .session_entry(peer_id, PeerViewScope::AnyKnownView, false)
+                .await
+                .is_none()
+        );
         assert!(
             registry.entry_if_present(peer_id).await.is_none(),
             "left membership should clear stale cached handles and capabilities"
@@ -2564,6 +2639,7 @@ mod tests {
             Arc::new(noise_keys),
             local_id,
             HealthMonitor::new(local_id),
+            ClusterViewState::legacy_default(),
         );
 
         peers
@@ -2594,7 +2670,12 @@ mod tests {
             .await
             .expect("insert local leave row");
 
-        assert!(registry.session_entry(peer_id, true, false).await.is_none());
+        assert!(
+            registry
+                .session_entry(peer_id, PeerViewScope::AnyKnownView, false)
+                .await
+                .is_none()
+        );
         assert!(
             registry.entry_if_present(peer_id).await.is_none(),
             "local leave should clear registry caches before declining session reuse"
@@ -2622,6 +2703,7 @@ mod tests {
             Arc::new(noise_keys),
             local_id,
             HealthMonitor::new(local_id),
+            ClusterViewState::legacy_default(),
         );
 
         peers
@@ -2684,6 +2766,7 @@ mod tests {
             Arc::new(noise_keys),
             local_id,
             HealthMonitor::new(local_id),
+            ClusterViewState::legacy_default(),
         );
 
         peers
@@ -2706,7 +2789,12 @@ mod tests {
 
         assert!(
             registry
-                .ensure_session_scoped(peer_id, &entry, SessionStrategy::TicketThenCredential, true)
+                .ensure_session_scoped(
+                    peer_id,
+                    &entry,
+                    SessionStrategy::TicketThenCredential,
+                    PeerViewScope::AnyKnownView,
+                )
                 .await
                 .is_none()
         );
@@ -2733,6 +2821,7 @@ mod tests {
             Arc::new(noise_keys),
             local_id,
             HealthMonitor::new(local_id),
+            ClusterViewState::legacy_default(),
         );
 
         let rejection = SessionBootstrapRejection::with_default_detail(
@@ -2881,9 +2970,9 @@ mod tests {
         );
     }
 
-    /// Authority-level bootstrap failures should still cool down every session caller.
+    /// Failures that affect all views should cool down every session caller.
     #[tokio::test]
-    async fn authority_backoff_blocks_cross_view_retry() {
+    async fn all_view_backoff_blocks_cross_view_retry() {
         let (registry, _dir) = registry_for_test(0x25);
         let peer_id = Uuid::new_v4();
         let rejection = SessionBootstrapRejection::with_default_detail(

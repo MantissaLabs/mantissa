@@ -31,7 +31,6 @@ enum ClusterOperationDependencyState {
 
 /// Minimum interval between terminal operation-history GC checks on an unchanged ledger.
 const CLUSTER_OPERATION_GC_CHECK_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Requests local service reconciliation after a completed rebalance merge.
 fn request_post_merge_service_reconcile(
     transition: &ClusterTransition,
@@ -102,7 +101,7 @@ impl Topology {
     fn local_view_member_count_from_snapshot(
         &self,
         snapshot: &PeerSnapshot,
-        excluded_peers: &HashSet<Uuid>,
+        out_of_view_node_ids: &HashSet<Uuid>,
         force_applied_operation: Option<Uuid>,
     ) -> Result<u32, capnp::Error> {
         let operations = self.load_cluster_operations()?;
@@ -114,7 +113,7 @@ impl Topology {
             return Ok(self.projected_active_member_count(&projected_members, snapshot));
         }
 
-        Ok(self.local_active_peer_row_member_count_from_snapshot(snapshot, excluded_peers))
+        Ok(self.local_active_peer_row_member_count_from_snapshot(snapshot, out_of_view_node_ids))
     }
 
     /// Publishes the local active cluster's current member count into replicated metadata.
@@ -134,10 +133,10 @@ impl Topology {
 
         let local_view = self.active_cluster_view();
         let snapshot = self.peer_snapshot_or_error().await?;
-        let excluded_peers = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
         let node_count = self.local_view_member_count_from_snapshot(
             &snapshot,
-            &excluded_peers,
+            &out_of_view_node_ids,
             applied_operation,
         )?;
         let current = self
@@ -316,22 +315,22 @@ impl Topology {
 
     /// Counts active replicated peer rows inside the locally installed view scope.
     ///
-    /// Split and merge transitions install `excluded_peers` atomically with the active view. That
-    /// durable membership plus local scope is authoritative here; publishing metadata must never
-    /// turn into an all-peer RPC health check.
+    /// Split and merge transitions install sibling nodes atomically with the active view. That
+    /// durable membership is authoritative here; publishing metadata must never turn into an
+    /// all-node RPC health check.
     pub(in crate::topology) async fn local_cluster_view_member_count(
         &self,
     ) -> Result<u32, capnp::Error> {
         let snapshot = self.peer_snapshot_or_error().await?;
-        let excluded_peers = self.excluded_peers_snapshot().await;
-        self.local_view_member_count_from_snapshot(&snapshot, &excluded_peers, None)
+        let out_of_view_node_ids = self.out_of_view_node_ids();
+        self.local_view_member_count_from_snapshot(&snapshot, &out_of_view_node_ids, None)
     }
 
     /// Counts active peer snapshot rows without opening peer sessions.
     fn local_active_peer_row_member_count_from_snapshot(
         &self,
         snapshot: &PeerSnapshot,
-        excluded_peers: &HashSet<Uuid>,
+        out_of_view_node_ids: &HashSet<Uuid>,
     ) -> u32 {
         let mut count = 1u32;
         for entry in snapshot.entries.iter() {
@@ -339,7 +338,7 @@ impl Topology {
             if peer_id == self.local.node.id {
                 continue;
             }
-            if excluded_peers.contains(&peer_id) {
+            if out_of_view_node_ids.contains(&peer_id) {
                 continue;
             }
             count = count.saturating_add(1);
@@ -701,11 +700,17 @@ impl Topology {
     fn persist_cluster_transition_view(
         &self,
         operation: &ClusterOperationRecord,
-        view: ClusterViewId,
+        transition: &ClusterTransition,
+        out_of_view_node_ids: &HashSet<Uuid>,
     ) -> Result<(), capnp::Error> {
         self.stores
             .cluster_view_store
-            .install_cluster_transition(operation.id, view, &operation.source_views)
+            .install_cluster_transition(
+                operation.id,
+                transition.local_target_view,
+                &operation.source_views,
+                out_of_view_node_ids,
+            )
             .map_err(|err| capnp::Error::failed(err.to_string()))
     }
 
@@ -998,9 +1003,23 @@ impl Topology {
         self.ensure_cluster_transition_can_apply(operation)?;
 
         let transition = self.transition_for_operation(operation)?;
+        let out_of_view_node_ids = self.out_of_view_node_ids_for_transition(&transition)?;
         let reports = self
             .run_cluster_transition_participants(&transition)
             .await?;
+        self.persist_cluster_transition_view(operation, &transition, &out_of_view_node_ids)?;
+        // Install the exact in-memory view before another await can admit
+        // traffic from a node that the durable transition just removed.
+        let previous =
+            self.install_cluster_view(transition.local_target_view, out_of_view_node_ids.clone());
+        info!(
+            target: "cluster_view",
+            operation_id = %transition.operation_id,
+            local_target_index = ?transition.local_split_target_index,
+            local_node_count = transition.local_view_node_ids.len(),
+            out_of_view_node_count = out_of_view_node_ids.len(),
+            "installed local cluster view"
+        );
         for report in reports {
             info!(
                 target: "cluster_view",
@@ -1011,8 +1030,6 @@ impl Topology {
             );
         }
 
-        self.persist_cluster_transition_view(operation, transition.local_target_view)?;
-        let previous = self.set_active_cluster_view(transition.local_target_view);
         match self.publish_pending_view_retirements().await {
             Ok(completed) if completed > 0 => {
                 info!(
@@ -1082,14 +1099,13 @@ impl Topology {
     /// Returns whether a finalized merge still has local split scope to clear.
     ///
     /// A destination-side participant can already report the merge target view when it learns the
-    /// finalized merge row. If split peer exclusions are still installed, this node has not run the
-    /// merge transition locally and must replay it once to rejoin peer scope.
+    /// finalized merge row. If any nodes remain outside the local view, this node has not run the
+    /// merge transition locally and must replay it once to restore one shared view.
     pub(in crate::topology) async fn finalized_merge_requires_cluster_transition_replay(
         &self,
         operation: &ClusterOperationRecord,
     ) -> bool {
-        operation.kind == ClusterOperationKind::Merge
-            && !self.excluded_peers_snapshot().await.is_empty()
+        operation.kind == ClusterOperationKind::Merge && !self.out_of_view_node_ids().is_empty()
     }
 
     /// Refreshes node-count metadata once when finalized history targets the active merge view.
@@ -1462,10 +1478,10 @@ impl Topology {
 
         match operation.stage {
             ClusterOperationStage::Proposed => {
-                // This is the only actionability frontier: a replicated Proposed row is harmless,
-                // while Prepared certifies that this node durably installed every target-key row
-                // it is responsible for publishing. Missing remote rows remain a retryable Sync
-                // condition and never turn into a participant acknowledgement barrier.
+                // The node selected to publish the keys also performs the volume
+                // check below. Other nodes wait for its Prepared or Aborted row.
+                // If that node is down, the existing deterministic fallback can
+                // take over both jobs.
                 if !self.publish_transition_key_material(&operation).await? {
                     debug!(
                         target: "cluster_view",
@@ -1474,6 +1490,36 @@ impl Topology {
                         "cluster operation is waiting for its deterministic key publisher"
                     );
                     return Ok(());
+                }
+                if operation.kind == ClusterOperationKind::Split {
+                    match self.validate_replicated_volumes_for_split(&operation).await {
+                        Ok(volume_group_count) => {
+                            info!(
+                                target: "cluster_view",
+                                operation_id = %operation.id,
+                                volume_group_count,
+                                "validated replicated volumes for cluster split"
+                            );
+                        }
+                        Err(error) => {
+                            let detail = format!("aborted replicated_volume_split_safety: {error}");
+                            let updated = self
+                                .update_cluster_operation_stage(
+                                    &mut operation,
+                                    ClusterOperationStage::Aborted,
+                                    &detail,
+                                )
+                                .await?;
+                            if updated && operation.stage == ClusterOperationStage::Aborted {
+                                warn!(
+                                    target: "cluster_view",
+                                    operation_id = %operation.id,
+                                    "aborted unsafe cluster split: {error}"
+                                );
+                            }
+                            return Ok(());
+                        }
+                    }
                 }
                 if !self
                     .update_cluster_operation_stage(
@@ -1637,88 +1683,6 @@ impl Topology {
 
         Ok(replayed)
     }
-
-    /// Restores split/merge peer scope from durable operation history after process startup.
-    ///
-    /// This rebuilds the in-memory excluded-peer set used by list/sync/health loops so
-    /// restart does not temporarily fall back to cross-view peer assumptions.
-    pub(crate) async fn restore_peer_scope_from_operation_history(
-        &self,
-    ) -> Result<usize, capnp::Error> {
-        let active_view = self.active_cluster_view();
-        let mut operations = self.load_cluster_operations()?;
-        operations.sort_by_key(ClusterOperationRecord::lineage_order_key);
-
-        let mut excluded = HashSet::<Uuid>::new();
-        let mut source_operation = None::<Uuid>;
-
-        for operation in operations {
-            if operation.dry_run {
-                continue;
-            }
-            if !matches!(
-                operation.stage,
-                ClusterOperationStage::Committed | ClusterOperationStage::Finalized
-            ) {
-                continue;
-            }
-
-            let local_target_view = match self.target_view_for_local_participant(&operation) {
-                Ok(view) => view,
-                Err(err) => {
-                    warn!(
-                        target: "cluster_view",
-                        operation_id = %operation.id,
-                        kind = ?operation.kind,
-                        stage = ?operation.stage,
-                        "skipping operation while restoring peer scope: {err}"
-                    );
-                    continue;
-                }
-            };
-            if local_target_view != active_view {
-                continue;
-            }
-
-            match operation.kind {
-                ClusterOperationKind::Merge => {
-                    excluded.clear();
-                    source_operation = Some(operation.id);
-                }
-                ClusterOperationKind::Split => {
-                    let transition = match self.transition_for_operation(&operation) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            warn!(
-                                target: "cluster_view",
-                                operation_id = %operation.id,
-                                kind = ?operation.kind,
-                                stage = ?operation.stage,
-                                "skipping split scope restore because transition derivation failed: {err}"
-                            );
-                            continue;
-                        }
-                    };
-                    excluded = transition.evicted_node_ids;
-                    source_operation = Some(operation.id);
-                }
-            }
-        }
-
-        self.set_excluded_peers(excluded.clone()).await;
-        self.deps.registry.set_excluded_peers(excluded.clone());
-
-        let excluded_count = excluded.len();
-        info!(
-            target: "cluster_view",
-            active_view = %active_view,
-            excluded_count,
-            source_operation = ?source_operation,
-            "restored peer scope from durable operation history"
-        );
-
-        Ok(excluded_count)
-    }
 }
 
 #[cfg(test)]
@@ -1737,8 +1701,8 @@ mod tests {
             kind,
             local_target_view: ClusterViewId::legacy_default(),
             local_split_target_index: None,
-            retained_node_ids: HashSet::new(),
-            evicted_node_ids: HashSet::new(),
+            local_view_node_ids: HashSet::new(),
+            out_of_view_node_ids: HashSet::new(),
             split_service_policy: SplitServicePolicy::default(),
             split_network_policy: SplitNetworkPolicy::default(),
             merge_service_policy,

@@ -304,6 +304,11 @@ impl RunningVolumeNode {
         self.node.member_ids()
     }
 
+    /// Returns whether Raft is between two committed voter configurations.
+    pub(super) fn membership_is_joint(&self) -> bool {
+        self.node.membership_is_joint()
+    }
+
     /// Returns a copy of the newest locally applied volume state.
     pub(super) fn state(&self) -> mantissa_volume::control_state::VolumeControlState {
         self.reader.state()

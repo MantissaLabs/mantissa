@@ -108,19 +108,21 @@ impl Topology {
 
     /// # Description:
     ///
-    /// Returns probe-eligible peers, excluding the local node and view-scoped excluded peers.
+    /// Returns probe-eligible nodes from the active cluster view.
     async fn swim_probe_candidates(&self) -> Vec<Uuid> {
         let snapshot = match self.peer_snapshot().await {
             Some(snapshot) => snapshot,
             None => return Vec::new(),
         };
-        let excluded = self.excluded_peers_snapshot().await;
+        let out_of_view_node_ids = self.out_of_view_node_ids();
 
         snapshot
             .entries
             .iter()
             .filter_map(|entry| {
-                if entry.peer_id == self.local.node.id || excluded.contains(&entry.peer_id) {
+                if entry.peer_id == self.local.node.id
+                    || out_of_view_node_ids.contains(&entry.peer_id)
+                {
                     None
                 } else {
                     Some(entry.peer_id)
