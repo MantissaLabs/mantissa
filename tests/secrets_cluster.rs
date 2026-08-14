@@ -548,6 +548,7 @@ struct MasterKeyRowShape {
     rows: usize,
     values: usize,
     descriptors: usize,
+    grant_rows: usize,
     grants: usize,
     currents: usize,
     tombs: usize,
@@ -561,11 +562,19 @@ fn master_key_row_shape(node: &TestNode) -> MasterKeyRowShape {
         .load_all()
         .expect("load replicated master-key rows");
     let mut descriptors = 0usize;
+    let mut grant_rows = 0usize;
     let mut grants = 0usize;
     let mut currents = 0usize;
     let mut values = 0usize;
     for (_, snapshot) in &rows {
         values += snapshot.as_slice().len();
+        if snapshot
+            .as_slice()
+            .iter()
+            .any(|record| matches!(record, SecretMasterKeySyncRecord::Grant(_)))
+        {
+            grant_rows += 1;
+        }
         for record in snapshot.as_slice() {
             match record {
                 SecretMasterKeySyncRecord::Descriptor(_) => descriptors += 1,
@@ -579,6 +588,7 @@ fn master_key_row_shape(node: &TestNode) -> MasterKeyRowShape {
         rows: rows.len(),
         values,
         descriptors,
+        grant_rows,
         grants,
         currents,
         tombs: tombs.len(),
@@ -930,6 +940,12 @@ local_test!(ten_node_empty_split_merge_keeps_master_key_rows_linear, {
                 && shape.grants <= 24
                 && shape.currents <= 3,
             "ten-node empty split/merge should stay linear and tightly bounded: {shape:?}; {}",
+            master_key_row_debug(node)
+        );
+        assert_eq!(
+            shape.grants,
+            shape.grant_rows,
+            "ten-node merge should leave one visible grant per recipient row: {shape:?}; {}",
             master_key_row_debug(node)
         );
     }
@@ -1512,6 +1528,12 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
         .stop()
         .await
         .expect("stop selected destination key holder");
+    let _ = survivor_health.record_probe_success(selected_holder_id);
+    assert_eq!(
+        survivor_health.status(selected_holder_id),
+        mantissa_health::Status::Alive,
+        "a stale successful probe should not decide which holder repairs merge grants"
+    );
 
     let merge_id = merge_cluster_views(&cluster[0], left_view, right_view).await;
     for node_index in [0, 1, surviving_holder_index] {

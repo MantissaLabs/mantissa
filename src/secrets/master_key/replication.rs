@@ -4,6 +4,7 @@ use crate::store::local::MasterKeyRecord;
 use crate::store::replicated::secret_key_sync::{
     SecretMasterKeyCurrent, SecretMasterKeyStore, SecretMasterKeySyncRecord,
     current_from_descriptor, current_row_id, descriptor_row_id, grant_row_id, upsert_record,
+    upsert_records,
 };
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
@@ -65,19 +66,24 @@ impl SecretMasterKeyPublisher {
         record: &MasterKeyRecord,
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<()> {
-        let rows = {
-            let _guard = self.publish_gate.lock().await;
-            let mut rows = Vec::with_capacity(recipients.len().saturating_add(2));
-            self.append_missing_key_grants(&mut rows, record, recipients)?;
-            self.append_current_if_missing(
-                &mut rows,
-                &current_from_descriptor(&record.descriptor),
-            )?;
-            self.persist_and_notify_locked(&rows).await?;
-            rows
-        };
+        let rows = self.persist_current_key_rows(record, recipients).await?;
         self.gossip_records(rows);
         Ok(())
+    }
+
+    /// Persists transition current-key rows and lets MST synchronization distribute them.
+    ///
+    /// Split and merge operations may grant one key to many nodes. A gossip event per row would
+    /// multiply transport work across large clusters, while periodic MST synchronization already
+    /// transfers the same durable rows in batches.
+    pub async fn publish_transition_current_key(
+        &self,
+        record: &MasterKeyRecord,
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<usize> {
+        self.persist_current_key_rows(record, recipients)
+            .await
+            .map(|rows| rows.len())
     }
 
     /// Ensures current key rows exist and returns rows for latency-sensitive join seeding.
@@ -165,25 +171,24 @@ impl SecretMasterKeyPublisher {
         records: &[MasterKeyRecord],
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        let rows = {
-            let _guard = self.publish_gate.lock().await;
-            let mut rows = Vec::with_capacity(
-                records
-                    .len()
-                    .saturating_mul(recipients.len().saturating_add(1)),
-            );
-            for record in records {
-                self.append_missing_key_grants(&mut rows, record, recipients)?;
-            }
-            self.persist_and_notify_locked(&rows).await?;
-            rows
-        };
+        let rows = self.persist_key_grant_rows(records, recipients).await?;
         self.gossip_records(rows);
         Ok(())
+    }
+
+    /// Persists missing merge grants and lets MST synchronization distribute them.
+    ///
+    /// A compatible visible grant suppresses another write to its deterministic recipient row.
+    /// Returning the persisted row count also gives transition diagnostics and tests a direct
+    /// amplification signal without exposing encrypted grant contents.
+    pub async fn repair_key_grants(
+        &self,
+        records: &[MasterKeyRecord],
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<usize> {
+        self.persist_key_grant_rows(records, recipients)
+            .await
+            .map(|rows| rows.len())
     }
 
     /// Returns true when any descriptor or grant row for this key still needs publication.
@@ -206,17 +211,52 @@ impl SecretMasterKeyPublisher {
         Ok(false)
     }
 
+    /// Persists one current pointer and its missing grants under the shared publication gate.
+    async fn persist_current_key_rows(
+        &self,
+        record: &MasterKeyRecord,
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<Vec<SecretMasterKeySyncRecord>> {
+        let _guard = self.publish_gate.lock().await;
+        let mut rows = Vec::with_capacity(recipients.len().saturating_add(2));
+        self.append_missing_key_grants(&mut rows, record, recipients)?;
+        self.append_current_if_missing(&mut rows, &current_from_descriptor(&record.descriptor))?;
+        self.persist_and_notify_locked(&rows).await?;
+        Ok(rows)
+    }
+
+    /// Persists missing descriptor and recipient rows under the shared publication gate.
+    async fn persist_key_grant_rows(
+        &self,
+        records: &[MasterKeyRecord],
+        recipients: &[SecretMasterKeyGrantRecipient],
+    ) -> Result<Vec<SecretMasterKeySyncRecord>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _guard = self.publish_gate.lock().await;
+        let mut rows = Vec::with_capacity(
+            records
+                .len()
+                .saturating_mul(recipients.len().saturating_add(1)),
+        );
+        for record in records {
+            self.append_missing_key_grants(&mut rows, record, recipients)?;
+        }
+        self.persist_and_notify_locked(&rows).await?;
+        Ok(rows)
+    }
+
     /// Persists rows and wakes local reconcilers while the caller holds `publish_gate`.
     async fn persist_and_notify_locked(&self, records: &[SecretMasterKeySyncRecord]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
 
-        for record in records {
-            upsert_record(&self.sync_store, record.clone())
-                .await
-                .map_err(|error| anyhow!("upsert replicated master-key row: {error}"))?;
-        }
+        upsert_records(&self.sync_store, records.iter().cloned())
+            .await
+            .map_err(|error| anyhow!("upsert replicated master-key rows: {error}"))?;
         // Wake the reconciler even if it is already busy with a previous row. Master-key rows often
         // arrive descriptor/current first and grants later; dropping the later wake can leave the
         // local current stuck until an unrelated sync delta happens.

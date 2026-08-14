@@ -993,6 +993,71 @@ local_test!(publish_master_key_rows_skips_visible_grants_and_current, {
     assert_eq!(grant_count, 1);
 });
 
+local_test!(transition_master_key_rows_use_mst_sync_without_gossip, {
+    let node_id = Uuid::new_v4();
+    let local_dir = tempdir().expect("local master key dir");
+    let local_db = Arc::new(
+        redb::Database::create(local_dir.path().join("secret-master.redb"))
+            .expect("create local master key db"),
+    );
+    let secret_master_store = SecretMasterStore::new(
+        local_db,
+        Arc::new(PassphraseProvider::for_test().expect("test passphrase provider")),
+    )
+    .expect("open local master key store");
+    let current = secret_master_store
+        .ensure_current_for_node(ClusterViewId::legacy_default(), node_id)
+        .expect("ensure current master key");
+    let additional = secret_master_store
+        .prepare_rotation(ClusterViewId::legacy_default(), node_id, None)
+        .expect("prepare additional key");
+
+    let (gossip_tx, gossip_rx) = async_channel::unbounded::<Message>();
+    let sender_noise = Arc::new(NoiseKeys::from_private_bytes([9u8; 32]));
+    let (_master_key_replication_dir, _secret_master_keys, publisher) =
+        temp_master_key_replication(node_id, gossip_tx, sender_noise).await;
+    let recipients = [
+        SecretMasterKeyGrantRecipient {
+            node_id: Uuid::new_v4(),
+            noise_static_pub: NoiseKeys::from_private_bytes([11u8; 32]).public_bytes(),
+        },
+        SecretMasterKeyGrantRecipient {
+            node_id: Uuid::new_v4(),
+            noise_static_pub: NoiseKeys::from_private_bytes([13u8; 32]).public_bytes(),
+        },
+    ];
+
+    let current_rows = publisher
+        .publish_transition_current_key(&current, &recipients)
+        .await
+        .expect("publish transition current key");
+    assert_eq!(current_rows, 4, "descriptor, two grants, and current row");
+    assert_eq!(drain_master_key_gossip(&gossip_rx), 0);
+
+    let additional_rows = publisher
+        .repair_key_grants(std::slice::from_ref(&additional), &recipients)
+        .await
+        .expect("repair additional transition grants");
+    assert_eq!(additional_rows, 3, "descriptor and two additional grants");
+    assert_eq!(drain_master_key_gossip(&gossip_rx), 0);
+
+    assert_eq!(
+        publisher
+            .publish_transition_current_key(&current, &recipients)
+            .await
+            .expect("replay transition current key"),
+        0
+    );
+    assert_eq!(
+        publisher
+            .repair_key_grants(std::slice::from_ref(&additional), &recipients)
+            .await
+            .expect("replay additional transition grants"),
+        0
+    );
+    assert_eq!(drain_master_key_gossip(&gossip_rx), 0);
+});
+
 local_test!(
     publish_master_key_rows_accepts_a_compatible_grant_from_another_sender,
     {

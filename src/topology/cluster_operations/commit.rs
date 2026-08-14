@@ -19,6 +19,10 @@ use async_trait::async_trait;
 use mantissa_health::Status as HealthStatus;
 use mantissa_store::uuid_key::UuidKey;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::Duration;
+
+const MIN_MERGE_KEY_FALLBACK_DELAY: Duration = Duration::from_millis(25);
+const MAX_MERGE_KEY_FALLBACK_DELAY: Duration = Duration::from_secs(1);
 
 struct SplitSecretMasterKeyParticipant {
     topology: Topology,
@@ -200,7 +204,7 @@ impl Topology {
                 })?;
             self.stores
                 .secret_master_key_publisher
-                .publish_current_key(&record, &recipients)
+                .publish_transition_current_key(&record, &recipients)
                 .await
                 .map_err(|err| {
                     capnp::Error::failed(format!(
@@ -326,15 +330,16 @@ impl Topology {
                 })?
         };
 
-        let grant_publishers = participant.merge_key_grant_publishers(&recipients)?;
-        if !participant.local_node_should_publish_key_grants(&record.descriptor, &grant_publishers)
+        let preferred_publishers = participant.merge_key_preferred_publishers(&recipients)?;
+        if !participant
+            .local_node_is_preferred_key_publisher(&record.descriptor, &preferred_publishers)
         {
-            return Ok(false);
+            participant.wait_for_key_grant_fallback(operation.id).await;
         }
 
         self.stores
             .secret_master_key_publisher
-            .publish_current_key(&record, &recipients)
+            .publish_transition_current_key(&record, &recipients)
             .await
             .map_err(|err| capnp::Error::failed(format!("publish merge target key: {err}")))?;
         Ok(true)
@@ -389,7 +394,7 @@ impl ClusterTransitionParticipant for MergeSecretMasterKeyParticipant {
         "merge_secret_master_key"
     }
 
-    /// Cross-grants local keys and republishes the destination current when this node owns it.
+    /// Ensures local merge keys are grantable before adopting the destination current.
     async fn on_commit(
         &self,
         transition: &ClusterTransition,
@@ -415,50 +420,85 @@ impl ClusterTransitionParticipant for MergeSecretMasterKeyParticipant {
             .map_err(|err| {
                 capnp::Error::failed(format!("load local master-key metadata: {err}"))
             })?;
-        let grant_publishers = self.merge_key_grant_publishers(&recipients)?;
+        let preferred_publishers = self.merge_key_preferred_publishers(&recipients)?;
 
         let target_current = self.target_current_record(transition, &current)?;
-        let publishes_target_current = target_current.as_ref().is_some_and(|record| {
-            self.local_node_should_publish_key_grants(&record.descriptor, &grant_publishers)
-        });
-        let current_action = match (target_current.as_ref(), publishes_target_current) {
-            (Some(_), true) => "reused_published",
-            (Some(_), false) => "reused_observed",
-            (None, false) => "awaiting_destination_current",
-            (None, true) => "awaiting_destination_current",
+        let current_action = match target_current.as_ref() {
+            Some(_) => "reused_observed",
+            None => "awaiting_destination_current",
         };
         let mut referenced_key_ids = self.referenced_secret_master_key_ids()?;
         if let Some(record) = target_current.as_ref() {
             referenced_key_ids.insert(record.key_id());
         }
-        let grant_records = self.master_key_records_needing_grants(
+        let missing_records = self.master_key_records_needing_grants(
             &descriptors,
             &recipients,
             target_current.as_ref(),
             &referenced_key_ids,
-            &grant_publishers,
         )?;
 
-        // Publish historical grants before the merge current pointer. If this
-        // hook crashes midway, startup replay can safely repeat the grant
-        // publication and then expose the current row once all known keys are
-        // grantable to the merged peer set.
-        self.topology
+        let mut preferred_records = Vec::new();
+        let mut fallback_records = Vec::new();
+        for record in missing_records {
+            if self.local_node_is_preferred_key_publisher(&record.descriptor, &preferred_publishers)
+            {
+                preferred_records.push(record);
+            } else {
+                fallback_records.push(record);
+            }
+        }
+
+        let mut grant_rows_written = self
+            .topology
             .stores
             .secret_master_key_publisher
-            .publish_key_grants(&grant_records, &recipients)
+            .repair_key_grants(&preferred_records, &recipients)
             .await
-            .map_err(|err| capnp::Error::failed(format!("publish merge key grants: {err}")))?;
+            .map_err(|err| capnp::Error::failed(format!("repair preferred merge grants: {err}")))?;
 
-        if let Some(record) = target_current.as_ref().filter(|_| publishes_target_current) {
-            self.topology
-                .stores
-                .secret_master_key_publisher
-                .publish_current_key(record, &recipients)
-                .await
-                .map_err(|err| {
-                    capnp::Error::failed(format!("publish merge master key current: {err}"))
-                })?;
+        if !fallback_records.is_empty() {
+            self.wait_for_key_grant_fallback(transition.operation_id)
+                .await;
+            let mut still_missing_fallback = Vec::with_capacity(fallback_records.len());
+            for record in fallback_records {
+                let still_missing = self
+                    .topology
+                    .stores
+                    .secret_master_key_publisher
+                    .key_grants_need_publication(&record.descriptor, &recipients)
+                    .map_err(|err| {
+                        capnp::Error::failed(format!(
+                            "recheck fallback merge master-key grants: {err}"
+                        ))
+                    })?;
+                if still_missing {
+                    still_missing_fallback.push(record);
+                }
+            }
+            grant_rows_written = grant_rows_written.saturating_add(
+                self.topology
+                    .stores
+                    .secret_master_key_publisher
+                    .repair_key_grants(&still_missing_fallback, &recipients)
+                    .await
+                    .map_err(|err| {
+                        capnp::Error::failed(format!("repair fallback merge grants: {err}"))
+                    })?,
+            );
+        }
+
+        let still_missing = self.master_key_records_needing_grants(
+            &descriptors,
+            &recipients,
+            target_current.as_ref(),
+            &referenced_key_ids,
+        )?;
+        if !still_missing.is_empty() {
+            return Err(capnp::Error::failed(format!(
+                "{} referenced merge master key(s) still lack recipient grants",
+                still_missing.len()
+            )));
         }
 
         let adopted_current = self.adopt_merge_target_current(transition).await?;
@@ -468,7 +508,7 @@ impl ClusterTransitionParticipant for MergeSecretMasterKeyParticipant {
             .add_detail("recipient_count", recipients.len().to_string())
             .add_detail("local_key_count", descriptors.len().to_string())
             .add_detail("referenced_key_count", referenced_key_ids.len().to_string())
-            .add_detail("granted_key_count", grant_records.len().to_string())
+            .add_detail("grant_rows_written", grant_rows_written.to_string())
             .add_detail("current_action", current_action.to_string());
         report = report
             .add_detail("key_id", adopted_current.key_id().to_string())
@@ -607,11 +647,12 @@ impl MergeSecretMasterKeyParticipant {
         Ok(key_ids)
     }
 
-    /// Selects one live publisher for every locally provisioned merge key.
+    /// Selects one preferred publisher for every locally provisioned merge key.
     ///
-    /// A live creator wins. Otherwise the lowest live grant recipient repairs the missing rows.
-    /// Existing compatible recipient grants suppress duplicate publication by another holder.
-    fn merge_key_grant_publishers(
+    /// The immutable creator wins when it remains in the merged recipient set. Otherwise the
+    /// lowest existing grant recipient is preferred. This only limits duplicate work: every other
+    /// holder becomes eligible after a bounded delay and grant completeness gates local commit.
+    fn merge_key_preferred_publishers(
         &self,
         recipients: &[SecretMasterKeyGrantRecipient],
     ) -> Result<BTreeMap<uuid::Uuid, uuid::Uuid>, capnp::Error> {
@@ -619,14 +660,13 @@ impl MergeSecretMasterKeyParticipant {
             .iter()
             .map(|recipient| recipient.node_id)
             .collect::<HashSet<_>>();
-        let health = self.topology.deps.health_monitor.snapshot();
         let (rows, _) = self
             .topology
             .stores
             .secret_master_keys
             .load_all()
             .map_err(|err| capnp::Error::failed(format!("load replicated key grants: {err}")))?;
-        let mut live_creator_publishers = BTreeMap::new();
+        let mut creator_publishers = BTreeMap::new();
         let mut fallback_publishers = BTreeMap::new();
 
         for (_, snapshot) in rows {
@@ -634,22 +674,14 @@ impl MergeSecretMasterKeyParticipant {
                 match record {
                     crate::store::replicated::secret_key_sync::SecretMasterKeySyncRecord::Descriptor(
                         descriptor,
-                    ) if recipient_ids.contains(&descriptor.created_by_node_id)
-                        && !matches!(
-                            health.get(&descriptor.created_by_node_id),
-                            Some(HealthStatus::Down)
-                        ) =>
+                    ) if recipient_ids.contains(&descriptor.created_by_node_id) =>
                     {
-                        live_creator_publishers
+                        creator_publishers
                             .insert(descriptor.key_id, descriptor.created_by_node_id);
                     }
                     crate::store::replicated::secret_key_sync::SecretMasterKeySyncRecord::Grant(
                         grant,
-                    ) if recipient_ids.contains(&grant.recipient_node_id)
-                        && !matches!(
-                            health.get(&grant.recipient_node_id),
-                            Some(HealthStatus::Down)
-                        ) =>
+                    ) if recipient_ids.contains(&grant.recipient_node_id) =>
                     {
                         fallback_publishers
                             .entry(grant.descriptor.key_id)
@@ -663,24 +695,47 @@ impl MergeSecretMasterKeyParticipant {
             }
         }
 
-        fallback_publishers.extend(live_creator_publishers);
+        fallback_publishers.extend(creator_publishers);
         Ok(fallback_publishers)
     }
 
-    /// Returns whether this node is the selected live grant holder for one key.
-    fn local_node_should_publish_key_grants(
+    /// Returns whether this node is the preferred first publisher for one key.
+    fn local_node_is_preferred_key_publisher(
         &self,
         descriptor: &MasterKeyDescriptor,
-        grant_publishers: &BTreeMap<uuid::Uuid, uuid::Uuid>,
+        preferred_publishers: &BTreeMap<uuid::Uuid, uuid::Uuid>,
     ) -> bool {
-        grant_publishers
+        preferred_publishers
             .get(&descriptor.key_id)
             .copied()
-            // A locally held key without any surviving replicated grant evidence is rare. Let its
-            // holder repair rows. Concurrent holders may duplicate work but cannot choose
-            // different plaintext because descriptors and envelopes are verified on import.
+            // A local key without replicated holder evidence must remain repairable. Concurrent
+            // envelopes remain compatible because import verifies the descriptor and plaintext;
+            // compaction retains one value at the deterministic recipient row.
             .unwrap_or(self.topology.local.node.id)
             == self.topology.local.node.id
+    }
+
+    /// Waits long enough for the preferred publisher's MST rows before attempting fallback work.
+    ///
+    /// The delay is derived only from local timing and immutable ids. It never decides correctness:
+    /// after it expires, any holder may fill rows that are still absent. A small deterministic
+    /// spread prevents all fallback holders from waking at exactly the same instant.
+    async fn wait_for_key_grant_fallback(&self, operation_id: uuid::Uuid) {
+        let base_delay = self
+            .topology
+            .global_metadata_sync_interval()
+            .clamp(MIN_MERGE_KEY_FALLBACK_DELAY, MAX_MERGE_KEY_FALLBACK_DELAY);
+        let base_delay_ms = match u64::try_from(base_delay.as_millis()) {
+            Ok(base_delay_ms) => base_delay_ms,
+            Err(_) => return,
+        };
+        let mixed = operation_id.as_u128() ^ self.topology.local.node.id.as_u128();
+        let folded = (mixed as u64) ^ ((mixed >> 64) as u64);
+        let jitter_ms = base_delay_ms.saturating_mul(folded % 16) / 16;
+        tokio::time::sleep(Duration::from_millis(
+            base_delay_ms.saturating_add(jitter_ms),
+        ))
+        .await;
     }
 
     /// Loads plaintext only for local keys whose replicated grant rows are still missing.
@@ -690,14 +745,10 @@ impl MergeSecretMasterKeyParticipant {
         recipients: &[SecretMasterKeyGrantRecipient],
         cached_current: Option<&MasterKeyRecord>,
         referenced_key_ids: &HashSet<uuid::Uuid>,
-        grant_publishers: &BTreeMap<uuid::Uuid, uuid::Uuid>,
     ) -> Result<Vec<MasterKeyRecord>, capnp::Error> {
         let mut records = Vec::new();
         for descriptor in descriptors {
             if !referenced_key_ids.contains(&descriptor.key_id) {
-                continue;
-            }
-            if !self.local_node_should_publish_key_grants(descriptor, grant_publishers) {
                 continue;
             }
 

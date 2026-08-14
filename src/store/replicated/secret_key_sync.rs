@@ -226,6 +226,27 @@ pub async fn upsert_record(
     }
 }
 
+/// Upserts replicated master-key rows in one durable transaction.
+pub async fn upsert_records(
+    store: &SecretMasterKeyStoreInner,
+    records: impl IntoIterator<Item = SecretMasterKeySyncRecord>,
+) -> mantissa_store::Result<()> {
+    store
+        .upsert_many(records.into_iter().map(|record| {
+            let row_id = match &record {
+                SecretMasterKeySyncRecord::Descriptor(descriptor) => {
+                    descriptor_row_id(descriptor.key_id)
+                }
+                SecretMasterKeySyncRecord::Grant(grant) => {
+                    grant_row_id(grant.descriptor.key_id, grant.recipient_node_id)
+                }
+                SecretMasterKeySyncRecord::Current(current) => current_row_id(current.scope_view),
+            };
+            (UuidKey::from(row_id), record)
+        }))
+        .await
+}
+
 /// Reads the deterministic current-key winner for one scope, if any row exists.
 pub fn current_for_scope(
     store: &SecretMasterKeyStoreInner,

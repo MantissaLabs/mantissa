@@ -488,13 +488,18 @@ impl Topology {
         operation: &ClusterOperationRecord,
     ) -> Result<HashSet<ClusterViewId>, capnp::Error> {
         let mut retired = HashSet::new();
-        let operation_key = operation.lineage_order_key();
-        for candidate in self.load_cluster_operations()? {
-            if candidate.id == operation.id
-                || candidate.dry_run
-                || candidate.kind != ClusterOperationKind::Merge
-                || candidate.lineage_order_key() >= operation_key
-            {
+        let mut operations = self.load_cluster_operations()?;
+        if !operations
+            .iter()
+            .any(|candidate| candidate.id == operation.id)
+        {
+            operations.push(operation.clone());
+        }
+        for candidate in Self::order_cluster_operations_by_dependency(operations) {
+            if candidate.id == operation.id {
+                break;
+            }
+            if candidate.dry_run || candidate.kind != ClusterOperationKind::Merge {
                 continue;
             }
             if matches!(
@@ -505,6 +510,42 @@ impl Topology {
             }
         }
         Ok(retired)
+    }
+
+    /// Orders operations so dependencies come first and unrelated rows remain stable.
+    ///
+    /// Wall clocks and operation ids only provide a tie-breaker for independent work. They cannot
+    /// place a chained operation before a dependency, because doing so can make the dependency's
+    /// destination look retired before the local node has entered it.
+    fn order_cluster_operations_by_dependency(
+        mut pending: Vec<ClusterOperationRecord>,
+    ) -> Vec<ClusterOperationRecord> {
+        pending.sort_by_key(ClusterOperationRecord::lineage_order_key);
+        let known_ids = pending
+            .iter()
+            .map(|operation| operation.id)
+            .collect::<HashSet<_>>();
+        let mut ordered_ids = HashSet::with_capacity(pending.len());
+        let mut ordered = Vec::with_capacity(pending.len());
+
+        while !pending.is_empty() {
+            let next = pending.iter().position(|operation| {
+                operation.dependency_operation_ids.iter().all(|dependency| {
+                    !known_ids.contains(dependency) || ordered_ids.contains(dependency)
+                })
+            });
+            let Some(next) = next else {
+                // Cycles are rejected while operations are non-terminal. Keep corrupt terminal
+                // history deterministic here so reconciliation remains bounded.
+                ordered.extend(pending);
+                break;
+            };
+            let operation = pending.remove(next);
+            ordered_ids.insert(operation.id);
+            ordered.push(operation);
+        }
+
+        ordered
     }
 
     /// Returns the local state of every immutable causal dependency.
@@ -1326,8 +1367,8 @@ impl Topology {
             );
         }
 
-        let mut operations = self.load_cluster_operations()?;
-        operations.sort_by_key(ClusterOperationRecord::lineage_order_key);
+        let operations =
+            Self::order_cluster_operations_by_dependency(self.load_cluster_operations()?);
 
         for operation in &operations {
             let _ = self
@@ -1691,6 +1732,32 @@ mod tests {
     use crate::cluster::operations::{SplitNetworkPolicy, SplitServicePolicy};
     use tokio::time::{Duration, timeout};
 
+    /// Builds one finalized merge row for causal-order tests.
+    fn finalized_merge_operation(
+        id: u128,
+        created_at_unix_ms: u64,
+        dependencies: &[u128],
+    ) -> ClusterOperationRecord {
+        ClusterOperationRecord {
+            id: Uuid::from_u128(id),
+            submitted_by_node_id: Uuid::from_u128(id),
+            kind: ClusterOperationKind::Merge,
+            stage: ClusterOperationStage::Finalized,
+            dry_run: false,
+            created_at_unix_ms,
+            dependency_operation_ids: dependencies.iter().copied().map(Uuid::from_u128).collect(),
+            source_views: Vec::new(),
+            target_views: Vec::new(),
+            target_cluster_names: Vec::new(),
+            split_assignments: Vec::new(),
+            split_service_policy: Default::default(),
+            split_network_policy: Default::default(),
+            merge_service_policy: Default::default(),
+            updated_at_unix_ms: created_at_unix_ms,
+            details: String::new(),
+        }
+    }
+
     /// Builds a transition with the requested kind and merge service policy.
     fn transition(
         kind: ClusterOperationKind,
@@ -1778,6 +1845,27 @@ mod tests {
         };
 
         assert_eq!(Topology::operation_cluster_name_timestamp(&operation), 10);
+    }
+
+    /// Ensures clock order cannot place a chained merge before its explicit dependency.
+    #[test]
+    fn cluster_operation_order_keeps_dependencies_first() {
+        let dependency = finalized_merge_operation(2, 30, &[]);
+        let chained = finalized_merge_operation(3, 20, &[2]);
+        let independent = finalized_merge_operation(1, 10, &[]);
+
+        let ordered = Topology::order_cluster_operations_by_dependency(vec![
+            dependency,
+            chained,
+            independent,
+        ]);
+        assert_eq!(
+            ordered
+                .into_iter()
+                .map(|operation| operation.id)
+                .collect::<Vec<_>>(),
+            [1, 2, 3].map(Uuid::from_u128).to_vec()
+        );
     }
 
     /// Ensures committed operations cannot be overwritten by late stale-precondition aborts.

@@ -55,6 +55,11 @@ impl Topology {
         self.runtime.metadata_sync.set_interval(d);
     }
 
+    /// Returns the interval used to spread cluster-wide transition metadata.
+    pub(super) fn global_metadata_sync_interval(&self) -> Duration {
+        self.runtime.metadata_sync.interval()
+    }
+
     /// Set metadata sync fanout (`0` means sync metadata against all known peers per tick).
     pub fn set_global_metadata_sync_fanout(&self, fanout: usize) {
         self.runtime.metadata_sync.set_fanout(fanout);
