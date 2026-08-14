@@ -8,11 +8,13 @@ use capnp::Error;
 use mantissa_protocol::secrets::{
     secret_master_key_current, secret_master_key_grant, secret_master_key_sync_record,
 };
-use mantissa_store::adapter::{CompactingStoreMvRegAdapterSorted, MvRegCompactionRanker};
+use mantissa_store::adapter::{
+    MvRegCompactionPolicy, MvRegCompactionRanker, RankedMvRegCompaction, StoreMvRegAdapterSorted,
+};
 use mantissa_store::codec::StoreValueCodec;
 use mantissa_store::hash::XXHash128;
 use mantissa_store::mst_store::CrdtMstStore;
-use mantissa_store::mvreg::{MvRegEntry, MvRegSnapshot};
+use mantissa_store::mvreg::{MvReg, MvRegEntry, MvRegSnapshot};
 use mantissa_store::table_set::TableSet;
 use mantissa_store::uuid_key::UuidKey;
 use std::io;
@@ -143,13 +145,58 @@ impl MvRegCompactionRanker<SecretMasterKeySyncRecord, Uuid> for SecretMasterKeyC
     }
 }
 
+/// Compaction policy for replicated secret-master-key rows.
+pub struct SecretMasterKeyCompaction;
+
+impl MvRegCompactionPolicy<SecretMasterKeySyncRecord, Uuid> for SecretMasterKeyCompaction {
+    /// Applies the configured background limit using master-key row precedence.
+    fn compact(
+        reg: MvReg<SecretMasterKeySyncRecord, Uuid>,
+        max_values: usize,
+    ) -> mantissa_store::Result<Option<MvReg<SecretMasterKeySyncRecord, Uuid>>> {
+        RankedMvRegCompaction::<SecretMasterKeyCompactionRank>::compact(reg, max_values)
+    }
+
+    /// Collapses concurrent envelopes that grant the same key to the same recipient.
+    fn compact_after_merge(
+        mut reg: MvReg<SecretMasterKeySyncRecord, Uuid>,
+    ) -> MvReg<SecretMasterKeySyncRecord, Uuid> {
+        collapse_grants_for_same_key_and_recipient(&mut reg);
+        reg
+    }
+}
+
 /// Store adapter for replicated secret-master-key rows.
-pub type SecretMasterKeyRegAdapter = CompactingStoreMvRegAdapterSorted<
-    UuidKey,
-    SecretMasterKeySyncRecord,
-    Uuid,
-    SecretMasterKeyCompactionRank,
->;
+pub type SecretMasterKeyRegAdapter =
+    StoreMvRegAdapterSorted<UuidKey, SecretMasterKeySyncRecord, Uuid, SecretMasterKeyCompaction>;
+
+/// Keeps one deterministic envelope when concurrent writers grant the same key.
+///
+/// A failed preferred writer can make several fallback holders publish at once.
+/// Their ciphertext differs because encryption uses fresh randomness, but every
+/// envelope is interchangeable when its descriptor, recipient, and recipient
+/// key match. Absorbing the discarded clocks prevents stale peers from restoring
+/// the duplicate values later. Conflicting row kinds or grant identities remain
+/// visible for validation instead of being hidden by this repair rule.
+fn collapse_grants_for_same_key_and_recipient(reg: &mut MvReg<SecretMasterKeySyncRecord, Uuid>) {
+    let Some(first_entry) = reg.entries().first() else {
+        return;
+    };
+    let SecretMasterKeySyncRecord::Grant(first) = first_entry.value() else {
+        return;
+    };
+    let same_key_and_recipient = reg.entries().iter().all(|entry| {
+        let SecretMasterKeySyncRecord::Grant(candidate) = entry.value() else {
+            return false;
+        };
+        candidate.descriptor == first.descriptor
+            && candidate.recipient_node_id == first.recipient_node_id
+            && candidate.recipient_noise_static_pub == first.recipient_noise_static_pub
+    });
+    if same_key_and_recipient {
+        let _ = reg.compact_with(1, SecretMasterKeyCompactionRank::rank);
+    }
+}
 
 /// MST-backed CRDT store for replicated master-key descriptors, grants, and current pointers.
 pub type SecretMasterKeyStoreInner =
@@ -559,13 +606,16 @@ fn secret_master_key_store_codec_error<E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::{
-        SecretMasterKeyCurrent, SecretMasterKeyGrant, SecretMasterKeySyncRecord, current_for_scope,
-        current_row_id, current_supersedes, descriptor_row_id, grant_row_id,
-        open_secret_master_key_store, upsert_current, upsert_descriptor, upsert_grant,
+        SecretMasterKeyCurrent, SecretMasterKeyGrant, SecretMasterKeyRegAdapter,
+        SecretMasterKeySyncRecord, current_for_scope, current_row_id, current_supersedes,
+        descriptor_row_id, grant_row_id, open_secret_master_key_store, upsert_current,
+        upsert_descriptor, upsert_grant,
     };
     use crate::cluster::ClusterViewId;
     use crate::secrets::master_key::envelope::{MASTER_KEY_SIZE, MasterKeyDescriptor};
+    use mantissa_store::adapter::RegAdapter;
     use mantissa_store::codec::StoreValueCodec;
+    use mantissa_store::mvreg::MvReg;
     use mantissa_store::uuid_key::UuidKey;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -596,6 +646,30 @@ mod tests {
             nonce: [4u8; 24],
             ciphertext: vec![5u8; 48],
         }
+    }
+
+    /// Builds a distinct envelope for the same key and recipient.
+    fn grant_from_sender(
+        key_id: Uuid,
+        recipient_node_id: Uuid,
+        sender_node_id: Uuid,
+        marker: u8,
+    ) -> SecretMasterKeyGrant {
+        let mut grant = grant(key_id, recipient_node_id);
+        grant.sender_node_id = sender_node_id;
+        grant.sender_noise_static_pub = [marker; MASTER_KEY_SIZE];
+        grant.transfer_public_key = [marker.saturating_add(1); MASTER_KEY_SIZE];
+        grant.nonce = [marker.saturating_add(2); 24];
+        grant.ciphertext = vec![marker.saturating_add(3); 48];
+        grant
+    }
+
+    /// Builds one single-write register for adapter merge tests.
+    fn grant_reg(
+        actor: Uuid,
+        grant: SecretMasterKeyGrant,
+    ) -> MvReg<SecretMasterKeySyncRecord, Uuid> {
+        SecretMasterKeyRegAdapter::upsert_reg(None, &actor, SecretMasterKeySyncRecord::Grant(grant))
     }
 
     /// Builds one deterministic current pointer for selection tests.
@@ -653,6 +727,50 @@ mod tests {
         assert_ne!(descriptor_row_id(key_id), grant_row_id(key_id, recipient));
         assert_ne!(descriptor_row_id(key_id), current_row_id(view));
         assert_ne!(grant_row_id(key_id, recipient), current_row_id(view));
+    }
+
+    /// Concurrent grants for the same key and recipient must converge without store GC.
+    #[test]
+    fn grants_for_same_key_and_recipient_collapse_during_merge() {
+        let key_id = Uuid::from_u128(210);
+        let recipient = Uuid::from_u128(211);
+        let left = grant_reg(
+            Uuid::from_u128(212),
+            grant_from_sender(key_id, recipient, Uuid::from_u128(212), 10),
+        );
+        let right = grant_reg(
+            Uuid::from_u128(213),
+            grant_from_sender(key_id, recipient, Uuid::from_u128(213), 20),
+        );
+
+        let left_then_right =
+            SecretMasterKeyRegAdapter::merge_regs(Some(left.clone()), right.clone());
+        let right_then_left = SecretMasterKeyRegAdapter::merge_regs(Some(right), left.clone());
+
+        assert_eq!(left_then_right, right_then_left);
+        assert_eq!(left_then_right.entries().len(), 1);
+
+        let after_stale_replay =
+            SecretMasterKeyRegAdapter::merge_regs(Some(left_then_right.clone()), left);
+        assert_eq!(after_stale_replay, left_then_right);
+    }
+
+    /// Conflicting recipient identities must remain visible for validation.
+    #[test]
+    fn conflicting_grants_remain_visible_during_merge() {
+        let key_id = Uuid::from_u128(220);
+        let recipient = Uuid::from_u128(221);
+        let left = grant_reg(
+            Uuid::from_u128(222),
+            grant_from_sender(key_id, recipient, Uuid::from_u128(222), 10),
+        );
+        let mut conflicting = grant_from_sender(key_id, recipient, Uuid::from_u128(223), 20);
+        conflicting.recipient_noise_static_pub = [99; MASTER_KEY_SIZE];
+        let right = grant_reg(Uuid::from_u128(223), conflicting);
+
+        let merged = SecretMasterKeyRegAdapter::merge_regs(Some(left), right);
+
+        assert_eq!(merged.entries().len(), 2);
     }
 
     /// Current row precedence should be deterministic across insertion orders.

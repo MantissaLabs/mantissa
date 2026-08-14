@@ -83,6 +83,11 @@ where
 {
     /// Returns a compacted register when this policy wants to rewrite the row.
     fn compact(reg: MvReg<V, A>, max_values: usize) -> crate::Result<Option<MvReg<V, A>>>;
+
+    /// Applies deterministic domain compaction after local and remote state merge.
+    fn compact_after_merge(reg: MvReg<V, A>) -> MvReg<V, A> {
+        reg
+    }
 }
 
 /// Default no-op compaction policy for domains that have not opted in.
@@ -173,12 +178,13 @@ where
     }
 
     fn merge_regs(current: Option<Self::Reg>, incoming: Self::Reg) -> Self::Reg {
-        match current {
+        let merged = match current {
             Some(mut current) => {
                 current.merge(incoming);
                 current
             }
             None => incoming,
-        }
+        };
+        C::compact_after_merge(merged)
     }
 }
