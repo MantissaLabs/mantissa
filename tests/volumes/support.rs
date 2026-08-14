@@ -254,6 +254,7 @@ pub(crate) const REAL_REPLICATED_VOLUME_EXPANDED_BYTES: u64 = 12 << 30;
 pub(crate) const REAL_REPLICATED_VOLUME_BUSY_EXPANDED_BYTES: u64 = 14 << 30;
 pub(crate) const REAL_REPLICATED_VOLUME_UNAVAILABLE_EXPANSION_BYTES: u64 = 1 << 40;
 pub(crate) const PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const REPLACEMENT_PUBLIC_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const REPLICATED_VOLUME_TEST_NODE_COUNT: usize = 5;
 pub(crate) const TEST_REPLICA_FAILURE_GRACE_MS: u64 = 15_000;
 pub(crate) const TEST_REPLICA_FAILURE_GRACE: Duration =
@@ -2156,7 +2157,18 @@ pub(crate) async fn wait_for_replica_replacement(
     expected_node_count: usize,
     timeout: Duration,
 ) -> anyhow::Result<ReplicaReplacementResult> {
-    let deadline = Instant::now() + timeout;
+    let descriptor = cluster
+        .first()
+        .context("replica replacement has no running node")?
+        .node
+        .volume_registry
+        .get_plan(volume_id)?
+        .context("replica replacement has no volume plan")?
+        .descriptor
+        .to_storage()?;
+    let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
+    let replacement_deadline = Instant::now() + timeout;
+    let mut status_deadline = None;
     let mut poll = tokio::time::interval(Duration::from_millis(200));
     let mut next_api_check = Instant::now();
     let mut api_latencies = Vec::new();
@@ -2170,6 +2182,7 @@ pub(crate) async fn wait_for_replica_replacement(
                 .context("read control state while waiting for replica replacement")?
                 && matches!(group.status, VolumeStatus::Ready | VolumeStatus::InUse)
                 && group.copy_node_ids.len() == 3
+                && group.voter_node_ids == group.copy_node_ids
                 && group.replacement_id.is_none()
                 && !group.copy_node_ids.contains(&old_node_id)
             {
@@ -2194,7 +2207,33 @@ pub(crate) async fn wait_for_replica_replacement(
             api_latencies.push(api_started.elapsed());
             next_api_check = Instant::now() + Duration::from_secs(1);
         }
-        if Instant::now() >= deadline {
+
+        let mut applied_nodes = Vec::new();
+        for node in cluster {
+            if node
+                .node
+                .replicated_volume_replacement_is_applied_for_test(key, old_node_id)?
+            {
+                applied_nodes.push(node.id());
+            }
+        }
+        let now = Instant::now();
+        if status_deadline.is_none() && applied_nodes.len() >= 2 {
+            status_deadline = Some(now + REPLACEMENT_PUBLIC_STATUS_TIMEOUT);
+        }
+        let timeout_reason = match status_deadline {
+            Some(deadline) if now >= deadline => Some(format!(
+                "replicated volume committed the replacement for node {old_node_id}, but its \
+                 public status did not converge within \
+                 {REPLACEMENT_PUBLIC_STATUS_TIMEOUT:?}; applied nodes: {applied_nodes:?}"
+            )),
+            None if now >= replacement_deadline => Some(format!(
+                "replicated volume did not commit a replacement for node {old_node_id} within \
+                 {timeout:?}; applied nodes: {applied_nodes:?}"
+            )),
+            Some(_) | None => None,
+        };
+        if let Some(timeout_reason) = timeout_reason {
             let group_rows = cluster
                 .iter()
                 .map(|node| {
@@ -2210,7 +2249,7 @@ pub(crate) async fn wait_for_replica_replacement(
                 .map(|node| (node.id(), node.node.registry.health_monitor().snapshot()))
                 .collect::<Vec<_>>();
             anyhow::bail!(
-                "replicated volume did not replace node {old_node_id}; running nodes: {:?}; \
+                "{timeout_reason}; running nodes: {:?}; \
                  group rows: {group_rows:#?}; local: {local:#?}; health: {health:#?}",
                 cluster.iter().map(TestNode::id).collect::<Vec<_>>()
             );

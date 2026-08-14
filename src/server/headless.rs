@@ -810,6 +810,34 @@ impl HeadlessNode {
         }
     }
 
+    /// Reports whether a replacement is committed in this test node's local Raft state.
+    #[doc(hidden)]
+    pub fn replicated_volume_replacement_is_applied_for_test(
+        &self,
+        key: mantissa_volume::catalog::ReplicaKey,
+        old_node_id: Uuid,
+    ) -> io::Result<bool> {
+        let Some(runtime) = self.replicated_volumes.as_ref() else {
+            return Ok(false);
+        };
+        let Some(state) = runtime.applied_state(key).map_err(to_io)? else {
+            return Ok(false);
+        };
+        let Some(data) = state.data() else {
+            return Ok(false);
+        };
+        let copies = data
+            .copies
+            .iter()
+            .map(|node_id| *node_id.as_uuid())
+            .collect::<std::collections::BTreeSet<_>>();
+        let voters = runtime.saved_membership(key).map_err(to_io)?;
+        Ok(state.replacement().is_none()
+            && copies.len() == 3
+            && !copies.contains(&old_node_id)
+            && copies == voters)
+    }
+
     /// Attempts one read-only replica RPC for cluster-view transport tests.
     #[doc(hidden)]
     pub async fn inspect_replicated_volume_replica_for_test(
