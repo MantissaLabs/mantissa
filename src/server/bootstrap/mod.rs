@@ -10,6 +10,7 @@ use tracing::{info, warn};
 pub(crate) use context::BootstrapContext;
 pub(crate) use runtime::{
     BootedRuntime, BootstrapOptions, ReplicatedVolumeStartup, RuntimeTaskHandles, boot,
+    boot_with_replicated_volume_listener,
 };
 
 pub(crate) type BootstrapResult<T> = Result<T, Box<dyn std::error::Error>>;

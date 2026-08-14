@@ -306,7 +306,6 @@ pub(crate) struct ReplicatedVolumeTestNodeState {
     noise_keys: Arc<NoiseKeys>,
     signing_key: ed25519_dalek::SigningKey,
     pub(crate) node_root: PathBuf,
-    storage_address: String,
     driver_limits: ReplicatedVolumeTestDriverLimits,
     storage_limits: ReplicatedVolumeTestStorageLimits,
     runtime: Arc<RecordingRuntimeBackend>,
@@ -315,7 +314,13 @@ pub(crate) struct ReplicatedVolumeTestNodeState {
 impl ReplicatedVolumeTestNodeState {
     /// Starts or restarts the real headless node described by this saved test state.
     async fn start(&self) -> anyhow::Result<TestNode> {
-        let node = HeadlessNode::new_with(
+        let storage_listener = TcpListener::bind("127.0.0.1:0")
+            .context("bind replicated-volume test storage listener")?;
+        let storage_address = storage_listener
+            .local_addr()
+            .context("read replicated-volume test storage address")?
+            .to_string();
+        let node = HeadlessNode::new_with_replicated_volume_listener(
             Arc::clone(&self.database),
             self.node_id,
             HeadlessKeys::new(Arc::clone(&self.noise_keys), self.signing_key.clone()),
@@ -335,12 +340,13 @@ impl ReplicatedVolumeTestNodeState {
                 local_volume_root: Some(self.node_root.join("local-volumes")),
                 replicated_volumes: Some(replicated_volume_test_config_with_driver_limits(
                     &self.node_root,
-                    self.storage_address.clone(),
+                    storage_address,
                     self.driver_limits,
                     self.storage_limits,
                 )),
                 ..HeadlessConfig::default()
             },
+            storage_listener,
         )
         .await
         .map_err(|error| {
@@ -691,12 +697,6 @@ pub(crate) async fn measure_pgbench(
     parse_pgbench(&output, started.elapsed())
 }
 
-/// Reserves an unused loopback address for one test storage listener.
-pub(crate) fn unused_storage_address() -> anyhow::Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.to_string())
-}
-
 /// Builds settings with exact driver limits for one measured comparison.
 pub(crate) fn replicated_volume_test_config_with_driver_limits(
     node_root: &Path,
@@ -868,7 +868,6 @@ pub(crate) async fn start_replicated_volume_test_cluster_with_node_count(
             noise_keys,
             signing_key,
             node_root,
-            storage_address: unused_storage_address()?,
             driver_limits,
             storage_limits,
             runtime,

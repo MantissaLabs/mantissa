@@ -378,6 +378,19 @@ where
 
     /// Binds the private address and starts the shared network worker.
     pub fn start_listening(&self) -> Result<(), TransportError> {
+        self.start_listening_with(None)
+    }
+
+    /// Starts the shared network worker on a listener already bound by the caller.
+    pub fn start_listening_on(&self, listener: StandardTcpListener) -> Result<(), TransportError> {
+        self.start_listening_with(Some(listener))
+    }
+
+    /// Starts the shared worker with either a new or caller-owned listener.
+    fn start_listening_with(
+        &self,
+        listener: Option<StandardTcpListener>,
+    ) -> Result<(), TransportError> {
         let mut waiting_worker = self.waiting_worker.lock();
         let mut shutdown_state = self.shutdown.lock();
         if shutdown_state.completion.is_some() {
@@ -390,11 +403,21 @@ where
             .as_ref()
             .map(|worker| worker.listen_address)
             .ok_or(TransportError::Stopped)?;
-        let listener = StandardTcpListener::bind(listen_address).map_err(TransportError::Bind)?;
+        let prebound = listener.is_some();
+        let listener = match listener {
+            Some(listener) => listener,
+            None => StandardTcpListener::bind(listen_address).map_err(TransportError::Bind)?,
+        };
+        let local_address = listener.local_addr().map_err(TransportError::Bind)?;
+        if prebound && listen_address != local_address {
+            return Err(TransportError::Bind(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("pre-bound Raft listener uses {local_address}, expected {listen_address}"),
+            )));
+        }
         listener
             .set_nonblocking(true)
             .map_err(TransportError::Bind)?;
-        let local_address = listener.local_addr().map_err(TransportError::Bind)?;
         let stream_runtime = if self.shared.stream_application.is_some() {
             Some(
                 tokio::runtime::Builder::new_multi_thread()

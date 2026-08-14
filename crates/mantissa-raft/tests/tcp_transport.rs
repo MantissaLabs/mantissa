@@ -705,6 +705,40 @@ async fn prepared_transport_does_not_bind_until_started() {
     );
 }
 
+#[tokio::test]
+async fn prepared_transport_accepts_a_prebound_listener() {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a loopback test listener");
+    let address = listener
+        .local_addr()
+        .expect("read the pre-bound loopback address");
+    let transport = TestTransport::prepare(TestTransportSettings::new(
+        1,
+        address,
+        noise_keys(1),
+        Arc::new(TestPeers::default()),
+        Arc::new(TestGroupIdAdapter),
+        Arc::new(TestNodeIdAdapter),
+        Arc::new(NoCommands),
+        protocol_limits(16),
+        transport_limits(),
+    ));
+
+    transport
+        .start_listening_on(listener)
+        .expect("prepared transport should use the pre-bound listener");
+    TcpStream::connect_timeout(&address, Duration::from_secs(1))
+        .expect("the pre-bound transport should accept TCP connections");
+    transport
+        .shutdown()
+        .await
+        .expect("pre-bound transport should stop");
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err(),
+        "the pre-bound storage address must close after shutdown"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_transport_start_and_shutdown_leave_no_listener() {
     for iteration in 0..32 {

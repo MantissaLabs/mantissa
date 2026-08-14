@@ -61,6 +61,7 @@ use mantissa_protocol::server::server::Client as ServerClient;
 use mantissa_protocol::services::services::Client as ServicesClient;
 use mantissa_protocol::topology::topology::Client as TopologyClient;
 use mantissa_protocol::volumes::volumes::Client as VolumesClient;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -404,6 +405,12 @@ struct ReplicatedVolumeBootstrapInputs {
     split_validator: ReplicatedVolumeSplitValidator,
 }
 
+/// Replicated-volume settings and any socket already bound by a test node.
+struct ReplicatedVolumeStartupInputs {
+    mode: ReplicatedVolumeStartup,
+    prebound_listener: Option<TcpListener>,
+}
+
 /// Boots the full server runtime from an initialized bootstrap context.
 ///
 /// This is the shared startup pipeline used by both the daemon and headless
@@ -411,6 +418,15 @@ struct ReplicatedVolumeBootstrapInputs {
 pub async fn boot(
     ctx: BootstrapContext,
     options: BootstrapOptions,
+) -> BootstrapResult<BootedRuntime> {
+    boot_with_replicated_volume_listener(ctx, options, None).await
+}
+
+/// Boots a test node without releasing its reserved storage socket first.
+pub(crate) async fn boot_with_replicated_volume_listener(
+    ctx: BootstrapContext,
+    options: BootstrapOptions,
+    replicated_volume_listener: Option<TcpListener>,
 ) -> BootstrapResult<BootedRuntime> {
     let stores = BootstrapStores::open(&ctx, &options).await?;
     let cluster_view = stores.restore_cluster_view_state()?;
@@ -426,7 +442,10 @@ pub async fn boot(
     let replicated_volumes = open_replicated_volumes(
         &ctx,
         &stores,
-        options.replicated_volumes.clone(),
+        ReplicatedVolumeStartupInputs {
+            mode: options.replicated_volumes.clone(),
+            prebound_listener: replicated_volume_listener,
+        },
         options.advertise_override.as_deref(),
         cluster_view.clone(),
         membership_change_blocker.clone(),
@@ -491,13 +510,13 @@ pub async fn boot(
 async fn open_replicated_volumes(
     ctx: &BootstrapContext,
     stores: &BootstrapStores,
-    startup: ReplicatedVolumeStartup,
+    startup: ReplicatedVolumeStartupInputs,
     advertise_override: Option<&str>,
     cluster_view: ClusterViewState,
     membership_change_blocker: VolumeMembershipChangeBlocker,
     desired_registry: VolumeRegistry,
 ) -> BootstrapResult<Option<Arc<ReplicatedVolumeRuntime>>> {
-    let (config, automatic) = match startup {
+    let (config, automatic) = match startup.mode {
         ReplicatedVolumeStartup::Disabled => return Ok(None),
         ReplicatedVolumeStartup::Automatic => {
             let config = match config::ReplicatedVolumeConfig::automatic(advertise_override) {
@@ -572,7 +591,11 @@ async fn open_replicated_volumes(
     let desired_specs = desired_registry.list_reconcilable_specs_including_deleting()?;
     storage.replace_desired_generations(desired_replica_generations(&desired_specs));
 
-    if let Err(error) = storage.start_listening() {
+    let listen_result = match startup.prebound_listener {
+        Some(listener) => storage.start_listening_on(listener),
+        None => storage.start_listening(),
+    };
+    if let Err(error) = listen_result {
         shutdown_replicated_volumes(Some(&storage)).await;
         if automatic {
             warn!(

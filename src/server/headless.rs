@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{io, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
+use std::{io, net::TcpListener, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
@@ -18,7 +18,7 @@ use crate::{
         RunHandles, Server,
         bootstrap::{
             BootedRuntime, BootstrapContext, BootstrapOptions, ReplicatedVolumeStartup,
-            RuntimeTaskHandles, boot,
+            RuntimeTaskHandles, boot_with_replicated_volume_listener,
         },
     },
     services::{ServiceController, ServiceControllerTiming},
@@ -189,6 +189,29 @@ impl HeadlessNode {
         keys: HeadlessKeys,
         cfg: HeadlessConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_optional_replicated_volume_listener(db, self_id, keys, cfg, None).await
+    }
+
+    /// Builds a real node while preserving a test-reserved storage socket.
+    pub async fn new_with_replicated_volume_listener(
+        db: Arc<redb::Database>,
+        self_id: Uuid,
+        keys: HeadlessKeys,
+        cfg: HeadlessConfig,
+        listener: TcpListener,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_optional_replicated_volume_listener(db, self_id, keys, cfg, Some(listener))
+            .await
+    }
+
+    /// Runs shared headless bootstrap with an optional pre-bound storage socket.
+    async fn new_with_optional_replicated_volume_listener(
+        db: Arc<redb::Database>,
+        self_id: Uuid,
+        keys: HeadlessKeys,
+        cfg: HeadlessConfig,
+        replicated_volume_listener: Option<TcpListener>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let HeadlessKeys { noise, signing } = keys;
         let HeadlessConfig {
             listen_addr,
@@ -268,7 +291,7 @@ impl HeadlessNode {
             components: comps,
             server,
             runtime_tasks,
-        } = boot(ctx, options).await?;
+        } = boot_with_replicated_volume_listener(ctx, options, replicated_volume_listener).await?;
 
         // Cap’n Proto Server capability
         let server_client: mantissa_protocol::server::server::Client =

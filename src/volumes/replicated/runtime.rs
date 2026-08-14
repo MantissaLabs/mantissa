@@ -1,7 +1,7 @@
 //! Node-local ownership and narrow Raft control state access for replicated volumes.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -634,6 +634,13 @@ impl ReplicatedVolumeRuntime {
     pub fn start_listening(&self) -> Result<()> {
         self.transport
             .start_listening()
+            .context("start the replicated-volume storage listener")
+    }
+
+    /// Starts storage on a socket reserved before the rest of node bootstrap.
+    pub(crate) fn start_listening_on(&self, listener: TcpListener) -> Result<()> {
+        self.transport
+            .start_listening_on(listener)
             .context("start the replicated-volume storage listener")
     }
 
