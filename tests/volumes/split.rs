@@ -359,13 +359,34 @@ async fn merge_split_children(
             Duration::from_secs(45),
         )
         .await;
-        wait_for_cluster_view(&node.topology(), split_views[0], Duration::from_secs(45)).await;
     }
-    if cluster
-        .iter()
-        .any(|node| !node.node.registry.out_of_view_node_ids().is_empty())
+    if !wait_until(
+        Duration::from_secs(45),
+        Duration::from_millis(25),
+        || async {
+            for node in cluster {
+                if current_cluster_view(&node.topology()).await != split_views[0]
+                    || !node.node.registry.out_of_view_node_ids().is_empty()
+                {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await
     {
-        anyhow::bail!("merged cluster still has nodes outside its local view");
+        let mut view_boundaries = Vec::with_capacity(cluster.len());
+        for node in cluster {
+            view_boundaries.push((
+                node.id(),
+                current_cluster_view(&node.topology()).await,
+                node.node.registry.out_of_view_node_ids(),
+            ));
+        }
+        anyhow::bail!(
+            "merged cluster did not clear its split boundaries: {view_boundaries:?}"
+        );
     }
     if !wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
         replicated_volume_test_nodes_have_sessions(cluster)
