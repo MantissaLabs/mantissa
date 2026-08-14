@@ -669,6 +669,12 @@ impl ReplicatedVolumeRuntime {
         self.node_id
     }
 
+    /// Returns the private address advertised for this node's storage listener.
+    #[must_use]
+    pub(crate) const fn advertise_address(&self) -> SocketAddr {
+        self.advertise_address
+    }
+
     /// Returns the delay before an unavailable copy may change data control state.
     #[must_use]
     pub(crate) const fn repair_failure_grace(&self) -> Duration {

@@ -905,6 +905,17 @@ pub(crate) async fn start_replicated_volume_test_cluster_with_node_count(
         let _ = shutdown_replicated_volume_test_cluster(cluster).await;
         anyhow::bail!("storage nodes did not establish control-plane sessions");
     }
+    let node_ids = cluster.iter().map(TestNode::id).collect::<Vec<_>>();
+    if let Err(error) = wait_for_replicated_volume_test_storage_addresses(
+        &cluster,
+        &node_ids,
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        let _ = shutdown_replicated_volume_test_cluster(cluster).await;
+        return Err(error).context("wait for storage addresses after cluster startup");
+    }
     Ok((cluster, states))
 }
 
@@ -928,6 +939,89 @@ pub(crate) async fn replicated_volume_test_nodes_have_sessions(cluster: &[TestNo
         }
     }
     true
+}
+
+/// Waits until every named observer has each node's current storage address.
+async fn wait_for_replicated_volume_test_storage_addresses(
+    cluster: &[TestNode],
+    node_ids: &[Uuid],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    if wait_until(timeout, Duration::from_millis(50), || async {
+        replicated_volume_test_nodes_have_current_storage_addresses(cluster, node_ids)
+    })
+    .await
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "current storage addresses did not converge: {}",
+        replicated_volume_test_storage_address_diagnostics(cluster, node_ids)
+    )
+}
+
+/// Returns whether every named observer has each node's current storage address.
+fn replicated_volume_test_nodes_have_current_storage_addresses(
+    cluster: &[TestNode],
+    node_ids: &[Uuid],
+) -> bool {
+    let mut expected = Vec::with_capacity(node_ids.len());
+    for node_id in node_ids {
+        let Some(node) = cluster.iter().find(|node| node.id() == *node_id) else {
+            return false;
+        };
+        let Some(address) = node.node.replicated_volume_storage_address_for_test() else {
+            return false;
+        };
+        expected.push((*node_id, address.to_string()));
+    }
+    node_ids.iter().all(|observer_id| {
+        cluster
+            .iter()
+            .find(|node| node.id() == *observer_id)
+            .is_some_and(|observer| {
+                expected.iter().all(|(peer_id, address)| {
+                    observer
+                        .node
+                        .registry
+                        .peer_value_unscoped(*peer_id)
+                        .is_some_and(|peer| {
+                            peer.replicated_volumes.is_running()
+                                && peer.replicated_volumes.address == *address
+                        })
+                })
+            })
+    })
+}
+
+/// Describes selected and running storage addresses after a readiness timeout.
+fn replicated_volume_test_storage_address_diagnostics(
+    cluster: &[TestNode],
+    node_ids: &[Uuid],
+) -> String {
+    node_ids
+        .iter()
+        .map(|node_id| {
+            let running = cluster
+                .iter()
+                .find(|node| node.id() == *node_id)
+                .and_then(|node| node.node.replicated_volume_storage_address_for_test());
+            let selected = node_ids
+                .iter()
+                .filter_map(|observer_id| {
+                    let observer = cluster.iter().find(|node| node.id() == *observer_id)?;
+                    let address = observer
+                        .node
+                        .registry
+                        .peer_value_unscoped(*node_id)
+                        .map(|peer| peer.replicated_volumes.address);
+                    Some((*observer_id, address))
+                })
+                .collect::<Vec<_>>();
+            format!("node={node_id}, running={running:?}, selected={selected:?}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Shuts down every storage node and reports the first cleanup error.
@@ -1012,6 +1106,10 @@ pub(crate) async fn restart_replicated_volume_test_node(
     {
         anyhow::bail!("restarted storage node did not reconnect to its known peers");
     }
+    let node_ids = cluster.iter().map(TestNode::id).collect::<Vec<_>>();
+    wait_for_replicated_volume_test_storage_addresses(cluster, &node_ids, Duration::from_secs(15))
+        .await
+        .context("wait for storage addresses after node restart")?;
     Ok(())
 }
 
@@ -1076,7 +1174,7 @@ pub(crate) async fn restart_replicated_volume_test_view(
             }
         }
         if ready {
-            return Ok(());
+            break;
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
@@ -1085,6 +1183,13 @@ pub(crate) async fn restart_replicated_volume_test_view(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    wait_for_replicated_volume_test_storage_addresses(
+        cluster,
+        view_node_ids,
+        Duration::from_secs(15),
+    )
+    .await
+    .context("wait for storage addresses after split-child restart")
 }
 
 /// Waits for stopped in-process RPC sessions to release a test node's volume database.
@@ -1172,6 +1277,10 @@ pub(crate) async fn restart_volume_copies_with_delayed_peers(
     {
         anyhow::bail!("restarted volume copies did not reconnect to their known peers");
     }
+    let node_ids = cluster.iter().map(TestNode::id).collect::<Vec<_>>();
+    wait_for_replicated_volume_test_storage_addresses(cluster, &node_ids, Duration::from_secs(15))
+        .await
+        .context("wait for storage addresses after delayed copy restart")?;
     Ok(())
 }
 

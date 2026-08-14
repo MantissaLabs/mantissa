@@ -810,6 +810,14 @@ impl HeadlessNode {
         }
     }
 
+    /// Returns the storage address owned by this running headless node.
+    #[doc(hidden)]
+    pub fn replicated_volume_storage_address_for_test(&self) -> Option<std::net::SocketAddr> {
+        self.replicated_volumes
+            .as_ref()
+            .map(|runtime| runtime.advertise_address())
+    }
+
     /// Reports whether a replacement is committed in this test node's local Raft state.
     #[doc(hidden)]
     pub fn replicated_volume_replacement_is_applied_for_test(
