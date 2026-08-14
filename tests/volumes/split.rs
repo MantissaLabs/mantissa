@@ -384,9 +384,7 @@ async fn merge_split_children(
                 node.node.registry.out_of_view_node_ids(),
             ));
         }
-        anyhow::bail!(
-            "merged cluster did not clear its split boundaries: {view_boundaries:?}"
-        );
+        anyhow::bail!("merged cluster did not clear its split boundaries: {view_boundaries:?}");
     }
     if !wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
         replicated_volume_test_nodes_have_sessions(cluster)

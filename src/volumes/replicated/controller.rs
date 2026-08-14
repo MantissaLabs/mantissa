@@ -116,7 +116,6 @@ impl ReplicatedVolumeController {
             return Ok(());
         }
         let specs = self.registry.list_reconcilable_specs_including_deleting()?;
-        self.registry.remove_stale_capacity_requests().await?;
         let desired_generations = desired_replica_generations(&specs);
         self.runtime
             .replace_desired_generations(desired_generations.clone());
@@ -124,13 +123,39 @@ impl ReplicatedVolumeController {
             let mut unavailable_since = self.unavailable_since.lock();
             prune_unavailable_observations(&mut unavailable_since, &desired_generations);
         }
+        // Public status is derived from local committed state. Reconcile it
+        // before every fallible operational path so attachment, cleanup, or
+        // maintenance failures cannot suppress information needed by peers.
+        for spec in &specs {
+            if !matches!(spec.driver, VolumeDriver::Replicated(_)) {
+                continue;
+            }
+            if let Err(error) = self.reconcile_group_status(spec).await {
+                warn!(
+                    target: "volumes",
+                    volume_id = %spec.id,
+                    "replicated-volume group status remains pending: {error:#}"
+                );
+            }
+        }
+        if let Err(error) = self.registry.remove_stale_capacity_requests().await {
+            warn!(
+                target: "volumes",
+                "stale replicated-volume capacity requests remain until a later pass: {error:#}"
+            );
+        }
         if let Err(error) = self.runtime.reconcile_local_attachments().await {
             warn!(
                 target: "volumes",
                 "local attachment reconciliation remains pending: {error:#}"
             );
         }
-        self.reconcile_superseded_generations(&specs).await?;
+        if let Err(error) = self.reconcile_superseded_generations(&specs).await {
+            warn!(
+                target: "volumes",
+                "superseded replicated-volume cleanup remains pending: {error:#}"
+            );
+        }
         let operational = match self.storage_peers() {
             Ok(peers) => Some(OperationalInputs {
                 peers,
@@ -144,11 +169,11 @@ impl ReplicatedVolumeController {
                 None
             }
         };
-        for spec in specs {
+        for spec in &specs {
             if !matches!(spec.driver, VolumeDriver::Replicated(_)) {
                 continue;
             }
-            if let Err(error) = self.reconcile_volume(&spec, operational.as_ref()).await {
+            if let Err(error) = self.reconcile_volume(spec, operational.as_ref()).await {
                 warn!(
                     target: "volumes",
                     volume_id = %spec.id,
@@ -353,7 +378,6 @@ impl ReplicatedVolumeController {
                 return Ok(());
             };
             self.runtime.reconcile_maintenance(&local_state)?;
-            self.publish_group_observation(spec, &plan).await?;
             let local_status = self.runtime.local_status(key).await?;
             let current_local_origin = self.runtime.local_replica_origin(key)?;
             let public_removal_hint = self
@@ -1332,10 +1356,10 @@ impl ReplicatedVolumeController {
         }
         observation.updated_at = Utc::now().to_rfc3339();
         self.registry.upsert_node_state(observation.clone()).await?;
-        if let Err(error) = self
-            .broadcast(VolumeEvent::NodeUpsert(Box::new(observation)))
-            .await
-        {
+        if let Err(error) = try_enqueue_volume_gossip(
+            &self.gossip_tx,
+            VolumeEvent::NodeUpsert(Box::new(observation)),
+        ) {
             warn!(
                 target: "volumes",
                 volume_id = %spec.id,
@@ -1355,9 +1379,8 @@ impl ReplicatedVolumeController {
             return Ok(());
         };
         self.registry.remove_node_state(observation.id).await?;
-        if let Err(error) = self
-            .broadcast(VolumeEvent::NodeRemove(observation.id))
-            .await
+        if let Err(error) =
+            try_enqueue_volume_gossip(&self.gossip_tx, VolumeEvent::NodeRemove(observation.id))
         {
             warn!(
                 target: "volumes",
@@ -1369,12 +1392,21 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Publishes a leader control-state view without using it to authorize changes.
-    async fn publish_group_observation(
-        &self,
-        spec: &VolumeSpecValue,
-        plan: &ReplicatedVolumePlan,
-    ) -> Result<()> {
+    /// Repairs public group status from local committed state independently of lifecycle work.
+    async fn reconcile_group_status(&self, spec: &VolumeSpecValue) -> Result<()> {
+        if spec.is_delete_marker() {
+            return Ok(());
+        }
+        let Some(plan) = self.registry.get_plan(spec.id)? else {
+            return Ok(());
+        };
+        let capacity = spec
+            .initial_capacity_bytes
+            .context("replicated desired generation has no capacity")?;
+        let desired_descriptor =
+            SavedVolumeDescriptor::for_volume(spec.id, spec.volume_epoch, capacity)?
+                .to_storage()?;
+        self.ensure_plan_matches_spec(spec, &plan, &desired_descriptor)?;
         let descriptor = plan.descriptor.to_storage()?;
         let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
         let group_id = compute_replicated_volume_group_id(
@@ -1382,82 +1414,101 @@ impl ReplicatedVolumeController {
             plan.descriptor.generation,
         );
         let local = self.runtime.local_status(key).await?;
-        let local_control_state = self.runtime.applied_state(key)?;
-        let public_status = self.registry.get_group_status(spec.id)?;
-        let public_status_is_behind = local_control_state
-            .as_ref()
-            .zip(local.applied_log_index)
-            .is_some_and(|(state, applied_log_index)| {
-                group_status_is_behind_local_state(
-                    public_status.as_ref(),
-                    spec.volume_epoch,
-                    group_id,
-                    state.revision(),
-                    applied_log_index,
-                )
-            });
-        let current = if public_status_is_behind {
-            self.runtime.poll_local_quorum_group_state(key).await?
-        } else {
-            self.runtime
-                .poll_running_local_leader_observation(key)
-                .await?
-        };
-        let Some(current) = current else {
+        let Some(local_control_state) = self.runtime.applied_state(key)? else {
             return Ok(());
         };
-        let control_state = current.control_state;
-        if control_state.descriptor().is_none() {
+        if local_control_state.descriptor().is_none() {
             return Ok(());
         }
-        let local = self.runtime.local_status(key).await?;
-        let status = match control_state.disposition() {
-            VolumeDisposition::Live
-                if control_state.data().and_then(|data| data.writer).is_some() =>
-            {
-                VolumeStatus::InUse
-            }
-            VolumeDisposition::Live => VolumeStatus::Ready,
-            VolumeDisposition::Retained => VolumeStatus::Retained,
+        let Some(local_applied_log_index) = local.applied_log_index else {
+            return Ok(());
         };
-        let mut observation = ReplicatedVolumeGroupStatusValue::new(
-            spec.id,
+        let public_status = self.registry.get_group_status(spec.id)?;
+        let public_status_is_behind = group_status_is_behind_local_state(
+            public_status.as_ref(),
             spec.volume_epoch,
             group_id,
-            self.runtime.node_id(),
-            status,
-            local.applied_log_index.unwrap_or_default(),
+            local_control_state.revision(),
+            local_applied_log_index,
         );
-        observation.leader_node_id = local.leader_node_id;
-        observation.attached_node_id = control_state
-            .data()
-            .and_then(|data| data.writer)
-            .map(|writer| *writer.node_id.as_uuid());
-        observation.control_revision = control_state.revision();
-        observation.replicated_capacity_bytes = control_state
-            .descriptor()
-            .map_or(0, |descriptor| descriptor.capacity().bytes());
-        if let Some(data) = control_state.data() {
-            observation.fence = Some(data.fence.get());
-            observation.copy_node_ids = data
-                .copies
-                .iter()
-                .map(|node_id| *node_id.as_uuid())
-                .collect();
-            observation.degraded = data.copies.len() < 3 || data.recovery.is_some();
+        let (control_state, committed_index, leader_node_id, voter_node_ids) =
+            if public_status_is_behind {
+                let leader_node_id = local
+                    .leader_node_id
+                    .filter(|leader| local.voter_node_ids.contains(leader));
+                (
+                    local_control_state,
+                    local_applied_log_index,
+                    leader_node_id,
+                    local.voter_node_ids,
+                )
+            } else {
+                if !public_status.as_ref().is_some_and(|status| {
+                    group_status_has_local_progress(
+                        status,
+                        spec.volume_epoch,
+                        group_id,
+                        local_control_state.revision(),
+                        local_applied_log_index,
+                    )
+                }) {
+                    return Ok(());
+                }
+                let Some(current) = self
+                    .runtime
+                    .poll_running_local_leader_observation(key)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                let local = self.runtime.local_status(key).await?;
+                let Some(committed_index) = local.applied_log_index else {
+                    return Ok(());
+                };
+                (
+                    current.control_state,
+                    committed_index,
+                    local.leader_node_id,
+                    current.membership.voters,
+                )
+            };
+        if voter_node_ids.is_empty() {
+            return Ok(());
         }
-        observation.voter_node_ids = current.membership.voters.into_iter().collect();
-        if let Some(replacement) = control_state.replacement() {
-            observation.replacement_id = Some(*replacement.id.as_uuid());
-            observation.replacement_old_node_id =
-                replacement.old_node_id.map(|node_id| *node_id.as_uuid());
-            observation.replacement_new_node_id = Some(*replacement.new_node_id.as_uuid());
-            observation.degraded = true;
-        }
-        if observation.copy_node_ids != observation.voter_node_ids {
-            observation.degraded = true;
-        }
+        let observation = group_observation_from_local_state(
+            spec,
+            &plan,
+            self.runtime.node_id(),
+            control_state,
+            committed_index,
+            leader_node_id,
+            voter_node_ids,
+        );
         let saved_group_status = self.registry.get_group_status(spec.id)?;
+        if public_status_is_behind
+            && !group_status_is_behind_local_state(
+                saved_group_status.as_ref(),
+                spec.volume_epoch,
+                group_id,
+                observation.control_revision,
+                observation.committed_index,
+            )
+        {
+            return Ok(());
+        }
+        if !public_status_is_behind
+            && !saved_group_status.as_ref().is_some_and(|status| {
+                group_status_has_local_progress(
+                    status,
+                    spec.volume_epoch,
+                    group_id,
+                    observation.control_revision,
+                    observation.committed_index,
+                )
+            })
+        {
+            return Ok(());
+        }
         if saved_group_status
             .as_ref()
             .is_some_and(|saved| same_group_observation(saved, &observation))
@@ -1493,10 +1544,10 @@ impl ReplicatedVolumeController {
                 ),
             }
         }
-        if let Err(error) = self
-            .broadcast(VolumeEvent::GroupStatusUpsert(Box::new(observation)))
-            .await
-        {
+        if let Err(error) = try_enqueue_volume_gossip(
+            &self.gossip_tx,
+            VolumeEvent::GroupStatusUpsert(Box::new(observation)),
+        ) {
             warn!(
                 target: "volumes",
                 volume_id = %spec.id,
@@ -1505,17 +1556,78 @@ impl ReplicatedVolumeController {
         }
         Ok(())
     }
+}
 
-    /// Enqueues one CRDT acceleration event after its local durable write.
-    async fn broadcast(&self, event: VolumeEvent) -> Result<()> {
-        self.gossip_tx
-            .send(Message::Volume {
-                id: Uuid::new_v4(),
-                event,
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("enqueue replicated-volume gossip: {error}"))
+/// Enqueues one optional gossip update without waiting after its durable local write.
+fn try_enqueue_volume_gossip(
+    gossip_tx: &async_channel::Sender<Message>,
+    event: VolumeEvent,
+) -> Result<()> {
+    gossip_tx
+        .try_send(Message::Volume {
+            id: Uuid::new_v4(),
+            event,
+        })
+        .map_err(|error| anyhow::anyhow!("enqueue replicated-volume gossip: {error}"))
+}
+
+/// Builds one advisory CRDT row from state already committed on this replica.
+fn group_observation_from_local_state(
+    spec: &VolumeSpecValue,
+    plan: &ReplicatedVolumePlan,
+    reporter_node_id: Uuid,
+    control_state: mantissa_volume::control_state::VolumeControlState,
+    committed_index: u64,
+    leader_node_id: Option<Uuid>,
+    voter_node_ids: BTreeSet<Uuid>,
+) -> ReplicatedVolumeGroupStatusValue {
+    let status = match control_state.disposition() {
+        VolumeDisposition::Live if control_state.data().and_then(|data| data.writer).is_some() => {
+            VolumeStatus::InUse
+        }
+        VolumeDisposition::Live => VolumeStatus::Ready,
+        VolumeDisposition::Retained => VolumeStatus::Retained,
+    };
+    let group_id =
+        compute_replicated_volume_group_id(plan.descriptor.volume_id, plan.descriptor.generation);
+    let mut observation = ReplicatedVolumeGroupStatusValue::new(
+        spec.id,
+        spec.volume_epoch,
+        group_id,
+        reporter_node_id,
+        status,
+        committed_index,
+    );
+    observation.leader_node_id = leader_node_id.filter(|leader| voter_node_ids.contains(leader));
+    observation.attached_node_id = control_state
+        .data()
+        .and_then(|data| data.writer)
+        .map(|writer| *writer.node_id.as_uuid());
+    observation.control_revision = control_state.revision();
+    observation.replicated_capacity_bytes = control_state
+        .descriptor()
+        .map_or(0, |descriptor| descriptor.capacity().bytes());
+    if let Some(data) = control_state.data() {
+        observation.fence = Some(data.fence.get());
+        observation.copy_node_ids = data
+            .copies
+            .iter()
+            .map(|node_id| *node_id.as_uuid())
+            .collect();
+        observation.degraded = data.copies.len() < 3 || data.recovery.is_some();
     }
+    observation.voter_node_ids = voter_node_ids.into_iter().collect();
+    if let Some(replacement) = control_state.replacement() {
+        observation.replacement_id = Some(*replacement.id.as_uuid());
+        observation.replacement_old_node_id =
+            replacement.old_node_id.map(|node_id| *node_id.as_uuid());
+        observation.replacement_new_node_id = Some(*replacement.new_node_id.as_uuid());
+        observation.degraded = true;
+    }
+    if observation.copy_node_ids != observation.voter_node_ids {
+        observation.degraded = true;
+    }
+    observation
 }
 
 /// Returns whether one exact copy has durable coverage for a proposed capacity.
@@ -1683,6 +1795,20 @@ fn group_status_is_behind_local_state(
     public.group_id != group_id
         || public.control_revision < control_revision
         || public.committed_index < applied_log_index
+}
+
+/// Returns whether one public row describes this exact locally applied progress.
+fn group_status_has_local_progress(
+    public: &ReplicatedVolumeGroupStatusValue,
+    volume_epoch: u64,
+    group_id: Uuid,
+    control_revision: u64,
+    applied_log_index: u64,
+) -> bool {
+    public.volume_epoch == volume_epoch
+        && public.group_id == group_id
+        && public.control_revision == control_revision
+        && public.committed_index == applied_log_index
 }
 
 /// Uses public state only to trigger a linearizable former-member inspection.
@@ -2675,9 +2801,9 @@ mod tests {
         assert!(!same_group_observation(&previous, &current));
     }
 
-    /// Public progress must wake voters only until it reaches durable local progress.
+    /// Public progress requires repair only until it reaches durable local progress.
     #[test]
-    fn public_group_status_lag_requires_raft_wake() {
+    fn public_group_status_lag_requires_local_repair() {
         let volume_id = Uuid::from_u128(10);
         let group_id = Uuid::from_u128(11);
         let mut public = ReplicatedVolumeGroupStatusValue::new(
@@ -2700,9 +2826,19 @@ mod tests {
             26,
             37,
         ));
+        assert!(group_status_has_local_progress(
+            &public, 1, group_id, 26, 37
+        ));
 
         let mut stale_revision = public.clone();
         stale_revision.control_revision = 25;
+        assert!(!group_status_has_local_progress(
+            &stale_revision,
+            1,
+            group_id,
+            26,
+            37,
+        ));
         assert!(group_status_is_behind_local_state(
             Some(&stale_revision),
             1,
@@ -2730,5 +2866,86 @@ mod tests {
             26,
             37,
         ));
+    }
+
+    /// A completed replacement can publish from local committed state without a live leader.
+    #[test]
+    fn local_replacement_state_builds_complete_group_status() {
+        let volume_id = Uuid::from_u128(10);
+        let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
+            name: "replacement-status".to_string(),
+            driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
+                ownership: FilesystemOwnership::Daemon,
+                filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Ext4,
+            }),
+            access_mode: VolumeAccessMode::ReadWriteOnce,
+            binding_mode: VolumeBindingMode::WaitForFirstConsumer,
+            reclaim_policy: VolumeReclaimPolicy::Delete,
+            initial_capacity_bytes: Some(64 << 20),
+            labels: Vec::new(),
+            bound_node_id: None,
+            bound_node_name: None,
+        });
+        spec.id = volume_id;
+        spec.volume_epoch = 0;
+        let initial_nodes = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+        let plan = ReplicatedVolumePlan::new(
+            volume_id,
+            spec.volume_epoch,
+            Uuid::from_u128(30),
+            initial_nodes[0],
+            initial_nodes,
+            SavedVolumeDescriptor::for_volume(
+                volume_id,
+                spec.volume_epoch,
+                spec.initial_capacity_bytes.expect("test capacity"),
+            )
+            .expect("valid saved descriptor"),
+        );
+        let current_voters =
+            BTreeSet::from([Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(4)]);
+        let observation = group_observation_from_local_state(
+            &spec,
+            &plan,
+            Uuid::from_u128(2),
+            control_state_after_replacement(),
+            37,
+            Some(Uuid::from_u128(3)),
+            current_voters.clone(),
+        );
+
+        assert_eq!(observation.committed_index, 37);
+        assert_eq!(observation.leader_node_id, None);
+        assert_eq!(
+            observation
+                .copy_node_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            current_voters
+        );
+        assert_eq!(
+            observation
+                .voter_node_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            current_voters
+        );
+        assert!(observation.replacement_id.is_none());
+        assert!(!observation.degraded);
+    }
+
+    /// A full gossip queue cannot turn an optional notification into an awaited dependency.
+    #[test]
+    fn full_gossip_queue_rejects_optional_update_immediately() {
+        let (gossip_tx, _gossip_rx) = async_channel::bounded(1);
+        try_enqueue_volume_gossip(&gossip_tx, VolumeEvent::NodeRemove(Uuid::from_u128(1)))
+            .expect("fill gossip queue");
+
+        let error =
+            try_enqueue_volume_gossip(&gossip_tx, VolumeEvent::NodeRemove(Uuid::from_u128(2)))
+                .expect_err("full gossip queue must reject the optional update");
+
+        assert!(error.to_string().contains("full"));
+        assert_eq!(gossip_tx.len(), 1);
     }
 }
