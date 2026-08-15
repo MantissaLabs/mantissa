@@ -2083,7 +2083,7 @@ pub(crate) async fn wait_for_failed_attachment_republish(
     }
 }
 
-/// Waits until the public state is detached and the old filesystem mount is gone.
+/// Waits until control state, task publications, and the old mount are detached.
 pub(crate) async fn wait_for_detached_volume(
     cluster: &[TestNode],
     volume_id: Uuid,
@@ -2094,8 +2094,9 @@ pub(crate) async fn wait_for_detached_volume(
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     loop {
         poll.tick().await;
-        let mut saw_status = false;
-        let mut all_detached = true;
+        let mut saw_group_status = false;
+        let mut all_group_statuses_detached = true;
+        let mut all_task_publications_cleared = true;
         for node in cluster {
             if let Some(status) = node
                 .node
@@ -2103,16 +2104,30 @@ pub(crate) async fn wait_for_detached_volume(
                 .get_group_status(volume_id)
                 .context("read volume state while waiting for detach")?
             {
-                saw_status = true;
-                all_detached &=
+                saw_group_status = true;
+                all_group_statuses_detached &=
                     status.attached_node_id.is_none() && status.status != VolumeStatus::InUse;
             }
+            all_task_publications_cleared &= node
+                .node
+                .volume_registry
+                .list_node_states_for_volume(volume_id)
+                .context("read task publications while waiting for detach")?
+                .iter()
+                .all(|state| state.published_task_ids.is_empty());
         }
-        if saw_status && all_detached && !path_is_mounted(old_mount)? {
+        if saw_group_status
+            && all_group_statuses_detached
+            && all_task_publications_cleared
+            && !path_is_mounted(old_mount)?
+        {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("replicated volume did not detach before the deadline");
+            anyhow::bail!(
+                "replicated volume did not fully detach before the deadline: {}",
+                replicated_volume_start_diagnostics(cluster, volume_id),
+            );
         }
     }
 }
