@@ -237,8 +237,17 @@ async fn run_six_node_split_flow(
         anyhow::bail!("post-split repair placed a copy outside the volume's child view");
     }
     wait_for_stable_group_on_nodes(cluster, &owner_node_ids, volume_id, &repaired_copies).await?;
+    let writer_mount_after_replacement = wait_for_writer_mount_after_replica_replacement(
+        cluster,
+        volume_id,
+        restarted_task_id,
+        restarted_writer,
+        drained_follower,
+        Duration::from_secs(90),
+    )
+    .await?;
     write_synced_probe(
-        restarted_mount.join("after-local-repair.txt"),
+        writer_mount_after_replacement.join("after-local-repair.txt"),
         b"replicated volume remained writable after local post-split repair",
     )
     .await?;
@@ -248,7 +257,7 @@ async fn run_six_node_split_flow(
         &complete_targets[0],
         restarted_task_id,
         volume_id,
-        &restarted_mount,
+        &writer_mount_after_replacement,
     )
     .await?;
     merge_split_children(
@@ -657,6 +666,56 @@ async fn wait_for_replacement_on_nodes(
             anyhow::bail!(
                 "post-split replacement did not finish: {}",
                 replicated_volume_start_diagnostics(cluster, volume_id)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Waits until the original writer has applied the replacement and serves its task again.
+async fn wait_for_writer_mount_after_replica_replacement(
+    cluster: &[TestNode],
+    volume_id: Uuid,
+    task_id: Uuid,
+    writer_node_id: Uuid,
+    replaced_node_id: Uuid,
+    timeout: Duration,
+) -> anyhow::Result<std::path::PathBuf> {
+    let writer = node_by_id(cluster, writer_node_id)?;
+    let descriptor = writer
+        .node
+        .volume_registry
+        .get_plan(volume_id)?
+        .context("post-split writer has no replicated-volume plan")?
+        .descriptor
+        .to_storage()?;
+    let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let replacement_is_applied = writer
+            .node
+            .replicated_volume_replacement_is_applied_for_test(key, replaced_node_id)?;
+        let published_mount = writer
+            .node
+            .volume_registry
+            .get_node_state(volume_id, writer_node_id)?
+            .filter(|state| {
+                state.state == VolumeNodeState::Published
+                    && state.published_task_ids.contains(&task_id)
+            })
+            .and_then(|state| state.local_path.map(std::path::PathBuf::from));
+        if replacement_is_applied
+            && writer.node.replicated_volume_is_mounted(key).await?
+            && let Some(path) = published_mount
+            && path_is_mounted(&path)?
+        {
+            return Ok(path);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "writer mount did not recover after post-split replica replacement: local={}; {}",
+                replicated_volume_local_diagnostics(cluster, volume_id).await?,
+                replicated_volume_start_diagnostics(cluster, volume_id),
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
