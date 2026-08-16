@@ -7,7 +7,11 @@
 mod device_mapper;
 mod progress;
 mod settings;
+#[cfg(target_os = "linux")]
 mod ublk;
+mod ublk_types;
+#[cfg(not(target_os = "linux"))]
+mod ublk_unsupported;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,10 +26,13 @@ pub use settings::{
     DriverLimitSettings, DriverLimits, InvalidDriverLimits, InvalidUblkSettings, UblkQueueSettings,
     UblkSettings,
 };
-pub use ublk::{
-    UblkDevice, UblkDeviceCheck, UblkDeviceId, UblkDeviceInfo, UblkDeviceState, UblkError,
-    UblkFeatures, UblkOwnerId, UblkSystem,
+#[cfg(target_os = "linux")]
+pub use ublk::{UblkDevice, UblkError, UblkSystem};
+pub use ublk_types::{
+    UblkDeviceCheck, UblkDeviceId, UblkDeviceInfo, UblkDeviceState, UblkFeatures, UblkOwnerId,
 };
+#[cfg(not(target_os = "linux"))]
+pub use ublk_unsupported::{UblkDevice, UblkError, UblkSystem};
 
 /// Handles checked block requests received from a local driver.
 #[async_trait]

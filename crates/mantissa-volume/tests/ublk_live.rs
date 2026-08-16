@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs::{File, OpenOptions};

@@ -3,6 +3,8 @@ use thiserror::Error;
 use crate::{VolumeBlockSizes, VolumeDescriptor};
 
 const LIBUBLK_MAX_REQUEST_BYTES: u32 = 32 * 1024 * 1024;
+const UBLK_MAX_QUEUE_COUNT: u32 = 4096;
+const UBLK_MAX_QUEUE_DEPTH: u32 = 4096;
 
 /// Caller-selected queue and memory limits for one ublk device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,19 +184,19 @@ fn check_queue_settings(
     if queues.queue_count == 0 {
         return Err(InvalidUblkSettings::ZeroQueueCount);
     }
-    if u32::from(queues.queue_count) > libublk::sys::UBLK_MAX_NR_QUEUES {
+    if u32::from(queues.queue_count) > UBLK_MAX_QUEUE_COUNT {
         return Err(InvalidUblkSettings::TooManyQueues {
             requested: queues.queue_count,
-            maximum: libublk::sys::UBLK_MAX_NR_QUEUES,
+            maximum: UBLK_MAX_QUEUE_COUNT,
         });
     }
     if queues.queue_depth == 0 {
         return Err(InvalidUblkSettings::ZeroQueueDepth);
     }
-    if u32::from(queues.queue_depth) > libublk::sys::UBLK_MAX_QUEUE_DEPTH {
+    if u32::from(queues.queue_depth) > UBLK_MAX_QUEUE_DEPTH {
         return Err(InvalidUblkSettings::QueueTooDeep {
             requested: queues.queue_depth,
-            maximum: libublk::sys::UBLK_MAX_QUEUE_DEPTH,
+            maximum: UBLK_MAX_QUEUE_DEPTH,
         });
     }
 

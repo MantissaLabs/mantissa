@@ -9,38 +9,20 @@ use std::thread::{self, JoinHandle};
 use libublk::ctrl::UblkCtrl;
 use thiserror::Error;
 
-use super::{BlockHandler, InvalidUblkSettings, UblkSettings};
-pub use inventory::{
-    UblkDeviceCheck, UblkDeviceId, UblkDeviceInfo, UblkDeviceState, UblkOwnerId, UblkSystem,
+use super::{
+    BlockHandler, InvalidUblkSettings, UblkDeviceCheck, UblkDeviceId, UblkDeviceInfo,
+    UblkDeviceState, UblkFeatures, UblkOwnerId, UblkSettings,
 };
+pub use inventory::UblkSystem;
 use server::{DeviceMode, ServerReady, serve};
 
 pub(super) const REQUIRED_KERNEL_FEATURES: u64 =
     (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_USER_RECOVERY_REISSUE) as u64;
 
-/// Kernel features needed by Mantissa's first ublk driver.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UblkFeatures {
-    raw: u64,
-}
-
-impl UblkFeatures {
-    /// Returns the feature bits reported by the running kernel.
-    #[must_use]
-    pub const fn raw(self) -> u64 {
-        self.raw
-    }
-
-    /// Returns whether a device can survive and recover after server death.
-    #[must_use]
-    pub const fn supports_user_recovery(self) -> bool {
-        self.raw & libublk::sys::UBLK_F_USER_RECOVERY as u64 != 0
-    }
-
-    /// Returns whether interrupted requests can be sent to the new server.
-    #[must_use]
-    pub const fn supports_request_reissue(self) -> bool {
-        self.raw & libublk::sys::UBLK_F_USER_RECOVERY_REISSUE as u64 != 0
+impl UblkDeviceId {
+    /// Converts this kernel ID to the signed type required by libublk.
+    fn as_i32(self) -> Result<i32, UblkError> {
+        i32::try_from(self.get()).map_err(|_| UblkError::DeviceIdOutOfRange { id: self })
     }
 }
 
