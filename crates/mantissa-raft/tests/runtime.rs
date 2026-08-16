@@ -440,7 +440,7 @@ async fn saved_groups_use_no_live_resources_until_activated() {
     let runtime = Arc::new(open_runtime(&directory, starter));
     runtime
         .catalog()
-        .ensure_groups(
+        .open_or_create_groups(
             (0..SAVED_GROUPS).map(|value| (TestGroupId(value), GroupActivation::Inactive)),
         )
         .expect("create idle groups");
@@ -519,7 +519,7 @@ async fn idle_suspension_preserves_recovery_and_active_callers() {
     let group_id = TestGroupId(20);
     runtime
         .catalog()
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create suspendable group");
 
     let held = runtime.activate(&group_id).await.expect("start held group");
@@ -577,7 +577,7 @@ async fn targeted_idle_suspension_reuses_active_capacity() {
     let group_ids = [TestGroupId(22), TestGroupId(23)];
     runtime
         .catalog()
-        .ensure_groups(
+        .open_or_create_groups(
             group_ids
                 .into_iter()
                 .map(|group_id| (group_id, GroupActivation::Active)),
@@ -629,7 +629,7 @@ async fn cancelled_idle_suspension_can_be_retried() {
     let group_id = TestGroupId(21);
     runtime
         .catalog()
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create suspendable paused group");
     drop(
         runtime
@@ -689,7 +689,7 @@ async fn failed_start_without_waiter_leaves_no_idle_entry() {
     let group_id = TestGroupId(24);
     runtime
         .catalog()
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create failing group");
 
     let activating_runtime = Arc::clone(&runtime);
@@ -751,7 +751,7 @@ async fn removed_groups_leave_no_runtime_entries() {
         let group_id = TestGroupId(value);
         runtime
             .catalog()
-            .ensure_group(&group_id, GroupActivation::Inactive)
+            .open_or_create_group(&group_id, GroupActivation::Inactive)
             .expect("create removable group");
         runtime.activate(&group_id).await.expect("start group");
         runtime
@@ -785,7 +785,7 @@ async fn shutdown_obeys_its_deadline_and_can_finish_after_work_completes() {
     let group_id = TestGroupId(30);
     runtime
         .catalog()
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create group");
     runtime.activate(&group_id).await.expect("start group");
 
@@ -845,7 +845,7 @@ async fn active_group_limit_is_checked_before_starting_another_group() {
     let runtime = Arc::new(open_runtime_with_limits(&directory, starter, limits));
     runtime
         .catalog()
-        .ensure_groups([
+        .open_or_create_groups([
             (TestGroupId(40), GroupActivation::Inactive),
             (TestGroupId(41), GroupActivation::Inactive),
         ])
@@ -879,7 +879,7 @@ async fn cancelled_start_and_stop_calls_can_be_retried() {
     let group_id = TestGroupId(50);
     runtime
         .catalog()
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create paused group");
 
     let starting_runtime = Arc::clone(&runtime);
@@ -935,7 +935,7 @@ async fn shutdown_retains_a_start_after_its_waiter_is_cancelled() {
     let group_id = TestGroupId(51);
     runtime
         .catalog()
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create paused group");
 
     let starting_runtime = Arc::clone(&runtime);

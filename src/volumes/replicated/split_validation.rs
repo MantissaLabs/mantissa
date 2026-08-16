@@ -73,7 +73,7 @@ impl VolumeMembershipChangeBlocker {
     }
 
     /// Rejects one replica or Raft membership change while a split is active.
-    pub(crate) fn ensure_changes_allowed(&self) -> Result<()> {
+    pub(crate) fn require_membership_changes_allowed(&self) -> Result<()> {
         if self.changes_are_blocked()? {
             anyhow::bail!(
                 "replicated-volume membership changes are paused while a cluster split is in progress"
@@ -102,7 +102,7 @@ impl ReplicatedVolumeSplitValidator {
         }
     }
 
-    /// Returns the storage operation bound used by preflight and authoritative validation.
+    /// Returns the storage operation bound used by preflight and commit-time validation.
     pub(crate) fn validation_timeout(&self) -> Duration {
         self.runtime
             .as_ref()
@@ -158,7 +158,7 @@ impl ReplicatedVolumeSplitValidator {
         let second = self
             .inspect_groups(operation, &assignments, &groups)
             .await?;
-        ensure_same_group_membership(&first, &second)?;
+        validate_unchanged_group_membership(&first, &second)?;
         Ok(second)
     }
 
@@ -510,7 +510,7 @@ fn validate_stable_group(
 }
 
 /// Rejects a voter change between the two post-freeze observations.
-fn ensure_same_group_membership(
+fn validate_unchanged_group_membership(
     first: &[ReplicatedVolumeSplitPlacement],
     second: &[ReplicatedVolumeSplitPlacement],
 ) -> Result<()> {
@@ -885,8 +885,11 @@ mod tests {
         };
 
         assert!(
-            ensure_same_group_membership(&[placement(first_voters)], &[placement(second_voters)])
-                .is_err()
+            validate_unchanged_group_membership(
+                &[placement(first_voters)],
+                &[placement(second_voters)]
+            )
+            .is_err()
         );
     }
 

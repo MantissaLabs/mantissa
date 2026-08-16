@@ -255,7 +255,7 @@ impl ReplicatedVolumeController {
             Some(plan) => plan,
             None => return Ok(()),
         };
-        self.ensure_plan_matches_spec(spec, &plan, &desired_descriptor)?;
+        self.validate_bootstrap_plan(spec, &plan, &desired_descriptor)?;
 
         let local_selected = plan.replica_node_ids.contains(&self.runtime.node_id());
         let descriptor = plan.descriptor.to_storage()?;
@@ -332,7 +332,7 @@ impl ReplicatedVolumeController {
             && (local_selected || plan.workload_node_id == self.runtime.node_id())
             && !control_state_initialized
             && !self
-                .ensure_bootstrap_replicas(&plan, local_selected)
+                .reconcile_bootstrap_replicas(&plan, local_selected)
                 .await?
         {
             return Ok(());
@@ -521,7 +521,7 @@ impl ReplicatedVolumeController {
         }) {
             return Ok(());
         }
-        let control_revision = ensure_applied(
+        let control_revision = require_command_applied(
             self.runtime
                 .propose_as_leader_for_reconcile(
                     key,
@@ -628,7 +628,7 @@ impl ReplicatedVolumeController {
     }
 
     /// Rejects a bootstrap plan that differs from this generation's initial request.
-    fn ensure_plan_matches_spec(
+    fn validate_bootstrap_plan(
         &self,
         spec: &VolumeSpecValue,
         plan: &ReplicatedVolumePlan,
@@ -645,7 +645,7 @@ impl ReplicatedVolumeController {
     }
 
     /// Returns true once this node may continue with control-state reconciliation.
-    async fn ensure_bootstrap_replicas(
+    async fn reconcile_bootstrap_replicas(
         &self,
         plan: &ReplicatedVolumePlan,
         local_selected: bool,
@@ -668,7 +668,7 @@ impl ReplicatedVolumeController {
                     (
                         node_id,
                         runtime
-                            .ensure_replica_on(node_id, descriptor, bootstrap_id, voters)
+                            .prepare_replica_on(node_id, descriptor, bootstrap_id, voters)
                             .await,
                     )
                 }
@@ -700,7 +700,7 @@ impl ReplicatedVolumeController {
                 .await?;
         } else if local_selected {
             self.runtime
-                .ensure_replica_on(self.runtime.node_id(), descriptor, bootstrap_id, voters)
+                .prepare_replica_on(self.runtime.node_id(), descriptor, bootstrap_id, voters)
                 .await?;
         }
         Ok(true)
@@ -816,7 +816,8 @@ impl ReplicatedVolumeController {
             return Ok(());
         };
         if state.descriptor().is_none() {
-            self.membership_change_blocker.ensure_changes_allowed()?;
+            self.membership_change_blocker
+                .require_membership_changes_allowed()?;
             let initial_copies = plan
                 .replica_node_ids
                 .into_iter()
@@ -832,7 +833,7 @@ impl ReplicatedVolumeController {
                     }),
                 )
                 .await?;
-            let control_revision = ensure_applied(response)?;
+            let control_revision = require_command_applied(response)?;
             info!(
                 target: "mantissa::volumes::raft",
                 volume_id = %spec.id,
@@ -846,7 +847,7 @@ impl ReplicatedVolumeController {
         }
         let wanted = desired_disposition(spec);
         if state.disposition() != wanted {
-            ensure_applied(
+            require_command_applied(
                 self.runtime
                     .propose_as_leader_for_reconcile(
                         key,
@@ -926,13 +927,13 @@ impl ReplicatedVolumeController {
                 let rollback_voters =
                     replacement_rollback_voters(&data.copies, &unavailable_copies)?;
                 self.runtime
-                    .ensure_replacement_membership(
+                    .reconcile_replacement_membership(
                         descriptor.clone(),
                         replacement.id,
                         ReplacementMembershipGoal::Absent { rollback_voters },
                     )
                     .await?;
-                ensure_applied(
+                require_command_applied(
                     self.runtime
                         .propose_as_leader_for_reconcile(
                             key,
@@ -964,7 +965,7 @@ impl ReplicatedVolumeController {
                 source_node_id: coordinator,
                 target_node_ids: data.copies.clone(),
             };
-            ensure_applied(
+            require_command_applied(
                 self.runtime
                     .propose_as_leader_for_reconcile(
                         key,
@@ -1012,7 +1013,7 @@ impl ReplicatedVolumeController {
                 source_node_id: coordinator,
                 target_node_ids: survivors,
             };
-            ensure_applied(
+            require_command_applied(
                 self.runtime
                     .propose_as_leader_for_reconcile(
                         key,
@@ -1043,7 +1044,7 @@ impl ReplicatedVolumeController {
                 source_node_id: bound,
                 target_node_ids: data.copies.clone(),
             };
-            ensure_applied(
+            require_command_applied(
                 self.runtime
                     .propose_as_leader_for_reconcile(
                         key,
@@ -1080,7 +1081,7 @@ impl ReplicatedVolumeController {
         if voters != copy_node_ids && data.copies.len() == 3 {
             if copy_voters.len() == 3 {
                 self.runtime
-                    .ensure_data_membership_as_leader(key, state.revision(), copy_node_ids)
+                    .reconcile_data_membership_as_leader(key, state.revision(), copy_node_ids)
                     .await?;
                 return Ok(());
             }
@@ -1099,7 +1100,7 @@ impl ReplicatedVolumeController {
                 source_node_id: coordinator,
                 target_node_ids: copy_voters,
             };
-            ensure_applied(
+            require_command_applied(
                 self.runtime
                     .propose_as_leader_for_reconcile(
                         key,
@@ -1194,7 +1195,7 @@ impl ReplicatedVolumeController {
             new_node_id,
             source_node_id: coordinator,
         };
-        ensure_applied(
+        require_command_applied(
             self.runtime
                 .propose_as_leader_for_reconcile(
                     key,
@@ -1406,7 +1407,7 @@ impl ReplicatedVolumeController {
         let desired_descriptor =
             SavedVolumeDescriptor::for_volume(spec.id, spec.volume_epoch, capacity)?
                 .to_storage()?;
-        self.ensure_plan_matches_spec(spec, &plan, &desired_descriptor)?;
+        self.validate_bootstrap_plan(spec, &plan, &desired_descriptor)?;
         let descriptor = plan.descriptor.to_storage()?;
         let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
         let group_id = compute_replicated_volume_group_id(
@@ -1838,7 +1839,7 @@ fn local_origin_allows_bootstrap(origin: &LocalReplicaOrigin) -> bool {
 }
 
 /// Returns the revision from a successful idempotent command outcome.
-fn ensure_applied(response: VolumeCommandResponse) -> Result<u64> {
+fn require_command_applied(response: VolumeCommandResponse) -> Result<u64> {
     match response {
         VolumeCommandResponse::Applied { revision, .. }
         | VolumeCommandResponse::Current { revision, .. } => Ok(revision),

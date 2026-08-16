@@ -804,7 +804,7 @@ async fn stored_node_restarts_from_its_local_database_and_log() {
     let group_id = TestGroupId(90);
     let (database, catalog, log) = open_stored_group(directory.path(), group_id);
     catalog
-        .ensure_group(&group_id, GroupActivation::Active)
+        .open_or_create_group(&group_id, GroupActivation::Active)
         .expect("save active group");
     let first_transport = start_transport(
         1,
@@ -919,7 +919,7 @@ async fn stored_node_builds_a_bounded_snapshot_and_compacts_its_log() {
     let group_id = TestGroupId(91);
     let (database, catalog, log) = open_stored_group(directory.path(), group_id);
     catalog
-        .ensure_group(&group_id, GroupActivation::Active)
+        .open_or_create_group(&group_id, GroupActivation::Active)
         .expect("save active snapshot group");
     let transport = start_transport(
         1,
@@ -1046,7 +1046,7 @@ async fn three_nodes_join_as_learners_then_become_voters_over_noise_tcp() {
         let directory = tempfile::tempdir().expect("create member directory");
         let (database, catalog, log) = open_stored_group(directory.path(), group_id);
         catalog
-            .ensure_group(&group_id, GroupActivation::Active)
+            .open_or_create_group(&group_id, GroupActivation::Active)
             .expect("save member group");
         if node_id != 1 {
             let first_voter = BTreeSet::from([1]);
@@ -1300,7 +1300,7 @@ async fn current_leader_waits_for_a_delayed_quorum() {
         let directory = tempfile::tempdir().expect("create durable member directory");
         let (database, catalog, log) = open_stored_group(directory.path(), group_id);
         catalog
-            .ensure_group(&group_id, GroupActivation::Active)
+            .open_or_create_group(&group_id, GroupActivation::Active)
             .expect("save active test group");
         if node_id != 1 {
             let first_voter = BTreeSet::from([1]);
@@ -1576,7 +1576,7 @@ async fn explicit_wake_renews_an_already_running_group() {
     let group_id = TestGroupId(21);
     let (_database, catalog, log) = open_stored_group(directory.path(), group_id);
     catalog
-        .ensure_group(&group_id, GroupActivation::Active)
+        .open_or_create_group(&group_id, GroupActivation::Active)
         .expect("save running group");
     let node = TestNode::start_stored(
         2,
@@ -2006,7 +2006,7 @@ async fn snapshot_write_does_not_delay_vote_request() {
     let (_target_database, target_catalog, target_log) =
         open_stored_group(target_directory.path(), group_id);
     target_catalog
-        .ensure_group(&group_id, GroupActivation::Active)
+        .open_or_create_group(&group_id, GroupActivation::Active)
         .expect("save snapshot target group");
     let target = TestNode::start_stored(
         2,

@@ -1,4 +1,4 @@
-//! Narrow idempotent storage ensures and local-fact inspection.
+//! Narrow replica preparation, membership reconciliation, and local inspection.
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -86,7 +86,7 @@ impl AuthenticatedStreamApplication<Uuid> for StorageServiceFactory {
     }
 }
 
-/// Handles authenticated ensure and inspect calls without changing control state.
+/// Handles authenticated preparation and inspection without changing control state.
 struct StorageServer {
     peer: Uuid,
     runtime: Weak<ReplicatedVolumeRuntime>,
@@ -99,18 +99,18 @@ impl StorageServer {
             capnp::Error::failed("replicated-volume runtime is unavailable".into())
         })?;
         runtime
-            .ensure_peer_in_active_view(self.peer)
+            .require_storage_peer_in_active_view(self.peer)
             .map_err(capnp_error)?;
         Ok(runtime)
     }
 }
 
 impl replicated_volume_storage::Server for StorageServer {
-    /// Ensures one immutable bootstrap replica and exact common voter set.
-    async fn ensure_replica(
+    /// Prepares one immutable bootstrap replica and exact common voter set.
+    async fn prepare_replica(
         self: Rc<Self>,
-        params: replicated_volume_storage::EnsureReplicaParams,
-        mut results: replicated_volume_storage::EnsureReplicaResults,
+        params: replicated_volume_storage::PrepareReplicaParams,
+        mut results: replicated_volume_storage::PrepareReplicaResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?.get_request()?;
         let descriptor = read_descriptor(request.get_descriptor()?).map_err(capnp_error)?;
@@ -124,7 +124,7 @@ impl replicated_volume_storage::Server for StorageServer {
             return Err(capnp_error("bootstrap caller is not in the voter set"));
         }
         let status = runtime
-            .ensure_replica_local(descriptor, bootstrap_id, voters)
+            .prepare_local_bootstrap_replica(descriptor, bootstrap_id, voters)
             .await
             .map_err(capnp_error)?;
         write_status(results.get().init_status(), &status);
@@ -162,11 +162,11 @@ impl replicated_volume_storage::Server for StorageServer {
         Ok(())
     }
 
-    /// Ensures only an inactive replacement named by current control state.
-    async fn ensure_replacement_replica(
+    /// Prepares only an inactive replacement named by current control state.
+    async fn prepare_replacement_replica(
         self: Rc<Self>,
-        params: replicated_volume_storage::EnsureReplacementReplicaParams,
-        mut results: replicated_volume_storage::EnsureReplacementReplicaResults,
+        params: replicated_volume_storage::PrepareReplacementReplicaParams,
+        mut results: replicated_volume_storage::PrepareReplacementReplicaResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?.get_request()?;
         let descriptor = read_descriptor(request.get_descriptor()?).map_err(capnp_error)?;
@@ -182,7 +182,7 @@ impl replicated_volume_storage::Server for StorageServer {
             return Err(capnp_error("replacement caller is not a current voter"));
         }
         let status = runtime
-            .ensure_replacement_local(descriptor, replacement_id, voters)
+            .prepare_local_replacement_replica(descriptor, replacement_id, voters)
             .await
             .map_err(capnp_error)?;
         write_status(results.get().init_status(), &status);
@@ -218,11 +218,11 @@ impl replicated_volume_storage::Server for StorageServer {
         Ok(())
     }
 
-    /// Ensures one current replacement's learner or final voter predicate.
-    async fn ensure_replacement_membership(
+    /// Reconciles one current replacement's learner or final voter predicate.
+    async fn reconcile_replacement_membership(
         self: Rc<Self>,
-        params: replicated_volume_storage::EnsureReplacementMembershipParams,
-        mut results: replicated_volume_storage::EnsureReplacementMembershipResults,
+        params: replicated_volume_storage::ReconcileReplacementMembershipParams,
+        mut results: replicated_volume_storage::ReconcileReplacementMembershipResults,
     ) -> Result<(), capnp::Error> {
         let request = params.get()?.get_request()?;
         let descriptor = read_descriptor(request.get_descriptor()?).map_err(capnp_error)?;
@@ -254,7 +254,7 @@ impl replicated_volume_storage::Server for StorageServer {
             }
         };
         let voters = runtime
-            .ensure_replacement_membership_as_leader(
+            .reconcile_replacement_membership_as_leader(
                 ReplicaKey::from(&descriptor),
                 replacement_id,
                 self.peer,
@@ -360,8 +360,8 @@ impl replicated_volume_storage::Server for StorageServer {
 }
 
 impl ReplicatedVolumeRuntime {
-    /// Ensures one bootstrap replica directly or over authenticated storage RPC.
-    pub(crate) async fn ensure_replica_on(
+    /// Prepares one bootstrap replica directly or over authenticated storage RPC.
+    pub(crate) async fn prepare_replica_on(
         &self,
         node_id: Uuid,
         descriptor: VolumeDescriptor,
@@ -370,7 +370,7 @@ impl ReplicatedVolumeRuntime {
     ) -> Result<LocalReplicaStatus> {
         if node_id == self.node_id() {
             return self
-                .ensure_replica_local(descriptor, bootstrap_id, voters)
+                .prepare_local_bootstrap_replica(descriptor, bootstrap_id, voters)
                 .await;
         }
         let maximum_nodes = self.protocol_limits().max_membership_nodes() as usize;
@@ -378,7 +378,7 @@ impl ReplicatedVolumeRuntime {
         self.call_storage(node_id, size, move |transport| {
             Box::pin(async move {
                 let client = storage_client(transport).await?;
-                let mut call = client.ensure_replica_request();
+                let mut call = client.prepare_replica_request();
                 {
                     let mut request = call.get().init_request();
                     write_descriptor(request.reborrow().init_descriptor(), &descriptor);
@@ -393,7 +393,7 @@ impl ReplicatedVolumeRuntime {
             })
         })
         .await
-        .context("ensure remote bootstrap replica")
+        .context("prepare remote bootstrap replica")
     }
 
     /// Inspects one local or remote replica without causing a transition.
@@ -448,8 +448,8 @@ impl ReplicatedVolumeRuntime {
         .context("inspect remote replica capacity")
     }
 
-    /// Ensures one inactive replacement file directly or over authenticated storage RPC.
-    pub(crate) async fn ensure_replacement_on(
+    /// Prepares one inactive replacement file directly or over authenticated storage RPC.
+    pub(crate) async fn prepare_replacement_replica_on(
         &self,
         node_id: Uuid,
         descriptor: VolumeDescriptor,
@@ -458,7 +458,7 @@ impl ReplicatedVolumeRuntime {
     ) -> Result<LocalReplicaStatus> {
         if node_id == self.node_id() {
             return self
-                .ensure_replacement_local(descriptor, replacement_id, voters)
+                .prepare_local_replacement_replica(descriptor, replacement_id, voters)
                 .await;
         }
         let maximum_nodes = self.protocol_limits().max_membership_nodes() as usize;
@@ -466,7 +466,7 @@ impl ReplicatedVolumeRuntime {
         self.call_storage(node_id, size, move |transport| {
             Box::pin(async move {
                 let client = storage_client(transport).await?;
-                let mut call = client.ensure_replacement_replica_request();
+                let mut call = client.prepare_replacement_replica_request();
                 {
                     let mut request = call.get().init_request();
                     write_descriptor(request.reborrow().init_descriptor(), &descriptor);
@@ -481,7 +481,7 @@ impl ReplicatedVolumeRuntime {
             })
         })
         .await
-        .context("ensure remote replacement replica")
+        .context("prepare remote replacement replica")
     }
 
     /// Proposes one bounded control state command to the already elected remote leader.
@@ -517,7 +517,7 @@ impl ReplicatedVolumeRuntime {
     }
 
     /// Requests one idempotent replacement membership predicate from the elected leader.
-    pub(crate) async fn ensure_replacement_membership_on(
+    pub(crate) async fn reconcile_replacement_membership_on(
         &self,
         leader_node_id: Uuid,
         descriptor: VolumeDescriptor,
@@ -526,7 +526,7 @@ impl ReplicatedVolumeRuntime {
     ) -> Result<BTreeSet<Uuid>> {
         if leader_node_id == self.node_id() {
             return self
-                .ensure_replacement_membership_as_leader(
+                .reconcile_replacement_membership_as_leader(
                     ReplicaKey::from(&descriptor),
                     replacement_id,
                     self.node_id(),
@@ -539,7 +539,7 @@ impl ReplicatedVolumeRuntime {
         self.call_storage(leader_node_id, size, move |transport| {
             Box::pin(async move {
                 let client = storage_client(transport).await?;
-                let mut call = client.ensure_replacement_membership_request();
+                let mut call = client.reconcile_replacement_membership_request();
                 {
                     let mut request = call.get().init_request();
                     write_descriptor(request.reborrow().init_descriptor(), &descriptor);
@@ -564,7 +564,7 @@ impl ReplicatedVolumeRuntime {
             })
         })
         .await
-        .context("ensure replacement membership on elected leader")
+        .context("reconcile replacement membership on elected leader")
     }
 
     /// Reads linearizable control state and membership from one elected leader.

@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub use controller::ReplicatedVolumeController;
 pub(crate) use controller::desired_replica_generations;
 pub use planner::ReplicatedVolumePlanner;
-pub(crate) use runtime::PreparedStorage;
+pub(crate) use runtime::PreparedReplicatedVolumeHost;
 pub use runtime::ReplicatedVolumeRuntime;
 pub(crate) use runtime::WriterFilesystemSpace;
 pub(crate) use split_validation::{ReplicatedVolumeSplitValidator, VolumeMembershipChangeBlocker};

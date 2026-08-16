@@ -422,7 +422,7 @@ struct DriverRoute {
     attachment: DriverAttachment,
 }
 
-/// Admits the mapped backend and queues an armed successor during a paused handoff.
+/// Admits the ublk device selected by the mapping and queues its armed successor.
 struct DriverDeviceGate {
     enabled: AtomicBool,
     shared: Arc<DriverHandler>,
@@ -452,7 +452,7 @@ impl DriverDeviceGate {
         self.enabled.load(Ordering::Acquire)
     }
 
-    /// Rejects a request unless the device is the active mapped backend.
+    /// Rejects a request unless the mapped volume selects this ublk device.
     fn check_enabled(&self) -> Result<(), BlockIoError> {
         if self.enabled.load(Ordering::Acquire) {
             return Ok(());
@@ -954,7 +954,7 @@ impl DriverIoPause {
 #[must_use = "a replicated driver must be stopped before it is dropped"]
 pub(super) struct ReplicatedDriver {
     active_device: Option<DriverDevice>,
-    larger_device: Option<DriverDevice>,
+    expansion_device: Option<DriverDevice>,
     retiring_device: Option<DriverDevice>,
     path: Option<FixedReplicaPath>,
     retiring_path: Option<FixedReplicaPath>,
@@ -1011,8 +1011,8 @@ impl ReplicatedDriver {
             .await
     }
 
-    /// Returns the private block-device path exposed by the ublk backend.
-    pub(super) fn backend_path(&self) -> Result<&Path, DriverError> {
+    /// Returns the private block-device path exposed by the ublk device.
+    pub(super) fn ublk_device_path(&self) -> Result<&Path, DriverError> {
         self.active_device
             .as_ref()
             .ok_or(DriverError::DeviceNotStarted)?
@@ -1046,34 +1046,34 @@ impl ReplicatedDriver {
         self.handler.route.read().descriptor.capacity()
     }
 
-    /// Starts one larger disabled private device while retaining the active owner.
-    pub(super) fn start_larger_device(
+    /// Starts one expanded disabled private device while retaining the active owner.
+    pub(super) fn start_expansion_device(
         &mut self,
         settings: ReplicatedDriverSettings,
     ) -> Result<(), DriverError> {
-        self.start_larger_device_with_mode(UblkDeviceMode::Start, settings)
+        self.start_expansion_device_with_mode(UblkDeviceMode::Start, settings)
     }
 
-    /// Recovers one saved larger inactive device behind the shared I/O gate.
-    pub(super) fn recover_larger_device(
+    /// Recovers one saved expanded inactive device behind the shared I/O gate.
+    pub(super) fn recover_expansion_device(
         &mut self,
         device_id: UblkDeviceId,
         settings: ReplicatedDriverSettings,
     ) -> Result<(), DriverError> {
-        self.start_larger_device_with_mode(UblkDeviceMode::Recover(device_id), settings)
+        self.start_expansion_device_with_mode(UblkDeviceMode::Recover(device_id), settings)
     }
 
-    /// Starts or recovers one disabled larger device with exact capacity.
-    fn start_larger_device_with_mode(
+    /// Starts or recovers one disabled expanded device with exact capacity.
+    fn start_expansion_device_with_mode(
         &mut self,
         mode: UblkDeviceMode,
         settings: ReplicatedDriverSettings,
     ) -> Result<(), DriverError> {
-        if let Some(larger) = self.larger_device.as_ref() {
-            if larger.capacity_bytes() == settings.ublk.capacity_bytes() {
+        if let Some(expanded) = self.expansion_device.as_ref() {
+            if expanded.capacity_bytes() == settings.ublk.capacity_bytes() {
                 return Ok(());
             }
-            return Err(DriverError::AnotherCapacityDevicePending);
+            return Err(DriverError::ExpansionDeviceAlreadyPending);
         }
         let active_capacity = self
             .active_device
@@ -1081,87 +1081,87 @@ impl ReplicatedDriver {
             .ok_or(DriverError::DeviceNotStarted)?
             .capacity_bytes();
         if settings.ublk.capacity_bytes() <= active_capacity || self.retiring_device.is_some() {
-            return Err(DriverError::AnotherCapacityDevicePending);
+            return Err(DriverError::ExpansionDeviceAlreadyPending);
         }
         let mut device = DriverDevice::prepare(mode, settings, Arc::clone(&self.handler), false);
         device.start_owner()?;
-        self.larger_device = Some(device);
+        self.expansion_device = Some(device);
         Ok(())
     }
 
-    /// Waits for the tracked larger device to expose its private backend path.
-    pub(super) async fn finish_larger_device_start(&mut self) -> Result<(), DriverError> {
+    /// Waits for the expansion device to expose its private block-device path.
+    pub(super) async fn finish_expansion_device_start(&mut self) -> Result<(), DriverError> {
         let started = {
             let device = self
-                .larger_device
+                .expansion_device
                 .as_mut()
                 .ok_or(DriverError::DeviceNotStarted)?;
             device.finish_start().await
         };
         match started {
             Ok(()) => Ok(()),
-            Err(start_error) => match self.stop_larger_device().await {
+            Err(start_error) => match self.stop_expansion_device().await {
                 Ok(()) => Err(start_error),
                 Err(cleanup_error) => Err(cleanup_error),
             },
         }
     }
 
-    /// Returns the durable record for the tracked larger private device.
-    pub(super) fn saved_larger_device(
+    /// Returns the durable record for the tracked expanded private device.
+    pub(super) fn saved_expansion_device(
         &self,
     ) -> Result<mantissa_volume::catalog::SavedUblkDevice, DriverError> {
-        self.larger_device
+        self.expansion_device
             .as_ref()
             .ok_or(DriverError::DeviceNotStarted)?
             .saved(self.attachment())
     }
 
-    /// Returns the private path for the tracked larger device.
-    pub(super) fn larger_backend_path(&self) -> Result<&Path, DriverError> {
-        self.larger_device
+    /// Returns the private path for the tracked expanded device.
+    pub(super) fn expansion_ublk_device_path(&self) -> Result<&Path, DriverError> {
+        self.expansion_device
             .as_ref()
             .ok_or(DriverError::DeviceNotStarted)?
             .path()
     }
 
-    /// Arms the larger private device without rejecting old requests still leaving dm-linear.
-    pub(super) fn arm_larger_device(&self) -> Result<(), DriverError> {
+    /// Arms the expanded private device without rejecting old requests still leaving dm-linear.
+    pub(super) fn arm_expansion_device(&self) -> Result<(), DriverError> {
         if !self.is_io_paused() {
             return Err(DriverError::Block(BlockIoError::NotServing));
         }
-        let larger = self
-            .larger_device
+        let expanded = self
+            .expansion_device
             .as_ref()
             .ok_or(DriverError::DeviceNotStarted)?;
-        larger.enable();
+        expanded.enable();
         Ok(())
     }
 
-    /// Makes the larger device active after device-mapper proves its table is active.
-    pub(super) fn promote_larger_device(&mut self) -> Result<(), DriverError> {
-        let larger = self
-            .larger_device
+    /// Makes the expanded device active after device-mapper proves its table is active.
+    pub(super) fn activate_expansion_device(&mut self) -> Result<(), DriverError> {
+        let expanded = self
+            .expansion_device
             .as_ref()
             .ok_or(DriverError::DeviceNotStarted)?;
-        larger.started()?;
-        if !larger.is_enabled() {
+        expanded.started()?;
+        if !expanded.is_enabled() {
             return Err(DriverError::DeviceNotStarted);
         }
         if self.active_device.is_none() || self.retiring_device.is_some() {
-            return Err(DriverError::AnotherCapacityDevicePending);
+            return Err(DriverError::ExpansionDeviceAlreadyPending);
         }
         self.active_device
             .as_ref()
             .ok_or(DriverError::DeviceNotStarted)?
             .disable();
-        let larger = self
-            .larger_device
+        let expanded = self
+            .expansion_device
             .take()
             .ok_or(DriverError::DeviceNotStarted)?;
         let active = self
             .active_device
-            .replace(larger)
+            .replace(expanded)
             .ok_or(DriverError::DeviceNotStarted)?;
         self.retiring_device = Some(active);
         Ok(())
@@ -1183,18 +1183,18 @@ impl ReplicatedDriver {
         result
     }
 
-    /// Stops an unactivated larger device after the old mapping remains active.
-    pub(super) async fn stop_larger_device(&mut self) -> Result<(), DriverError> {
-        let result = match self.larger_device.as_mut() {
+    /// Stops an unactivated expanded device after the old mapping remains active.
+    pub(super) async fn stop_expansion_device(&mut self) -> Result<(), DriverError> {
+        let result = match self.expansion_device.as_mut() {
             Some(device) => device.stop().await,
             None => Ok(()),
         };
         if self
-            .larger_device
+            .expansion_device
             .as_ref()
             .is_none_or(DriverDevice::is_stopped)
         {
-            self.larger_device.take();
+            self.expansion_device.take();
         }
         result
     }
@@ -1278,12 +1278,12 @@ impl ReplicatedDriver {
         });
         format!(
             "attachment={:?}, mode={mode}, in_flight={}, active_device={:?}, \
-             larger_device={:?}, \
+             expansion_device={:?}, \
              active={active:?}, retiring_path={retiring:?}, retiring_device={}",
             self.attachment(),
             self.handler.in_flight.load(Ordering::Acquire),
             self.active_device.as_ref().and_then(DriverDevice::id),
-            self.larger_device.as_ref().and_then(DriverDevice::id),
+            self.expansion_device.as_ref().and_then(DriverDevice::id),
             self.retiring_device.is_some(),
         )
     }
@@ -1300,11 +1300,11 @@ impl ReplicatedDriver {
         descriptor: VolumeDescriptor,
         attachment: DriverAttachment,
     ) {
-        let next_handler: Arc<dyn DriverPath> = path.handler();
+        let prepared_handler: Arc<dyn DriverPath> = path.handler();
         self.retiring_path = self.path.take();
         self.path = Some(path);
         self.handler
-            .install_waiting(next_handler, descriptor, attachment);
+            .install_waiting(prepared_handler, descriptor, attachment);
     }
 
     /// Resumes requests after the new fence and local record are installed.
@@ -1336,18 +1336,18 @@ impl ReplicatedDriver {
         {
             self.active_device.take();
         }
-        let larger_result = self.stop_larger_device().await;
+        let expansion_result = self.stop_expansion_device().await;
         let retiring_result = self.stop_retiring_device().await;
         data_result
             .and(active_result)
-            .and(larger_result)
+            .and(expansion_result)
             .and(retiring_result)
     }
 
     /// Returns whether both the kernel device and data path reached terminal cleanup.
     pub(super) fn is_stopped(&self) -> bool {
         self.active_device.is_none()
-            && self.larger_device.is_none()
+            && self.expansion_device.is_none()
             && self.retiring_device.is_none()
             && self.path.is_none()
             && self.retiring_path.is_none()
@@ -1389,7 +1389,7 @@ impl ReplicatedDriver {
         let device = DriverDevice::prepare(mode, settings, Arc::clone(&handler), true);
         Self {
             active_device: Some(device),
-            larger_device: None,
+            expansion_device: None,
             retiring_device: None,
             path: Some(path),
             retiring_path: None,
@@ -1448,7 +1448,7 @@ pub(super) enum DriverError {
 
     /// Another private device already owns an unfinished capacity handoff.
     #[error("another ublk capacity handoff is still pending")]
-    AnotherCapacityDevicePending,
+    ExpansionDeviceAlreadyPending,
 
     /// Creating or recovering the kernel device exceeded its deadline.
     #[error("ublk device did not start within {timeout:?}")]
@@ -1710,14 +1710,14 @@ mod tests {
         assert!(owner.is_stopped());
     }
 
-    /// Old requests remain valid until device mapper confirms the larger backend is active.
+    /// Old requests remain valid until device-mapper activates the expansion device.
     #[tokio::test]
-    async fn device_gates_keep_old_requests_alive_until_larger_mapping_is_active() {
+    async fn device_gates_keep_old_requests_alive_until_expanded_mapping_is_active() {
         let path: Arc<dyn DriverPath> = Arc::new(TestHandler(6, false, None));
         let (handler, _applied_state) = authorized_handler(path);
         let shared = Arc::new(handler);
         let old = Arc::new(DriverDeviceGate::new(Arc::clone(&shared), true));
-        let larger = Arc::new(DriverDeviceGate::new(Arc::clone(&shared), false));
+        let expanded = Arc::new(DriverDeviceGate::new(Arc::clone(&shared), false));
         let mut output = [0_u8; 4];
 
         old.read(0, &mut output)
@@ -1725,7 +1725,7 @@ mod tests {
             .expect("active old device must reach the shared path");
         assert_eq!(output, [6; 4]);
         assert_eq!(
-            larger.read(0, &mut output).await,
+            expanded.read(0, &mut output).await,
             Err(BlockIoError::NotServing)
         );
 
@@ -1740,41 +1740,43 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!old_request.is_finished());
 
-        larger.enable();
+        expanded.enable();
         assert!(old.is_enabled());
-        assert!(larger.is_enabled());
-        let queued_larger = Arc::clone(&larger);
-        let larger_request = tokio::spawn(async move {
+        assert!(expanded.is_enabled());
+        let queued_expansion = Arc::clone(&expanded);
+        let expansion_request = tokio::spawn(async move {
             let mut output = [0_u8; 4];
-            queued_larger.read(0, &mut output).await.map(|()| output)
+            queued_expansion.read(0, &mut output).await.map(|()| output)
         });
         tokio::task::yield_now().await;
-        assert!(!larger_request.is_finished());
+        assert!(!expansion_request.is_finished());
 
-        shared.resume_current().expect("resume on larger backend");
+        shared.resume_current().expect("resume on expansion device");
         assert_eq!(
             old_request.await.expect("join queued old request"),
             Ok([6; 4])
         );
         assert_eq!(
-            larger_request.await.expect("join queued larger request"),
+            expansion_request
+                .await
+                .expect("join queued expanded request"),
             Ok([6; 4])
         );
         old.read(0, &mut output)
             .await
             .expect("old requests already leaving the mapper must still finish");
 
-        // Promotion happens only after device mapper reports the larger table
-        // active. From that point the old private backend must reject I/O.
+        // Promotion happens only after device mapper reports the expanded table
+        // active. From that point the old ublk device must reject I/O.
         old.disable();
         assert_eq!(
             old.read(0, &mut output).await,
             Err(BlockIoError::NotServing)
         );
-        larger
+        expanded
             .read(0, &mut output)
             .await
-            .expect("activated larger device must reach the same shared path");
+            .expect("activated expanded device must reach the same shared path");
         assert_eq!(output, [6; 4]);
         assert_eq!(shared.progress.completed_requests(), 5);
     }
@@ -2151,9 +2153,9 @@ mod tests {
         );
     }
 
-    /// A failed larger-device start is removed so the next level pass can try again.
+    /// A failed expanded-device start is removed so the next level pass can try again.
     #[tokio::test]
-    async fn failed_larger_device_start_clears_its_retry_slot() {
+    async fn failed_expansion_device_start_clears_its_retry_slot() {
         let path: Arc<dyn DriverPath> = Arc::new(TestHandler(0, false, None));
         let (handler, _applied_state) = authorized_handler(path);
         let handler = Arc::new(handler);
@@ -2164,13 +2166,13 @@ mod tests {
             memory_limit_bytes: 4096,
         };
         let current = descriptor();
-        let larger = current
-            .with_capacity(VolumeCapacity::new(128 << 20).expect("larger test capacity"))
-            .expect("compatible larger descriptor");
+        let expanded = current
+            .with_capacity(VolumeCapacity::new(128 << 20).expect("expanded test capacity"))
+            .expect("compatible expanded descriptor");
         let operation_timeout = Duration::from_secs(1);
-        let larger_settings = ReplicatedDriverSettings::new(
+        let expansion_settings = ReplicatedDriverSettings::new(
             UblkOwnerId::new(1),
-            UblkSettings::new(&larger, queues).expect("larger ublk settings"),
+            UblkSettings::new(&expanded, queues).expect("expanded ublk settings"),
             operation_timeout,
         );
 
@@ -2180,11 +2182,11 @@ mod tests {
         let owner_thread = std::thread::spawn(move || {
             let request: super::DeviceStopRequest = stop_receiver
                 .recv()
-                .expect("failed larger device must request cleanup");
+                .expect("failed expanded device must request cleanup");
             drop(request);
             let _ = finished_sender.send(Ok(()));
         });
-        let larger_owner = UblkDeviceOwner {
+        let expansion_owner = UblkDeviceOwner {
             pending_start: None,
             ready: Some(ready_receiver),
             started: None,
@@ -2193,10 +2195,10 @@ mod tests {
             stop_attempt: None,
             finished: Some(finished_receiver),
         };
-        let larger_device = DriverDevice {
-            owner: larger_owner,
+        let expansion_device = DriverDevice {
+            owner: expansion_owner,
             gate: Arc::new(DriverDeviceGate::new(Arc::clone(&handler), false)),
-            settings: larger_settings,
+            settings: expansion_settings,
         };
         ready_sender
             .send(Err(mantissa_volume::driver::UblkError::Unavailable {
@@ -2207,7 +2209,7 @@ mod tests {
         let progress = handler.progress.clone();
         let mut driver = ReplicatedDriver {
             active_device: None,
-            larger_device: Some(larger_device),
+            expansion_device: Some(expansion_device),
             retiring_device: None,
             path: None,
             retiring_path: None,
@@ -2217,10 +2219,10 @@ mod tests {
         };
 
         assert!(matches!(
-            driver.finish_larger_device_start().await,
+            driver.finish_expansion_device_start().await,
             Err(DriverError::Ublk(_))
         ));
-        assert!(driver.larger_device.is_none());
+        assert!(driver.expansion_device.is_none());
         owner_thread.join().expect("cleanup owner must finish");
     }
 }

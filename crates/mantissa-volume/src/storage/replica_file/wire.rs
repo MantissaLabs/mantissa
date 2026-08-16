@@ -277,7 +277,7 @@ pub enum ReplicaDataAction {
     SyncRepair(ReplicaMaintenanceIdentity),
 
     /// Makes the current grant own repair state after older work drains.
-    EnsureRepair(ReplicaMaintenanceIdentity),
+    ActivateRepair(ReplicaMaintenanceIdentity),
 
     /// Installs one newer Raft-approved data fence in a fixed file.
     InstallFence {
@@ -728,8 +728,8 @@ pub fn encode_request(
             ReplicaDataAction::SyncRepair(identity) => {
                 write_repair_identity(root.init_sync_repair(), identity);
             }
-            ReplicaDataAction::EnsureRepair(identity) => {
-                write_repair_identity(root.init_ensure_repair(), identity);
+            ReplicaDataAction::ActivateRepair(identity) => {
+                write_repair_identity(root.init_activate_repair(), identity);
             }
             ReplicaDataAction::InstallFence {
                 descriptor,
@@ -852,8 +852,8 @@ pub fn decode_request(
         volume_block_request::Which::SyncRepair(identity) => {
             ReplicaDataAction::SyncRepair(read_repair_identity(identity?)?)
         }
-        volume_block_request::Which::EnsureRepair(identity) => {
-            ReplicaDataAction::EnsureRepair(read_repair_identity(identity?)?)
+        volume_block_request::Which::ActivateRepair(identity) => {
+            ReplicaDataAction::ActivateRepair(read_repair_identity(identity?)?)
         }
         volume_block_request::Which::InstallFence(start) => {
             let start = start?;

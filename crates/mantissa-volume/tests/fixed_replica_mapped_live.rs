@@ -127,7 +127,7 @@ struct MountCleanup {
     mounted: bool,
 }
 
-/// Removes the published mapping before the private backend on test failure.
+/// Removes the published mapping before the private ublk device on test failure.
 struct MappedCleanup {
     mapped_volumes: MappedVolumeSystem,
     node_id: VolumeNodeId,
@@ -383,7 +383,7 @@ impl MappedCleanup {
         self.mapped = false;
     }
 
-    /// Takes cleanup ownership again after backend recovery or replacement.
+    /// Takes cleanup ownership again after restoring or replacing its ublk device.
     fn mapped(&mut self) {
         self.mapped = true;
     }
@@ -730,7 +730,7 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
     )?;
     let mut device = UblkDevice::start(TEST_OWNER, ublk_settings(), path.handler())?;
     let mapped_layout = MappedVolumeLayout::new(node(1), &descriptor(), device.block_path())?;
-    let mapped_path = mapped_volumes.ensure(&mapped_layout)?;
+    let mapped_path = mapped_volumes.create_or_verify(&mapped_layout)?;
     let mut mapped_cleanup = MappedCleanup::new(
         mapped_volumes.clone(),
         mapped_layout.node_id(),
@@ -814,7 +814,7 @@ async fn fixed_replica_path_formats_and_mounts_ext4() -> Result<(), Box<dyn Erro
             UblkDevice::start(TEST_OWNER, ublk_settings(), reopened_path.handler())?;
         let reopened_layout =
             MappedVolumeLayout::new(node(1), &descriptor(), reopened_device.block_path())?;
-        let reopened_mapped_path = mapped_volumes.ensure(&reopened_layout)?;
+        let reopened_mapped_path = mapped_volumes.create_or_verify(&reopened_layout)?;
         mapped_cleanup.mapped();
         run(
             Command::new("mount")

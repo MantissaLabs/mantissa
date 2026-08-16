@@ -419,9 +419,11 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             anyhow::bail!("restored replicated volume did not become ready");
         }
 
-        // The earlier unflushed direct write leaves stored progress ahead of
-        // the common durable point. The first restored path attempt must
-        // authorize recovery so this level-triggered task retry can converge.
+        // The earlier direct write intentionally omits fsync, but a clean
+        // detach may still flush it before retention. If replica progress
+        // remains ahead, the first mount may report volume_unavailable while
+        // recovery starts. Recovery may also finish before this response.
+        // Both paths must converge without losing the synced retained probe.
         let restored_task = start_volume_task_via_public_api_with_state(
             &cluster[0].node.task_client,
             volume_id,
@@ -429,9 +431,12 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             "/var/lib/data",
         )
         .await?;
-        if restored_task.state != "volume_unavailable" {
+        if !matches!(
+            restored_task.state.as_str(),
+            "volume_unavailable" | "running"
+        ) {
             anyhow::bail!(
-                "restore regression did not exercise retryable recovery admission: state={}",
+                "restored task returned an unexpected initial state: {}",
                 restored_task.state
             );
         }

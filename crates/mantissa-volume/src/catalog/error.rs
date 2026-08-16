@@ -160,11 +160,11 @@ pub enum CatalogError {
     #[error("local replica already has a different volume mount")]
     VolumeMountChanged,
 
-    /// A mount must use the same writer session as its saved backend.
-    #[error("local volume mount does not match the saved backend session")]
+    /// A mount must use the same writer session as its saved ublk device.
+    #[error("local volume mount does not match the saved ublk device session")]
     VolumeMountDeviceMismatch,
 
-    /// A filesystem-expansion receipt cannot exceed the mapped frontend.
+    /// A filesystem-expansion receipt cannot exceed the mapped device.
     #[error("saved filesystem capacity exceeds the mapped device capacity")]
     FilesystemCapacityExceedsDevice,
 
@@ -258,7 +258,7 @@ pub enum CatalogError {
     #[error("local replica still has an active ublk device or filesystem operation")]
     ReplicaStillAttached,
 
-    /// An attachment row remains until its mount and saved backend are gone.
+    /// An attachment row remains until its mount and saved ublk device are gone.
     #[error("local volume attachment still owns kernel resources")]
     AttachmentStillActive,
 }

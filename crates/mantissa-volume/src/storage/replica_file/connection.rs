@@ -134,7 +134,7 @@ impl DynamicReplicaAuthorization {
                     ReplicaDataAction::WriteRepairRange { .. }
                     | ReplicaDataAction::MakeRepairRangeSparse { .. }
                     | ReplicaDataAction::SyncRepair(_)
-                    | ReplicaDataAction::EnsureRepair(_)
+                    | ReplicaDataAction::ActivateRepair(_)
                     | ReplicaDataAction::FinishRepair { .. } => {
                         self.admit(IoRequestKind::RecoveryTarget(recovery_id))
                     }
@@ -169,7 +169,7 @@ impl DynamicReplicaAuthorization {
                     ReplicaDataAction::WriteRepairRange { .. }
                     | ReplicaDataAction::MakeRepairRangeSparse { .. }
                     | ReplicaDataAction::SyncRepair(_)
-                    | ReplicaDataAction::EnsureRepair(_)
+                    | ReplicaDataAction::ActivateRepair(_)
                     | ReplicaDataAction::FinishRepair { .. } => {
                         self.admit(IoRequestKind::ReplacementTarget(replacement_id))
                     }
@@ -241,7 +241,7 @@ fn action_identity(
         | ReplicaDataAction::MakeRepairRangeSparse { identity, .. }
         | ReplicaDataAction::RotateChangedRegions { identity, .. }
         | ReplicaDataAction::SyncRepair(identity)
-        | ReplicaDataAction::EnsureRepair(identity)
+        | ReplicaDataAction::ActivateRepair(identity)
         | ReplicaDataAction::FinishRepair { identity, .. } => {
             (identity.descriptor(), identity.data_fence())
         }
@@ -258,7 +258,7 @@ fn action_maintenance_id(action: &ReplicaDataAction) -> Option<ReplicaMaintenanc
         | ReplicaDataAction::MakeRepairRangeSparse { identity, .. }
         | ReplicaDataAction::RotateChangedRegions { identity, .. }
         | ReplicaDataAction::SyncRepair(identity)
-        | ReplicaDataAction::EnsureRepair(identity)
+        | ReplicaDataAction::ActivateRepair(identity)
         | ReplicaDataAction::FinishRepair { identity, .. } => Some(identity.maintenance_id()),
         ReplicaDataAction::Write(_)
         | ReplicaDataAction::Sync { .. }
@@ -694,12 +694,15 @@ impl ReplicaDataConnection {
         }
     }
 
-    /// Ensures the current grant owns target repair state.
-    pub async fn ensure_repair(
+    /// Activates the current grant on the repair target.
+    pub async fn activate_repair(
         &self,
         identity: ReplicaMaintenanceIdentity,
     ) -> Result<(), ReplicaDataConnectionError> {
-        match self.call(ReplicaDataAction::EnsureRepair(identity)).await? {
+        match self
+            .call(ReplicaDataAction::ActivateRepair(identity))
+            .await?
+        {
             ReplicaDataResult::Repaired => Ok(()),
             ReplicaDataResult::Rejected(reason) => {
                 Err(ReplicaDataConnectionError::Rejected { reason })
@@ -848,7 +851,7 @@ where
         result
     });
     // Repair changes have an explicit order: for example, a range cannot be
-    // written before EnsureRepair establishes its identity. The node-wide file
+    // written before repair activation establishes its identity. The node-wide file
     // pool may execute unrelated files concurrently, while this one connection
     // must admit only one repair request at a time.
     let admitted_requests = if repair_file.is_some() {
@@ -1161,7 +1164,7 @@ where
             | ReplicaDataAction::WriteRepairRange { .. }
             | ReplicaDataAction::MakeRepairRangeSparse { .. }
             | ReplicaDataAction::SyncRepair(_)
-            | ReplicaDataAction::EnsureRepair(_)
+            | ReplicaDataAction::ActivateRepair(_)
             | ReplicaDataAction::RotateChangedRegions { .. }
             | ReplicaDataAction::FinishRepair { .. }) => {
                 let Some(repair_file) = repair_file.clone() else {
@@ -1306,8 +1309,8 @@ async fn run_repair_action(
                 .await?;
             Ok(ReplicaDataResult::RepairSynced)
         }
-        ReplicaDataAction::EnsureRepair(identity) => {
-            file.ensure_repair(identity.maintenance_id().file_operation_id(), fence)
+        ReplicaDataAction::ActivateRepair(identity) => {
+            file.activate_repair(identity.maintenance_id().file_operation_id(), fence)
                 .await?;
             Ok(ReplicaDataResult::Repaired)
         }

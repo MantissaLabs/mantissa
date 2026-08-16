@@ -32,25 +32,25 @@ interface Volumes {
 
 # Node API for replicated-volume setup, control, and inspection.
 interface ReplicatedVolumeStorage {
-  ensureReplica @0 (request :EnsureReplicaRequest)
+  prepareReplica @0 (request :PrepareReplicaRequest)
       -> (status :LocalReplicaStatus);
-  # Ensure one immutable bootstrap replica and exact common voter set.
+  # Prepare one immutable bootstrap replica and exact common voter set.
 
   inspectReplica @1 (request :ReplicaStatusRequest)
       -> (status :LocalReplicaStatus);
   # Inspect durable local facts without advancing a distributed phase.
 
-  ensureReplacementReplica @2 (request :EnsureReplacementReplicaRequest)
+  prepareReplacementReplica @2 (request :PrepareReplacementReplicaRequest)
       -> (status :LocalReplicaStatus);
-  # Ensure one inactive replacement keyed by current replacement grant.
+  # Prepare one inactive replacement keyed by current replacement grant.
 
   proposeVolumeCommand @3 (request :ProposeVolumeCommandRequest)
       -> (response :VolumeControlCommandResponse);
   # Propose one semantic command only on the already elected local leader.
 
-  ensureReplacementMembership @4 (request :EnsureReplacementMembershipRequest)
+  reconcileReplacementMembership @4 (request :ReconcileReplacementMembershipRequest)
       -> (voterNodeIds :List(Data));
-  # Ensure learner, final voters, or cancellation cleanup for one replacement.
+  # Reconcile learner, final voters, or cancellation cleanup for one replacement.
 
   inspectQuorumState @5 (request :ReplicaStatusRequest)
       -> (state :VolumeControlSnapshot, voterNodeIds :List(Data),
@@ -160,7 +160,7 @@ struct VolumeBlockRequest {
     finishRepair @11 :VolumeFinishRepair;
     # Promote a checked repair target into the next data fence.
 
-    ensureRepair @12 :VolumeMaintenanceIdentity;
+    activateRepair @12 :VolumeMaintenanceIdentity;
     # Make the current grant own repair state, superseding stale work.
 
   }
@@ -791,7 +791,7 @@ struct ReplicatedVolumePlan {
   # Requested volume generation this immutable plan belongs to.
 
   bootstrapId @3 :Data;
-  # Non-zero identity reused by every local ensure.
+  # Non-zero identity reused by every local preparation attempt.
 
   workloadNodeId @4 :Data;
   # 16-byte UUID of the node selected to run the first workload.
@@ -804,7 +804,7 @@ struct ReplicatedVolumePlan {
 }
 
 # Idempotent request to create or inspect one planned replica.
-struct EnsureReplicaRequest {
+struct PrepareReplicaRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact immutable volume generation to realize.
 
@@ -852,7 +852,7 @@ struct ReplicaCapacityStatus {
 }
 
 # Idempotent request to prepare one granted replacement copy.
-struct EnsureReplacementReplicaRequest {
+struct PrepareReplacementReplicaRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact volume generation being rebuilt on this node.
 
@@ -873,7 +873,7 @@ struct ProposeVolumeCommandRequest {
 }
 
 # Idempotent request for one granted replacement membership state.
-struct EnsureReplacementMembershipRequest {
+struct ReconcileReplacementMembershipRequest {
   descriptor @0 :VolumeDescriptor;
   # Exact generation whose elected leader owns membership changes.
 
@@ -1790,7 +1790,7 @@ enum LocalVolumeMountState {
   # The mount was found and its ownership was applied.
 
   unmounting @2;
-  # The mount must be removed before its mapped device and ublk backend.
+  # The mount must be removed before its mapped device and ublk device.
 }
 
 # Complete node-local catalog row for one replica generation.

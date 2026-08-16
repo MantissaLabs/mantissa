@@ -238,14 +238,14 @@ impl MaintenanceSource {
         ))
     }
 
-    /// Ensures the recovery grant owns local repair state on a tracked worker.
+    /// Activates the recovery grant on the tracked local repair worker.
     async fn begin_recovery(&self, id: RecoveryId) -> Result<()> {
         let permit = self.permit(self.recovery_target_purpose(id))?;
         let operation_id = self.maintenance_id.file_operation_id();
         self.file
-            .ensure_repair(operation_id, permit)
+            .activate_repair(operation_id, permit)
             .await
-            .context("ensure local recovery ownership")?;
+            .context("activate local recovery ownership")?;
         Ok(())
     }
 
@@ -335,7 +335,7 @@ impl ReplicatedVolumeRuntime {
         self.spawn_maintenance(state.clone(), id)
     }
 
-    /// Waits on the same recovery task after ensuring its exact grant is owned.
+    /// Waits on the same recovery task after reconciling its exact grant ownership.
     pub(crate) async fn wait_for_recovery(
         &self,
         state: &VolumeControlState,
@@ -475,7 +475,7 @@ impl ReplicatedVolumeRuntime {
             match self.run_replacement(key, replacement, cancel).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    ensure_not_cancelled(cancel)?;
+                    require_not_cancelled(cancel)?;
                     let since = *failed_since.get_or_insert_with(Instant::now);
                     if since.elapsed() < self.repair_failure_grace {
                         warn!(
@@ -505,7 +505,7 @@ impl ReplicatedVolumeRuntime {
                 {
                     Ok(()) => return Ok(()),
                     Err(error) => {
-                        ensure_not_cancelled(cancel)?;
+                        require_not_cancelled(cancel)?;
                         warn!(
                             target: "volumes",
                             ?key,
@@ -542,7 +542,7 @@ impl ReplicatedVolumeRuntime {
         let rollback_voters = default_replacement_rollback_voters(data, replacement)?;
         cancellable(
             cancel,
-            self.ensure_replacement_membership(
+            self.reconcile_replacement_membership(
                 descriptor.clone(),
                 replacement.id,
                 ReplacementMembershipGoal::Absent { rollback_voters },
@@ -611,7 +611,7 @@ impl ReplicatedVolumeRuntime {
 
         cancellable(cancel, source.begin_recovery(current.id)).await?;
         for (_, target) in &targets {
-            cancellable(cancel, target.ensure_repair(identity.clone())).await?;
+            cancellable(cancel, target.activate_repair(identity.clone())).await?;
         }
         let (source_progress, _) = source.state()?;
         let mut changed_generation = source_progress.changed_region_generation();
@@ -692,7 +692,7 @@ impl ReplicatedVolumeRuntime {
         let voters = self.membership(key).await?;
         cancellable(
             cancel,
-            self.ensure_replacement_on(
+            self.prepare_replacement_replica_on(
                 *replacement.new_node_id.as_uuid(),
                 descriptor.clone(),
                 replacement.id,
@@ -702,7 +702,7 @@ impl ReplicatedVolumeRuntime {
         .await?;
         cancellable(
             cancel,
-            self.ensure_replacement_membership(
+            self.reconcile_replacement_membership(
                 descriptor.clone(),
                 replacement.id,
                 ReplacementMembershipGoal::Learner,
@@ -710,11 +710,11 @@ impl ReplicatedVolumeRuntime {
         )
         .await?;
         // Adding a new learner publishes the replacement grant on that node.
-        // Repeat the idempotent local ensure after catch-up so its fail-closed
+        // Reactivate local repair ownership after catch-up so its fail-closed
         // admission gate is enabled from the applied grant before repair I/O.
         cancellable(
             cancel,
-            self.ensure_replacement_on(
+            self.prepare_replacement_replica_on(
                 *replacement.new_node_id.as_uuid(),
                 descriptor.clone(),
                 replacement.id,
@@ -800,7 +800,7 @@ impl ReplicatedVolumeRuntime {
                 ReplicaDataConnectionPurpose::Replacement(replacement.id),
             )
             .await?;
-        cancellable(cancel, target.ensure_repair(identity.clone())).await?;
+        cancellable(cancel, target.activate_repair(identity.clone())).await?;
         let (source_progress, regions) = source.state()?;
         if source_progress.stored_write_number() != source_progress.durable_write_number() {
             anyhow::bail!("replacement source contains changes that were not durably flushed");
@@ -858,7 +858,7 @@ impl ReplicatedVolumeRuntime {
 
         let voters = cancellable(
             cancel,
-            self.ensure_replacement_membership(
+            self.reconcile_replacement_membership(
                 descriptor.clone(),
                 replacement.id,
                 ReplacementMembershipGoal::FinalVoters,
@@ -980,7 +980,7 @@ impl ReplicatedVolumeRuntime {
                 ReplicaDataConnectionPurpose::Replacement(replacement.id),
             )
             .await?;
-        cancellable(cancel, target.ensure_repair(identity.clone())).await?;
+        cancellable(cancel, target.activate_repair(identity.clone())).await?;
         self.copy_full(&source, &target, &identity, false, cancel)
             .await
     }
@@ -1088,7 +1088,7 @@ impl ReplicatedVolumeRuntime {
             .replicas
             .replica(key)?
             .context("maintenance source has no local replica")?;
-        self.ensure_local_gate(&record).await?;
+        self.reconcile_replica_io_gate(&record).await?;
         let gate = self
             .gates
             .read()
@@ -1193,7 +1193,7 @@ impl ReplicatedVolumeRuntime {
             anyhow::bail!("maintenance range ends before it starts");
         }
         while offset < end {
-            ensure_not_cancelled(cancel)?;
+            require_not_cancelled(cancel)?;
             let maximum =
                 usize::try_from((end - offset).min(self.maintenance.maximum_chunk_bytes as u64))?;
             let range = cancellable(cancel, source.read(offset, maximum, stable)).await?;
@@ -1283,7 +1283,7 @@ fn maintenance_session(id: ReplicaMaintenanceId) -> Result<DriverSessionId> {
 }
 
 /// Fails promptly when shutdown or a newer grant cancels this task.
-fn ensure_not_cancelled(cancel: &watch::Receiver<bool>) -> Result<()> {
+fn require_not_cancelled(cancel: &watch::Receiver<bool>) -> Result<()> {
     if *cancel.borrow() {
         anyhow::bail!("replica maintenance was cancelled");
     }
@@ -1296,7 +1296,7 @@ where
     F: Future<Output = std::result::Result<T, E>>,
     E: Into<anyhow::Error>,
 {
-    ensure_not_cancelled(cancel)?;
+    require_not_cancelled(cancel)?;
     tokio::select! {
         biased;
         changed = cancel.changed() => {

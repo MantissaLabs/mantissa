@@ -168,7 +168,7 @@ fn vote_membership_and_activation_survive_restart() {
     let database = database(&directory);
     let catalog = open_catalog(Arc::clone(&database));
     catalog
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create group");
     catalog.save_vote(&group_id, &vote).expect("save vote");
     catalog
@@ -200,18 +200,18 @@ fn vote_membership_and_activation_survive_restart() {
 }
 
 #[test]
-fn ensuring_an_existing_group_does_not_reset_it() {
+fn opening_an_existing_group_does_not_reset_it() {
     let directory = TempDir::new().expect("create test directory");
     let catalog = open_catalog(database(&directory));
     let group_id = TestGroupId(12);
     let vote = Vote::new_committed(4, 1);
 
     catalog
-        .ensure_group(&group_id, GroupActivation::Active)
+        .open_or_create_group(&group_id, GroupActivation::Active)
         .expect("create active group");
     catalog.save_vote(&group_id, &vote).expect("save vote");
     let existing = catalog
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("load existing group");
 
     assert_eq!(GroupActivation::Active, existing.activation());
@@ -226,13 +226,13 @@ fn bounded_group_admission_preserves_restartable_catalog_size() {
     let second = TestGroupId(121);
 
     catalog
-        .ensure_group_bounded(&first, GroupActivation::Active, 1)
+        .open_or_create_group_bounded(&first, GroupActivation::Active, 1)
         .expect("create first bounded group");
     catalog
-        .ensure_group_bounded(&first, GroupActivation::Inactive, 1)
+        .open_or_create_group_bounded(&first, GroupActivation::Inactive, 1)
         .expect("retry existing bounded group");
     let error = catalog
-        .ensure_group_bounded(&second, GroupActivation::Inactive, 1)
+        .open_or_create_group_bounded(&second, GroupActivation::Inactive, 1)
         .expect_err("second bounded group must be rejected");
 
     assert!(matches!(
@@ -258,7 +258,7 @@ fn only_an_inactive_group_can_be_removed() {
     let catalog = open_catalog(database(&directory));
     let group_id = TestGroupId(13);
     catalog
-        .ensure_group(&group_id, GroupActivation::Active)
+        .open_or_create_group(&group_id, GroupActivation::Active)
         .expect("create active group");
 
     assert!(matches!(
@@ -287,22 +287,22 @@ fn only_an_inactive_group_can_be_removed() {
 }
 
 #[test]
-fn ensuring_many_groups_does_not_reset_existing_rows() {
+fn opening_many_groups_does_not_reset_existing_rows() {
     let directory = TempDir::new().expect("create test directory");
     let catalog = open_catalog(database(&directory));
     let existing = TestGroupId(17);
     let vote = Vote::new_committed(4, 2);
     catalog
-        .ensure_group(&existing, GroupActivation::Active)
+        .open_or_create_group(&existing, GroupActivation::Active)
         .expect("create existing group");
     catalog.save_vote(&existing, &vote).expect("save vote");
 
     catalog
-        .ensure_groups([
+        .open_or_create_groups([
             (existing, GroupActivation::Inactive),
             (TestGroupId(18), GroupActivation::Inactive),
         ])
-        .expect("ensure group batch");
+        .expect("open or create group batch");
 
     let record = catalog
         .group(&existing)
@@ -318,7 +318,7 @@ fn stale_and_conflicting_updates_are_rejected() {
     let catalog = open_catalog(database(&directory));
     let group_id = TestGroupId(13);
     catalog
-        .ensure_group(&group_id, GroupActivation::Inactive)
+        .open_or_create_group(&group_id, GroupActivation::Inactive)
         .expect("create group");
 
     catalog
@@ -376,7 +376,7 @@ fn truncated_catalog_record_fails_discovery() {
     let database = database(&directory);
     let catalog = open_catalog(Arc::clone(&database));
     catalog
-        .ensure_group(&TestGroupId(14), GroupActivation::Inactive)
+        .open_or_create_group(&TestGroupId(14), GroupActivation::Inactive)
         .expect("create group");
 
     let mut rows = raw_rows(&database);
@@ -396,10 +396,10 @@ fn mismatched_catalog_key_and_group_id_fail_discovery() {
     let database = database(&directory);
     let catalog = open_catalog(Arc::clone(&database));
     catalog
-        .ensure_group(&TestGroupId(15), GroupActivation::Inactive)
+        .open_or_create_group(&TestGroupId(15), GroupActivation::Inactive)
         .expect("create first group");
     catalog
-        .ensure_group(&TestGroupId(16), GroupActivation::Inactive)
+        .open_or_create_group(&TestGroupId(16), GroupActivation::Inactive)
         .expect("create second group");
 
     let rows = raw_rows(&database);
@@ -419,7 +419,7 @@ fn discovery_limit_is_checked_before_record_allocation() {
     let catalog = open_catalog(database(&directory));
     for value in 20..23 {
         catalog
-            .ensure_group(&TestGroupId(value), GroupActivation::Inactive)
+            .open_or_create_group(&TestGroupId(value), GroupActivation::Inactive)
             .expect("create idle group");
     }
 
@@ -442,7 +442,7 @@ fn idle_groups_share_one_database_handle_and_start_no_runtime() {
     let catalog = open_catalog(Arc::clone(&database));
     for value in 100..132 {
         catalog
-            .ensure_group(&TestGroupId(value), GroupActivation::Inactive)
+            .open_or_create_group(&TestGroupId(value), GroupActivation::Inactive)
             .expect("create idle group");
     }
 

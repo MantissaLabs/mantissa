@@ -429,7 +429,7 @@ impl ReplicaCatalog {
     }
 
     /// Creates or reopens the one durable attachment session for a generation.
-    pub fn ensure_attachment(
+    pub fn open_or_create_attachment(
         &self,
         descriptor: VolumeDescriptor,
         session_id: DriverSessionId,
@@ -1644,7 +1644,7 @@ mod tests {
             .apply_replica_capacity(key, target.capacity())
             .expect("apply target capacity");
         catalog
-            .ensure_attachment(initial.clone(), session)
+            .open_or_create_attachment(initial.clone(), session)
             .expect("save attachment");
         catalog
             .save_attachment_fence(key, session, fence)
@@ -1846,7 +1846,7 @@ mod tests {
         let second = SavedUblkDevice::new(UblkDeviceId::new(5), epoch, session, settings);
 
         catalog
-            .ensure_attachment(descriptor.clone(), session)
+            .open_or_create_attachment(descriptor.clone(), session)
             .expect("save attachment session");
         catalog
             .save_attachment_fence(key, session, epoch)
@@ -1937,7 +1937,7 @@ mod tests {
         .expect("valid saved mount");
 
         catalog
-            .ensure_attachment(descriptor.clone(), session)
+            .open_or_create_attachment(descriptor.clone(), session)
             .expect("save attachment session");
         catalog
             .save_attachment_fence(key, session, epoch)
@@ -2050,7 +2050,7 @@ mod tests {
             .reserve_replica(descriptor.clone(), setup_operation_id())
             .expect("reserve replica");
         catalog
-            .ensure_attachment(descriptor, session)
+            .open_or_create_attachment(descriptor, session)
             .expect("save attachment session");
         catalog
             .save_attachment_fence(key, session, fence)
@@ -2119,7 +2119,7 @@ mod tests {
             .expect("mounted state");
 
         catalog
-            .ensure_attachment(descriptor, session)
+            .open_or_create_attachment(descriptor, session)
             .expect("save attachment session");
         catalog
             .save_attachment_fence(key, session, old)
@@ -2276,7 +2276,7 @@ mod tests {
             .expect("finish rebuilt replica");
         let session = DriverSessionId::new(Uuid::from_u128(702)).expect("driver session");
         catalog
-            .ensure_attachment(expanded.clone(), session)
+            .open_or_create_attachment(expanded.clone(), session)
             .expect("save attachment");
         assert!(matches!(
             catalog.begin_replica_replacement(key, expanded, origin),

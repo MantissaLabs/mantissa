@@ -93,7 +93,8 @@ impl ReplicatedVolumePlanner {
         if self.registry.get_plan(spec.id)?.is_some() {
             return Ok(());
         }
-        self.membership_change_blocker.ensure_changes_allowed()?;
+        self.membership_change_blocker
+            .require_membership_changes_allowed()?;
         let plan = self.create_plan(spec)?;
         self.registry.upsert_plan(plan.clone()).await?;
         self.gossip_tx

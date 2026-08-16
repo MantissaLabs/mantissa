@@ -169,7 +169,7 @@ fn applied_state_reconstructs_the_exact_bounded_state() {
 }
 
 #[test]
-fn larger_applied_capacity_accepts_old_bounded_requests_but_rejects_future_capacity() {
+fn expanded_applied_capacity_accepts_old_bounded_requests_but_rejects_future_capacity() {
     let registry = AppliedVolumeStateRegistry::new();
     let (attached, writer) = attached();
     let cell = registry

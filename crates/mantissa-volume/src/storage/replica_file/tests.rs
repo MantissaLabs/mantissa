@@ -383,7 +383,7 @@ fn data_connection_header_round_trips_admission_identity() {
 
 /// File extension stays invisible until Raft capacity is published and survives restart.
 #[test]
-fn prepared_capacity_is_not_served_before_commit_and_reopens_at_the_larger_size() {
+fn prepared_capacity_is_not_served_before_commit_and_reopens_at_the_expanded_size() {
     let directory = TempDir::new().expect("temporary replica directory");
     let initial = VolumeDescriptor::new(
         descriptor().volume_id(),
@@ -410,7 +410,7 @@ fn prepared_capacity_is_not_served_before_commit_and_reopens_at_the_larger_size(
     );
     assert_eq!(file.served_capacity(), initial.capacity());
     let first_new_block = initial.capacity().bytes() / BLOCK_BYTES as u64;
-    let larger_write = ReplicaWrite::new(
+    let expanded_range_write = ReplicaWrite::new(
         target.clone(),
         data_fence(),
         1,
@@ -421,13 +421,13 @@ fn prepared_capacity_is_not_served_before_commit_and_reopens_at_the_larger_size(
     )
     .expect("valid larger-range write");
     assert!(matches!(
-        file.write(&larger_write),
+        file.write(&expanded_range_write),
         Err(ReplicaFileError::WrongDescriptor)
     ));
 
     file.serve_capacity(target_capacity)
         .expect("publish committed capacity");
-    file.write(&larger_write)
+    file.write(&expanded_range_write)
         .expect("larger-range write after publication");
     drop(file);
 
@@ -902,11 +902,11 @@ fn completed_generation_change_is_safe_to_retry() {
     file.install_fence(later_data_fence(2), 3)
         .expect("a partial multi-copy retry may advance an unused generation");
     let operation = repair_id(30);
-    file.ensure_repair(operation)
+    file.activate_repair(operation)
         .expect("same promotion retry may begin repair");
     file.finish_repair(operation, later_data_fence(2), 3, 0, 0)
         .expect("same repaired generation must be idempotent");
-    file.ensure_repair(repair_id(31))
+    file.activate_repair(repair_id(31))
         .expect("idempotent finish must release repair state");
 }
 
@@ -917,7 +917,7 @@ fn repaired_copy_preserves_source_durable_progress() {
     let operation = repair_id(33);
     let file = ReplicaFile::create(directory.path(), descriptor(), data_fence(), settings())
         .expect("replica file must be created");
-    file.ensure_repair(operation)
+    file.activate_repair(operation)
         .expect("repair ownership must install");
     file.finish_repair(operation, data_fence(), 2, 7, 11)
         .expect("source durable point must install");
@@ -941,7 +941,7 @@ fn repaired_copy_rejects_invalid_durable_progress() {
     let operation = repair_id(34);
     let file = ReplicaFile::create(directory.path(), descriptor(), data_fence(), settings())
         .expect("replica file must be created");
-    file.ensure_repair(operation)
+    file.activate_repair(operation)
         .expect("repair ownership must install");
     assert!(matches!(
         file.finish_repair(operation, data_fence(), 2, 0, 1),
@@ -966,9 +966,9 @@ fn current_repair_supersedes_an_interrupted_older_grant() {
         bytes: vec![0x5a; BLOCK_BYTES].into(),
     };
 
-    file.ensure_repair(old)
+    file.activate_repair(old)
         .expect("old repair must establish local ownership");
-    file.ensure_repair(current)
+    file.activate_repair(current)
         .expect("current control state must supersede stale ownership");
     assert!(matches!(
         file.write_repair_range(old, &range),
@@ -1015,7 +1015,7 @@ fn completed_repair_may_be_repeated_in_a_new_changed_region_generation() {
         bytes: vec![0x42; BLOCK_BYTES].into(),
     };
 
-    file.ensure_repair(operation)
+    file.activate_repair(operation)
         .expect("first rebuild attempt must start");
     file.write_repair_range(operation, &range)
         .expect("first rebuild attempt must copy data");
@@ -1024,7 +1024,7 @@ fn completed_repair_may_be_repeated_in_a_new_changed_region_generation() {
     file.finish_repair(operation, later_data_fence(2), 2, 0, 0)
         .expect("first rebuild attempt must prepare the new epoch");
 
-    file.ensure_repair(operation)
+    file.activate_repair(operation)
         .expect("same rebuild must restart after an interrupted control write");
     file.write_repair_range(operation, &range)
         .expect("restarted rebuild must recopy data");
@@ -1052,7 +1052,7 @@ fn completed_repair_may_be_repeated_in_a_new_changed_region_generation() {
         .expect("normal write must store after rebuild");
     file.sync(ReplicaFlush::new(later_data_fence(2), 1, 1).expect("normal flush must be valid"))
         .expect("normal write must become durable");
-    file.ensure_repair(operation)
+    file.activate_repair(operation)
         .expect("repair check must stop new writes");
     assert!(matches!(
         file.finish_repair(operation, later_data_fence(2), 4, 0, 0),
@@ -1215,7 +1215,7 @@ fn repair_messages_round_trip() {
             flush_number: 7,
             durable_write_number: 11,
         },
-        ReplicaDataAction::EnsureRepair(identity),
+        ReplicaDataAction::ActivateRepair(identity),
     ];
     for (index, action) in actions.into_iter().enumerate() {
         let request = ReplicaDataRequest::new(
@@ -1727,7 +1727,7 @@ async fn data_connection_checks_repair_source_and_target() {
     let (target, target_server) =
         start_repair_connection(Arc::clone(&files[1]), node(3), operation);
     target
-        .ensure_repair(identity.clone())
+        .activate_repair(identity.clone())
         .await
         .expect("approved target must start repair");
     assert!(matches!(
@@ -1784,7 +1784,7 @@ async fn recovery_checks_and_promotes_an_active_copy() {
         ReplicaMaintenanceId::Recovery(operation),
     );
     connection
-        .ensure_repair(identity.clone())
+        .activate_repair(identity.clone())
         .await
         .expect("recovery must stop the active copy");
     connection

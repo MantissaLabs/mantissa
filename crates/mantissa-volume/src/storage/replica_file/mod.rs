@@ -798,8 +798,8 @@ impl ReplicaFile {
         ))
     }
 
-    /// Ensures the current grant supersedes any stale in-memory repair owner.
-    pub fn ensure_repair(&self, repair_id: OperationId) -> Result<(), ReplicaFileError> {
+    /// Activates the current grant and supersedes stale in-memory repair work.
+    pub fn activate_repair(&self, repair_id: OperationId) -> Result<(), ReplicaFileError> {
         let mut progress = self.progress.lock();
         if progress.failed {
             return Err(ReplicaFileError::Failed);

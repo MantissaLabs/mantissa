@@ -343,7 +343,7 @@ pub enum SavedMountState {
     /// The mount was found and its ownership was applied.
     Mounted,
 
-    /// The mount must be removed before its mapped device and ublk backend.
+    /// The mount must be removed before its mapped device and ublk device.
     Unmounting,
 }
 
@@ -740,7 +740,7 @@ impl LocalAttachmentRecord {
         ReplicaKey::from(&self.descriptor)
     }
 
-    /// Returns the descriptor exposed by the active mapped frontend.
+    /// Returns the descriptor currently used by the mapped device.
     pub const fn descriptor(&self) -> &VolumeDescriptor {
         &self.descriptor
     }
@@ -775,7 +775,7 @@ impl LocalAttachmentRecord {
         self.granted_fence = Some(fence);
     }
 
-    /// Records the descriptor proven active in the mapped frontend.
+    /// Records the descriptor proven active in the mapped device.
     pub(super) fn set_descriptor(&mut self, descriptor: VolumeDescriptor) {
         self.descriptor = descriptor;
     }

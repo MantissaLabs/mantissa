@@ -132,7 +132,7 @@ enum FileAction {
         repair_id: OperationId,
         reply: oneshot::Sender<Result<(), ReplicaFileError>>,
     },
-    EnsureRepair {
+    ActivateRepair {
         file: Arc<ReplicaFile>,
         repair_id: OperationId,
         reply: oneshot::Sender<Result<(), ReplicaFileError>>,
@@ -577,8 +577,8 @@ impl ReplicaFileRequestScope {
             .map_err(ReplicaFileWorkerError::File)
     }
 
-    /// Ensures this grant owns repair state after older file work drains.
-    pub(super) async fn ensure_repair(
+    /// Activates this grant after older file work drains.
+    pub(super) async fn activate_repair(
         &self,
         repair_id: OperationId,
         fence: Option<FencePermit>,
@@ -587,7 +587,7 @@ impl ReplicaFileRequestScope {
         let (reply, result) = oneshot::channel();
         self.sender
             .send(FileRequest {
-                action: FileAction::EnsureRepair {
+                action: FileAction::ActivateRepair {
                     file: Arc::clone(&self.file),
                     repair_id,
                     reply,
@@ -738,13 +738,13 @@ impl ReplicaFileMaintenance {
             .await
     }
 
-    /// Ensures one current grant owns local repair state on a pool worker.
-    pub async fn ensure_repair(
+    /// Activates one current grant on a pool worker.
+    pub async fn activate_repair(
         &self,
         repair_id: OperationId,
         fence: FencePermit,
     ) -> Result<(), ReplicaFileWorkerError> {
-        self.scope.ensure_repair(repair_id, Some(fence)).await
+        self.scope.activate_repair(repair_id, Some(fence)).await
     }
 
     /// Reads one local maintenance range while retaining its fence permit.
@@ -898,12 +898,12 @@ fn run_worker(receiver: async_channel::Receiver<FileRequest>) {
             } => {
                 let _ = reply.send(file.sync_repair(repair_id));
             }
-            FileAction::EnsureRepair {
+            FileAction::ActivateRepair {
                 file,
                 repair_id,
                 reply,
             } => {
-                let _ = reply.send(file.ensure_repair(repair_id));
+                let _ = reply.send(file.activate_repair(repair_id));
             }
             FileAction::InstallFence {
                 file,

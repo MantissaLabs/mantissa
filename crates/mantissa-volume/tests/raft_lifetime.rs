@@ -153,7 +153,7 @@ impl TestMemberStorage {
         )
         .expect("open durable volume group catalog");
         catalog
-            .ensure_group(&group_id, GroupActivation::Active)
+            .open_or_create_group(&group_id, GroupActivation::Active)
             .expect("save active volume group");
         if !is_initial_voter {
             let voters = BTreeSet::from([initial_voter]);

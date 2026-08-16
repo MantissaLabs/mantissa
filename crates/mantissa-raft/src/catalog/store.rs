@@ -79,26 +79,26 @@ where
     ///
     /// Repeating the call for the same group returns its existing record. It
     /// does not reset a saved vote, membership, or activation state.
-    pub fn ensure_group(
+    pub fn open_or_create_group(
         &self,
         group_id: &GID,
         activation: GroupActivation,
     ) -> Result<GroupRecord<GID, NID>, CatalogError> {
-        self.ensure_group_inner(group_id, activation, None)
+        self.open_or_create_group_inner(group_id, activation, None)
     }
 
     /// Creates one group without allowing the durable catalog to exceed its limit.
-    pub fn ensure_group_bounded(
+    pub fn open_or_create_group_bounded(
         &self,
         group_id: &GID,
         activation: GroupActivation,
         maximum: usize,
     ) -> Result<GroupRecord<GID, NID>, CatalogError> {
-        self.ensure_group_inner(group_id, activation, Some(maximum))
+        self.open_or_create_group_inner(group_id, activation, Some(maximum))
     }
 
-    /// Performs one idempotent group ensure and checks optional admission atomically.
-    fn ensure_group_inner(
+    /// Opens or creates one group and checks optional admission atomically.
+    fn open_or_create_group_inner(
         &self,
         group_id: &GID,
         activation: GroupActivation,
@@ -136,13 +136,13 @@ where
     /// Creates many missing group rows in one durable catalog change.
     ///
     /// Existing rows keep their vote, membership, and activation state.
-    pub fn ensure_groups(
+    pub fn open_or_create_groups(
         &self,
-        groups_to_ensure: impl IntoIterator<Item = (GID, GroupActivation)>,
+        requested_groups: impl IntoIterator<Item = (GID, GroupActivation)>,
     ) -> Result<(), CatalogError> {
         let write = self.database.begin_write()?;
         let mut groups = write.open_table(GROUPS)?;
-        for (group_id, activation) in groups_to_ensure {
+        for (group_id, activation) in requested_groups {
             let key = encode_group_id(&group_id, &self.group_ids, self.limits)?;
             if let Some(stored) = groups.get(key.as_slice())? {
                 let record = self.decode_checked(key.as_slice(), stored.value())?;

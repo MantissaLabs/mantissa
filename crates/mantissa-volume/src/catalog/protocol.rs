@@ -653,8 +653,8 @@ pub enum CatalogProtocolError {
     #[error("bootstrap replica origin must not duplicate its voter set")]
     UnexpectedBootstrapVoters,
 
-    /// A mount did not use the saved backend's writer session and fence.
-    #[error("saved volume mount does not match the saved backend session")]
+    /// A mount did not use the saved ublk device's writer session and fence.
+    #[error("saved volume mount does not match the saved ublk device session")]
     VolumeMountDeviceMismatch,
 
     /// A saved device does not match the attachment's committed control state.

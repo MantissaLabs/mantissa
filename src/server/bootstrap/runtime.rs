@@ -636,7 +636,7 @@ async fn open_replicated_volumes(
 /// Opens storage with either new checks or checks completed by automatic setup.
 async fn open_replicated_volume_runtime(
     config: config::ReplicatedVolumeConfig,
-    prepared: Option<crate::volumes::replicated::PreparedStorage>,
+    prepared: Option<crate::volumes::replicated::PreparedReplicatedVolumeHost>,
     node_id: uuid::Uuid,
     noise_keys: Arc<mantissa_net::noise::NoiseKeys>,
     peers: crate::store::replicated::peers::PeersStore,

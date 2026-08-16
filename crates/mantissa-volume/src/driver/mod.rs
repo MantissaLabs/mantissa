@@ -1,6 +1,6 @@
 //! Local block-device boundaries for replicated volumes.
 //!
-//! The ublk backend owns kernel queues and buffers. A block handler owns the
+//! The ublk device owns kernel queues and buffers. A block handler owns the
 //! replicated storage behavior. Device-mapper provides the stable device that
 //! the filesystem uses without taking part in replication.
 
