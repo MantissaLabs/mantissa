@@ -2337,7 +2337,7 @@ pub(super) use linux::PlatformBpfManager;
 
 #[cfg(not(target_os = "linux"))]
 mod stub {
-    use super::super::{BpfProgramSpec, NetworkInterfaceContext};
+    use super::super::NetworkInterfaceContext;
     use crate::network::types::NetworkSpecValue;
     use anyhow::Result;
 

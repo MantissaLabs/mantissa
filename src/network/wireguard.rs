@@ -1,12 +1,24 @@
+#[cfg(target_os = "linux")]
 use crate::config;
 use crate::registry::Registry;
+#[cfg(target_os = "linux")]
 use crate::topology::peers::{PeerValue, WireGuardPeerValue};
-use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::Result;
+#[cfg(target_os = "linux")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::HashSet;
+#[cfg(target_os = "linux")]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(target_os = "linux")]
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::net::IpAddr;
+#[cfg(target_os = "linux")]
+use std::net::{Ipv6Addr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::Instant;
 use uuid::Uuid;
 
 /// Name of the kernel WireGuard interface managed by Mantissa.
@@ -30,12 +42,14 @@ pub const MANTISSA_WIREGUARD_MTU: u32 = 1420;
 pub const MANTISSA_WIREGUARD_VXLAN_MTU: u32 = MANTISSA_WIREGUARD_MTU - 70;
 
 /// Periodic forced reconfiguration interval to correct external drift.
+#[cfg(target_os = "linux")]
 const WIREGUARD_FORCE_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// UDP destination port used by Mantissa VXLAN devices.
 ///
 /// We keep this local to the WireGuard module so we can punch firewall holes without depending
 /// on private constants from the network controller.
+#[cfg(target_os = "linux")]
 const MANTISSA_VXLAN_UDP_PORT: u16 = 4789;
 
 /// Snapshot of the current WireGuard underlay readiness as seen by the network controller.
@@ -76,6 +90,7 @@ pub struct WireGuardUnderlayState {
 
 /// Snapshot the per-peer configuration fields that affect the kernel WireGuard interface.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[cfg(target_os = "linux")]
 struct PeerConfigFingerprint {
     peer_id: Uuid,
     public_key: [u8; 32],
@@ -89,6 +104,7 @@ struct PeerConfigFingerprint {
 /// The controller passes a desired peer scope derived from shared participating networks. This
 /// planner then intersects that scope with the visible peer metadata snapshot so view-scoped
 /// exclusions do not block local convergence.
+#[cfg(target_os = "linux")]
 struct WireGuardPeerPlan {
     peer_configs: Vec<PeerConfigFingerprint>,
     desired_peer_count: usize,
@@ -111,6 +127,7 @@ struct LocalWireGuardConfig {
 }
 
 /// Return the inert underlay state used when WireGuard is disabled or unsupported on this host.
+#[cfg(target_os = "linux")]
 fn inactive_wireguard_state() -> WireGuardUnderlayState {
     WireGuardUnderlayState {
         underlay_active: false,
@@ -124,6 +141,7 @@ fn inactive_wireguard_state() -> WireGuardUnderlayState {
 }
 
 /// Compute a stable hash for the WireGuard interface configuration so we only reconfigure when needed.
+#[cfg(target_os = "linux")]
 fn compute_wireguard_config_hash(
     listen_port: u16,
     tunnel_ip: IpAddr,
@@ -139,6 +157,7 @@ fn compute_wireguard_config_hash(
 }
 
 /// Decide whether the WireGuard interface should be reconfigured to reduce churn while correcting drift.
+#[cfg(target_os = "linux")]
 fn should_reconfigure_wireguard(
     previous: Option<&WireGuardUnderlayState>,
     config_hash: u64,
@@ -209,6 +228,7 @@ fn load_local_wireguard_config(self_id: Uuid) -> Result<LocalWireGuardConfig> {
 /// Only peers present in both the caller-provided desired scope and the local peer snapshot are
 /// considered. This keeps split-view exclusions from blocking encryption for the peers that remain
 /// visible in the local controller scope.
+#[cfg(target_os = "linux")]
 fn build_wireguard_peer_plan(
     peers_snapshot: &[(Uuid, PeerValue)],
     self_id: Uuid,
@@ -606,6 +626,7 @@ pub async fn ensure_wireguard_underlay(
 ///
 /// Returns `None` when the address is not compatible with an IP underlay (e.g. in-process
 /// transports used in tests).
+#[cfg(target_os = "linux")]
 fn build_wireguard_endpoint(advertise: &str, listen_port: u16) -> Option<String> {
     if advertise.starts_with("inproc://") || advertise.starts_with("unix://") {
         return None;
@@ -711,15 +732,6 @@ fn ensure_vxlan_firewall_accept(ifname: &str) -> Result<()> {
         );
     }
 
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-/// Treat VXLAN firewall setup as a no-op on non-Linux builds.
-///
-/// The production WireGuard overlay is Linux-only, but keeping this stub lets the rest of the crate
-/// compile on macOS for control-plane development and unprivileged tests.
-fn ensure_vxlan_firewall_accept(_ifname: &str) -> Result<()> {
     Ok(())
 }
 

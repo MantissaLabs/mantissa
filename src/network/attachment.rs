@@ -3,9 +3,10 @@ use async_trait::async_trait;
 use std::net::IpAddr;
 use uuid::Uuid;
 
+pub(crate) use crate::network::naming::{bridge_name, host_iface_name, vxlan_name};
+#[cfg(target_os = "linux")]
 pub(crate) use crate::network::naming::{
-    bridge_name, host_access_host_iface_name, host_access_peer_iface_name, host_iface_name,
-    instance_iface_name, vxlan_name,
+    host_access_host_iface_name, host_access_peer_iface_name, instance_iface_name,
 };
 use crate::runtime::types::RuntimeAttachmentTarget;
 

@@ -1,7 +1,9 @@
 use crate::ingress::registry::IngressPoolRegistry;
 use crate::ingress::types::IngressPoolSpecValue;
 use crate::network::allocator::{OverlayIpFamily, parse_overlay_cidr};
-use crate::network::attachment::{bridge_name, host_access_host_iface_name, vxlan_name};
+#[cfg(target_os = "linux")]
+use crate::network::attachment::host_access_host_iface_name;
+use crate::network::attachment::{bridge_name, vxlan_name};
 use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::nodeport::{NodePortManager, NodePortMapping, NodePortProtocol};

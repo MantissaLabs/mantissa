@@ -6,10 +6,13 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+#[cfg(any(test, target_os = "linux"))]
 use uuid::Uuid;
 
 use crate::catalog::ReplicaKey;
-use crate::{VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId, VolumeNodeId};
+use crate::{VolumeBlockSizes, VolumeDescriptor, VolumeNodeId};
+#[cfg(any(test, target_os = "linux"))]
+use crate::{VolumeGeneration, VolumeId};
 
 const DEVICE_MAPPER_SECTOR_BYTES: u64 = 512;
 const MANTISSA_NAME_PREFIX: &str = "mantissa-rv-";
@@ -117,6 +120,7 @@ impl MappedVolumeLayout {
 
     /// Returns the number of 512-byte sectors required by dm-linear.
     #[must_use]
+    #[cfg(target_os = "linux")]
     const fn device_mapper_sectors(&self) -> u64 {
         self.capacity_bytes / DEVICE_MAPPER_SECTOR_BYTES
     }
@@ -303,6 +307,7 @@ impl MappedVolumeIdentity {
     }
 
     /// Parses only the exact UUID namespace emitted by this module.
+    #[cfg(any(test, target_os = "linux"))]
     fn from_uuid(value: &str) -> Option<Self> {
         let body = value.strip_prefix(MANTISSA_UUID_PREFIX)?;
         let (node, volume_and_generation) = body.split_once("-V")?;
@@ -336,9 +341,11 @@ fn validate_identity_value(
 }
 
 /// Raw target row returned by device-mapper table inspection.
+#[cfg(any(test, target_os = "linux"))]
 type RawTarget = (u64, u64, String, String);
 
 /// Checks one active or inactive table against the expected volume layout.
+#[cfg(any(test, target_os = "linux"))]
 fn validate_linear_table(
     name: &str,
     table: &[RawTarget],
@@ -380,12 +387,14 @@ fn validate_linear_table(
 
 /// One saved device candidate reduced to the values stored in a linear table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "linux"))]
 struct SavedLinearLayout {
     sectors: u64,
     underlying_device: BlockDeviceNumber,
 }
 
 /// Selects the saved device used by the active table and checks any pending table.
+#[cfg(any(test, target_os = "linux"))]
 fn select_saved_linear_layout(
     name: &str,
     active: &[RawTarget],
@@ -432,6 +441,7 @@ fn select_saved_linear_layout(
 
 /// Next safe action derived from exact active and inactive linear tables.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "linux"))]
 enum ExpansionAction {
     /// The expanded table is already active; resume it if it is suspended.
     Finish,
@@ -442,6 +452,7 @@ enum ExpansionAction {
 }
 
 /// Classifies only the states that interrupted mapped-volume expansion may leave behind.
+#[cfg(any(test, target_os = "linux"))]
 fn classify_expansion(
     name: &str,
     active: &[RawTarget],
@@ -477,6 +488,7 @@ fn classify_expansion(
 }
 
 /// Parses one kernel major:minor pair without accepting path aliases.
+#[cfg(any(test, target_os = "linux"))]
 fn parse_device_number(value: &str) -> Option<BlockDeviceNumber> {
     let (major, minor) = value.split_once(':')?;
     Some(BlockDeviceNumber::new(

@@ -1,3 +1,4 @@
+#[cfg(target_os = "linux")]
 use std::collections::{BTreeSet, HashSet};
 use uuid::Uuid;
 
@@ -17,6 +18,7 @@ pub(crate) fn host_iface_name(attachment_id: Uuid) -> String {
 }
 
 /// Compute the deterministic runtime-side veth name for one local task attachment.
+#[cfg(target_os = "linux")]
 pub(crate) fn instance_iface_name(attachment_id: Uuid) -> String {
     format!("mntc-{}", managed_interface_suffix(attachment_id))
 }
@@ -27,6 +29,7 @@ pub(crate) fn bridge_name(network_id: Uuid) -> String {
 }
 
 /// Compute the deterministic host-facing veth name for one overlay network.
+#[cfg(target_os = "linux")]
 pub(crate) fn host_access_host_iface_name(network_id: Uuid) -> String {
     format!("mnhost-{}", managed_interface_suffix(network_id))
 }
@@ -45,6 +48,7 @@ pub(crate) fn vxlan_name(network_id: Uuid) -> String {
 ///
 /// Mantissa-managed network interfaces all embed the same eight-hex network suffix, which lets
 /// the controller identify orphaned devices without storing extra local metadata.
+#[cfg(target_os = "linux")]
 pub(crate) fn managed_network_interface_suffix(link_name: &str) -> Option<&str> {
     // Prefixes that encode one network suffix rather than one task attachment suffix.
     const PREFIXES: [&str; 4] = ["mvx-", "mnt-br-", "mnhost-", "mnhp-"];
@@ -64,6 +68,7 @@ pub(crate) fn managed_network_interface_suffix(link_name: &str) -> Option<&str> 
 /// Underlay detection must ignore the controller's own bridge, VXLAN, host-access, and task
 /// attachment devices or it can accidentally bootstrap a new network from another overlay's local
 /// transient MTU and addressing state.
+#[cfg(target_os = "linux")]
 pub(crate) fn is_managed_overlay_link_name(link_name: &str) -> bool {
     managed_network_interface_suffix(link_name).is_some()
         || link_name.starts_with("mnth-")
@@ -75,6 +80,7 @@ pub(crate) fn is_managed_overlay_link_name(link_name: &str) -> bool {
 /// The controller uses this before reconciling active networks so orphaned host-access links from
 /// earlier crashes cannot leave duplicate connected routes that hijack host-originated health
 /// probes and embedded DNS traffic.
+#[cfg(target_os = "linux")]
 pub(crate) fn collect_orphaned_network_suffixes<I, S>(
     desired: &HashSet<Uuid>,
     link_names: I,

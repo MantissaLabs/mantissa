@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use mantissa::rest::is_valid_rest_token_format;
 use mantissa::server::headless::HeadlessNode;
 use mantissa_client::config::ClientConfig;

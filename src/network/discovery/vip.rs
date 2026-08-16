@@ -184,7 +184,7 @@ async fn ensure_host_vip_neighbor(network_id: Uuid, vip: IpAddr, vip_mac: [u8; 6
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (network_id, vip, vip_mac);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -246,7 +246,7 @@ pub(super) async fn reconcile_host_vip_neighbors(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (network_id, desired_vips, managed_vips);
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

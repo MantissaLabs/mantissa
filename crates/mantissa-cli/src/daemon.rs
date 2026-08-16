@@ -10,8 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(not(unix))]

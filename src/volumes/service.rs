@@ -1143,7 +1143,7 @@ fn public_volume_status(
         };
     }
     if spec.lifecycle.disposition == DesiredVolumeDisposition::Retained
-        && !group_status.is_some_and(|group| group.status == VolumeStatus::Retained)
+        && group_status.is_none_or(|group| group.status != VolumeStatus::Retained)
     {
         return PublicVolumeStatus {
             state: VolumeState::Retaining,

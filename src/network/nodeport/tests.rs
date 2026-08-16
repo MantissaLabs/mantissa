@@ -1,15 +1,18 @@
 #[cfg(target_os = "linux")]
+use super::NodePortProtocol;
+#[cfg(target_os = "linux")]
 use super::platform::{
     NodePortPublishedMapping, NodePortReturnKey, NodePortReturnKey6, NodePortSelector,
     nodeport_return_keys, stale_nodeport_mappings, stale_overlay_ifindices,
 };
 use super::{
     NODEPORT_FLOW_CAPACITY, NODEPORT_HOST_CAPACITY, NODEPORT_VIP_CAPACITY, NodePortFlowDiagnostics,
-    NodePortIdentitySource, NodePortMapCapacities, NodePortPacketCounters, NodePortProtocol,
-    NodePortRuntimeState, NodePortStatus, configured_node_ip_from_sources,
-    configured_node_ip_source, estimated_flow_evictions, nodeport_capacity_error,
-    projected_active_networks_after_sync, resolve_advertise_ip,
+    NodePortIdentitySource, NodePortMapCapacities, NodePortPacketCounters, NodePortRuntimeState,
+    NodePortStatus, configured_node_ip_from_sources, configured_node_ip_source,
+    estimated_flow_evictions, nodeport_capacity_error, projected_active_networks_after_sync,
+    resolve_advertise_ip,
 };
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

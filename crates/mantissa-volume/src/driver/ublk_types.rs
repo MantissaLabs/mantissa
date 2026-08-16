@@ -202,6 +202,7 @@ pub struct UblkFeatures {
 impl UblkFeatures {
     /// Creates the portable representation returned by the Linux driver.
     #[must_use]
+    #[cfg(target_os = "linux")]
     pub(super) const fn from_raw(raw: u64) -> Self {
         Self { raw }
     }

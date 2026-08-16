@@ -419,7 +419,7 @@ impl ReplicaCatalog {
             .get(table_key.as_slice())?
             .map(|value| decode_retirement_checked(table_key.as_slice(), value.value()))
             .transpose()?;
-        if !saved.is_some_and(|retirement| retirement.key().generation() < current.generation()) {
+        if saved.is_none_or(|retirement| retirement.key().generation() >= current.generation()) {
             return Ok(());
         }
         retirements.remove(table_key.as_slice())?;

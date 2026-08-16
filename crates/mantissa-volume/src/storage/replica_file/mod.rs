@@ -2370,6 +2370,7 @@ fn write_zeroes(file: &File, mut offset: u64, mut length: u64) -> Result<(), Rep
 }
 
 /// Uses an unwritten extent for zeroes and falls back when unsupported.
+#[cfg(target_os = "linux")]
 fn zero_range(file: &File, offset: u64, length: u64) -> Result<(), ReplicaFileError> {
     let offset_value =
         libc::off_t::try_from(offset).map_err(|_| ReplicaFileError::FileOffsetOverflow)?;
@@ -2399,7 +2400,14 @@ fn zero_range(file: &File, offset: u64, length: u64) -> Result<(), ReplicaFileEr
     }
 }
 
+/// Writes zeroes when this host has no Linux unwritten-extent operation.
+#[cfg(not(target_os = "linux"))]
+fn zero_range(file: &File, offset: u64, length: u64) -> Result<(), ReplicaFileError> {
+    write_zeroes(file, offset, length)
+}
+
 /// Releases one file range while preserving the sparse file length.
+#[cfg(target_os = "linux")]
 fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
     let offset = libc::off_t::try_from(offset)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "hole offset is too large"))?;
@@ -2420,6 +2428,12 @@ fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Preserves discard reads with zeroes when hole punching is unavailable.
+#[cfg(not(target_os = "linux"))]
+fn punch_hole(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    write_zeroes(file, offset, length).map_err(io::Error::other)
 }
 
 /// Explains why a fixed replica file could not be used safely.

@@ -2164,6 +2164,7 @@ pub(crate) async fn write_synced_probe(path: PathBuf, value: &'static [u8]) -> a
 }
 
 /// Issues one aligned direct write without a flush so restart must reconcile volatile progress.
+#[cfg(target_os = "linux")]
 pub(crate) async fn write_unflushed_direct_probe(path: PathBuf) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         use std::os::fd::AsRawFd as _;
@@ -2219,6 +2220,12 @@ pub(crate) async fn write_unflushed_direct_probe(path: PathBuf) -> anyhow::Resul
     })
     .await
     .context("join unflushed replicated-volume direct write")?
+}
+
+/// Reports that the Linux direct-I/O recovery probe cannot run on this host.
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn write_unflushed_direct_probe(_path: PathBuf) -> anyhow::Result<()> {
+    anyhow::bail!("the unflushed direct-write probe is supported only on Linux")
 }
 
 /// Reads one previously synced file after a volume recovery or writer change.
@@ -2747,10 +2754,26 @@ async fn request_replicated_volume_expansion(
 
 /// Returns the mounted filesystem's total data-block capacity.
 fn mounted_filesystem_capacity(path: &Path) -> anyhow::Result<u64> {
-    let stat = nix::sys::statvfs::statvfs(path)
-        .with_context(|| format!("read filesystem capacity for {}", path.display()))?;
-    stat.blocks()
-        .checked_mul(stat.fragment_size())
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("convert filesystem path {}", path.display()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path_bytes` is terminated and `statvfs` initializes `stat`
+    // before reporting success.
+    let result = unsafe { libc::statvfs(path_bytes.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("read filesystem capacity for {}", path.display()));
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let stat = unsafe { stat.assume_init() };
+    #[cfg(target_os = "macos")]
+    let block_count = u64::from(stat.f_blocks);
+    #[cfg(not(target_os = "macos"))]
+    let block_count = stat.f_blocks;
+    block_count
+        .checked_mul(stat.f_frsize)
         .context("mounted filesystem capacity overflowed")
 }
 

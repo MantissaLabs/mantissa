@@ -8,6 +8,10 @@ use crate::storage_format::ReplicaSpaceError;
 /// Explains why a local directory cannot be used as a replica pool.
 #[derive(Debug, Error)]
 pub enum PoolError {
+    /// The host cannot provide the Linux filesystem checks required by a pool.
+    #[error("replica pools are supported only on Linux")]
+    UnsupportedPlatform,
+
     /// A filesystem or path check could not be completed.
     #[error("could not {action}")]
     Io {
@@ -52,6 +56,7 @@ pub enum PoolError {
 
 impl PoolError {
     /// Adds a short action to one operating-system error.
+    #[cfg(target_os = "linux")]
     pub(super) fn io(action: &'static str, source: io::Error) -> Self {
         Self::Io { action, source }
     }

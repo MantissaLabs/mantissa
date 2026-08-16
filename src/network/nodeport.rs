@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+#[cfg(any(test, target_os = "linux"))]
 use crate::network::addressing::resolve_advertise_ip;
 
 /// IP protocol number for TCP used by NodePort selector and dataplane keys.
@@ -20,18 +21,25 @@ const NODEPORT_FLOW_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_FLOW_CAPAC
 #[cfg(test)]
 const NODEPORT_HOST_CAPACITY: usize = crate::config::DEFAULT_NODEPORT_HOST_CAPACITY;
 /// Keep the userspace readers aligned with the ingress drop-reason map size in the tc ingress program.
+#[cfg(target_os = "linux")]
 const NODEPORT_INGRESS_DROP_REASON_COUNT: usize = 6;
 /// Keep the userspace readers aligned with the shared NodePort flow-event map size in the tc programs.
+#[cfg(target_os = "linux")]
 const NODEPORT_FLOW_EVENT_COUNT: usize = 5;
 /// Flow-event counter index incremented when the dataplane creates a conntrack pair.
+#[cfg(target_os = "linux")]
 const NODEPORT_FLOW_CREATE_INDEX: usize = 0;
 /// Flow-event counter index incremented when userspace clears stale conntrack entries.
+#[cfg(target_os = "linux")]
 const NODEPORT_FLOW_CLEAR_INDEX: usize = 1;
 /// Flow-event counter index incremented when a return packet misses reverse conntrack.
+#[cfg(target_os = "linux")]
 const NODEPORT_REVERSE_MISS_INDEX: usize = 2;
 /// Flow-event counter index incremented when TCP state transitions are invalid.
+#[cfg(target_os = "linux")]
 const NODEPORT_INVALID_TRANSITION_INDEX: usize = 3;
 /// Flow-event counter index incremented when return traffic bypasses NodePort translation.
+#[cfg(target_os = "linux")]
 const NODEPORT_RETURN_BYPASS_INDEX: usize = 4;
 
 /// Capacity limits for the pinned NodePort maps that back publication, host-access SNAT, and
@@ -54,16 +62,19 @@ impl NodePortMapCapacities {
     }
 
     /// Convert the configured VIP-map capacity into Aya's `u32` max-entry type.
+    #[cfg(target_os = "linux")]
     fn vip_u32(self) -> Result<u32> {
         checked_map_capacity("network.nodeport.vip_capacity", self.vip)
     }
 
     /// Convert the configured host-access map capacity into Aya's `u32` max-entry type.
+    #[cfg(target_os = "linux")]
     fn host_u32(self) -> Result<u32> {
         checked_map_capacity("network.nodeport.host_capacity", self.host)
     }
 
     /// Convert the configured public flow-map capacity into Aya's `u32` max-entry type.
+    #[cfg(target_os = "linux")]
     fn flow_u32(self) -> Result<u32> {
         checked_map_capacity("network.nodeport.flow_capacity", self.flow)
     }
@@ -202,6 +213,7 @@ impl std::fmt::Display for NodePortRuntimeState {
 
 /// Pick the configured NodePort IP identity, preferring the explicit `network.nodeport.ip`
 /// override over the advertise address when both exist.
+#[cfg(any(test, target_os = "linux"))]
 fn configured_node_ip_from_sources(
     configured_node_ip: Option<IpAddr>,
     advertise_addr: Option<&str>,
@@ -210,6 +222,7 @@ fn configured_node_ip_from_sources(
 }
 
 /// Identify which explicit configuration source currently supplies the NodePort publication IP.
+#[cfg(any(test, target_os = "linux"))]
 fn configured_node_ip_source(
     configured_node_ip: Option<IpAddr>,
     advertise_addr: Option<&str>,
@@ -225,6 +238,7 @@ fn configured_node_ip_source(
 
 /// Convert one configured NodePort map capacity into the `u32` value expected by Aya before the
 /// kernel creates the pinned map.
+#[cfg(target_os = "linux")]
 fn checked_map_capacity(name: &str, value: usize) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| anyhow::anyhow!("configured {name} exceeds the kernel map size limit"))
@@ -232,6 +246,7 @@ fn checked_map_capacity(name: &str, value: usize) -> Result<u32> {
 
 /// Estimate how many tracked NodePort flow pairs were evicted from the LRU maps by comparing the
 /// total successful flow creations against explicit clears and the current forward-map occupancy.
+#[cfg(any(test, target_os = "linux"))]
 fn estimated_flow_evictions(
     flow_creates: u64,
     flow_clears: u64,
@@ -243,6 +258,7 @@ fn estimated_flow_evictions(
 }
 
 /// Project the active-public-network count after one NodePort sync applies.
+#[cfg(any(test, target_os = "linux"))]
 fn projected_active_networks_after_sync(
     current_active_networks: usize,
     had_ports: bool,
@@ -256,6 +272,7 @@ fn projected_active_networks_after_sync(
 }
 
 /// Return the first fixed-capacity violation that would make one NodePort sync unsafe to apply.
+#[cfg(any(test, target_os = "linux"))]
 fn nodeport_capacity_error(
     projected_active_ports: usize,
     projected_active_networks: usize,

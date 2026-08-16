@@ -2,17 +2,21 @@
 
 use std::collections::BTreeSet;
 use std::error::Error as StdError;
+#[cfg(any(test, target_os = "linux"))]
 use std::ffi::OsString;
 use std::fs;
+#[cfg(any(test, target_os = "linux"))]
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use nix::mount::mount;
-use nix::mount::{MntFlags, MsFlags, umount2};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
+#[cfg(target_os = "linux")]
 use nix::sys::stat::{major, minor};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -231,6 +235,7 @@ struct Ext4FormatProfile {
 
 impl Ext4FormatProfile {
     /// Builds the complete ext4 profile from checked filesystem settings.
+    #[cfg(any(test, target_os = "linux"))]
     fn new(settings: &Settings) -> Self {
         let options = &settings.options;
         Self {
@@ -247,6 +252,7 @@ impl Ext4FormatProfile {
     }
 
     /// Builds the private config that stops mke2fs from using host defaults.
+    #[cfg(any(test, target_os = "linux"))]
     fn mke2fs_config(&self) -> String {
         format!(
             "[defaults]\n\
@@ -293,6 +299,7 @@ impl Ext4FormatProfile {
     }
 
     /// Hashes the config and arguments that define the created filesystem.
+    #[cfg(any(test, target_os = "linux"))]
     fn hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"mantissa replicated ext4 format profile v1");
@@ -316,6 +323,7 @@ struct XfsFormatProfile {
 
 impl XfsFormatProfile {
     /// Returns the complete XFS profile without consulting host defaults.
+    #[cfg(any(test, target_os = "linux"))]
     const fn new() -> Self {
         Self {
             block_size_bytes: 4096,
@@ -345,6 +353,7 @@ impl XfsFormatProfile {
     }
 
     /// Hashes every XFS layout choice except the per-volume UUID.
+    #[cfg(any(test, target_os = "linux"))]
     fn hash(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"mantissa replicated XFS format profile v1");
@@ -398,9 +407,13 @@ pub struct Manager {
     mke2fs_config_path: PathBuf,
     ext4_format_profile: Ext4FormatProfile,
     xfs_format_profile: XfsFormatProfile,
+    #[cfg(target_os = "linux")]
     ext4_mount_flags: MsFlags,
+    #[cfg(target_os = "linux")]
     ext4_mount_data: String,
+    #[cfg(target_os = "linux")]
     xfs_mount_flags: MsFlags,
+    #[cfg(target_os = "linux")]
     xfs_mount_data: String,
     command_timeout: Duration,
     ext4_format_profile_hash: [u8; 32],
@@ -427,46 +440,55 @@ impl Manager {
 
     /// Checks the tool files and prepares the private mount root.
     pub fn prepare(settings: &Settings, command_timeout: Duration) -> Result<Self> {
-        let mount_root = settings.options.mount_root.clone();
-        let wipefs_path = settings.options.wipefs_path.clone();
-        let mkfs_ext4_path = settings.options.mkfs_ext4_path.clone();
-        let resize2fs_path = settings.options.resize2fs_path.clone();
-        let mkfs_xfs_path = settings.options.mkfs_xfs_path.clone();
-        let xfs_growfs_path = settings.options.xfs_growfs_path.clone();
-        Self::check_tools(settings)?;
-        prepare_mount_root(&mount_root)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (settings, command_timeout);
+            Err(Error::UnsupportedPlatform)
+        }
 
-        let ext4_format_profile = Ext4FormatProfile::new(settings);
-        let xfs_format_profile = XfsFormatProfile::new();
-        let mke2fs_config_path = mount_root.join(".mke2fs.conf");
-        save_exact_mke2fs_config(
-            &mke2fs_config_path,
-            ext4_format_profile.mke2fs_config().as_bytes(),
-        )?;
-        let (ext4_mount_flags, ext4_mount_data) =
-            split_mount_options(&settings.options.ext4_mount_options);
-        let (xfs_mount_flags, xfs_mount_data) =
-            split_mount_options(&settings.options.xfs_mount_options);
-        let ext4_format_profile_hash = ext4_format_profile.hash();
-        let xfs_format_profile_hash = xfs_format_profile.hash();
-        Ok(Self {
-            mount_root,
-            wipefs_path,
-            mkfs_ext4_path,
-            resize2fs_path,
-            mkfs_xfs_path,
-            xfs_growfs_path,
-            mke2fs_config_path,
-            ext4_format_profile,
-            xfs_format_profile,
-            ext4_mount_flags,
-            ext4_mount_data,
-            xfs_mount_flags,
-            xfs_mount_data,
-            command_timeout,
-            ext4_format_profile_hash,
-            xfs_format_profile_hash,
-        })
+        #[cfg(target_os = "linux")]
+        {
+            let mount_root = settings.options.mount_root.clone();
+            let wipefs_path = settings.options.wipefs_path.clone();
+            let mkfs_ext4_path = settings.options.mkfs_ext4_path.clone();
+            let resize2fs_path = settings.options.resize2fs_path.clone();
+            let mkfs_xfs_path = settings.options.mkfs_xfs_path.clone();
+            let xfs_growfs_path = settings.options.xfs_growfs_path.clone();
+            Self::check_tools(settings)?;
+            prepare_mount_root(&mount_root)?;
+
+            let ext4_format_profile = Ext4FormatProfile::new(settings);
+            let xfs_format_profile = XfsFormatProfile::new();
+            let mke2fs_config_path = mount_root.join(".mke2fs.conf");
+            save_exact_mke2fs_config(
+                &mke2fs_config_path,
+                ext4_format_profile.mke2fs_config().as_bytes(),
+            )?;
+            let (ext4_mount_flags, ext4_mount_data) =
+                split_mount_options(&settings.options.ext4_mount_options);
+            let (xfs_mount_flags, xfs_mount_data) =
+                split_mount_options(&settings.options.xfs_mount_options);
+            let ext4_format_profile_hash = ext4_format_profile.hash();
+            let xfs_format_profile_hash = xfs_format_profile.hash();
+            Ok(Self {
+                mount_root,
+                wipefs_path,
+                mkfs_ext4_path,
+                resize2fs_path,
+                mkfs_xfs_path,
+                xfs_growfs_path,
+                mke2fs_config_path,
+                ext4_format_profile,
+                xfs_format_profile,
+                ext4_mount_flags,
+                ext4_mount_data,
+                xfs_mount_flags,
+                xfs_mount_data,
+                command_timeout,
+                ext4_format_profile_hash,
+                xfs_format_profile_hash,
+            })
+        }
     }
 
     /// Returns the hash used to reject a changed profile during a format retry.
@@ -622,32 +644,41 @@ impl Manager {
         device: &Path,
         path: &Path,
     ) -> Result<()> {
-        match find_mount(device, path, filesystem)? {
-            MountCheck::Exact => return Ok(()),
-            MountCheck::ReadOnly => {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, filesystem, device, path);
+            Err(Error::UnsupportedPlatform)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            match find_mount(device, path, filesystem)? {
+                MountCheck::Exact => return Ok(()),
+                MountCheck::ReadOnly => {
+                    return Err(Error::invalid(
+                        "replicated-volume filesystem is mounted read-only",
+                    ));
+                }
+                MountCheck::Conflict => {
+                    return Err(Error::invalid(
+                        "another filesystem is already mounted at the volume path",
+                    ));
+                }
+                MountCheck::Absent => self.prepare_mount_path(path)?,
+            }
+            let (flags, data) = match filesystem {
+                ReplicatedVolumeFilesystem::Ext4 => (self.ext4_mount_flags, &self.ext4_mount_data),
+                ReplicatedVolumeFilesystem::Xfs => (self.xfs_mount_flags, &self.xfs_mount_data),
+            };
+            let data = (!data.is_empty()).then_some(data.as_str());
+            mount_filesystem(filesystem, device, path, flags, data)?;
+            if find_mount(device, path, filesystem)? != MountCheck::Exact {
                 return Err(Error::invalid(
-                    "replicated-volume filesystem is mounted read-only",
+                    "replicated-volume mount did not appear in the kernel mount table",
                 ));
             }
-            MountCheck::Conflict => {
-                return Err(Error::invalid(
-                    "another filesystem is already mounted at the volume path",
-                ));
-            }
-            MountCheck::Absent => self.prepare_mount_path(path)?,
+            Ok(())
         }
-        let (flags, data) = match filesystem {
-            ReplicatedVolumeFilesystem::Ext4 => (self.ext4_mount_flags, &self.ext4_mount_data),
-            ReplicatedVolumeFilesystem::Xfs => (self.xfs_mount_flags, &self.xfs_mount_data),
-        };
-        let data = (!data.is_empty()).then_some(data.as_str());
-        mount_filesystem(filesystem, device, path, flags, data)?;
-        if find_mount(device, path, filesystem)? != MountCheck::Exact {
-            return Err(Error::invalid(
-                "replicated-volume mount did not appear in the kernel mount table",
-            ));
-        }
-        Ok(())
     }
 
     /// Removes one exact mount and rejects a conflicting filesystem.
@@ -657,46 +688,65 @@ impl Manager {
         device: &Path,
         path: &Path,
     ) -> Result<()> {
-        match find_mount(device, path, filesystem)? {
-            MountCheck::Absent => return Ok(()),
-            MountCheck::Conflict => {
-                return Err(Error::invalid(
-                    "volume path contains a mount from another device",
-                ));
-            }
-            MountCheck::Exact | MountCheck::ReadOnly => {}
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, filesystem, device, path);
+            Err(Error::UnsupportedPlatform)
         }
-        umount2(path, MntFlags::UMOUNT_NOFOLLOW)
-            .with_context(|| format!("unmount {} from {}", filesystem.name(), path.display()))?;
-        Ok(())
+
+        #[cfg(target_os = "linux")]
+        {
+            match find_mount(device, path, filesystem)? {
+                MountCheck::Absent => return Ok(()),
+                MountCheck::Conflict => {
+                    return Err(Error::invalid(
+                        "volume path contains a mount from another device",
+                    ));
+                }
+                MountCheck::Exact | MountCheck::ReadOnly => {}
+            }
+            umount2(path, MntFlags::UMOUNT_NOFOLLOW).with_context(|| {
+                format!("unmount {} from {}", filesystem.name(), path.display())
+            })?;
+            Ok(())
+        }
     }
 
     /// Removes a catalog-owned mount when its old device path has disappeared.
     pub fn unmount_saved(&self, filesystem: ReplicatedVolumeFilesystem, path: &Path) -> Result<()> {
-        if path.parent() != Some(self.mount_root.as_path()) {
-            return Err(Error::invalid(
-                "saved volume mount path is outside the configured mount root",
-            ));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, filesystem, path);
+            Err(Error::UnsupportedPlatform)
         }
-        let Some(found) = read_mounts()?
-            .into_iter()
-            .find(|mount| mount.target == path)
-        else {
-            return Ok(());
-        };
-        if found.filesystem != filesystem.name() {
-            return Err(Error::invalid(
-                "saved volume mount path contains another filesystem type",
-            ));
+
+        #[cfg(target_os = "linux")]
+        {
+            if path.parent() != Some(self.mount_root.as_path()) {
+                return Err(Error::invalid(
+                    "saved volume mount path is outside the configured mount root",
+                ));
+            }
+            let Some(found) = read_mounts()?
+                .into_iter()
+                .find(|mount| mount.target == path)
+            else {
+                return Ok(());
+            };
+            if found.filesystem != filesystem.name() {
+                return Err(Error::invalid(
+                    "saved volume mount path contains another filesystem type",
+                ));
+            }
+            umount2(path, MntFlags::UMOUNT_NOFOLLOW).with_context(|| {
+                format!(
+                    "unmount saved {} from {}",
+                    filesystem.name(),
+                    path.display()
+                )
+            })?;
+            Ok(())
         }
-        umount2(path, MntFlags::UMOUNT_NOFOLLOW).with_context(|| {
-            format!(
-                "unmount saved {} from {}",
-                filesystem.name(),
-                path.display()
-            )
-        })?;
-        Ok(())
     }
 
     /// Detaches a catalog-owned mount after local I/O admission is quarantined.
@@ -704,26 +754,35 @@ impl Manager {
     /// The durable unmount marker independently retains any pending distributed writer fence, so
     /// process-local mount cleanup never needs to wait for quorum before becoming safe.
     pub fn detach_saved(&self, filesystem: ReplicatedVolumeFilesystem, path: &Path) -> Result<()> {
-        if path.parent() != Some(self.mount_root.as_path()) {
-            return Err(Error::invalid(
-                "saved volume mount path is outside the configured mount root",
-            ));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, filesystem, path);
+            Err(Error::UnsupportedPlatform)
         }
-        let Some(found) = read_mounts()?
-            .into_iter()
-            .find(|mount| mount.target == path)
-        else {
-            return Ok(());
-        };
-        if found.filesystem != filesystem.name() {
-            return Err(Error::invalid(
-                "saved volume mount path contains another filesystem type",
-            ));
+
+        #[cfg(target_os = "linux")]
+        {
+            if path.parent() != Some(self.mount_root.as_path()) {
+                return Err(Error::invalid(
+                    "saved volume mount path is outside the configured mount root",
+                ));
+            }
+            let Some(found) = read_mounts()?
+                .into_iter()
+                .find(|mount| mount.target == path)
+            else {
+                return Ok(());
+            };
+            if found.filesystem != filesystem.name() {
+                return Err(Error::invalid(
+                    "saved volume mount path contains another filesystem type",
+                ));
+            }
+            umount2(path, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW).with_context(|| {
+                format!("detach saved {} from {}", filesystem.name(), path.display())
+            })?;
+            Ok(())
         }
-        umount2(path, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW).with_context(|| {
-            format!("detach saved {} from {}", filesystem.name(), path.display())
-        })?;
-        Ok(())
     }
 
     /// Removes a mount directory and files written there after its mount disappeared.
@@ -758,20 +817,31 @@ impl Manager {
 
     /// Disconnects mounts in the private root that have no local catalog row.
     pub fn remove_unknown_mounts(&self, expected: &BTreeSet<PathBuf>) -> Result<()> {
-        for mount in read_mounts()? {
-            if mount.target.parent() != Some(self.mount_root.as_path())
-                || expected.contains(&mount.target)
-            {
-                continue;
-            }
-            umount2(
-                &mount.target,
-                MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW,
-            )
-            .with_context(|| format!("remove unknown volume mount {}", mount.target.display()))?;
-            self.remove_mount_path(&mount.target)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, expected);
+            Err(Error::UnsupportedPlatform)
         }
-        Ok(())
+
+        #[cfg(target_os = "linux")]
+        {
+            for mount in read_mounts()? {
+                if mount.target.parent() != Some(self.mount_root.as_path())
+                    || expected.contains(&mount.target)
+                {
+                    continue;
+                }
+                umount2(
+                    &mount.target,
+                    MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW,
+                )
+                .with_context(|| {
+                    format!("remove unknown volume mount {}", mount.target.display())
+                })?;
+                self.remove_mount_path(&mount.target)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -786,18 +856,6 @@ fn mount_filesystem(
 ) -> Result<()> {
     mount(Some(device), path, Some(filesystem.name()), flags, data)
         .with_context(|| format!("mount {} at {}", filesystem.name(), path.display()))
-}
-
-/// Keeps the crate buildable while reporting that replicated volumes need Linux.
-#[cfg(not(target_os = "linux"))]
-fn mount_filesystem(
-    _filesystem: ReplicatedVolumeFilesystem,
-    _device: &Path,
-    _path: &Path,
-    _flags: MsFlags,
-    _data: Option<&str>,
-) -> Result<()> {
-    Err(Error::UnsupportedPlatform)
 }
 
 /// Checks paths and options without touching the local filesystem.
@@ -946,6 +1004,7 @@ fn check_tool(path: &Path, name: &str) -> Result<()> {
 }
 
 /// Creates the daemon-owned directory that contains only managed mounts.
+#[cfg(target_os = "linux")]
 fn prepare_mount_root(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("create replicated-volume mount root {}", path.display()))?;
@@ -961,6 +1020,7 @@ fn prepare_mount_root(path: &Path) -> Result<()> {
 }
 
 /// Saves the small config that prevents mke2fs from reading host defaults.
+#[cfg(target_os = "linux")]
 fn save_exact_mke2fs_config(path: &Path, expected: &[u8]) -> Result<()> {
     match fs::read(path) {
         Ok(current) if current == expected => {}
@@ -988,6 +1048,7 @@ fn save_exact_mke2fs_config(path: &Path, expected: &[u8]) -> Result<()> {
 }
 
 /// Adds one length-delimited value to a filesystem profile hash.
+#[cfg(any(test, target_os = "linux"))]
 fn hash_profile_value(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
@@ -1136,6 +1197,7 @@ fn parse_signatures(output: &[u8]) -> Result<Vec<Signature>> {
 }
 
 /// Separates generic mount flags from filesystem-specific option text.
+#[cfg(target_os = "linux")]
 fn split_mount_options(options: &[String]) -> (MsFlags, String) {
     let mut flags = MsFlags::empty();
     let mut data = Vec::new();
@@ -1164,6 +1226,7 @@ fn split_mount_options(options: &[String]) -> (MsFlags, String) {
 }
 
 /// Result of checking one device and mount path against the kernel table.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MountCheck {
     Absent,
@@ -1183,6 +1246,7 @@ struct KernelMount {
 }
 
 /// Finds whether the requested device owns the exact filesystem mount path.
+#[cfg(target_os = "linux")]
 fn find_mount(
     device: &Path,
     target: &Path,
@@ -1215,12 +1279,20 @@ fn find_mount(
 }
 
 /// Reads the current process mount table.
+#[cfg(target_os = "linux")]
 fn read_mounts() -> Result<Vec<KernelMount>> {
     let contents = fs::read("/proc/self/mountinfo").context("read Linux mount table")?;
     parse_mounts(&contents)
 }
 
+/// Reports that the Linux mount table is unavailable on this host.
+#[cfg(not(target_os = "linux"))]
+fn read_mounts() -> Result<Vec<KernelMount>> {
+    Err(Error::UnsupportedPlatform)
+}
+
 /// Parses only the mount-table fields needed by replicated volumes.
+#[cfg(any(test, target_os = "linux"))]
 fn parse_mounts(contents: &[u8]) -> Result<Vec<KernelMount>> {
     let contents = std::str::from_utf8(contents).context("mount table is not UTF-8")?;
     let mut mounts = Vec::new();
@@ -1258,11 +1330,13 @@ fn parse_mounts(contents: &[u8]) -> Result<Vec<KernelMount>> {
 }
 
 /// Finds one complete option in a comma-separated mount-table field.
+#[cfg(any(test, target_os = "linux"))]
 fn mount_options_contain(options: &str, expected: &str) -> bool {
     options.split(',').any(|option| option == expected)
 }
 
 /// Decodes the octal path escapes used by Linux mountinfo.
+#[cfg(any(test, target_os = "linux"))]
 fn unescape_mount_field(field: &str) -> Result<OsString> {
     let bytes = field.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());

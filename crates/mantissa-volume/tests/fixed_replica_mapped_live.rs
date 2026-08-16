@@ -1,5 +1,7 @@
 //! Live fixed-file data-path proof through ublk, dm-linear, and ext4.
 
+#![cfg(target_os = "linux")]
+
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};

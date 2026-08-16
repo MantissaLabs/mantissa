@@ -4,13 +4,15 @@ use crate::ingress::registry::IngressPoolRegistry;
 use crate::ingress::types::{IngressPoolSpecValue, select_ingress_pool_nodes};
 use crate::network::allocator::{parse_overlay_cidr, resolver_ip_address};
 use crate::network::attachment::{PlatformAttachmentProvisioner, host_iface_name};
-use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext, overlay_bpf_program_specs};
+#[cfg(target_os = "linux")]
+use crate::network::bpf::overlay_bpf_program_specs;
+use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::defaults::merge_default_bpf_programs;
 use crate::network::discovery::{PublicEndpointSnapshot, ServiceDiscovery, ServiceDiscoveryInit};
 use crate::network::events::ForwardingEvent;
-use crate::network::naming::{
-    collect_orphaned_network_suffixes, is_managed_overlay_link_name, managed_interface_suffix,
-};
+use crate::network::naming::managed_interface_suffix;
+#[cfg(target_os = "linux")]
+use crate::network::naming::{collect_orphaned_network_suffixes, is_managed_overlay_link_name};
 use crate::network::nodeport::NodePortManager;
 use crate::network::registry::NetworkRegistry;
 use crate::network::types::{
@@ -61,10 +63,13 @@ const WIREGUARD_RECONCILE_RETRY_LIMIT: usize = 3;
 /// Error prefix used for the expected encrypted-underlay convergence gate.
 const WIREGUARD_UNDERLAY_NOT_READY_ERROR_PREFIX: &str = "wireguard underlay required for ";
 /// Number of checks used when waiting for netlink link state to converge.
+#[cfg(target_os = "linux")]
 const LINK_STATE_SETTLE_ATTEMPTS: usize = 10;
 /// Delay between netlink link-state convergence checks.
+#[cfg(target_os = "linux")]
 const LINK_STATE_SETTLE_DELAY: Duration = Duration::from_millis(20);
 /// Number of netlink update retries after a transient link-state failure.
+#[cfg(target_os = "linux")]
 const LINK_STATE_UPDATE_RETRIES: usize = 2;
 /// Maximum time one local-use admission may wait for on-demand realization to converge.
 const LOCAL_REALIZATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
