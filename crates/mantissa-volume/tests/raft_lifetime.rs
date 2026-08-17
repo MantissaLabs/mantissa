@@ -13,10 +13,11 @@ use mantissa_raft::durable_log::{
     EncryptedLog, EncryptedLogSettings, GroupEncryptionKey, GroupKeyProvider, LogLimitSettings,
     LogLimits,
 };
+use mantissa_raft::memory::{GroupError, WriteResult};
 use mantissa_raft::protocol::{ProtocolLimitSettings, ProtocolLimits};
 use mantissa_raft::transport::{
-    IncomingSnapshots, RaftPeer, RaftPeerDirectory, TcpNode, TcpTransport, TcpTransportSettings,
-    TransportError, TransportLimitSettings, TransportLimits,
+    IncomingSnapshots, RaftPeer, RaftPeerDirectory, TcpNode, TcpNodeError, TcpTransport,
+    TcpTransportSettings, TransportError, TransportLimitSettings, TransportLimits,
 };
 use mantissa_volume::catalog::ReplicaKey;
 use mantissa_volume::control_state::{
@@ -372,6 +373,49 @@ fn require_applied(response: VolumeCommandResponse) {
     );
 }
 
+/// Sends one test command to the elected leader even if an election happens
+/// during this long-running lifetime test. A follower's explicit leader reply
+/// is safe to follow because that follower rejected the command before adding
+/// it to the Raft log. Every other write error still fails the test.
+async fn write_to_leader(
+    nodes: &BTreeMap<Uuid, TestNode>,
+    leader: &mut Uuid,
+    command: VolumeCommand,
+) -> WriteResult<Uuid, VolumeCommandResponse> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "volume lifetime command did not find a writable leader within {WAIT:?}"
+        );
+        let attempted_leader = *leader;
+        let node = nodes
+            .get(&attempted_leader)
+            .expect("reported volume leader must be a running test voter");
+        match node.write(command.clone()).await {
+            Ok(result) => return result,
+            Err(TcpNodeError::Group(GroupError::Write(error))) => {
+                let Some(openraft::error::ClientWriteError::ForwardToLeader(forward)) =
+                    error.api_error()
+                else {
+                    panic!("volume lifetime command failed: {error:?}");
+                };
+                *leader = match forward.leader_id {
+                    Some(leader) => leader,
+                    None => {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        node.wait_for_leader(remaining)
+                            .await
+                            .expect("volume lifetime group must elect another leader")
+                    }
+                };
+            }
+            Err(error) => panic!("volume lifetime command failed: {error:?}"),
+        }
+    }
+}
+
 /// Stops every node before stopping the shared transport threads.
 async fn stop_cluster(
     nodes: BTreeMap<Uuid, TestNode>,
@@ -461,19 +505,21 @@ async fn three_voters_snapshot_purge_restart_and_continue_control_state() {
             .expect("every member must observe three voters");
     }
 
-    let leader = nodes[&node_ids[0]]
+    let mut leader = nodes[&node_ids[0]]
         .wait_for_leader(WAIT)
         .await
         .expect("volume group must retain a leader");
     require_applied(
-        nodes[&leader]
-            .write(VolumeCommand::Initialize(InitializeVolume {
+        write_to_leader(
+            &nodes,
+            &mut leader,
+            VolumeCommand::Initialize(InitializeVolume {
                 descriptor: descriptor.clone(),
                 initial_copies: copies.clone(),
-            }))
-            .await
-            .expect("initialize bounded volume control state")
-            .response,
+            }),
+        )
+        .await
+        .response,
     );
 
     for cycle in 0..ATTACH_CYCLES {
@@ -484,26 +530,44 @@ async fn three_voters_snapshot_purge_restart_and_continue_control_state() {
                 .expect("test writer session must be valid"),
         };
         require_applied(
-            nodes[&leader]
-                .write(VolumeCommand::GrantWriter(GrantVolumeWriter {
+            write_to_leader(
+                &nodes,
+                &mut leader,
+                VolumeCommand::GrantWriter(GrantVolumeWriter {
                     expected: expected(&state),
                     writer,
-                }))
-                .await
-                .expect("grant lifetime writer")
-                .response,
+                }),
+            )
+            .await
+            .response,
         );
         let state = readers[&leader].state();
         require_applied(
-            nodes[&leader]
-                .write(VolumeCommand::FenceWriter(FenceVolumeWriter {
+            write_to_leader(
+                &nodes,
+                &mut leader,
+                VolumeCommand::FenceWriter(FenceVolumeWriter {
                     expected: expected(&state),
                     writer,
-                }))
-                .await
-                .expect("fence lifetime writer")
-                .response,
+                }),
+            )
+            .await
+            .response,
         );
+
+        if cycle == ATTACH_CYCLES / 2 {
+            let next_leader = node_ids
+                .iter()
+                .copied()
+                .find(|node_id| *node_id != leader)
+                .expect("three-voter test must have another leader candidate");
+            nodes[&next_leader]
+                .become_leader(WAIT)
+                .await
+                .expect("lifetime test must move leadership between voters");
+            // Keep the old leader cached so the next command proves that the
+            // test follows Raft's reply instead of assuming a fixed leader.
+        }
     }
 
     let state = readers[&leader].state();
@@ -512,13 +576,15 @@ async fn three_voters_snapshot_purge_restart_and_continue_control_state() {
         session_id: DriverSessionId::new(Uuid::from_u128(9_999))
             .expect("final writer session must be valid"),
     };
-    let final_write = nodes[&leader]
-        .write(VolumeCommand::GrantWriter(GrantVolumeWriter {
+    let final_write = write_to_leader(
+        &nodes,
+        &mut leader,
+        VolumeCommand::GrantWriter(GrantVolumeWriter {
             expected: expected(&state),
             writer: final_writer,
-        }))
-        .await
-        .expect("grant final lifetime writer");
+        }),
+    )
+    .await;
     require_applied(final_write.response);
     let final_index = final_write.log_id.index;
     for node in nodes.values() {
@@ -582,7 +648,7 @@ async fn three_voters_snapshot_purge_restart_and_continue_control_state() {
         nodes.insert(node_id, node);
         readers.insert(node_id, reader);
     }
-    let restarted_leader = nodes[&node_ids[0]]
+    let mut restarted_leader = nodes[&node_ids[0]]
         .wait_for_leader(WAIT)
         .await
         .expect("restarted volume group must elect a leader");
@@ -599,13 +665,15 @@ async fn three_voters_snapshot_purge_restart_and_continue_control_state() {
     }
 
     let state = readers[&restarted_leader].state();
-    let continued = nodes[&restarted_leader]
-        .write(VolumeCommand::FenceWriter(FenceVolumeWriter {
+    let continued = write_to_leader(
+        &nodes,
+        &mut restarted_leader,
+        VolumeCommand::FenceWriter(FenceVolumeWriter {
             expected: expected(&state),
             writer: final_writer,
-        }))
-        .await
-        .expect("commit control state after every voter restarts");
+        }),
+    )
+    .await;
     require_applied(continued.response);
     for node_id in node_ids {
         nodes[&node_id]
