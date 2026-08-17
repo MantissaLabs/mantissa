@@ -155,7 +155,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         shell: "bash"
       - name: "Install bpf-linker"
-        run: bash .github/scripts/install-bpf-linker.sh
+        run: "bash .github/scripts/install-bpf-linker.sh"
         shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
