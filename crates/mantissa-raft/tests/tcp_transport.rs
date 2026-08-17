@@ -742,12 +742,11 @@ async fn prepared_transport_accepts_a_prebound_listener() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_transport_start_and_shutdown_leave_no_listener() {
     for iteration in 0..32 {
-        let reserved =
+        let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve a loopback test address");
-        let address = reserved
+        let address = listener
             .local_addr()
             .expect("read the reserved loopback address");
-        drop(reserved);
         let transport = Arc::new(TestTransport::prepare(TestTransportSettings::new(
             1,
             address,
@@ -765,7 +764,7 @@ async fn concurrent_transport_start_and_shutdown_leave_no_listener() {
             let barrier = Arc::clone(&barrier);
             tokio::spawn(async move {
                 barrier.wait().await;
-                transport.start_listening()
+                transport.start_listening_on(listener)
             })
         };
         let stopping = {
