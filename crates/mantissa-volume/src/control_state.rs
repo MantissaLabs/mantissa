@@ -194,28 +194,13 @@ impl VolumeControlState {
         {
             return Err(VolumeControlStateInvariantError::WriterOutsideCopySet);
         }
-        if let Some(recovery) = data.recovery.as_ref()
-            && (data.writer.is_some()
-                || self.replacement.is_some()
-                || recovery.coordinator_node_id != recovery.source_node_id
-                || recovery.target_node_ids != data.copies
-                || !recovery.target_node_ids.contains(&recovery.source_node_id))
-        {
-            return Err(VolumeControlStateInvariantError::InvalidRecovery);
+        if let Some(recovery) = data.recovery.as_ref() {
+            check_stored_recovery(data, self.replacement, recovery)
+                .map_err(|_| VolumeControlStateInvariantError::InvalidRecovery)?;
         }
-        if let Some(replacement) = self.replacement
-            && (replacement.coordinator_node_id != replacement.source_node_id
-                || !data.copies.contains(&replacement.source_node_id)
-                || data
-                    .writer
-                    .is_some_and(|writer| writer.node_id != replacement.source_node_id)
-                || data.copies.contains(&replacement.new_node_id)
-                || replacement.old_node_id == Some(replacement.new_node_id)
-                || replacement.old_node_id == Some(replacement.source_node_id)
-                || replacement.new_node_id == replacement.source_node_id
-                || replacement_copy_set(&data.copies, replacement).len() != 3)
-        {
-            return Err(VolumeControlStateInvariantError::InvalidReplacement);
+        if let Some(replacement) = self.replacement {
+            check_replacement_grant(data, replacement)
+                .map_err(|_| VolumeControlStateInvariantError::InvalidReplacement)?;
         }
         if self.disposition != VolumeDisposition::Live
             && (data.writer.is_some() || data.recovery.is_some() || self.replacement.is_some())
@@ -434,15 +419,7 @@ impl VolumeControlState {
             (Some(_), _) => return self.rejected(VolumeCommandRejection::RecoveryInProgress),
             (None, Some(_)) => return self.rejected(VolumeCommandRejection::NoRecovery),
         }
-        if !(2..=3).contains(&command.recovery.target_node_ids.len())
-            || command.recovery.coordinator_node_id != command.recovery.source_node_id
-            || !command
-                .recovery
-                .target_node_ids
-                .contains(&command.recovery.source_node_id)
-            || !data.copies.contains(&command.recovery.source_node_id)
-            || !command.recovery.target_node_ids.is_subset(&data.copies)
-        {
+        if check_requested_recovery(data, &command.recovery).is_err() {
             return self.rejected(VolumeCommandRejection::InvalidRecovery);
         }
         let Some((revision, fence)) = self.next_revision_and_fence() else {
@@ -514,17 +491,7 @@ impl VolumeControlState {
             });
         }
         let replacement = command.replacement;
-        if replacement.coordinator_node_id != replacement.source_node_id
-            || !data.copies.contains(&replacement.source_node_id)
-            || data
-                .writer
-                .is_some_and(|writer| writer.node_id != replacement.source_node_id)
-            || data.copies.contains(&replacement.new_node_id)
-            || replacement.new_node_id == replacement.source_node_id
-            || replacement.old_node_id == Some(replacement.new_node_id)
-            || replacement.old_node_id == Some(replacement.source_node_id)
-            || replacement_copy_set(&data.copies, replacement).len() != 3
-        {
+        if check_replacement_grant(data, replacement).is_err() {
             return self.rejected(VolumeCommandRejection::InvalidReplacement);
         }
         let Some(revision) = self.revision.checked_add(1) else {
@@ -586,7 +553,7 @@ impl VolumeControlState {
         if data.writer != command.expected_writer {
             return self.rejected(VolumeCommandRejection::WrongWriter);
         }
-        if !valid_adoption(&data.copies, replacement, &command.new_copies) {
+        if !finished_copies_match_replacement(&data.copies, replacement, &command.new_copies) {
             return self.rejected(VolumeCommandRejection::InvalidReplacement);
         }
         if command
@@ -706,8 +673,169 @@ fn next_fence(state: &VolumeControlState) -> Option<FenceEpoch> {
     state.data.as_ref()?.fence.next()
 }
 
-/// Checks that adoption adds one built target and removes at most its old copy.
-fn valid_adoption(
+/// Reasons recovery cannot use the selected nodes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryGrantError {
+    /// A task still has permission to write to the volume.
+    WriterIsActive,
+
+    /// The volume is already replacing one of its copies.
+    ReplacementIsActive,
+
+    /// Recovery did not select two or three copies.
+    InvalidTargetCount,
+
+    /// The node running recovery is not the node whose data will be copied.
+    CoordinatorDiffersFromSource,
+
+    /// The node supplying data does not hold a current copy.
+    SourceIsNotActive,
+
+    /// Recovery would remove the node supplying its data.
+    SourceIsNotTargeted,
+
+    /// Raft records different current copies and recovery copies.
+    StoredTargetsDifferFromCopies,
+
+    /// Recovery selected a node that does not hold a current copy.
+    TargetOutsideActiveCopies,
+}
+
+/// Checks the node whose volume data will be copied during recovery.
+///
+/// This node must run the recovery, must already hold a current copy, and must
+/// stay in the list of copies used during recovery.
+fn check_recovery_source(
+    data: &DataControlState,
+    recovery: &RecoveryGrant,
+) -> Result<(), RecoveryGrantError> {
+    if recovery.coordinator_node_id != recovery.source_node_id {
+        return Err(RecoveryGrantError::CoordinatorDiffersFromSource);
+    }
+    if !data.copies.contains(&recovery.source_node_id) {
+        return Err(RecoveryGrantError::SourceIsNotActive);
+    }
+    if !recovery.target_node_ids.contains(&recovery.source_node_id) {
+        return Err(RecoveryGrantError::SourceIsNotTargeted);
+    }
+    Ok(())
+}
+
+/// Checks recovery information read from Raft.
+///
+/// Starting recovery removes permission to write and saves the recovery nodes
+/// as the current copies. The saved state is invalid if a writer or replacement
+/// is also present, or if Raft records a different list of current copies.
+fn check_stored_recovery(
+    data: &DataControlState,
+    replacement: Option<ReplacementGrant>,
+    recovery: &RecoveryGrant,
+) -> Result<(), RecoveryGrantError> {
+    if data.writer.is_some() {
+        return Err(RecoveryGrantError::WriterIsActive);
+    }
+    if replacement.is_some() {
+        return Err(RecoveryGrantError::ReplacementIsActive);
+    }
+    check_recovery_source(data, recovery)?;
+    if recovery.target_node_ids != data.copies {
+        return Err(RecoveryGrantError::StoredTargetsDifferFromCopies);
+    }
+    Ok(())
+}
+
+/// Checks a request to start recovery.
+///
+/// One selected node supplies the data and runs recovery. The request must use
+/// two or three nodes that already hold current copies. It may leave a failed
+/// copy out, but adding a new copy requires replica replacement instead.
+fn check_requested_recovery(
+    data: &DataControlState,
+    recovery: &RecoveryGrant,
+) -> Result<(), RecoveryGrantError> {
+    if !(2..=3).contains(&recovery.target_node_ids.len()) {
+        return Err(RecoveryGrantError::InvalidTargetCount);
+    }
+    check_recovery_source(data, recovery)?;
+    if !recovery.target_node_ids.is_subset(&data.copies) {
+        return Err(RecoveryGrantError::TargetOutsideActiveCopies);
+    }
+    Ok(())
+}
+
+/// Reasons the selected nodes cannot perform a replica replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplacementGrantError {
+    /// The node running replacement is not the node whose data will be copied.
+    CoordinatorDiffersFromSource,
+
+    /// The node supplying data does not hold a current copy.
+    SourceIsNotActive,
+
+    /// Data would be copied from a node other than the current writer.
+    WriterDiffersFromSource,
+
+    /// The new node already holds a current copy.
+    NewNodeAlreadyActive,
+
+    /// The new node is also the node supplying data.
+    NewNodeIsSource,
+
+    /// The same node was selected for removal and addition.
+    OldNodeIsNewNode,
+
+    /// Replacement would remove the node supplying its data.
+    OldNodeIsSource,
+
+    /// Removing the old node and adding the new one does not leave three copies.
+    ResultDoesNotHaveThreeCopies,
+}
+
+/// Checks a request or saved plan to replace one volume copy.
+///
+/// One node with a current copy sends its data to a new node and runs the
+/// replacement. If a task can write to the volume, that writer must supply the
+/// data. The new node cannot already hold a current copy. Removing the old node,
+/// when one is named, and adding the new node must leave exactly three copies.
+fn check_replacement_grant(
+    data: &DataControlState,
+    replacement: ReplacementGrant,
+) -> Result<(), ReplacementGrantError> {
+    if replacement.coordinator_node_id != replacement.source_node_id {
+        return Err(ReplacementGrantError::CoordinatorDiffersFromSource);
+    }
+    if !data.copies.contains(&replacement.source_node_id) {
+        return Err(ReplacementGrantError::SourceIsNotActive);
+    }
+    if data
+        .writer
+        .is_some_and(|writer| writer.node_id != replacement.source_node_id)
+    {
+        return Err(ReplacementGrantError::WriterDiffersFromSource);
+    }
+    if data.copies.contains(&replacement.new_node_id) {
+        return Err(ReplacementGrantError::NewNodeAlreadyActive);
+    }
+    if replacement.new_node_id == replacement.source_node_id {
+        return Err(ReplacementGrantError::NewNodeIsSource);
+    }
+    if replacement.old_node_id == Some(replacement.new_node_id) {
+        return Err(ReplacementGrantError::OldNodeIsNewNode);
+    }
+    if replacement.old_node_id == Some(replacement.source_node_id) {
+        return Err(ReplacementGrantError::OldNodeIsSource);
+    }
+    if copies_after_replacement(&data.copies, replacement).len() != 3 {
+        return Err(ReplacementGrantError::ResultDoesNotHaveThreeCopies);
+    }
+    Ok(())
+}
+
+/// Checks the copy list submitted after replica replacement finishes.
+///
+/// The list must be exactly the result of removing the old node, when one was
+/// named, and adding the new node. It must contain three copies.
+fn finished_copies_match_replacement(
     current: &BTreeSet<VolumeNodeId>,
     replacement: ReplacementGrant,
     next: &BTreeSet<VolumeNodeId>,
@@ -715,11 +843,14 @@ fn valid_adoption(
     if next.len() != 3 || !next.contains(&replacement.new_node_id) {
         return false;
     }
-    replacement_copy_set(current, replacement) == *next
+    copies_after_replacement(current, replacement) == *next
 }
 
-/// Calculates the only copy set one replacement grant may adopt.
-fn replacement_copy_set(
+/// Builds the copy list that a finished replica replacement must report.
+///
+/// Remove the old node, when one was named, and add the new node. The start and
+/// finish checks both use this function so they expect the same result.
+fn copies_after_replacement(
     current: &BTreeSet<VolumeNodeId>,
     replacement: ReplacementGrant,
 ) -> BTreeSet<VolumeNodeId> {
