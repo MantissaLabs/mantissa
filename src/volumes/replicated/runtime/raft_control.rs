@@ -406,12 +406,19 @@ impl ReplicatedVolumeRuntime {
         Ok(voters)
     }
 
-    /// Removes only extra voters after committed control state still names all three data copies.
-    pub(crate) async fn reconcile_data_membership_as_leader(
+    /// Removes Raft voters left behind by an interrupted replica replacement.
+    ///
+    /// Raft can add the new node before the volume records it as a data copy. If
+    /// replacement then stops, the voter list can contain an extra node. Only
+    /// the elected Raft leader may change that list, so this method rejects the
+    /// request on any other node. Extra voters are removed only when the volume
+    /// still has the same three data copies and no recovery or replacement is
+    /// running.
+    pub(crate) async fn remove_extra_raft_voters(
         &self,
         key: ReplicaKey,
-        expected_revision: u64,
-        expected_voters: BTreeSet<Uuid>,
+        observed_revision: u64,
+        data_copy_nodes: BTreeSet<Uuid>,
     ) -> Result<BTreeSet<Uuid>> {
         let _membership_change = self.lock_raft_membership_change(key).await?;
         self.require_current_generation(key)?;
@@ -423,30 +430,41 @@ impl ReplicatedVolumeRuntime {
         let data = state
             .data()
             .context("initialized volume has no data control state")?;
-        let current_copies = data
+        let current_copy_nodes = data
             .copies
             .iter()
             .map(|node_id| *node_id.as_uuid())
             .collect::<BTreeSet<_>>();
-        if state.disposition() != VolumeDisposition::Live
-            || state.revision() != expected_revision
-            || state.replacement().is_some()
-            || data.recovery.is_some()
-            || current_copies != expected_voters
-            || expected_voters.len() != 3
-        {
-            anyhow::bail!("control-state changed before data membership reconciliation");
+        if state.revision() != observed_revision {
+            anyhow::bail!("volume state changed before extra Raft voters could be removed");
+        }
+        if state.disposition() != VolumeDisposition::Live {
+            anyhow::bail!("extra Raft voters cannot be removed from a retained volume");
+        }
+        if state.replacement().is_some() {
+            anyhow::bail!("extra Raft voters cannot be removed while replacement is running");
+        }
+        if data.recovery.is_some() {
+            anyhow::bail!("extra Raft voters cannot be removed while recovery is running");
+        }
+        if data_copy_nodes.len() != 3 {
+            anyhow::bail!(
+                "extra Raft voters can be removed only when all three data copies are present"
+            );
+        }
+        if current_copy_nodes != data_copy_nodes {
+            anyhow::bail!("the volume copy list changed before extra Raft voters could be removed");
         }
         let mut voters = group.voter_node_ids();
-        if !expected_voters.is_subset(&voters) {
-            anyhow::bail!("current membership does not contain every active data copy");
+        if !data_copy_nodes.is_subset(&voters) {
+            anyhow::bail!("Raft is missing at least one current data copy");
         }
-        if voters != expected_voters {
-            group.set_voters(expected_voters.clone()).await?;
+        if voters != data_copy_nodes {
+            group.set_voters(data_copy_nodes.clone()).await?;
             voters = group.voter_node_ids();
         }
-        if voters != expected_voters {
-            anyhow::bail!("data membership reconciliation has not converged");
+        if voters != data_copy_nodes {
+            anyhow::bail!("Raft voter list still differs from the current volume copies");
         }
         Ok(voters)
     }

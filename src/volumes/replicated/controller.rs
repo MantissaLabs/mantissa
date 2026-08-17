@@ -1081,7 +1081,7 @@ impl ReplicatedVolumeController {
         if voters != copy_node_ids && data.copies.len() == 3 {
             if copy_voters.len() == 3 {
                 self.runtime
-                    .reconcile_data_membership_as_leader(key, state.revision(), copy_node_ids)
+                    .remove_extra_raft_voters(key, state.revision(), copy_node_ids)
                     .await?;
                 return Ok(());
             }
