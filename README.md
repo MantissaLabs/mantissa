@@ -45,6 +45,7 @@ See the [docs/limits.md](docs/limits.md) for more details on the ongoing challen
 - GPU-aware scheduling with device-level reservations (NVIDIA).
 - eBPF-accelerated overlay networking for low-latency service discovery and routing.
 - Durable state via CRDT + Merkle Search Tree (backed by Redb) for fault tolerance and convergence.
+- Replicated volumes backed by [ublk](https://docs.kernel.org/block/ublk.html) for stateful services that could support node/storage failure.
 - Support for cluster split/merge operations (creating cluster views).
 - Cluster dataplane encryption using Noise, vxlan traffic encrypted via wireguard.
 

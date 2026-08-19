@@ -11,10 +11,9 @@ made and evaluate if the project is a good fit for your use case or not.
 
 Relying on anti-entropy and CRDTs/Merkle Search Tree means that a high throughput
 cluster with many operations can lead to a lot of burned CPU on synchronization.
-Noise encryption is especially costly at scale. Mantissa limits the number of fanout
-nodes, so the cost stays bounded. Still, this is why Mantissa fits best for a cluster
-of large nodes (32/64 vCPU cores) rather than a cluster with small nodes (4/8 vCPU
-cores).
+Mantissa limits the number of fanout nodes, so the cost stays bounded. Still, this
+is why Mantissa fits best for a cluster of large nodes (32/64 vCPU cores) rather than
+a cluster with small nodes (4/8 vCPU cores).
 
 Mantissa may spawn more synchronization rounds than required. Further work on coalescing
 and batching updates needs to be done, especially on the repair/anti-entropy path
