@@ -620,6 +620,7 @@ mod tests {
             .expect("timed-out test filesystem call must be released");
         retry.await??;
         assert!(retry_started.load(Ordering::Acquire));
+        tracker.stop(Duration::from_secs(1)).await?;
         assert_eq!(tracker.len(), 0);
         Ok(())
     }
