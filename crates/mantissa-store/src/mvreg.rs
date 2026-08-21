@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 /// Stable, hashable snapshot of the active values stored in one MVReg.
@@ -315,7 +315,7 @@ where
     pub fn compact_with<F, R>(&mut self, max_values: usize, mut rank: F) -> bool
     where
         A: Clone,
-        V: Clone + Ord,
+        V: Ord,
         F: FnMut(&MvRegEntry<V, A>) -> R,
         R: Ord,
     {
@@ -323,6 +323,8 @@ where
             return false;
         }
 
+        // Borrow values and clocks while ranking so compaction does not duplicate
+        // potentially large CRDT payloads before it drains the original entries.
         let mut ranked = self
             .entries
             .iter()
@@ -330,23 +332,28 @@ where
             .map(|(index, entry)| RankedEntry {
                 index,
                 rank: rank(entry),
-                value: entry.value.clone(),
-                clock: entry.clock.clone(),
+                value: &entry.value,
+                clock: &entry.clock,
             })
             .collect::<Vec<_>>();
         ranked.sort_by(compare_ranked_entries_desc);
 
         let absorb_index = ranked[0].index;
-        let retained = ranked
+        let mut retained = ranked
             .iter()
             .take(max_values)
             .map(|entry| entry.index)
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
+        retained.sort_unstable();
+        drop(ranked);
+
+        let mut retained = retained.into_iter().peekable();
         let mut absorbed_clock = VectorClock::new();
 
         let mut compacted_entries = Vec::with_capacity(max_values);
         for (index, entry) in self.entries.drain(..).enumerate() {
-            if retained.contains(&index) {
+            if retained.peek() == Some(&index) {
+                retained.next();
                 compacted_entries.push((index, entry));
             } else {
                 absorbed_clock.merge(&entry.clock);
@@ -369,20 +376,20 @@ where
 }
 
 /// Cached ranking data used to choose MVReg compaction winners deterministically.
-struct RankedEntry<R, V, A>
+struct RankedEntry<'a, R, V, A>
 where
     A: Ord,
 {
     index: usize,
     rank: R,
-    value: V,
-    clock: VectorClock<A>,
+    value: &'a V,
+    clock: &'a VectorClock<A>,
 }
 
 /// Sorts higher-ranked entries first, with deterministic durable-state tie breaks.
 fn compare_ranked_entries_desc<R, V, A>(
-    left: &RankedEntry<R, V, A>,
-    right: &RankedEntry<R, V, A>,
+    left: &RankedEntry<'_, R, V, A>,
+    right: &RankedEntry<'_, R, V, A>,
 ) -> Ordering
 where
     R: Ord,
@@ -392,8 +399,8 @@ where
     right
         .rank
         .cmp(&left.rank)
-        .then_with(|| right.value.cmp(&left.value))
-        .then_with(|| total_clock_cmp_desc(&left.clock, &right.clock))
+        .then_with(|| right.value.cmp(left.value))
+        .then_with(|| total_clock_cmp_desc(left.clock, right.clock))
         .then_with(|| left.index.cmp(&right.index))
 }
 
@@ -675,5 +682,20 @@ mod tests {
 
         assert_eq!(left, right);
         assert_eq!(mantissa_values(&left), vec!["b".to_string()]);
+    }
+
+    /// Compaction should rank entries without cloning their potentially large values.
+    #[test]
+    fn mvreg_compaction_does_not_require_cloneable_values() {
+        #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+        struct NonCloneValue(u8);
+
+        let mut reg = MvReg::from_entries(vec![
+            MvRegEntry::new(clock(actor(1), 1), NonCloneValue(1)),
+            MvRegEntry::new(clock(actor(2), 1), NonCloneValue(2)),
+        ]);
+
+        assert!(reg.compact_with(1, |entry| entry.value().0));
+        assert_eq!(reg.entries()[0].value(), &NonCloneValue(2));
     }
 }

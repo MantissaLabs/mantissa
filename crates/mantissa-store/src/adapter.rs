@@ -108,7 +108,7 @@ pub struct RankedMvRegCompaction<R>(PhantomData<R>);
 
 impl<V, A, R> MvRegCompactionPolicy<V, A> for RankedMvRegCompaction<R>
 where
-    V: Clone + Ord,
+    V: Ord,
     A: Clone + Ord,
     R: MvRegCompactionRanker<V, A>,
 {
