@@ -135,11 +135,43 @@ pub struct RowDigest {
     pub digest: [u8; 16],
 }
 
-/// Returns whether one raw row key is covered by any requested inclusive range.
-fn row_key_is_in_ranges(key: &[u8], ranges: &[PageDigestRange]) -> bool {
-    ranges
-        .iter()
-        .any(|range| range.start.as_slice() <= key && key <= range.end.as_slice())
+/// Matches ascending MST row keys against a start-sorted view of requested ranges.
+///
+/// The cursor borrows the ranges and advances monotonically with `node_iter()`, so
+/// each range is visited at most once instead of scanning every range for every row.
+struct SortedRangeCursor<'a> {
+    ranges: Vec<&'a PageDigestRange>,
+    index: usize,
+}
+
+impl<'a> SortedRangeCursor<'a> {
+    /// Builds the temporary sorted range view without copying range boundaries.
+    fn new(ranges: &'a [PageDigestRange]) -> Self {
+        let mut ranges: Vec<_> = ranges
+            .iter()
+            .filter(|range| range.start <= range.end)
+            .collect();
+        ranges.sort_unstable_by(|left, right| {
+            left.start
+                .cmp(&right.start)
+                .then_with(|| left.end.cmp(&right.end))
+        });
+        Self { ranges, index: 0 }
+    }
+
+    /// Returns whether the next ascending row key is covered by any range.
+    fn contains(&mut self, key: &[u8]) -> bool {
+        while let Some(range) = self.ranges.get(self.index) {
+            if key < range.start.as_slice() {
+                return false;
+            }
+            if key <= range.end.as_slice() {
+                return true;
+            }
+            self.index += 1;
+        }
+        false
+    }
 }
 
 #[inline]
@@ -1903,12 +1935,13 @@ where
             return self.row_digests_from_disk(want, root_schema_version);
         }
 
+        let mut range_cursor = SortedRangeCursor::new(want);
         let tree = self.mst.read().await;
         Ok(tree
             .node_iter()
             .filter_map(|node| {
                 let key = node.key().as_ref();
-                row_key_is_in_ranges(key, want).then(|| RowDigest {
+                range_cursor.contains(key).then(|| RowDigest {
                     key: key.to_vec(),
                     digest: *node.value_hash().as_bytes(),
                 })
@@ -1986,12 +2019,13 @@ where
                 .collect());
         }
 
+        let mut range_cursor = SortedRangeCursor::new(want);
         let tree = self.mst.read().await;
         Ok(tree
             .node_iter()
             .filter_map(|node| {
                 let key = node.key().as_ref();
-                (row_key_is_in_ranges(key, want)
+                (range_cursor.contains(key)
                     && have_by_key.get(key).copied() != Some(node.value_hash().as_bytes()))
                 .then(|| key.to_vec())
             })
@@ -2568,6 +2602,15 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[15] = n;
         UuidKey::try_from(&bytes[..]).unwrap()
+    }
+
+    /// Builds one inclusive test range from deterministic UUID keys.
+    fn key_range(start: u8, end: u8) -> PageDigestRange {
+        PageDigestRange {
+            start: <Adapter as RegAdapter>::key_to_bytes(&key(start)),
+            end: <Adapter as RegAdapter>::key_to_bytes(&key(end)),
+            hash: Vec::new(),
+        }
     }
 
     fn actor(n: u128) -> Uuid {
@@ -3502,6 +3545,66 @@ mod tests {
 
         assert_eq!(reg_keys, vec![key(2), key(4), key(5)]);
         assert_eq!(tmb_keys, vec![key(3)]);
+    }
+
+    /// The sorted cursor must preserve selection and filtering for every range shape.
+    #[tokio::test]
+    async fn semantic_row_filtering_accepts_unsorted_overlapping_ranges() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+
+        for n in 1..=9u8 {
+            store.upsert(&key(n), format!("v{n}")).await.unwrap();
+        }
+        store.remove(&key(4)).await.unwrap();
+
+        let want = vec![
+            key_range(8, 9),
+            key_range(5, 6),
+            key_range(2, 4),
+            key_range(3, 5),
+            key_range(2, 3),
+        ];
+
+        assert!(
+            store
+                .row_digests_for_ranges(&[], 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut have_rows = store.row_digests_for_ranges(&want, 1).await.unwrap();
+        let selected_keys: Vec<_> = have_rows.iter().map(|row| row.key.clone()).collect();
+        assert_eq!(
+            selected_keys,
+            (2..=6)
+                .chain(8..=9)
+                .map(|n| <Adapter as RegAdapter>::key_to_bytes(&key(n)))
+                .collect::<Vec<_>>()
+        );
+
+        for row in &mut have_rows {
+            if row.key == <Adapter as RegAdapter>::key_to_bytes(&key(3))
+                || row.key == <Adapter as RegAdapter>::key_to_bytes(&key(4))
+            {
+                row.digest[0] ^= 0xFF;
+            }
+        }
+        have_rows.retain(|row| row.key != <Adapter as RegAdapter>::key_to_bytes(&key(6)));
+
+        let (registers, tombstones) = store
+            .export_page_ranges_delta_filtered(&want, &have_rows, 1)
+            .await
+            .unwrap();
+        let mut register_keys: Vec<_> = registers.into_iter().map(|(row_key, _)| row_key).collect();
+        let mut tombstone_keys: Vec<_> =
+            tombstones.into_iter().map(|(row_key, _)| row_key).collect();
+        register_keys.sort();
+        tombstone_keys.sort();
+
+        assert_eq!(register_keys, vec![key(3), key(6)]);
+        assert_eq!(tombstone_keys, vec![key(4)]);
     }
 
     /// Filtered exports should omit semantic matches while retaining every required row kind.
