@@ -2034,11 +2034,45 @@ async fn wait_for_surviving_copies_to_observe_down(
     }
 }
 
-/// Waits until an applied recovery grant is also visible through public volume status.
-async fn wait_for_two_copy_state(
+/// Returns whether public state preserves recovery or a later completed replacement.
+fn public_group_reflects_failed_copy_recovery(
+    group: &ReplicatedVolumeGroupStatusValue,
+    failed_node_id: Uuid,
+    surviving_copy_node_ids: &[Uuid],
+) -> bool {
+    if !matches!(group.status, VolumeStatus::Ready | VolumeStatus::InUse)
+        || group.copy_node_ids.contains(&failed_node_id)
+        || !surviving_copy_node_ids
+            .iter()
+            .all(|node_id| group.copy_node_ids.contains(node_id))
+    {
+        return false;
+    }
+
+    match group.copy_node_ids.len() {
+        // Beginning a rebuild is a monotonic successor to two-copy recovery;
+        // requiring the preceding no-replacement state makes publication race
+        // the controller's next reconciliation pass.
+        2 => group.degraded,
+        3 => {
+            group.replacement_id.is_none()
+                && !group.degraded
+                && group.voter_node_ids.len() == 3
+                && group
+                    .copy_node_ids
+                    .iter()
+                    .all(|node_id| group.voter_node_ids.contains(node_id))
+        }
+        _ => false,
+    }
+}
+
+/// Waits until public status reflects recovery or a later completed replacement.
+async fn wait_for_failed_copy_recovery_status(
     cluster: &[TestNode],
     volume_id: Uuid,
     failed_node_id: Uuid,
+    surviving_copy_node_ids: &[Uuid],
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let descriptor = cluster
@@ -2060,10 +2094,11 @@ async fn wait_for_two_copy_state(
                 .ok()
                 .flatten()
                 .is_some_and(|group| {
-                    group.status == VolumeStatus::Ready
-                        && group.degraded
-                        && group.copy_node_ids.len() == 2
-                        && group.replacement_id.is_none()
+                    public_group_reflects_failed_copy_recovery(
+                        &group,
+                        failed_node_id,
+                        surviving_copy_node_ids,
+                    )
                 })
         }) {
             return Ok(());
@@ -2085,7 +2120,8 @@ async fn wait_for_two_copy_state(
         let timeout_reason = match publication_deadline {
             Some(deadline) if now >= deadline => Some(format!(
                 "two-copy recovery for failed node {failed_node_id} was applied on \
-                 {applied_nodes:?}, but public status did not converge within \
+                 {applied_nodes:?}, but public status did not reflect recovered copies \
+                 {surviving_copy_node_ids:?} or a completed replacement within \
                  {REPLICATED_VOLUME_PUBLIC_STATUS_TIMEOUT:?}"
             )),
             None if now >= recovery_deadline => Some(format!(
@@ -2134,6 +2170,12 @@ pub(crate) async fn wait_for_failed_copy_recovery(
         .copied()
         .filter(|node_id| *node_id != failed_node_id)
         .collect::<Vec<_>>();
+    if surviving_copy_node_ids.len() != 2 {
+        anyhow::bail!(
+            "failed node {failed_node_id} did not leave exactly two surviving copies: \
+             {copies_before_failure:?}"
+        );
+    }
     let health_timeout = swim_down_transition_timeout(cluster.len());
     wait_for_surviving_copies_to_observe_down(
         cluster,
@@ -2146,9 +2188,15 @@ pub(crate) async fn wait_for_failed_copy_recovery(
 
     let recovery_timeout =
         TEST_REPLICA_FAILURE_GRACE.saturating_add(TEST_REPLICA_RECOVERY_CONVERGENCE_AFTER_GRACE);
-    wait_for_two_copy_state(cluster, volume_id, failed_node_id, recovery_timeout)
-        .await
-        .context("wait for two-copy recovery after confirmed replica failure")
+    wait_for_failed_copy_recovery_status(
+        cluster,
+        volume_id,
+        failed_node_id,
+        &surviving_copy_node_ids,
+        recovery_timeout,
+    )
+    .await
+    .context("wait for recovered copy set after confirmed replica failure")
 }
 
 /// Waits until workload reconciliation republishes a recovered two-copy path.
@@ -3355,9 +3403,9 @@ pub(crate) async fn run_replicated_volume_public_flow(
     )
     .await
     .context("wait for reachable-copy recovery grant")?;
-    // Return the follower immediately after the committed two-copy recovery
-    // fact. Waiting for workload publication first can consume the complete
-    // replacement grace and accidentally test permanent loss instead.
+    // Return the follower after the committed two-copy recovery fact. The
+    // failure grace has already elapsed, so reconciliation may either rebuild
+    // this voter in place or finish replacing it with a spare.
     restart_replicated_volume_test_node(cluster, states, restarted_follower_id)
         .await
         .context("restart one volume follower before rebuilding the third copy")?;
@@ -3377,7 +3425,7 @@ pub(crate) async fn run_replicated_volume_public_flow(
     )
     .await
     .context("write through the two surviving copies")?;
-    wait_for_stable_replicas(
+    wait_for_stable_replicas_after_restart(
         cluster,
         volume_id,
         restarted_follower_id,
@@ -3386,7 +3434,7 @@ pub(crate) async fn run_replicated_volume_public_flow(
         Duration::from_secs(45),
     )
     .await
-    .context("wait for the restarted follower to remain in the group")?;
+    .context("wait for a healthy replica set after restarting the follower")?;
     let follower_restart_write = tokio::time::timeout(
         Duration::from_secs(30),
         write_synced_probe(
@@ -4119,20 +4167,32 @@ pub(crate) async fn wait_for_node_drain(
     }
 }
 
-/// Ensures a restarted follower remains in one unchanged three-copy group.
-pub(crate) async fn wait_for_stable_replicas(
+/// Waits for one stable three-copy group after a failed follower returns.
+pub(crate) async fn wait_for_stable_replicas_after_restart(
     cluster: &[TestNode],
     volume_id: Uuid,
     restarted_node_id: Uuid,
-    expected_replicas: [Uuid; 3],
+    replicas_before_restart: [Uuid; 3],
     stable_for: Duration,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    let surviving_replicas = replicas_before_restart
+        .into_iter()
+        .filter(|node_id| *node_id != restarted_node_id)
+        .collect::<Vec<_>>();
+    if surviving_replicas.len() != 2 {
+        anyhow::bail!(
+            "restarted node {restarted_node_id} was not one member of the previous replica set: \
+             {replicas_before_restart:?}"
+        );
+    }
+
     let deadline = Instant::now() + timeout;
     let mut stable_since = None;
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     loop {
         poll.tick().await;
+        let mut agreed_replicas = None;
         let all_match = cluster.iter().all(|node| {
             node.node
                 .volume_registry
@@ -4140,12 +4200,25 @@ pub(crate) async fn wait_for_stable_replicas(
                 .ok()
                 .flatten()
                 .is_some_and(|group| {
-                    group.replacement_id.is_none()
+                    let steady = group.replacement_id.is_none()
                         && !group.degraded
                         && group.copy_node_ids.len() == 3
-                        && expected_replicas
+                        && group.voter_node_ids.len() == 3
+                        && group
+                            .copy_node_ids
                             .iter()
-                            .all(|node_id| group.copy_node_ids.contains(node_id))
+                            .all(|node_id| group.voter_node_ids.contains(node_id))
+                        && surviving_replicas
+                            .iter()
+                            .all(|node_id| group.copy_node_ids.contains(node_id));
+                    if !steady {
+                        return false;
+                    }
+                    let expected =
+                        agreed_replicas.get_or_insert_with(|| group.copy_node_ids.clone());
+                    expected
+                        .iter()
+                        .all(|node_id| group.copy_node_ids.contains(node_id))
                 })
         });
         if all_match {
@@ -4158,8 +4231,8 @@ pub(crate) async fn wait_for_stable_replicas(
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "replica set changed or did not converge after restarting follower \
-                 {restarted_node_id}: {}",
+                "replica set did not converge after restarting follower {restarted_node_id} \
+                 while retaining surviving copies {surviving_replicas:?}: {}",
                 replicated_volume_start_diagnostics(cluster, volume_id)
             );
         }
