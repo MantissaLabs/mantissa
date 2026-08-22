@@ -846,6 +846,29 @@ impl HeadlessNode {
             && copies == voters)
     }
 
+    /// Reports whether local applied Raft state has durably excluded one failed copy.
+    #[doc(hidden)]
+    pub fn replicated_volume_two_copy_state_is_applied_for_test(
+        &self,
+        key: mantissa_volume::catalog::ReplicaKey,
+        failed_node_id: Uuid,
+    ) -> io::Result<bool> {
+        let Some(runtime) = self.replicated_volumes.as_ref() else {
+            return Ok(false);
+        };
+        let Some(state) = runtime.applied_state(key).map_err(to_io)? else {
+            return Ok(false);
+        };
+        let Some(data) = state.data() else {
+            return Ok(false);
+        };
+        Ok(data.copies.len() == 2
+            && !data
+                .copies
+                .iter()
+                .any(|node_id| node_id.as_uuid() == &failed_node_id))
+    }
+
     /// Attempts one read-only replica RPC for cluster-view transport tests.
     #[doc(hidden)]
     pub async fn inspect_replicated_volume_replica_for_test(

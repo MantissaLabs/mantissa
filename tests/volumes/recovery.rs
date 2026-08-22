@@ -202,7 +202,7 @@ async fn run_recovery_benchmark(
         shutdown_replicated_volume_test_node(cluster, failed_node_id, Duration::from_secs(10))
             .await
             .context("stop one replica during the recovery benchmark")?;
-        wait_for_two_copy_state(cluster, volume_id, Duration::from_secs(45))
+        wait_for_failed_copy_recovery(cluster, volume_id, failed_node_id, &previous_copies)
             .await
             .context("wait for recovery benchmark two-copy control state")?;
         wait_for_failed_attachment_republish(

@@ -1,4 +1,4 @@
-pub(crate) use crate::common::convergence::wait_until;
+pub(crate) use crate::common::convergence::{swim_down_transition_timeout, wait_until};
 pub(crate) use crate::common::testkit::{ClusterConfig, TestNode};
 pub(crate) use anyhow::Context;
 pub(crate) use async_trait::async_trait;
@@ -28,6 +28,7 @@ pub(crate) use mantissa::volumes::types::{
 pub(crate) use mantissa::workload::manager::{WorkloadRuntimeConfig, WorkloadStartRequest};
 pub(crate) use mantissa::workload::model::{ExecutionPlatform, WorkloadStateFilter};
 pub(crate) use mantissa::workload::types::ResolvedExecutionSpec;
+pub(crate) use mantissa_health::Status as HealthStatus;
 pub(crate) use mantissa_net::noise::NoiseKeys;
 pub(crate) use mantissa_protocol::services::services as services_api;
 pub(crate) use mantissa_protocol::task::task as task_api;
@@ -254,11 +255,13 @@ pub(crate) const REAL_REPLICATED_VOLUME_EXPANDED_BYTES: u64 = 12 << 30;
 pub(crate) const REAL_REPLICATED_VOLUME_BUSY_EXPANDED_BYTES: u64 = 14 << 30;
 pub(crate) const REAL_REPLICATED_VOLUME_UNAVAILABLE_EXPANSION_BYTES: u64 = 1 << 40;
 pub(crate) const PUBLIC_API_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const REPLACEMENT_PUBLIC_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const REPLICATED_VOLUME_PUBLIC_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const REPLICATED_VOLUME_TEST_NODE_COUNT: usize = 5;
 pub(crate) const TEST_REPLICA_FAILURE_GRACE_MS: u64 = 15_000;
 pub(crate) const TEST_REPLICA_FAILURE_GRACE: Duration =
     Duration::from_millis(TEST_REPLICA_FAILURE_GRACE_MS);
+/// Covers controller retries, Raft wake and election, proposal, and local application after grace.
+const TEST_REPLICA_RECOVERY_CONVERGENCE_AFTER_GRACE: Duration = Duration::from_secs(30);
 
 /// Storage limits selected explicitly by real replicated-volume tests.
 #[derive(Clone, Copy)]
@@ -1988,13 +1991,65 @@ async fn wait_for_recovered_attachment(
     }
 }
 
-/// Waits until recovery grant keeps only the two reachable copies.
-pub(crate) async fn wait_for_two_copy_state(
+/// Waits until every surviving copy's failure detector confirms the stopped copy is down.
+async fn wait_for_surviving_copies_to_observe_down(
     cluster: &[TestNode],
-    volume_id: Uuid,
+    failed_node_id: Uuid,
+    surviving_copy_node_ids: &[Uuid],
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        poll.tick().await;
+        let observations = surviving_copy_node_ids
+            .iter()
+            .map(|observer_id| {
+                let status = cluster
+                    .iter()
+                    .find(|node| node.id() == *observer_id)
+                    .and_then(|node| {
+                        node.node
+                            .registry
+                            .health_monitor()
+                            .snapshot()
+                            .get(&failed_node_id)
+                            .copied()
+                    });
+                (*observer_id, status)
+            })
+            .collect::<Vec<_>>();
+        if observations
+            .iter()
+            .all(|(_, status)| *status == Some(HealthStatus::Down))
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "surviving volume copies did not observe failed copy {failed_node_id} as Down \
+                 within {timeout:?}: observations={observations:?}"
+            );
+        }
+    }
+}
+
+/// Waits until an applied recovery grant is also visible through public volume status.
+async fn wait_for_two_copy_state(
+    cluster: &[TestNode],
+    volume_id: Uuid,
+    failed_node_id: Uuid,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let descriptor = cluster
+        .iter()
+        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .context("two-copy recovery diagnostics have no volume plan")?
+        .descriptor
+        .to_storage()?;
+    let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
+    let recovery_deadline = Instant::now() + timeout;
+    let mut publication_deadline = None;
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     loop {
         poll.tick().await;
@@ -2013,13 +2068,87 @@ pub(crate) async fn wait_for_two_copy_state(
         }) {
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        let applied_nodes = cluster
+            .iter()
+            .filter_map(|node| {
+                node.node
+                    .replicated_volume_two_copy_state_is_applied_for_test(key, failed_node_id)
+                    .ok()
+                    .filter(|applied| *applied)
+                    .map(|_| node.id())
+            })
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        if publication_deadline.is_none() && !applied_nodes.is_empty() {
+            publication_deadline = Some(now + REPLICATED_VOLUME_PUBLIC_STATUS_TIMEOUT);
+        }
+        let timeout_reason = match publication_deadline {
+            Some(deadline) if now >= deadline => Some(format!(
+                "two-copy recovery for failed node {failed_node_id} was applied on \
+                 {applied_nodes:?}, but public status did not converge within \
+                 {REPLICATED_VOLUME_PUBLIC_STATUS_TIMEOUT:?}"
+            )),
+            None if now >= recovery_deadline => Some(format!(
+                "surviving voters observed failed node {failed_node_id} as Down, but no node \
+                 applied a two-copy recovery within {timeout:?}"
+            )),
+            Some(_) | None => None,
+        };
+        if let Some(timeout_reason) = timeout_reason {
+            let applied = cluster
+                .iter()
+                .map(|node| {
+                    (
+                        node.id(),
+                        node.node
+                            .replicated_volume_two_copy_state_is_applied_for_test(
+                                key,
+                                failed_node_id,
+                            ),
+                    )
+                })
+                .collect::<Vec<_>>();
             anyhow::bail!(
-                "failed writer did not commit two-copy recovery grant: {}",
+                "{timeout_reason}; local_applied={applied:?}; {}",
                 replicated_volume_start_diagnostics(cluster, volume_id)
             );
         }
     }
+}
+
+/// Separates failure detection from the grace and Raft phases of one copy recovery.
+pub(crate) async fn wait_for_failed_copy_recovery(
+    cluster: &[TestNode],
+    volume_id: Uuid,
+    failed_node_id: Uuid,
+    copies_before_failure: &[Uuid; 3],
+) -> anyhow::Result<()> {
+    if !copies_before_failure.contains(&failed_node_id) {
+        anyhow::bail!(
+            "failed node {failed_node_id} was not an active copy before recovery: \
+             {copies_before_failure:?}"
+        );
+    }
+    let surviving_copy_node_ids = copies_before_failure
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != failed_node_id)
+        .collect::<Vec<_>>();
+    let health_timeout = swim_down_transition_timeout(cluster.len());
+    wait_for_surviving_copies_to_observe_down(
+        cluster,
+        failed_node_id,
+        &surviving_copy_node_ids,
+        health_timeout,
+    )
+    .await
+    .context("wait for surviving volume copies to confirm replica failure")?;
+
+    let recovery_timeout =
+        TEST_REPLICA_FAILURE_GRACE.saturating_add(TEST_REPLICA_RECOVERY_CONVERGENCE_AFTER_GRACE);
+    wait_for_two_copy_state(cluster, volume_id, failed_node_id, recovery_timeout)
+        .await
+        .context("wait for two-copy recovery after confirmed replica failure")
 }
 
 /// Waits until workload reconciliation republishes a recovered two-copy path.
@@ -2350,13 +2479,13 @@ pub(crate) async fn wait_for_replica_replacement(
         }
         let now = Instant::now();
         if status_deadline.is_none() && applied_nodes.len() >= 2 {
-            status_deadline = Some(now + REPLACEMENT_PUBLIC_STATUS_TIMEOUT);
+            status_deadline = Some(now + REPLICATED_VOLUME_PUBLIC_STATUS_TIMEOUT);
         }
         let timeout_reason = match status_deadline {
             Some(deadline) if now >= deadline => Some(format!(
                 "replicated volume committed the replacement for node {old_node_id}, but its \
                  public status did not converge within \
-                 {REPLACEMENT_PUBLIC_STATUS_TIMEOUT:?}; applied nodes: {applied_nodes:?}"
+                 {REPLICATED_VOLUME_PUBLIC_STATUS_TIMEOUT:?}; applied nodes: {applied_nodes:?}"
             )),
             None if now >= replacement_deadline => Some(format!(
                 "replicated volume did not commit a replacement for node {old_node_id} within \
@@ -3218,9 +3347,14 @@ pub(crate) async fn run_replicated_volume_public_flow(
     shutdown_replicated_volume_test_node(cluster, restarted_follower_id, Duration::from_secs(10))
         .await
         .context("shut down one volume follower")?;
-    wait_for_two_copy_state(cluster, volume_id, Duration::from_secs(45))
-        .await
-        .context("wait for reachable-copy recovery grant")?;
+    wait_for_failed_copy_recovery(
+        cluster,
+        volume_id,
+        restarted_follower_id,
+        &replicas_before_follower_restart,
+    )
+    .await
+    .context("wait for reachable-copy recovery grant")?;
     // Return the follower immediately after the committed two-copy recovery
     // fact. Waiting for workload publication first can consume the complete
     // replacement grace and accidentally test permanent loss instead.
@@ -3312,7 +3446,7 @@ pub(crate) async fn run_replicated_volume_public_flow(
     shutdown_replicated_volume_test_node(cluster, failed_node_id, Duration::from_secs(10))
         .await
         .context("shut down one active volume copy")?;
-    wait_for_two_copy_state(cluster, volume_id, Duration::from_secs(45))
+    wait_for_failed_copy_recovery(cluster, volume_id, failed_node_id, &replicas_before_failure)
         .await
         .context("wait for busy writer recovery grant")?;
     wait_for_failed_attachment_republish(
