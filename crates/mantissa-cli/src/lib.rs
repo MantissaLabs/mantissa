@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub use crate::app::{run_cli, run_cli_with_args};
