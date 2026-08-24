@@ -6,8 +6,8 @@ use super::state::*;
 use super::*;
 use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
 use crate::services::ownership::{
-    build_replica_slots, build_service_deployment_groups, compute_slot_targets,
-    select_generation_owner, select_slot_owner, select_task_owner,
+    DeploymentCoordinatorSelector, build_replica_slots, build_service_deployment_groups,
+    compute_slot_targets, select_generation_owner, select_slot_owner, select_task_owner,
 };
 use crate::services::types::TaskTemplateNetworkRequirement;
 use crate::store::replicated::networks::{
@@ -741,21 +741,16 @@ fn generation_owner_is_deterministic() {
     assert_eq!(owner, owner_reversed);
 }
 
-/// Ensures the same nodes and coordinators are grouped regardless of input order.
+/// Ensures target nodes are grouped the same way regardless of input order.
 #[test]
 fn service_deployment_groups_are_deterministic() {
-    let service_id = Uuid::from_u128(42);
     let targets = (1u128..=10).map(Uuid::from_u128).collect::<Vec<_>>();
     let mut reversed_targets = targets.clone();
     reversed_targets.reverse();
-    let mut eligible = targets.clone();
-    eligible.push(Uuid::from_u128(100));
-    let mut reversed_eligible = eligible.clone();
-    reversed_eligible.reverse();
+    reversed_targets.push(targets[0]);
 
-    let groups = build_service_deployment_groups(service_id, 9, &eligible, &targets, 3);
-    let reversed =
-        build_service_deployment_groups(service_id, 9, &reversed_eligible, &reversed_targets, 3);
+    let groups = build_service_deployment_groups(&targets, 3);
+    let reversed = build_service_deployment_groups(&reversed_targets, 3);
 
     assert_eq!(groups, reversed);
 }
@@ -763,9 +758,8 @@ fn service_deployment_groups_are_deterministic() {
 /// Ensures every target node appears in exactly one deployment group.
 #[test]
 fn service_deployment_groups_include_each_target_once() {
-    let service_id = Uuid::from_u128(43);
     let targets = (1u128..=10).map(Uuid::from_u128).collect::<Vec<_>>();
-    let groups = build_service_deployment_groups(service_id, 2, &targets, &targets, 4);
+    let groups = build_service_deployment_groups(&targets, 4);
 
     assert_eq!(groups.len(), 3);
     assert!(groups.iter().all(|group| group.target_node_ids.len() <= 4));
@@ -783,21 +777,25 @@ fn service_deployment_groups_include_each_target_once() {
 
 /// Ensures a node receiving tasks is used as coordinator when it is eligible.
 #[test]
-fn service_deployment_groups_prefer_nodes_that_run_tasks() {
+fn coordinator_selection_prefers_nodes_that_run_tasks() {
     let service_id = Uuid::from_u128(44);
     let targets = (1u128..=6).map(Uuid::from_u128).collect::<Vec<_>>();
     let outside = Uuid::from_u128(99);
     let mut eligible = targets.clone();
     eligible.push(outside);
 
-    let groups = build_service_deployment_groups(service_id, 3, &eligible, &targets, 2);
+    let groups = build_service_deployment_groups(&targets, 2);
+    let selector = DeploymentCoordinatorSelector::new(&eligible);
 
     assert!(!groups.is_empty());
-    for group in groups {
+    for (batch_index, group) in groups.into_iter().enumerate() {
+        let coordinator = selector
+            .select(service_id, 3, batch_index, &group.target_node_ids)
+            .expect("coordinator");
         assert!(
-            group.target_node_ids.contains(&group.coordinator_node_id),
+            group.target_node_ids.contains(&coordinator),
             "coordinator {} should be one of {:?}",
-            group.coordinator_node_id,
+            coordinator,
             group.target_node_ids
         );
     }
@@ -805,21 +803,42 @@ fn service_deployment_groups_prefer_nodes_that_run_tasks() {
 
 /// Ensures another eligible node is used when no task destination may coordinate.
 #[test]
-fn service_deployment_groups_use_another_eligible_coordinator() {
+fn coordinator_selection_uses_another_eligible_node() {
     let service_id = Uuid::from_u128(45);
     let targets = (1u128..=6).map(Uuid::from_u128).collect::<Vec<_>>();
     let eligible = vec![Uuid::from_u128(100), Uuid::from_u128(101)];
     let mut reversed_eligible = eligible.clone();
     reversed_eligible.reverse();
 
-    let groups = build_service_deployment_groups(service_id, 4, &eligible, &targets, 2);
-    let reversed = build_service_deployment_groups(service_id, 4, &reversed_eligible, &targets, 2);
+    let groups = build_service_deployment_groups(&targets, 2);
+    let selector = DeploymentCoordinatorSelector::new(&eligible);
+    let reversed_selector = DeploymentCoordinatorSelector::new(&reversed_eligible);
+    let coordinators = groups
+        .iter()
+        .enumerate()
+        .map(|(batch_index, group)| {
+            selector.select(service_id, 4, batch_index, &group.target_node_ids)
+        })
+        .collect::<Vec<_>>();
+    let reversed = groups
+        .iter()
+        .enumerate()
+        .map(|(batch_index, group)| {
+            reversed_selector.select(service_id, 4, batch_index, &group.target_node_ids)
+        })
+        .collect::<Vec<_>>();
 
-    assert_eq!(groups, reversed);
-    assert!(groups.iter().all(|group| {
-        eligible.contains(&group.coordinator_node_id)
-            && !group.target_node_ids.contains(&group.coordinator_node_id)
-    }));
+    assert_eq!(coordinators, reversed);
+    assert!(
+        coordinators
+            .into_iter()
+            .zip(groups)
+            .all(|(coordinator, group)| {
+                coordinator.is_some_and(|node_id| {
+                    eligible.contains(&node_id) && !group.target_node_ids.contains(&node_id)
+                })
+            })
+    );
 }
 
 /// Ensures slot targets are deterministic regardless of candidate ordering.

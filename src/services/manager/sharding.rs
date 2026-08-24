@@ -32,10 +32,11 @@ pub(super) struct DeploymentCoordinatorPlan {
     node_groups: Vec<ServiceDeploymentGroup>,
 }
 
-/// One coordinator request and the positions of its tasks in the original list.
-#[derive(Clone)]
+/// One request sent to a coordinator during a large service launch.
 struct CoordinatorBatch {
-    group: ServiceDeploymentGroup,
+    batch_index: usize,
+    coordinator_node_id: Uuid,
+    target_node_count: usize,
     indexed_requests: Vec<(usize, WorkloadStartRequest)>,
 }
 
@@ -83,11 +84,15 @@ fn build_coordinator_batches(
     let max_tasks_per_request = max_tasks_per_request.max(1);
     // The nodes allowed to coordinate are the same for every request.
     let coordinator_selector = DeploymentCoordinatorSelector::new(eligible_nodes);
-    let mut target_to_group = HashMap::new();
-    for group in node_groups {
+    let target_node_count = node_groups
+        .iter()
+        .map(|group| group.target_node_ids.len())
+        .sum();
+    let mut target_to_group = HashMap::with_capacity(target_node_count);
+    for (group_index, group) in node_groups.iter().enumerate() {
         for target_node_id in &group.target_node_ids {
             if target_to_group
-                .insert(*target_node_id, group.clone())
+                .insert(*target_node_id, group_index)
                 .is_some()
             {
                 return Err(anyhow!(
@@ -97,30 +102,30 @@ fn build_coordinator_batches(
         }
     }
 
-    let mut requests_by_group: HashMap<
-        usize,
-        (ServiceDeploymentGroup, Vec<(usize, WorkloadStartRequest)>),
-    > = HashMap::new();
+    let mut requests_by_group = (0..node_groups.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<Vec<(usize, WorkloadStartRequest)>>>();
     for (index, request) in requests.into_iter().enumerate() {
         let target_node = request.target_node.ok_or_else(|| {
             anyhow!("service launch for {context} received a task without a target node")
         })?;
-        let group = target_to_group.get(&target_node).ok_or_else(|| {
+        let group_index = target_to_group.get(&target_node).copied().ok_or_else(|| {
             anyhow!("service launch for {context} has no group for target node {target_node}")
         })?;
-        requests_by_group
-            .entry(group.group_index)
-            .or_insert_with(|| (group.clone(), Vec::new()))
-            .1
-            .push((index, request));
+        requests_by_group[group_index].push((index, request));
     }
 
-    let mut grouped_requests = requests_by_group.into_values().collect::<Vec<_>>();
-    grouped_requests.sort_by_key(|(group, _)| group.group_index);
-
     let mut batches = Vec::new();
-    for (_, indexed_requests) in grouped_requests {
-        for chunk in indexed_requests.chunks(max_tasks_per_request) {
+    for indexed_requests in requests_by_group {
+        let mut remaining_requests = indexed_requests.into_iter();
+        loop {
+            let chunk = remaining_requests
+                .by_ref()
+                .take(max_tasks_per_request)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
             let batch_index = batches.len();
             let mut target_node_ids = chunk
                 .iter()
@@ -138,12 +143,10 @@ fn build_coordinator_batches(
             })?;
 
             batches.push(CoordinatorBatch {
-                group: ServiceDeploymentGroup {
-                    group_index: batch_index,
-                    coordinator_node_id,
-                    target_node_ids,
-                },
-                indexed_requests: chunk.to_vec(),
+                batch_index,
+                coordinator_node_id,
+                target_node_count: target_node_ids.len(),
+                indexed_requests: chunk,
             });
         }
     }
@@ -226,13 +229,19 @@ impl ServiceController {
         let mut eligible_nodes = self.collect_eligible_nodes();
         eligible_nodes.sort_unstable();
         eligible_nodes.dedup();
-        let node_groups = build_service_deployment_groups(
-            service_id,
-            service_epoch,
-            &eligible_nodes,
-            &target_nodes,
-            runtime.service_shard_target_size,
-        );
+        if eligible_nodes.is_empty() {
+            tracing::info!(
+                target: "services",
+                service_id = %service_id,
+                service_epoch,
+                request_count,
+                target_node_count = target_nodes.len(),
+                "using direct service deployment launch because no node can coordinate it"
+            );
+            return None;
+        }
+        let node_groups =
+            build_service_deployment_groups(&target_nodes, runtime.service_shard_target_size);
         if node_groups.is_empty() {
             tracing::info!(
                 target: "services",
@@ -293,7 +302,7 @@ impl ServiceController {
         )?;
         let coordinator_count = coordinator_batches
             .iter()
-            .map(|batch| batch.group.coordinator_node_id)
+            .map(|batch| batch.coordinator_node_id)
             .collect::<HashSet<_>>()
             .len();
         let max_tasks_per_batch = coordinator_batches
@@ -303,12 +312,12 @@ impl ServiceController {
             .unwrap_or(0);
         let max_targets_per_batch = coordinator_batches
             .iter()
-            .map(|batch| batch.group.target_node_ids.len())
+            .map(|batch| batch.target_node_count)
             .max()
             .unwrap_or(0);
         let last_batch_index = coordinator_batches
             .last()
-            .map(|batch| batch.group.group_index)
+            .map(|batch| batch.batch_index)
             .unwrap_or(0);
 
         tracing::info!(
@@ -344,11 +353,8 @@ impl ServiceController {
         );
 
         let mut ordered: Vec<Option<WorkloadSpec>> = vec![None; request_count];
-        let mut ordered_batches = coordinator_batches;
-        ordered_batches.sort_by_key(|batch| batch.group.group_index);
-
         let parallelism = service_coordinator_parallelism();
-        let mut pending_batches = ordered_batches.into_iter();
+        let mut pending_batches = coordinator_batches.into_iter();
         let mut inflight = FuturesUnordered::new();
 
         loop {
@@ -359,8 +365,7 @@ impl ServiceController {
                 inflight.push(self.coordinate_deployment_batch(
                     service_id,
                     service_epoch,
-                    batch.group,
-                    batch.indexed_requests,
+                    batch,
                     context,
                 ));
             }
@@ -403,34 +408,32 @@ impl ServiceController {
         &self,
         service_id: Uuid,
         service_epoch: u64,
-        group: ServiceDeploymentGroup,
-        indexed_requests: Vec<(usize, WorkloadStartRequest)>,
+        batch: CoordinatorBatch,
         context: &str,
     ) -> (usize, Vec<usize>, anyhow::Result<Vec<WorkloadSpec>>) {
-        let original_indices = indexed_requests
-            .iter()
-            .map(|(index, _)| *index)
-            .collect::<Vec<_>>();
-        let batch_requests = indexed_requests
-            .into_iter()
-            .map(|(_, request)| request)
-            .collect::<Vec<_>>();
+        let CoordinatorBatch {
+            batch_index,
+            coordinator_node_id,
+            indexed_requests,
+            ..
+        } = batch;
+        let (original_indices, batch_requests) = indexed_requests.into_iter().unzip();
         let request = ServiceShardAssignmentRequest {
             owner_node_id: self.local_node_id,
-            coordinator_node_id: group.coordinator_node_id,
+            coordinator_node_id,
             service_id,
             service_epoch,
-            shard_index: group.group_index,
+            shard_index: batch_index,
             requests: batch_requests,
         };
 
-        let result = if group.coordinator_node_id == self.local_node_id {
+        let result = if coordinator_node_id == self.local_node_id {
             self.workload_manager
                 .coordinate_service_shard_assignments(request)
                 .await
         } else {
             self.workload_manager
-                .coordinate_remote_service_shard_assignments(group.coordinator_node_id, request)
+                .coordinate_remote_service_shard_assignments(coordinator_node_id, request)
                 .await
                 .map_err(|err| {
                     if err.chain().any(|cause| {
@@ -442,8 +445,8 @@ impl ServiceController {
                     }
 
                     anyhow::Error::new(CoordinatorRequestError {
-                        batch_index: group.group_index,
-                        coordinator_node_id: group.coordinator_node_id,
+                        batch_index,
+                        coordinator_node_id,
                         reason: err.to_string(),
                     })
                 })
@@ -451,11 +454,11 @@ impl ServiceController {
         .with_context(|| {
             format!(
                 "service batch {} coordinator request failed for {context}",
-                group.group_index
+                batch_index
             )
         });
 
-        (group.group_index, original_indices, result)
+        (batch_index, original_indices, result)
     }
 }
 
@@ -515,13 +518,7 @@ mod tests {
         let service_id = compute_service_id(service_name);
         let service_epoch = 3;
         let eligible_nodes = (1u128..=4).map(Uuid::from_u128).collect::<Vec<_>>();
-        let node_groups = build_service_deployment_groups(
-            service_id,
-            service_epoch,
-            &eligible_nodes,
-            &eligible_nodes,
-            4,
-        );
+        let node_groups = build_service_deployment_groups(&eligible_nodes, 4);
         let requests = (0..10)
             .map(|index| {
                 pinned_service_request(
@@ -551,8 +548,7 @@ mod tests {
                 .all(|batch| batch.indexed_requests.len() <= 3)
         );
         assert!(batches.iter().all(|batch| {
-            eligible_nodes.contains(&batch.group.coordinator_node_id)
-                && !batch.group.target_node_ids.is_empty()
+            eligible_nodes.contains(&batch.coordinator_node_id) && batch.target_node_count > 0
         }));
 
         let mut original_indices = batches

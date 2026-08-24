@@ -35,21 +35,17 @@ pub(super) struct ReplicaSlot {
     pub(super) replica_id: Option<Uuid>,
 }
 
-/// Nodes that will run tasks together and the node that sends their start requests.
+/// A bounded group of nodes whose tasks will be batched together.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ServiceDeploymentGroup {
-    /// Stable number for this group within the deployment plan.
-    pub(super) group_index: usize,
-    /// Node that sends start requests to the nodes in this group.
-    pub(super) coordinator_node_id: Uuid,
-    /// Nodes that will receive task requests from the coordinator.
+    /// Nodes grouped before their tasks are divided into bounded requests.
     pub(super) target_node_ids: Vec<Uuid>,
 }
 
 /// Stores the nodes allowed to coordinate one deployment.
 ///
-/// Coordinator selection runs once per group, but the eligible nodes do not
-/// change between groups. This type builds the membership set only once.
+/// Coordinator selection runs once per final task batch, but the eligible nodes
+/// do not change between batches. This type builds the membership set only once.
 pub(super) struct DeploymentCoordinatorSelector<'a> {
     /// Nodes currently allowed to send start requests for this deployment.
     eligible_nodes: &'a [Uuid],
@@ -58,7 +54,7 @@ pub(super) struct DeploymentCoordinatorSelector<'a> {
 }
 
 impl<'a> DeploymentCoordinatorSelector<'a> {
-    /// Builds the membership lookup shared by all groups in one deployment plan.
+    /// Builds the membership lookup shared by all task batches in one launch.
     pub(super) fn new(eligible_nodes: &'a [Uuid]) -> Self {
         Self {
             eligible_nodes,
@@ -66,7 +62,7 @@ impl<'a> DeploymentCoordinatorSelector<'a> {
         }
     }
 
-    /// Chooses the coordinator for a group of nodes that will run tasks.
+    /// Chooses the coordinator for one task batch.
     ///
     /// It first considers eligible nodes in `target_node_ids`. Such a coordinator
     /// can start its own tasks locally. If that list has no eligible node, the
@@ -75,13 +71,13 @@ impl<'a> DeploymentCoordinatorSelector<'a> {
         &self,
         service_id: Uuid,
         service_epoch: u64,
-        group_index: usize,
+        batch_index: usize,
         target_node_ids: &[Uuid],
     ) -> Option<Uuid> {
         select_highest_scoring_coordinator(
             service_id,
             service_epoch,
-            group_index,
+            batch_index,
             target_node_ids
                 .iter()
                 .copied()
@@ -91,7 +87,7 @@ impl<'a> DeploymentCoordinatorSelector<'a> {
             select_highest_scoring_coordinator(
                 service_id,
                 service_epoch,
-                group_index,
+                batch_index,
                 self.eligible_nodes.iter().copied(),
             )
         })
@@ -602,40 +598,29 @@ pub(crate) fn select_autoscale_owner(service_id: Uuid, candidates: &[Uuid]) -> O
     best.map(|(node_id, _)| node_id)
 }
 
-/// Puts target nodes into groups and chooses a coordinator for each group.
+/// Divides target nodes into groups of at most `max_nodes_per_group` nodes.
 ///
-/// Each group contains at most `max_nodes_per_group` nodes, and every target
-/// node appears in exactly one group. The same inputs always produce the same
-/// groups and coordinators.
+/// Unsorted input is normalized so group membership does not depend on input
+/// order. Already sorted production input avoids another sort. This step does
+/// not choose coordinators because task limits may split a group later.
 pub(super) fn build_service_deployment_groups(
-    service_id: Uuid,
-    service_epoch: u64,
-    eligible_nodes: &[Uuid],
     target_node_ids: &[Uuid],
     max_nodes_per_group: usize,
 ) -> Vec<ServiceDeploymentGroup> {
-    if max_nodes_per_group == 0 || eligible_nodes.is_empty() || target_node_ids.is_empty() {
+    if max_nodes_per_group == 0 || target_node_ids.is_empty() {
         return Vec::new();
     }
 
-    // Every group has the same coordinator candidates. Build the lookup once.
-    let coordinator_selector = DeploymentCoordinatorSelector::new(eligible_nodes);
-
     let mut targets = target_node_ids.to_vec();
-    targets.sort_unstable();
+    if !targets.is_sorted() {
+        targets.sort_unstable();
+    }
     targets.dedup();
 
     targets
         .chunks(max_nodes_per_group)
-        .enumerate()
-        .filter_map(|(group_index, group_nodes)| {
-            let coordinator_node_id =
-                coordinator_selector.select(service_id, service_epoch, group_index, group_nodes)?;
-            Some(ServiceDeploymentGroup {
-                group_index,
-                coordinator_node_id,
-                target_node_ids: group_nodes.to_vec(),
-            })
+        .map(|group_nodes| ServiceDeploymentGroup {
+            target_node_ids: group_nodes.to_vec(),
         })
         .collect()
 }
@@ -647,12 +632,12 @@ pub(super) fn build_service_deployment_groups(
 fn select_highest_scoring_coordinator(
     service_id: Uuid,
     service_epoch: u64,
-    group_index: usize,
+    batch_index: usize,
     candidates: impl IntoIterator<Item = Uuid>,
 ) -> Option<Uuid> {
     let mut best: Option<(Uuid, u128)> = None;
     for node_id in candidates {
-        let score = deployment_coordinator_score(service_id, service_epoch, group_index, node_id);
+        let score = deployment_coordinator_score(service_id, service_epoch, batch_index, node_id);
         match best {
             None => best = Some((node_id, score)),
             Some((best_node_id, best_score))
@@ -721,7 +706,7 @@ fn autoscale_owner_score(service_id: Uuid, node_id: Uuid) -> u128 {
 fn deployment_coordinator_score(
     service_id: Uuid,
     service_epoch: u64,
-    group_index: usize,
+    batch_index: usize,
     node_id: Uuid,
 ) -> u128 {
     let mut hasher = blake3::Hasher::new();
@@ -729,7 +714,7 @@ fn deployment_coordinator_score(
     hasher.update(b"deployment-shard");
     hasher.update(service_id.as_bytes());
     hasher.update(&service_epoch.to_le_bytes());
-    hasher.update(&group_index.to_le_bytes());
+    hasher.update(&batch_index.to_le_bytes());
     hasher.update(node_id.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
