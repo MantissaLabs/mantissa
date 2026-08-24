@@ -12,7 +12,7 @@ use super::placement::{
     is_volume_unavailable_error, requests_require_pinned_targets,
 };
 use super::sharding::{
-    deployment_launch_error_requires_service_requeue, service_launch_target_peer_count,
+    deployment_launch_error_requires_service_requeue, service_launch_target_node_count,
 };
 use super::state::deploying_assignment_incomplete;
 use super::*;
@@ -2075,15 +2075,15 @@ impl ServiceController {
         let context_label = context.to_string();
         let launch = async move {
             match admission_policy.mode {
-                WorkloadAdmissionMode::Incremental => match self.deployment_shard_plan(&requests) {
+                WorkloadAdmissionMode::Incremental => match self.coordinator_plan(&requests) {
                     Some(plan) => {
-                        self.start_tasks_with_deployment_shards(plan, requests, context)
+                        self.start_tasks_with_coordinators(plan, requests, context)
                             .await
                     }
                     None => {
                         crate::observability::metrics::record_service_deployment_launch_shape(
                             "direct",
-                            service_launch_target_peer_count(&requests),
+                            service_launch_target_node_count(&requests),
                             0,
                             0,
                             requests.len(),

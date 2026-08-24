@@ -6,7 +6,7 @@ use super::state::*;
 use super::*;
 use crate::network::types::{NetworkDriver, NetworkSpecDraft, NetworkSpecValue};
 use crate::services::ownership::{
-    build_replica_slots, build_service_deployment_shards, compute_slot_targets,
+    build_replica_slots, build_service_deployment_groups, compute_slot_targets,
     select_generation_owner, select_slot_owner, select_task_owner,
 };
 use crate::services::types::TaskTemplateNetworkRequirement;
@@ -741,9 +741,9 @@ fn generation_owner_is_deterministic() {
     assert_eq!(owner, owner_reversed);
 }
 
-/// Ensures deployment shard planning is deterministic across input orderings.
+/// Ensures the same nodes and coordinators are grouped regardless of input order.
 #[test]
-fn service_deployment_shards_are_deterministic() {
+fn service_deployment_groups_are_deterministic() {
     let service_id = Uuid::from_u128(42);
     let targets = (1u128..=10).map(Uuid::from_u128).collect::<Vec<_>>();
     let mut reversed_targets = targets.clone();
@@ -753,26 +753,26 @@ fn service_deployment_shards_are_deterministic() {
     let mut reversed_eligible = eligible.clone();
     reversed_eligible.reverse();
 
-    let shards = build_service_deployment_shards(service_id, 9, &eligible, &targets, 3);
+    let groups = build_service_deployment_groups(service_id, 9, &eligible, &targets, 3);
     let reversed =
-        build_service_deployment_shards(service_id, 9, &reversed_eligible, &reversed_targets, 3);
+        build_service_deployment_groups(service_id, 9, &reversed_eligible, &reversed_targets, 3);
 
-    assert_eq!(shards, reversed);
+    assert_eq!(groups, reversed);
 }
 
-/// Ensures deployment shards partition every target node exactly once.
+/// Ensures every target node appears in exactly one deployment group.
 #[test]
-fn service_deployment_shards_partition_targets_once() {
+fn service_deployment_groups_include_each_target_once() {
     let service_id = Uuid::from_u128(43);
     let targets = (1u128..=10).map(Uuid::from_u128).collect::<Vec<_>>();
-    let shards = build_service_deployment_shards(service_id, 2, &targets, &targets, 4);
+    let groups = build_service_deployment_groups(service_id, 2, &targets, &targets, 4);
 
-    assert_eq!(shards.len(), 3);
-    assert!(shards.iter().all(|shard| shard.target_node_ids.len() <= 4));
+    assert_eq!(groups.len(), 3);
+    assert!(groups.iter().all(|group| group.target_node_ids.len() <= 4));
 
     let mut seen = HashSet::new();
-    for shard in &shards {
-        for target in &shard.target_node_ids {
+    for group in &groups {
+        for target in &group.target_node_ids {
             assert!(seen.insert(*target), "target {target} assigned twice");
         }
     }
@@ -781,26 +781,45 @@ fn service_deployment_shards_partition_targets_once() {
     assert_eq!(seen, expected);
 }
 
-/// Ensures shard coordinator selection prefers an eligible target inside the shard.
+/// Ensures a node receiving tasks is used as coordinator when it is eligible.
 #[test]
-fn service_deployment_shards_prefer_in_shard_coordinators() {
+fn service_deployment_groups_prefer_nodes_that_run_tasks() {
     let service_id = Uuid::from_u128(44);
     let targets = (1u128..=6).map(Uuid::from_u128).collect::<Vec<_>>();
     let outside = Uuid::from_u128(99);
     let mut eligible = targets.clone();
     eligible.push(outside);
 
-    let shards = build_service_deployment_shards(service_id, 3, &eligible, &targets, 2);
+    let groups = build_service_deployment_groups(service_id, 3, &eligible, &targets, 2);
 
-    assert!(!shards.is_empty());
-    for shard in shards {
+    assert!(!groups.is_empty());
+    for group in groups {
         assert!(
-            shard.target_node_ids.contains(&shard.coordinator_node_id),
+            group.target_node_ids.contains(&group.coordinator_node_id),
             "coordinator {} should be one of {:?}",
-            shard.coordinator_node_id,
-            shard.target_node_ids
+            group.coordinator_node_id,
+            group.target_node_ids
         );
     }
+}
+
+/// Ensures another eligible node is used when no task destination may coordinate.
+#[test]
+fn service_deployment_groups_use_another_eligible_coordinator() {
+    let service_id = Uuid::from_u128(45);
+    let targets = (1u128..=6).map(Uuid::from_u128).collect::<Vec<_>>();
+    let eligible = vec![Uuid::from_u128(100), Uuid::from_u128(101)];
+    let mut reversed_eligible = eligible.clone();
+    reversed_eligible.reverse();
+
+    let groups = build_service_deployment_groups(service_id, 4, &eligible, &targets, 2);
+    let reversed = build_service_deployment_groups(service_id, 4, &reversed_eligible, &targets, 2);
+
+    assert_eq!(groups, reversed);
+    assert!(groups.iter().all(|group| {
+        eligible.contains(&group.coordinator_node_id)
+            && !group.target_node_ids.contains(&group.coordinator_node_id)
+    }));
 }
 
 /// Ensures slot targets are deterministic regardless of candidate ordering.

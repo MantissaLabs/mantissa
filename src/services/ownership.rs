@@ -35,12 +35,67 @@ pub(super) struct ReplicaSlot {
     pub(super) replica_id: Option<Uuid>,
 }
 
-/// Deterministic target-node shard assigned to one replaceable coordinator.
+/// Nodes that will run tasks together and the node that sends their start requests.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ServiceDeploymentShard {
-    pub(super) shard_index: usize,
+pub(super) struct ServiceDeploymentGroup {
+    /// Stable number for this group within the deployment plan.
+    pub(super) group_index: usize,
+    /// Node that sends start requests to the nodes in this group.
     pub(super) coordinator_node_id: Uuid,
+    /// Nodes that will receive task requests from the coordinator.
     pub(super) target_node_ids: Vec<Uuid>,
+}
+
+/// Stores the nodes allowed to coordinate one deployment.
+///
+/// Coordinator selection runs once per group, but the eligible nodes do not
+/// change between groups. This type builds the membership set only once.
+pub(super) struct DeploymentCoordinatorSelector<'a> {
+    /// Nodes currently allowed to send start requests for this deployment.
+    eligible_nodes: &'a [Uuid],
+    /// Set used to quickly test whether a node may coordinate.
+    eligible_node_ids: HashSet<Uuid>,
+}
+
+impl<'a> DeploymentCoordinatorSelector<'a> {
+    /// Builds the membership lookup shared by all groups in one deployment plan.
+    pub(super) fn new(eligible_nodes: &'a [Uuid]) -> Self {
+        Self {
+            eligible_nodes,
+            eligible_node_ids: eligible_nodes.iter().copied().collect(),
+        }
+    }
+
+    /// Chooses the coordinator for a group of nodes that will run tasks.
+    ///
+    /// It first considers eligible nodes in `target_node_ids`. Such a coordinator
+    /// can start its own tasks locally. If that list has no eligible node, the
+    /// method chooses from all eligible nodes.
+    pub(super) fn select(
+        &self,
+        service_id: Uuid,
+        service_epoch: u64,
+        group_index: usize,
+        target_node_ids: &[Uuid],
+    ) -> Option<Uuid> {
+        select_highest_scoring_coordinator(
+            service_id,
+            service_epoch,
+            group_index,
+            target_node_ids
+                .iter()
+                .copied()
+                .filter(|node_id| self.eligible_node_ids.contains(node_id)),
+        )
+        .or_else(|| {
+            select_highest_scoring_coordinator(
+                service_id,
+                service_epoch,
+                group_index,
+                self.eligible_nodes.iter().copied(),
+            )
+        })
+    }
 }
 
 /// Expands the service spec into an ordered list of desired replica slots.
@@ -547,86 +602,62 @@ pub(crate) fn select_autoscale_owner(service_id: Uuid, candidates: &[Uuid]) -> O
     best.map(|(node_id, _)| node_id)
 }
 
-/// Builds deterministic target-node shards for one service deployment generation.
+/// Puts target nodes into groups and chooses a coordinator for each group.
 ///
-/// The generation owner uses this as the only supported sharding shape for
-/// large deployments: target nodes are partitioned once, and each partition is
-/// assigned to a replaceable coordinator selected by rendezvous hashing. The
-/// function is intentionally pure so every owner or backup can recompute the
-/// same shard plan from the service generation and active eligible view.
-pub(super) fn build_service_deployment_shards(
+/// Each group contains at most `max_nodes_per_group` nodes, and every target
+/// node appears in exactly one group. The same inputs always produce the same
+/// groups and coordinators.
+pub(super) fn build_service_deployment_groups(
     service_id: Uuid,
     service_epoch: u64,
     eligible_nodes: &[Uuid],
     target_node_ids: &[Uuid],
-    max_targets_per_shard: usize,
-) -> Vec<ServiceDeploymentShard> {
-    if max_targets_per_shard == 0 || eligible_nodes.is_empty() || target_node_ids.is_empty() {
+    max_nodes_per_group: usize,
+) -> Vec<ServiceDeploymentGroup> {
+    if max_nodes_per_group == 0 || eligible_nodes.is_empty() || target_node_ids.is_empty() {
         return Vec::new();
     }
 
-    let mut eligible = eligible_nodes.to_vec();
-    eligible.sort_unstable();
-    eligible.dedup();
-    if eligible.is_empty() {
-        return Vec::new();
-    }
+    // Every group has the same coordinator candidates. Build the lookup once.
+    let coordinator_selector = DeploymentCoordinatorSelector::new(eligible_nodes);
 
     let mut targets = target_node_ids.to_vec();
     targets.sort_unstable();
     targets.dedup();
 
     targets
-        .chunks(max_targets_per_shard)
+        .chunks(max_nodes_per_group)
         .enumerate()
-        .filter_map(|(shard_index, target_chunk)| {
-            let coordinator_node_id = select_shard_coordinator(
-                service_id,
-                service_epoch,
-                shard_index,
-                target_chunk,
-                &eligible,
-            )?;
-            Some(ServiceDeploymentShard {
-                shard_index,
+        .filter_map(|(group_index, group_nodes)| {
+            let coordinator_node_id =
+                coordinator_selector.select(service_id, service_epoch, group_index, group_nodes)?;
+            Some(ServiceDeploymentGroup {
+                group_index,
                 coordinator_node_id,
-                target_node_ids: target_chunk.to_vec(),
+                target_node_ids: group_nodes.to_vec(),
             })
         })
         .collect()
 }
 
-/// Selects the deterministic coordinator for one deployment shard.
+/// Returns the candidate with the highest rendezvous score.
 ///
-/// A coordinator inside the shard target set is preferred so the shard can
-/// often handle one of its own target batches locally. If every shard target is
-/// unavailable in the current eligible view, the function falls back to the
-/// broader eligible set so the generation can still be delegated.
-pub(super) fn select_shard_coordinator(
+/// A score collision is unlikely but possible. Choosing the lower UUID on a tie
+/// makes the result independent of input order without sorting the candidates.
+fn select_highest_scoring_coordinator(
     service_id: Uuid,
     service_epoch: u64,
-    shard_index: usize,
-    target_node_ids: &[Uuid],
-    eligible_nodes: &[Uuid],
+    group_index: usize,
+    candidates: impl IntoIterator<Item = Uuid>,
 ) -> Option<Uuid> {
-    let eligible: HashSet<Uuid> = eligible_nodes.iter().copied().collect();
-    let mut candidates = target_node_ids
-        .iter()
-        .copied()
-        .filter(|node_id| eligible.contains(node_id))
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        candidates.extend_from_slice(eligible_nodes);
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-
     let mut best: Option<(Uuid, u128)> = None;
     for node_id in candidates {
-        let score = shard_coordinator_score(service_id, service_epoch, shard_index, node_id);
+        let score = deployment_coordinator_score(service_id, service_epoch, group_index, node_id);
         match best {
             None => best = Some((node_id, score)),
-            Some((_, best_score)) if score > best_score => {
+            Some((best_node_id, best_score))
+                if score > best_score || (score == best_score && node_id < best_node_id) =>
+            {
                 best = Some((node_id, score));
             }
             _ => {}
@@ -686,18 +717,19 @@ fn autoscale_owner_score(service_id: Uuid, node_id: Uuid) -> u128 {
     u128::from_le_bytes(bytes)
 }
 
-/// Computes the rendezvous score used to choose one deployment shard coordinator.
-fn shard_coordinator_score(
+/// Computes the rendezvous score used to choose a deployment coordinator.
+fn deployment_coordinator_score(
     service_id: Uuid,
     service_epoch: u64,
-    shard_index: usize,
+    group_index: usize,
     node_id: Uuid,
 ) -> u128 {
     let mut hasher = blake3::Hasher::new();
+    // This label is part of the hash input. Changing it would reassign groups.
     hasher.update(b"deployment-shard");
     hasher.update(service_id.as_bytes());
     hasher.update(&service_epoch.to_le_bytes());
-    hasher.update(&shard_index.to_le_bytes());
+    hasher.update(&group_index.to_le_bytes());
     hasher.update(node_id.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
