@@ -358,6 +358,7 @@ impl ClusterMetadataSyncHintState {
 #[derive(Default)]
 pub(super) struct GossipWarmSetState {
     pub(super) source_entries: Option<Arc<Vec<PeerCacheEntry>>>,
+    pub(super) source_out_of_view_node_ids: Option<Arc<HashSet<Uuid>>>,
     pub(super) population: Vec<PeerHandle>,
     pub(super) peers: Vec<PeerHandle>,
     pub(super) refresh_cursor: usize,

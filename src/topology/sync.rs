@@ -160,73 +160,16 @@ impl Topology {
             Some(snapshot) => snapshot,
             None => return Vec::new(),
         };
-        let out_of_view_node_ids = self.out_of_view_node_ids();
-        let mut population = Vec::with_capacity(snapshot.entries.len());
-        for entry in snapshot.entries.iter() {
-            if entry.peer_id == self.local.node.id || out_of_view_node_ids.contains(&entry.peer_id)
-            {
-                continue;
-            }
-            let value = entry.value.as_ref();
-            population.push(PeerHandle {
-                id: entry.peer_id,
-                address: value.address.clone(),
-                hostname: value.hostname.clone(),
-                noise_static_pub: PublicKey::from(value.noise_static_pub),
-                root_hash: Default::default(),
-            });
-        }
-        population.sort_by_key(|peer| peer.id);
-
-        let target = gossip_warm_target(population.len(), fanout_hint);
-        if target == 0 {
-            self.deps
-                .registry
-                .evict_idle_capabilities(
-                    DEFAULT_GOSSIP_CAPABILITY_MAX_IDLE,
-                    DEFAULT_GOSSIP_CAPABILITY_CACHE_MAX,
-                )
-                .await;
-            let mut state = self.runtime.gossip_warm_set.lock().await;
-            state.source_entries = Some(snapshot.entries.clone());
-            state.population.clear();
-            state.peers.clear();
-            state.refresh_cursor = 0;
-            return Vec::new();
-        }
-
-        let mut state = self.runtime.gossip_warm_set.lock().await;
-        let source_changed = state
-            .source_entries
-            .as_ref()
-            .map(|entries| !Arc::ptr_eq(entries, &snapshot.entries))
-            .unwrap_or(true);
-        state.source_entries = Some(snapshot.entries.clone());
-        state.population = population;
-        let population = state.population.clone();
-        let mut refresh_cursor = state.refresh_cursor;
-        let mut warm_peers = std::mem::take(&mut state.peers);
-
-        if source_changed || warm_peers.is_empty() || warm_peers.len() != target {
-            rebuild_gossip_warm_set(self.local.node.id, &population, target, &mut warm_peers);
-            refresh_cursor = gossip_warm_refresh_seed(self.local.node.id, population.len(), target);
-            refill_gossip_warm_set(&population, target, &mut refresh_cursor, &mut warm_peers);
-        } else {
-            let population_ids: HashSet<Uuid> = population.iter().map(|peer| peer.id).collect();
-            warm_peers.retain(|peer| population_ids.contains(&peer.id));
-            refill_gossip_warm_set(&population, target, &mut refresh_cursor, &mut warm_peers);
-            rotate_gossip_warm_set(
-                &population,
-                DEFAULT_GOSSIP_WARM_ROTATION,
-                &mut refresh_cursor,
-                &mut warm_peers,
-            );
-        }
-
-        state.refresh_cursor = refresh_cursor;
-        state.peers = warm_peers;
-        let peers = state.peers.clone();
-        drop(state);
+        let out_of_view_node_ids = self.local.cluster_view.out_of_view_node_ids_snapshot();
+        let mut warm_set = self.runtime.gossip_warm_set.lock().await;
+        let peers = update_gossip_warm_set(
+            &mut warm_set,
+            snapshot.entries,
+            out_of_view_node_ids,
+            self.local.node.id,
+            fanout_hint,
+        );
+        drop(warm_set);
         self.deps
             .registry
             .evict_idle_capabilities(
@@ -830,6 +773,80 @@ impl Topology {
     }
 }
 
+/// Returns the small peer set kept ready for outgoing gossip.
+///
+/// The full peer list is rebuilt only after peer data or the set of excluded
+/// nodes changes. Other calls only rotate peers through the small ready set.
+fn update_gossip_warm_set(
+    state: &mut GossipWarmSetState,
+    source_entries: Arc<Vec<PeerCacheEntry>>,
+    out_of_view_node_ids: Arc<HashSet<Uuid>>,
+    local_id: Uuid,
+    fanout_hint: usize,
+) -> Vec<PeerHandle> {
+    let entries_changed = state
+        .source_entries
+        .as_ref()
+        .map(|entries| !Arc::ptr_eq(entries, &source_entries))
+        .unwrap_or(true);
+    let excluded_nodes_changed = state
+        .source_out_of_view_node_ids
+        .as_ref()
+        .map(|node_ids| !Arc::ptr_eq(node_ids, &out_of_view_node_ids))
+        .unwrap_or(true);
+    let population_changed = entries_changed || excluded_nodes_changed;
+
+    if population_changed {
+        state.population.clear();
+        state.population.reserve(source_entries.len());
+        for entry in source_entries.iter() {
+            if entry.peer_id == local_id || out_of_view_node_ids.contains(&entry.peer_id) {
+                continue;
+            }
+            let value = entry.value.as_ref();
+            state.population.push(PeerHandle {
+                id: entry.peer_id,
+                address: value.address.clone(),
+                hostname: value.hostname.clone(),
+                noise_static_pub: PublicKey::from(value.noise_static_pub),
+                root_hash: Default::default(),
+            });
+        }
+        // Peer snapshots are already ordered by UUID. Filtering entries keeps
+        // that order, so the warm population does not need another sort.
+        state.source_entries = Some(source_entries);
+        state.source_out_of_view_node_ids = Some(out_of_view_node_ids);
+    }
+
+    let target = gossip_warm_target(state.population.len(), fanout_hint);
+    if target == 0 {
+        state.peers.clear();
+        state.refresh_cursor = 0;
+        return Vec::new();
+    }
+
+    let GossipWarmSetState {
+        population,
+        peers,
+        refresh_cursor,
+        ..
+    } = state;
+    if population_changed || peers.is_empty() || peers.len() != target {
+        rebuild_gossip_warm_set(local_id, population, target, peers);
+        *refresh_cursor = gossip_warm_refresh_seed(local_id, population.len(), target);
+        refill_gossip_warm_set(population, target, refresh_cursor, peers);
+    } else {
+        rotate_gossip_warm_set(
+            population,
+            DEFAULT_GOSSIP_WARM_ROTATION,
+            refresh_cursor,
+            peers,
+        );
+    }
+
+    peers.clone()
+}
+
 #[async_trait(?Send)]
 impl NoisePeerVerifier for Topology {
     /// Check whether a remote Noise static public key belongs to a known peer.
@@ -1151,10 +1168,11 @@ mod tests {
         negotiated_sync_root_schema_version, rebuild_gossip_warm_set, refill_gossip_warm_set,
         rotate_gossip_warm_set, select_sync_peers_round_robin_for_node,
         select_workload_repair_peers_for_node, take_workload_repair_hints_for_tick,
+        update_gossip_warm_set,
     };
     use crate::cluster::RootSchemaInfo;
     use crate::runtime::types::RuntimeSupportProfile;
-    use crate::topology::runtime::WorkloadRepairHintState;
+    use crate::topology::runtime::{GossipWarmSetState, WorkloadRepairHintState};
     use parking_lot::Mutex;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1199,6 +1217,79 @@ mod tests {
             noise_static_pub: x25519_dalek::PublicKey::from([idx as u8; 32]),
             root_hash: Default::default(),
         }
+    }
+
+    /// Unchanged peer data and excluded nodes should reuse the cached population.
+    #[test]
+    fn unchanged_gossip_source_reuses_cached_population() {
+        let local_id = Uuid::nil();
+        let entries = Arc::new(
+            (1..=8)
+                .map(|idx| make_entry(Uuid::from_u128(idx as u128), idx))
+                .collect::<Vec<_>>(),
+        );
+        let out_of_view = Arc::new(HashSet::new());
+        let mut state = GossipWarmSetState::default();
+        let first = update_gossip_warm_set(
+            &mut state,
+            entries.clone(),
+            Arc::clone(&out_of_view),
+            local_id,
+            2,
+        );
+        let population_ptr = state.population.as_ptr();
+
+        let second = update_gossip_warm_set(
+            &mut state,
+            Arc::clone(&entries),
+            Arc::clone(&out_of_view),
+            local_id,
+            2,
+        );
+
+        assert_eq!(state.population.as_ptr(), population_ptr);
+        assert_eq!(state.population.len(), entries.len());
+        assert_eq!(first.len(), second.len());
+    }
+
+    /// Peer updates and excluded-node changes should refresh the cached population.
+    #[test]
+    fn gossip_population_refreshes_when_its_sources_change() {
+        let local_id = Uuid::nil();
+        let first_node = Uuid::from_u128(1);
+        let second_node = Uuid::from_u128(2);
+        let entries = Arc::new(vec![make_entry(first_node, 1), make_entry(second_node, 2)]);
+        let full_view = Arc::new(HashSet::new());
+        let mut state = GossipWarmSetState::default();
+        update_gossip_warm_set(
+            &mut state,
+            Arc::clone(&entries),
+            Arc::clone(&full_view),
+            local_id,
+            1,
+        );
+
+        let restricted_view = Arc::new(HashSet::from([first_node]));
+        update_gossip_warm_set(
+            &mut state,
+            entries,
+            Arc::clone(&restricted_view),
+            local_id,
+            1,
+        );
+        assert_eq!(
+            state
+                .population
+                .iter()
+                .map(|peer| peer.id)
+                .collect::<Vec<_>>(),
+            vec![second_node]
+        );
+
+        let refreshed_entries =
+            Arc::new(vec![make_entry(first_node, 1), make_entry(second_node, 99)]);
+        update_gossip_warm_set(&mut state, refreshed_entries, restricted_view, local_id, 1);
+        assert_eq!(state.population[0].hostname, "peer-99");
     }
 
     /// Negotiation must pick the highest version shared by both peers.

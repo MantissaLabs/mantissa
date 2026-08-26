@@ -120,7 +120,7 @@ impl fmt::Display for ClusterViewId {
 #[derive(Debug)]
 struct CurrentClusterView {
     active_view: ClusterViewId,
-    out_of_view_node_ids: HashSet<Uuid>,
+    out_of_view_node_ids: Arc<HashSet<Uuid>>,
 }
 
 /// Mutable process-local state used to scope cluster work and peer traffic.
@@ -143,7 +143,7 @@ impl ClusterViewState {
         Self {
             current: Arc::new(ArcSwap::from_pointee(CurrentClusterView {
                 active_view,
-                out_of_view_node_ids,
+                out_of_view_node_ids: Arc::new(out_of_view_node_ids),
             })),
         }
     }
@@ -165,6 +165,11 @@ impl ClusterViewState {
 
     /// Returns a stable copy of nodes outside the active cluster view.
     pub fn out_of_view_node_ids(&self) -> HashSet<Uuid> {
+        self.current.load().out_of_view_node_ids.as_ref().clone()
+    }
+
+    /// Returns the shared set of nodes excluded from the active cluster view.
+    pub(crate) fn out_of_view_node_ids_snapshot(&self) -> Arc<HashSet<Uuid>> {
         self.current.load().out_of_view_node_ids.clone()
     }
 
@@ -177,7 +182,7 @@ impl ClusterViewState {
         self.current
             .swap(Arc::new(CurrentClusterView {
                 active_view,
-                out_of_view_node_ids,
+                out_of_view_node_ids: Arc::new(out_of_view_node_ids),
             }))
             .active_view
     }
@@ -205,6 +210,7 @@ impl Default for ClusterViewState {
 mod tests {
     use super::{ClusterId, ClusterViewId, ClusterViewState};
     use std::collections::HashSet;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     /// `ClusterId` should preserve UUID round-trips for interoperability.
@@ -228,5 +234,22 @@ mod tests {
         assert_eq!(state.active_view(), next);
         assert!(!state.includes_node(&sibling));
         assert_eq!(state.out_of_view_node_ids(), HashSet::from([sibling]));
+    }
+
+    /// The shared excluded-node set should be replaced only when a view is installed.
+    #[test]
+    fn cluster_view_boundary_snapshot_is_reused_until_install() {
+        let state = ClusterViewState::legacy_default();
+        let first = state.out_of_view_node_ids_snapshot();
+        let unchanged = state.out_of_view_node_ids_snapshot();
+        assert!(Arc::ptr_eq(&first, &unchanged));
+
+        state.install(
+            ClusterViewId::legacy_default(),
+            HashSet::from([Uuid::from_u128(1)]),
+        );
+        let replaced = state.out_of_view_node_ids_snapshot();
+        assert!(!Arc::ptr_eq(&first, &replaced));
+        assert_eq!(replaced.as_ref(), &HashSet::from([Uuid::from_u128(1)]));
     }
 }
