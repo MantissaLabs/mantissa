@@ -13,6 +13,7 @@ use mantissa_store::uuid_key::UuidKey;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -25,9 +26,8 @@ struct NetworkRegistryCache {
     active_cidrs_by_spec: HashMap<Uuid, CidrBlock>,
     attachment_generation: u64,
     attachments_all: Vec<NetworkAttachmentValue>,
-    attachments_by_network: HashMap<Uuid, Vec<NetworkAttachmentValue>>,
-    attachments_by_task: HashMap<Uuid, Vec<NetworkAttachmentValue>>,
-    attachment_counts: HashMap<Uuid, usize>,
+    attachment_ranges_by_network: HashMap<Uuid, Range<usize>>,
+    attachment_positions_by_task: HashMap<Uuid, Vec<usize>>,
     peer_generation: u64,
     peer_states_all: Vec<NetworkPeerStateValue>,
     peer_states_by_network: HashMap<Uuid, Vec<NetworkPeerStateValue>>,
@@ -45,9 +45,8 @@ impl NetworkRegistryCache {
             active_cidrs_by_spec: HashMap::new(),
             attachment_generation: 0,
             attachments_all: Vec::new(),
-            attachments_by_network: HashMap::new(),
-            attachments_by_task: HashMap::new(),
-            attachment_counts: HashMap::new(),
+            attachment_ranges_by_network: HashMap::new(),
+            attachment_positions_by_task: HashMap::new(),
             peer_generation: 0,
             peer_states_all: Vec::new(),
             peer_states_by_network: HashMap::new(),
@@ -95,6 +94,32 @@ impl NetworkRegistryCache {
             self.remove_active_subnet(existing.id);
         }
     }
+}
+
+/// Indexes the sorted attachment list without retaining more copies of its rows.
+fn build_attachment_indexes(
+    attachments: &[NetworkAttachmentValue],
+) -> (HashMap<Uuid, Range<usize>>, HashMap<Uuid, Vec<usize>>) {
+    let mut ranges_by_network: HashMap<Uuid, Range<usize>> = HashMap::new();
+    let mut positions_by_task: HashMap<Uuid, Vec<usize>> = HashMap::new();
+
+    for (position, attachment) in attachments.iter().enumerate() {
+        // Rows for one network are adjacent because the cache sorts by network first. One range
+        // can therefore locate the whole group without storing an index for every row.
+        ranges_by_network
+            .entry(attachment.network_id)
+            .and_modify(|range| {
+                debug_assert_eq!(range.end, position);
+                range.end = position + 1;
+            })
+            .or_insert(position..position + 1);
+        positions_by_task
+            .entry(attachment.task_id)
+            .or_default()
+            .push(position);
+    }
+
+    (ranges_by_network, positions_by_task)
 }
 
 /// Return the exact-CIDR key used by default-subnet selection for active specs.
@@ -328,26 +353,12 @@ impl NetworkRegistry {
                 .then(a.created_at.cmp(&b.created_at))
         });
 
-        let mut by_network: HashMap<Uuid, Vec<NetworkAttachmentValue>> = HashMap::new();
-        let mut by_task: HashMap<Uuid, Vec<NetworkAttachmentValue>> = HashMap::new();
-        let mut counts: HashMap<Uuid, usize> = HashMap::new();
-        for attachment in &list {
-            by_network
-                .entry(attachment.network_id)
-                .or_default()
-                .push(attachment.clone());
-            by_task
-                .entry(attachment.task_id)
-                .or_default()
-                .push(attachment.clone());
-            *counts.entry(attachment.network_id).or_insert(0) += 1;
-        }
+        let (ranges_by_network, positions_by_task) = build_attachment_indexes(&list);
 
         cache.attachment_generation = generation;
         cache.attachments_all = list;
-        cache.attachments_by_network = by_network;
-        cache.attachments_by_task = by_task;
-        cache.attachment_counts = counts;
+        cache.attachment_ranges_by_network = ranges_by_network;
+        cache.attachment_positions_by_task = positions_by_task;
 
         Ok(())
     }
@@ -621,9 +632,9 @@ impl NetworkRegistry {
         let cache = self.cache_read();
         Ok(match network_filter {
             Some(network_id) => cache
-                .attachments_by_network
+                .attachment_ranges_by_network
                 .get(&network_id)
-                .cloned()
+                .map(|range| cache.attachments_all[range.clone()].to_vec())
                 .unwrap_or_default(),
             None => cache.attachments_all.clone(),
         })
@@ -634,9 +645,9 @@ impl NetworkRegistry {
         self.refresh_attachment_cache_if_needed()?;
         let cache = self.cache_read();
         Ok(cache
-            .attachment_counts
+            .attachment_ranges_by_network
             .get(&network_id)
-            .copied()
+            .map(|range| range.len())
             .unwrap_or(0))
     }
 
@@ -645,9 +656,14 @@ impl NetworkRegistry {
         self.refresh_attachment_cache_if_needed()?;
         let cache = self.cache_read();
         Ok(cache
-            .attachments_by_task
+            .attachment_positions_by_task
             .get(&task_id)
-            .cloned()
+            .map(|positions| {
+                positions
+                    .iter()
+                    .map(|position| cache.attachments_all[*position].clone())
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -660,8 +676,12 @@ impl NetworkRegistry {
         let cache = self.cache_read();
         let mut attachments = HashMap::with_capacity(task_ids.len());
         for task_id in task_ids {
-            if let Some(rows) = cache.attachments_by_task.get(task_id) {
-                attachments.insert(*task_id, rows.clone());
+            if let Some(positions) = cache.attachment_positions_by_task.get(task_id) {
+                let rows = positions
+                    .iter()
+                    .map(|position| cache.attachments_all[*position].clone())
+                    .collect();
+                attachments.insert(*task_id, rows);
             }
         }
         Ok(attachments)
@@ -671,7 +691,11 @@ impl NetworkRegistry {
     pub fn attachment_counts(&self) -> Result<HashMap<Uuid, usize>> {
         self.refresh_attachment_cache_if_needed()?;
         let cache = self.cache_read();
-        Ok(cache.attachment_counts.clone())
+        Ok(cache
+            .attachment_ranges_by_network
+            .iter()
+            .map(|(network_id, range)| (*network_id, range.len()))
+            .collect())
     }
 
     /// Compute aggregated peer readiness counts for every network.
@@ -1118,6 +1142,79 @@ mod tests {
                 .attachment_count(network_a)
                 .expect("count after remove"),
             1
+        );
+    }
+
+    /// Attachment indexes must preserve the existing network and task lookup results.
+    #[tokio::test]
+    async fn attachment_indexes_preserve_filtered_lookup_order() {
+        let registry = temp_registry();
+        let network_a = Uuid::from_u128(1);
+        let network_b = Uuid::from_u128(2);
+        let shared_task = Uuid::from_u128(10);
+        let other_task = Uuid::from_u128(11);
+        let node_id = Uuid::from_u128(20);
+        let attachment_a_shared = test_attachment(network_a, shared_task, node_id);
+        let attachment_a_other = test_attachment(network_a, other_task, node_id);
+        let attachment_b_shared = test_attachment(network_b, shared_task, node_id);
+
+        for attachment in [
+            attachment_b_shared.clone(),
+            attachment_a_other.clone(),
+            attachment_a_shared.clone(),
+        ] {
+            registry
+                .upsert_attachment(attachment)
+                .await
+                .expect("upsert indexed attachment");
+        }
+
+        let attachment_ids = |rows: Vec<NetworkAttachmentValue>| {
+            rows.into_iter().map(|row| row.id).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            attachment_ids(
+                registry
+                    .list_attachments(None)
+                    .expect("list all attachments")
+            ),
+            vec![
+                attachment_a_shared.id,
+                attachment_a_other.id,
+                attachment_b_shared.id,
+            ]
+        );
+        assert_eq!(
+            attachment_ids(
+                registry
+                    .list_attachments(Some(network_a))
+                    .expect("list attachments by network")
+            ),
+            vec![attachment_a_shared.id, attachment_a_other.id]
+        );
+        assert_eq!(
+            attachment_ids(
+                registry
+                    .list_attachments_for_task(shared_task)
+                    .expect("list attachments by task")
+            ),
+            vec![attachment_a_shared.id, attachment_b_shared.id]
+        );
+
+        let by_task = registry
+            .list_attachments_for_tasks(&HashSet::from([shared_task, other_task]))
+            .expect("list attachments for task set");
+        assert_eq!(
+            attachment_ids(by_task[&shared_task].clone()),
+            vec![attachment_a_shared.id, attachment_b_shared.id]
+        );
+        assert_eq!(
+            attachment_ids(by_task[&other_task].clone()),
+            vec![attachment_a_other.id]
+        );
+        assert_eq!(
+            registry.attachment_counts().expect("count attachments"),
+            HashMap::from([(network_a, 2), (network_b, 1)])
         );
     }
 
