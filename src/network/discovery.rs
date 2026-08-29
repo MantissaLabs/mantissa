@@ -8,7 +8,9 @@ use crate::network::bpf::{NetworkBpfManager, NetworkInterfaceContext};
 use crate::network::lb::{BackendAddress, BpfLoadBalancer};
 use crate::network::nodeport::{NodePortManager, NodePortMapping, NodePortProtocol};
 use crate::network::registry::NetworkRegistry;
-use crate::network::types::{NetworkDriver, NetworkServiceDependencyRequirement, NetworkSpecValue};
+use crate::network::types::{
+    NetworkAttachmentValue, NetworkDriver, NetworkServiceDependencyRequirement, NetworkSpecValue,
+};
 use crate::registry::Registry;
 use crate::scheduler::placement::PlacementNode;
 use crate::services::registry::ServiceRegistry;
@@ -390,6 +392,7 @@ fn nodeport_protocol_rank(protocol: NodePortProtocol) -> u8 {
 }
 
 /// Backend resolver output split into global candidates and candidates local to this node.
+#[derive(Default)]
 struct ResolvedServiceBackends {
     candidates: Vec<BackendAddress>,
     local_candidates: Vec<BackendAddress>,
@@ -639,17 +642,16 @@ impl ServiceDiscovery {
 /// Resolves service backends while one backend-catalog refresh is in progress.
 struct ServiceBackendResolver<'a> {
     runtime: &'a DiscoveryRuntime,
-    template_index: &'a HashMap<Uuid, (String, String)>,
+    service_assignment_by_task: &'a HashMap<Uuid, (String, String)>,
     health_snapshot: &'a HashMap<Uuid, HealthStatus>,
 }
 
 impl ServiceBackendResolver<'_> {
-    /// Resolve the currently routable backend attachment set for one service template.
-    async fn resolve(
-        &self,
-        service_name: &str,
-        template_name: &str,
-    ) -> Result<ResolvedServiceBackends> {
+    /// Build every backend list with one pass over this network's attachments.
+    ///
+    /// One attachment can belong to only one service template. Grouping it here avoids loading
+    /// the same attachment and task again for every other template on the network.
+    fn resolve_all(&self) -> Result<HashMap<String, ResolvedServiceBackends>> {
         let network_spec = self.runtime.registry.get_spec(self.runtime.network_id)?;
         let expected_family = network_spec
             .as_ref()
@@ -682,16 +684,13 @@ impl ServiceBackendResolver<'_> {
             .list_attachments(Some(self.runtime.network_id))
             .context("list attachments for discovery")?;
         let mut cache: HashMap<Uuid, Option<WorkloadValue>> = HashMap::new();
-        let mut results = Vec::new();
-        let mut local_results = Vec::new();
+        let mut backends_by_catalog_key: HashMap<String, ResolvedServiceBackends> = HashMap::new();
 
         tracing::trace!(
             target: "network",
             network = %self.runtime.network_id,
-            service = %service_name,
-            template = %template_name,
             attachments = attachments.len(),
-            "resolving service backends"
+            "resolving network service backends"
         );
 
         for attachment in attachments {
@@ -783,42 +782,20 @@ impl ServiceBackendResolver<'_> {
                 }
             };
 
-            let mut saw_identity = false;
-            let mut identity_matches = true;
-            if let (Some(attached_service), Some(attached_template)) = (
-                attachment.service_name.as_deref(),
-                attachment.template_name.as_deref(),
-            ) {
-                saw_identity = true;
-                identity_matches &= attached_service.eq_ignore_ascii_case(service_name)
-                    && attached_template.eq_ignore_ascii_case(template_name);
-            }
-            if let Some(meta) = task.service_owner() {
-                saw_identity = true;
-                identity_matches &= meta.service_name.eq_ignore_ascii_case(service_name)
-                    && meta.template.eq_ignore_ascii_case(template_name);
-            }
-            if let Some((indexed_service, indexed_template)) =
-                self.template_index.get(&attachment.task_id)
-            {
-                saw_identity = true;
-                identity_matches &= indexed_service.eq_ignore_ascii_case(service_name)
-                    && indexed_template.eq_ignore_ascii_case(template_name);
-            }
-
-            if !saw_identity || !identity_matches {
+            let Some(service_key) = backend_catalog_key_for_attachment(
+                &attachment,
+                task,
+                self.service_assignment_by_task,
+            ) else {
                 tracing::trace!(
                     target: "network",
                     network = %self.runtime.network_id,
                     attachment = %attachment.id,
                     task = %attachment.task_id,
-                    template = %attachment.template_name.clone().unwrap_or_default(),
-                    expected_template = %template_name,
-                    service = %service_name,
-                    "skipping attachment; service-template mismatch"
+                    "skipping attachment; service and template metadata is missing or inconsistent"
                 );
                 continue;
-            }
+            };
 
             if task.node_id != attachment.node_id {
                 if attachment_is_newer_than_task(&attachment, task) {
@@ -895,26 +872,93 @@ impl ServiceBackendResolver<'_> {
                 }
             };
             let backend = BackendAddress { ip: ip_addr, mac };
+            let service_backends = backends_by_catalog_key.entry(service_key).or_default();
             if attachment.node_id == self.runtime.local_node_id {
-                local_results.push(backend.clone());
+                service_backends.local_candidates.push(backend.clone());
             }
-            results.push(backend);
+            service_backends.candidates.push(backend);
         }
 
         tracing::trace!(
             target: "network",
             network = %self.runtime.network_id,
-            service = %service_name,
-            template = %template_name,
-            backends = results.len(),
-            "resolved service backends"
+            service_templates = backends_by_catalog_key.len(),
+            backends = backends_by_catalog_key
+                .values()
+                .map(|entry| entry.candidates.len())
+                .sum::<usize>(),
+            "resolved network service backends"
         );
 
-        Ok(ResolvedServiceBackends {
-            candidates: results,
-            local_candidates: local_results,
-        })
+        Ok(backends_by_catalog_key)
     }
+}
+
+/// Service and template names used to decide which backend list receives an attachment.
+#[derive(Clone, Copy)]
+struct ServiceTemplateNames<'a> {
+    service_name: &'a str,
+    template_name: &'a str,
+}
+
+/// Return whether two records name the same service template, ignoring DNS casing.
+fn same_service_template(left: ServiceTemplateNames<'_>, right: ServiceTemplateNames<'_>) -> bool {
+    let same_service = left.service_name.eq_ignore_ascii_case(right.service_name);
+    let same_template = left.template_name.eq_ignore_ascii_case(right.template_name);
+    same_service && same_template
+}
+
+/// Decide which service template should receive this attachment as a backend.
+///
+/// The service and template can be recorded in the attachment, the task owner, and the service's
+/// assigned task list. Some records may be missing while updates replicate, but records that are
+/// present must name the same service and template. A disagreement returns `None` so discovery
+/// cannot route traffic to the wrong service.
+fn backend_catalog_key_for_attachment(
+    attachment: &NetworkAttachmentValue,
+    task: &WorkloadValue,
+    service_assignment_by_task: &HashMap<Uuid, (String, String)>,
+) -> Option<String> {
+    let names_from_attachment = match (
+        attachment.service_name.as_deref(),
+        attachment.template_name.as_deref(),
+    ) {
+        (Some(service_name), Some(template_name)) => Some(ServiceTemplateNames {
+            service_name,
+            template_name,
+        }),
+        _ => None,
+    };
+    let names_from_task_owner = task.service_owner().map(|owner| ServiceTemplateNames {
+        service_name: owner.service_name.as_str(),
+        template_name: owner.template.as_str(),
+    });
+    let names_from_service_assignment =
+        service_assignment_by_task
+            .get(&attachment.task_id)
+            .map(|(service_name, template_name)| ServiceTemplateNames {
+                service_name: service_name.as_str(),
+                template_name: template_name.as_str(),
+            });
+    let mut recorded_names = [
+        names_from_attachment,
+        names_from_task_owner,
+        names_from_service_assignment,
+    ]
+    .into_iter()
+    .flatten();
+    let first_recorded_names = recorded_names.next()?;
+
+    for other_recorded_names in recorded_names {
+        if !same_service_template(first_recorded_names, other_recorded_names) {
+            return None;
+        }
+    }
+
+    Some(discovery_service_key(
+        first_recorded_names.service_name,
+        first_recorded_names.template_name,
+    ))
 }
 
 /// Build the canonical DNS catalog key for one service template.
@@ -1062,20 +1106,20 @@ fn compare_ip_addrs(left: IpAddr, right: IpAddr) -> std::cmp::Ordering {
     }
 }
 
-/// Index service replica IDs back to their service and template names for backend resolution.
-fn build_task_template_index(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
-    let mut index = HashMap::new();
+/// Map every assigned task ID to the service template that created it.
+fn build_service_assignment_by_task(specs: &[ServiceSpecValue]) -> HashMap<Uuid, (String, String)> {
+    let mut assignments = HashMap::new();
     for spec in specs {
         let replica_ids = spec.assigned_replica_ids();
         let mut ids = replica_ids.iter();
         for template in &spec.task_templates {
             for _ in 0..template.replicas {
                 let Some(task_id) = ids.next() else { break };
-                index.insert(*task_id, (spec.service_name.clone(), template.name.clone()));
+                assignments.insert(*task_id, (spec.service_name.clone(), template.name.clone()));
             }
         }
     }
-    index
+    assignments
 }
 
 /// Builds ingress-pool publication state once per distinct pool referenced by this network.
@@ -1408,12 +1452,7 @@ async fn refresh_backend_catalog_if_needed(
         .context("load service specs for backend catalog refresh")?;
     let ingress_pool_states =
         build_ingress_pool_publication_states(runtime, &service_specs, health_snapshot)?;
-    let template_index = build_task_template_index(&service_specs);
-    let resolver = ServiceBackendResolver {
-        runtime,
-        template_index: &template_index,
-        health_snapshot,
-    };
+    let service_assignment_by_task = build_service_assignment_by_task(&service_specs);
     let mut next_services = HashMap::new();
     for spec in &service_specs {
         if matches!(
@@ -1435,7 +1474,6 @@ async fn refresh_backend_catalog_if_needed(
             let service_name = spec.service_name.clone();
             let template_name = template.name.clone();
             let discovery_name = discovery_service_key(&service_name, &template_name);
-            let resolved = resolver.resolve(&service_name, &template_name).await?;
             let public_port = template.public_port();
             let public_target_port = template.public_target_port();
             let public_protocols = if public_port.is_some() {
@@ -1455,8 +1493,8 @@ async fn refresh_backend_catalog_if_needed(
                     service_epoch: spec.service_epoch,
                     template_name,
                     discovery_name,
-                    candidates: resolved.candidates,
-                    local_candidates: resolved.local_candidates,
+                    candidates: Vec::new(),
+                    local_candidates: Vec::new(),
                     readiness: template.readiness().cloned(),
                     expose_to_host: public_port.is_some(),
                     public_port,
@@ -1466,6 +1504,21 @@ async fn refresh_backend_catalog_if_needed(
                     public_protocols,
                 },
             );
+        }
+    }
+
+    if !next_services.is_empty() {
+        let resolver = ServiceBackendResolver {
+            runtime,
+            service_assignment_by_task: &service_assignment_by_task,
+            health_snapshot,
+        };
+        for (service_key, resolved) in resolver.resolve_all()? {
+            let Some(service) = next_services.get_mut(&service_key) else {
+                continue;
+            };
+            service.candidates = resolved.candidates;
+            service.local_candidates = resolved.local_candidates;
         }
     }
 

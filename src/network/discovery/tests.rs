@@ -1278,6 +1278,140 @@ async fn backend_catalog_filters_remote_backends_for_bridge_network() {
     assert_eq!(candidates[0].ip, IpAddr::V4(Ipv4Addr::new(10, 88, 1, 10)));
 }
 
+/// Conflicting service metadata must never publish one task under either service name.
+#[tokio::test(flavor = "current_thread")]
+async fn backend_catalog_rejects_conflicting_service_names() {
+    let harness = setup_catalog_harness().await;
+    let assigned_service = "payments";
+    let conflicting_service = "billing";
+    let node_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    upsert_catalog_service(
+        &harness.services,
+        assigned_service,
+        harness.network.id,
+        vec![task_id],
+    )
+    .await;
+    upsert_catalog_service(
+        &harness.services,
+        conflicting_service,
+        harness.network.id,
+        Vec::new(),
+    )
+    .await;
+
+    harness
+        .workloads
+        .upsert(
+            &UuidKey::from(task_id),
+            catalog_task(task_id, node_id, assigned_service, harness.network.id).into(),
+        )
+        .await
+        .expect("upsert running task");
+    harness
+        .registry
+        .upsert_attachment(catalog_attachment(
+            task_id,
+            node_id,
+            harness.network.id,
+            Ipv4Addr::new(10, 88, 1, 10),
+            conflicting_service,
+        ))
+        .await
+        .expect("upsert conflicting attachment");
+    harness
+        .registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            harness.network.id,
+            node_id,
+            "backend-node",
+            NetworkPeerState::Ready,
+            None,
+        ))
+        .await
+        .expect("upsert ready peer state");
+
+    refresh_catalog(&harness, &HashMap::from([(node_id, HealthStatus::Alive)])).await;
+
+    let guard = harness.runtime.backend_catalog.lock().await;
+    for service_name in [assigned_service, conflicting_service] {
+        let candidates = &guard
+            .services
+            .get(&catalog_key(service_name))
+            .expect("service catalog entry")
+            .candidates;
+        assert!(
+            candidates.is_empty(),
+            "conflicting metadata must not route the task through {service_name}"
+        );
+    }
+}
+
+/// Task ownership and service assignment can identify an attachment during metadata convergence.
+#[tokio::test(flavor = "current_thread")]
+async fn backend_catalog_accepts_attachment_with_missing_service_names() {
+    let harness = setup_catalog_harness().await;
+    let service_name = "payments";
+    let node_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    upsert_catalog_service(
+        &harness.services,
+        service_name,
+        harness.network.id,
+        vec![task_id],
+    )
+    .await;
+
+    harness
+        .workloads
+        .upsert(
+            &UuidKey::from(task_id),
+            catalog_task(task_id, node_id, service_name, harness.network.id).into(),
+        )
+        .await
+        .expect("upsert running task");
+    let mut attachment = catalog_attachment(
+        task_id,
+        node_id,
+        harness.network.id,
+        Ipv4Addr::new(10, 88, 1, 10),
+        service_name,
+    );
+    attachment.service_name = None;
+    attachment.template_name = None;
+    harness
+        .registry
+        .upsert_attachment(attachment)
+        .await
+        .expect("upsert attachment without service metadata");
+    harness
+        .registry
+        .upsert_peer_state(NetworkPeerStateValue::new(
+            harness.network.id,
+            node_id,
+            "backend-node",
+            NetworkPeerState::Ready,
+            None,
+        ))
+        .await
+        .expect("upsert ready peer state");
+
+    refresh_catalog(&harness, &HashMap::from([(node_id, HealthStatus::Alive)])).await;
+
+    let guard = harness.runtime.backend_catalog.lock().await;
+    assert_eq!(
+        guard
+            .services
+            .get(&catalog_key(service_name))
+            .expect("service catalog entry")
+            .candidates
+            .len(),
+        1,
+        "task ownership and assignment should keep the attachment routable"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn backend_catalog_scopes_same_template_names_by_service() {
     let harness = setup_catalog_harness().await;
