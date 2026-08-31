@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -11,7 +10,7 @@ use uuid::Uuid;
 
 use crate::config;
 use crate::gossip::Message;
-use crate::network::allocator::{OverlayAddressAllocator, parse_overlay_cidr};
+use crate::network::allocator::{AttachmentAllocation, parse_overlay_cidr};
 use crate::network::attachment::{AttachmentProvisioningRequest, bridge_name};
 use crate::network::controller::{DEFAULT_BRIDGE_MTU, DEFAULT_MTU};
 use crate::network::events::ForwardingEvent;
@@ -858,38 +857,42 @@ fn conflicting_overlay_attachment_ids(attachments: &[NetworkAttachmentValue]) ->
 }
 
 impl WorkloadManager {
-    /// Allocate an overlay IP that does not conflict with existing attachments on the network.
+    /// Allocate one overlay address and reclaim stale rows only after indexed allocation fails.
     ///
-    /// Removing rows are ignored because they are already being withdrawn and should not pin an
-    /// address indefinitely.
-    fn allocate_overlay_address_for_attachment(
+    /// Normal task starts use the registry's address index directly. The slower orphan scan is a
+    /// recovery path so stale rows can still release an address before allocation is rejected.
+    async fn allocate_overlay_address_for_attachment(
         &self,
         network: &crate::network::types::NetworkSpecValue,
         task_id: Uuid,
         attachment_id: Uuid,
-    ) -> Result<crate::network::allocator::AttachmentAllocation> {
-        let mut allocator = OverlayAddressAllocator::new(network);
-        let attachments = self
-            .networking
-            .network_registry
-            .list_attachments(Some(network.id))
-            .context("list attachments for overlay address allocation")?;
-        for attachment in attachments {
-            if attachment.id == attachment_id
-                || matches!(attachment.state, NetworkAttachmentState::Removing)
-            {
-                continue;
-            }
-            if let Some(ip) = attachment.assigned_ip
-                && let Ok(ip) = ip.parse::<IpAddr>()
-            {
-                allocator.reserve(ip);
+    ) -> Result<AttachmentAllocation> {
+        match self.networking.network_registry.allocate_overlay_address(
+            network,
+            task_id,
+            attachment_id,
+        ) {
+            Ok(allocation) => Ok(allocation),
+            Err(initial_error) => {
+                self.cleanup_orphaned_local_attachments()
+                    .await
+                    .context("cleanup orphaned attachments before retrying address allocation")?;
+                self.networking
+                    .network_registry
+                    .allocate_overlay_address(network, task_id, attachment_id)
+                    .with_context(|| {
+                        format!(
+                            "address allocation failed before and after orphan cleanup; first failure: {initial_error:#}"
+                        )
+                    })
             }
         }
-        allocator.allocate_overlay_address(task_id)
     }
 
-    /// Ensures that runtime network attachments exist for the provided task identifier.
+    /// Make one running task's interfaces and attachment rows match its requested networks.
+    ///
+    /// Task launch and periodic repair share this path so they assign addresses, provision runtime
+    /// interfaces, and remove networks using the same rules.
     pub(super) async fn ensure_runtime_attachments(
         &self,
         task_id: Uuid,
@@ -897,28 +900,16 @@ impl WorkloadManager {
         network_ids: &[Uuid],
         service_meta: Option<&WorkloadServiceMetadata>,
     ) -> Result<()> {
-        // Only clean up orphaned attachments when the task already exists in the store. During
-        // initial creation (before we persist the WorkloadSpec) this would incorrectly delete
-        // attachments we just created for earlier tasks in the same batch.
         let snapshot = self
             .core
             .store
             .get_snapshot(&UuidKey::from(task_id))
             .map_err(|e| anyhow::anyhow!("task lookup failed: {e}"))?;
-        let (has_snapshot, workload_revision) = match snapshot {
-            Some(values) => (
-                true,
-                select_best_workload_value(values.as_slice())
-                    .as_ref()
-                    .and_then(task_revision_timestamp),
-            ),
-            None => (false, None),
-        };
-        if has_snapshot {
-            self.cleanup_orphaned_local_attachments()
-                .await
-                .context("cleanup orphaned network attachments")?;
-        }
+        let workload_revision = snapshot.and_then(|values| {
+            select_best_workload_value(values.as_slice())
+                .as_ref()
+                .and_then(task_revision_timestamp)
+        });
 
         if network_ids.is_empty() {
             debug!(
@@ -1086,6 +1077,7 @@ impl WorkloadManager {
                 let _assignment_guard = self.local_state.attachment_assignment_lock.lock().await;
                 allocation = self
                     .allocate_overlay_address_for_attachment(&spec, task_id, attachment.id)
+                    .await
                     .context("failed to allocate overlay address")?;
 
                 attachment.set_assignment(

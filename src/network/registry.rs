@@ -1,8 +1,10 @@
+use crate::network::allocator::{AttachmentAllocation, allocate_overlay_address_avoiding};
 use crate::network::defaults::{
     CidrBlock, CidrOverlapIndex, DefaultNetworkIpFamily, default_network_subnet_with_conflict_check,
 };
 use crate::network::types::{
-    NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue, compute_network_peer_state_id,
+    NetworkAttachmentState, NetworkAttachmentValue, NetworkPeerStateValue, NetworkSpecValue,
+    compute_network_peer_state_id,
 };
 use crate::store::replicated::networks::{
     NetworkAttachmentStore, NetworkPeerStore, NetworkSpecStore,
@@ -12,10 +14,31 @@ use chrono::{DateTime, Utc};
 use mantissa_store::uuid_key::UuidKey;
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Orders one network's rows by task while allowing local writes to update the cache in place.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NetworkAttachmentKey {
+    task_id: Uuid,
+    attachment_id: Uuid,
+}
+
+/// Lets task reconciliation find its networks without scanning every cluster attachment.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TaskAttachmentKey {
+    network_id: Uuid,
+    attachment_id: Uuid,
+}
+
+/// Points an attachment ID back to its network and task indexes without copying the full row.
+#[derive(Clone, Copy, Debug)]
+struct AttachmentLocation {
+    network_id: Uuid,
+    task_id: Uuid,
+}
 
 /// Cached projections over network stores keyed by store generation.
 struct NetworkRegistryCache {
@@ -25,9 +48,10 @@ struct NetworkRegistryCache {
     active_subnet_index: CidrOverlapIndex,
     active_cidrs_by_spec: HashMap<Uuid, CidrBlock>,
     attachment_generation: u64,
-    attachments_all: Vec<NetworkAttachmentValue>,
-    attachment_ranges_by_network: HashMap<Uuid, Range<usize>>,
-    attachment_positions_by_task: HashMap<Uuid, Vec<usize>>,
+    attachments_by_network: BTreeMap<Uuid, BTreeMap<NetworkAttachmentKey, NetworkAttachmentValue>>,
+    attachment_locations: HashMap<Uuid, AttachmentLocation>,
+    attachment_keys_by_task: HashMap<Uuid, Vec<TaskAttachmentKey>>,
+    occupied_addresses_by_network: HashMap<Uuid, HashMap<IpAddr, usize>>,
     peer_generation: u64,
     peer_states_all: Vec<NetworkPeerStateValue>,
     peer_states_by_network: HashMap<Uuid, Vec<NetworkPeerStateValue>>,
@@ -44,9 +68,10 @@ impl NetworkRegistryCache {
             active_subnet_index: CidrOverlapIndex::new(),
             active_cidrs_by_spec: HashMap::new(),
             attachment_generation: 0,
-            attachments_all: Vec::new(),
-            attachment_ranges_by_network: HashMap::new(),
-            attachment_positions_by_task: HashMap::new(),
+            attachments_by_network: BTreeMap::new(),
+            attachment_locations: HashMap::new(),
+            attachment_keys_by_task: HashMap::new(),
+            occupied_addresses_by_network: HashMap::new(),
             peer_generation: 0,
             peer_states_all: Vec::new(),
             peer_states_by_network: HashMap::new(),
@@ -94,32 +119,170 @@ impl NetworkRegistryCache {
             self.remove_active_subnet(existing.id);
         }
     }
-}
 
-/// Indexes the sorted attachment list without retaining more copies of its rows.
-fn build_attachment_indexes(
-    attachments: &[NetworkAttachmentValue],
-) -> (HashMap<Uuid, Range<usize>>, HashMap<Uuid, Vec<usize>>) {
-    let mut ranges_by_network: HashMap<Uuid, Range<usize>> = HashMap::new();
-    let mut positions_by_task: HashMap<Uuid, Vec<usize>> = HashMap::new();
+    /// Replace every attachment projection after replicated state changed outside this registry.
+    fn replace_attachments(&mut self, values: Vec<NetworkAttachmentValue>) {
+        self.attachments_by_network.clear();
+        self.attachment_locations.clear();
+        self.attachment_keys_by_task.clear();
+        self.occupied_addresses_by_network.clear();
 
-    for (position, attachment) in attachments.iter().enumerate() {
-        // Rows for one network are adjacent because the cache sorts by network first. One range
-        // can therefore locate the whole group without storing an index for every row.
-        ranges_by_network
-            .entry(attachment.network_id)
-            .and_modify(|range| {
-                debug_assert_eq!(range.end, position);
-                range.end = position + 1;
-            })
-            .or_insert(position..position + 1);
-        positions_by_task
-            .entry(attachment.task_id)
-            .or_default()
-            .push(position);
+        for value in values {
+            self.apply_attachment_upsert(value);
+        }
     }
 
-    (ranges_by_network, positions_by_task)
+    /// Apply one successful local attachment write to every lookup used by runtime networking.
+    fn apply_attachment_upsert(&mut self, value: NetworkAttachmentValue) {
+        self.apply_attachment_remove(value.id);
+
+        let network_key = NetworkAttachmentKey {
+            task_id: value.task_id,
+            attachment_id: value.id,
+        };
+        let task_key = TaskAttachmentKey {
+            network_id: value.network_id,
+            attachment_id: value.id,
+        };
+        self.attachment_locations.insert(
+            value.id,
+            AttachmentLocation {
+                network_id: value.network_id,
+                task_id: value.task_id,
+            },
+        );
+        let task_keys = self
+            .attachment_keys_by_task
+            .entry(value.task_id)
+            .or_default();
+        let position = task_keys
+            .binary_search(&task_key)
+            .unwrap_or_else(|position| position);
+        task_keys.insert(position, task_key);
+
+        if let Some(address) = active_attachment_address(&value) {
+            *self
+                .occupied_addresses_by_network
+                .entry(value.network_id)
+                .or_default()
+                .entry(address)
+                .or_default() += 1;
+        }
+
+        self.attachments_by_network
+            .entry(value.network_id)
+            .or_default()
+            .insert(network_key, value);
+    }
+
+    /// Remove one attachment from every projection after its store row was deleted or replaced.
+    fn apply_attachment_remove(&mut self, attachment_id: Uuid) {
+        let Some(location) = self.attachment_locations.remove(&attachment_id) else {
+            return;
+        };
+        let network_key = NetworkAttachmentKey {
+            task_id: location.task_id,
+            attachment_id,
+        };
+        let task_key = TaskAttachmentKey {
+            network_id: location.network_id,
+            attachment_id,
+        };
+
+        let (removed, network_is_empty) = self
+            .attachments_by_network
+            .get_mut(&location.network_id)
+            .map(|attachments| {
+                let removed = attachments.remove(&network_key);
+                (removed, attachments.is_empty())
+            })
+            .unwrap_or((None, false));
+        if network_is_empty {
+            self.attachments_by_network.remove(&location.network_id);
+        }
+
+        let task_index_is_empty = self
+            .attachment_keys_by_task
+            .get_mut(&location.task_id)
+            .map(|keys| {
+                if let Ok(position) = keys.binary_search(&task_key) {
+                    keys.remove(position);
+                }
+                keys.is_empty()
+            })
+            .unwrap_or(false);
+        if task_index_is_empty {
+            self.attachment_keys_by_task.remove(&location.task_id);
+        }
+
+        if let Some(address) = removed.as_ref().and_then(active_attachment_address) {
+            self.release_occupied_address(location.network_id, address);
+        }
+    }
+
+    /// Decrement one occupied-address count without freeing an address still owned by another row.
+    fn release_occupied_address(&mut self, network_id: Uuid, address: IpAddr) {
+        let remove_network =
+            if let Some(addresses) = self.occupied_addresses_by_network.get_mut(&network_id) {
+                if let Some(owner_count) = addresses.get_mut(&address) {
+                    *owner_count = owner_count.saturating_sub(1);
+                    if *owner_count == 0 {
+                        addresses.remove(&address);
+                    }
+                }
+                addresses.is_empty()
+            } else {
+                false
+            };
+        if remove_network {
+            self.occupied_addresses_by_network.remove(&network_id);
+        }
+    }
+
+    /// Return one attachment by id from the single retained value collection.
+    fn attachment(&self, attachment_id: Uuid) -> Option<&NetworkAttachmentValue> {
+        let location = self.attachment_locations.get(&attachment_id)?;
+        self.attachments_by_network
+            .get(&location.network_id)?
+            .get(&NetworkAttachmentKey {
+                task_id: location.task_id,
+                attachment_id,
+            })
+    }
+
+    /// Clone attachments in the stable network, task, and attachment order exposed by the API.
+    fn list_attachments(&self, network_filter: Option<Uuid>) -> Vec<NetworkAttachmentValue> {
+        match network_filter {
+            Some(network_id) => self
+                .attachments_by_network
+                .get(&network_id)
+                .map(|attachments| attachments.values().cloned().collect())
+                .unwrap_or_default(),
+            None => self
+                .attachments_by_network
+                .values()
+                .flat_map(|attachments| attachments.values().cloned())
+                .collect(),
+        }
+    }
+
+    /// Clone only the attachment rows belonging to one task in stable network order.
+    fn list_attachments_for_task(&self, task_id: Uuid) -> Vec<NetworkAttachmentValue> {
+        self.attachment_keys_by_task
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.attachment(key.attachment_id).cloned())
+            .collect()
+    }
+}
+
+/// Return the assigned address only while an attachment must reserve it against new allocations.
+fn active_attachment_address(value: &NetworkAttachmentValue) -> Option<IpAddr> {
+    if matches!(value.state, NetworkAttachmentState::Removing) {
+        return None;
+    }
+    value.assigned_ip.as_deref()?.parse().ok()
 }
 
 /// Return the exact-CIDR key used by default-subnet selection for active specs.
@@ -339,28 +502,57 @@ impl NetworkRegistry {
             .load_all()
             .map_err(|e| anyhow!("network attachment load_all failed: {e}"))?;
 
-        let mut list = Vec::with_capacity(entries.len());
+        let mut attachments = Vec::with_capacity(entries.len());
         for (_key, snapshot) in entries {
             if let Some(value) = select_best_attachment_value(snapshot.as_slice()) {
-                list.push(value);
+                attachments.push(value);
             }
         }
 
-        list.sort_by(|a, b| {
-            a.network_id
-                .cmp(&b.network_id)
-                .then(a.task_id.cmp(&b.task_id))
-                .then(a.created_at.cmp(&b.created_at))
-        });
-
-        let (ranges_by_network, positions_by_task) = build_attachment_indexes(&list);
-
+        cache.replace_attachments(attachments);
         cache.attachment_generation = generation;
-        cache.attachments_all = list;
-        cache.attachment_ranges_by_network = ranges_by_network;
-        cache.attachment_positions_by_task = positions_by_task;
 
         Ok(())
+    }
+
+    /// Keep attachment lookups current after one local write without rereading the whole store.
+    fn write_through_attachment_upsert_cache(
+        &self,
+        value: NetworkAttachmentValue,
+        previous_generation: u64,
+        generation: u64,
+    ) {
+        if generation != previous_generation.saturating_add(1) {
+            return;
+        }
+
+        let mut cache = self.cache_write();
+        if cache.attachment_generation != previous_generation {
+            return;
+        }
+
+        cache.apply_attachment_upsert(value);
+        cache.attachment_generation = generation;
+    }
+
+    /// Keep attachment lookups current after one local delete without rereading the whole store.
+    fn write_through_attachment_remove_cache(
+        &self,
+        id: Uuid,
+        previous_generation: u64,
+        generation: u64,
+    ) {
+        if generation != previous_generation.saturating_add(1) {
+            return;
+        }
+
+        let mut cache = self.cache_write();
+        if cache.attachment_generation != previous_generation {
+            return;
+        }
+
+        cache.apply_attachment_remove(id);
+        cache.attachment_generation = generation;
     }
 
     /// Upsert a network specification into the replicated store.
@@ -569,19 +761,64 @@ impl NetworkRegistry {
     /// Upsert an attachment record into the replicated store.
     pub async fn upsert_attachment(&self, mut value: NetworkAttachmentValue) -> Result<()> {
         value.touch();
+        let previous_generation = self.attachments.change_clock();
         self.attachments
-            .upsert(&UuidKey::from(value.id), value)
+            .upsert(&UuidKey::from(value.id), value.clone())
             .await
-            .map_err(|e| anyhow!("network attachment upsert failed: {e}"))
+            .map_err(|e| anyhow!("network attachment upsert failed: {e}"))?;
+        let generation = self.attachments.change_clock();
+        self.write_through_attachment_upsert_cache(value, previous_generation, generation);
+        Ok(())
     }
 
     /// Remove a specific attachment record.
     pub async fn remove_attachment(&self, id: Uuid) -> Result<()> {
+        let previous_generation = self.attachments.change_clock();
         self.attachments
             .remove(&UuidKey::from(id))
             .await
             .map_err(|e| anyhow!("network attachment remove failed: {e}"))?;
+        let generation = self.attachments.change_clock();
+        self.write_through_attachment_remove_cache(id, previous_generation, generation);
         Ok(())
+    }
+
+    /// Allocate one task address from the current attachment index without cloning its rows.
+    ///
+    /// The caller still serializes local allocation and persistence. Replicated writes advance the
+    /// store clock, which forces this index to reload before another local address is selected.
+    pub fn allocate_overlay_address(
+        &self,
+        network: &NetworkSpecValue,
+        task_id: Uuid,
+        attachment_id: Uuid,
+    ) -> Result<AttachmentAllocation> {
+        self.refresh_attachment_cache_if_needed()?;
+        let cache = self.cache_read();
+        let occupied = cache.occupied_addresses_by_network.get(&network.id);
+        let excluded_address = cache
+            .attachment(attachment_id)
+            .and_then(active_attachment_address);
+        let excluded_is_unique = excluded_address.is_some_and(|address| {
+            occupied
+                .and_then(|addresses| addresses.get(&address))
+                .is_some_and(|owner_count| *owner_count == 1)
+        });
+        let occupied_count = occupied
+            .map(HashMap::len)
+            .unwrap_or(0)
+            .saturating_sub(usize::from(excluded_is_unique)) as u128;
+
+        allocate_overlay_address_avoiding(network, task_id, occupied_count, |address| {
+            let Some(owner_count) = occupied.and_then(|addresses| addresses.get(address)) else {
+                return false;
+            };
+            if Some(*address) == excluded_address {
+                *owner_count > 1
+            } else {
+                true
+            }
+        })
     }
 
     /// Return the attachment store root hash used to detect forwarding drift.
@@ -630,14 +867,7 @@ impl NetworkRegistry {
     ) -> Result<Vec<NetworkAttachmentValue>> {
         self.refresh_attachment_cache_if_needed()?;
         let cache = self.cache_read();
-        Ok(match network_filter {
-            Some(network_id) => cache
-                .attachment_ranges_by_network
-                .get(&network_id)
-                .map(|range| cache.attachments_all[range.clone()].to_vec())
-                .unwrap_or_default(),
-            None => cache.attachments_all.clone(),
-        })
+        Ok(cache.list_attachments(network_filter))
     }
 
     /// Return the number of attachment rows associated with one network without cloning them.
@@ -645,9 +875,9 @@ impl NetworkRegistry {
         self.refresh_attachment_cache_if_needed()?;
         let cache = self.cache_read();
         Ok(cache
-            .attachment_ranges_by_network
+            .attachments_by_network
             .get(&network_id)
-            .map(|range| range.len())
+            .map(BTreeMap::len)
             .unwrap_or(0))
     }
 
@@ -655,16 +885,7 @@ impl NetworkRegistry {
     pub fn list_attachments_for_task(&self, task_id: Uuid) -> Result<Vec<NetworkAttachmentValue>> {
         self.refresh_attachment_cache_if_needed()?;
         let cache = self.cache_read();
-        Ok(cache
-            .attachment_positions_by_task
-            .get(&task_id)
-            .map(|positions| {
-                positions
-                    .iter()
-                    .map(|position| cache.attachments_all[*position].clone())
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(cache.list_attachments_for_task(task_id))
     }
 
     /// List attachment rows for a bounded set of task identifiers with one cache refresh.
@@ -676,11 +897,8 @@ impl NetworkRegistry {
         let cache = self.cache_read();
         let mut attachments = HashMap::with_capacity(task_ids.len());
         for task_id in task_ids {
-            if let Some(positions) = cache.attachment_positions_by_task.get(task_id) {
-                let rows = positions
-                    .iter()
-                    .map(|position| cache.attachments_all[*position].clone())
-                    .collect();
+            let rows = cache.list_attachments_for_task(*task_id);
+            if !rows.is_empty() {
                 attachments.insert(*task_id, rows);
             }
         }
@@ -692,9 +910,9 @@ impl NetworkRegistry {
         self.refresh_attachment_cache_if_needed()?;
         let cache = self.cache_read();
         Ok(cache
-            .attachment_ranges_by_network
+            .attachments_by_network
             .iter()
-            .map(|(network_id, range)| (*network_id, range.len()))
+            .map(|(network_id, attachments)| (*network_id, attachments.len()))
             .collect())
     }
 
@@ -1216,6 +1434,117 @@ mod tests {
             registry.attachment_counts().expect("count attachments"),
             HashMap::from([(network_a, 2), (network_b, 1)])
         );
+    }
+
+    /// Local attachment writes must update every cache view without waiting for a store reload.
+    #[tokio::test]
+    async fn local_attachment_writes_update_cached_views() {
+        let registry = temp_registry();
+        let network_id = Uuid::from_u128(1);
+        let task_id = Uuid::from_u128(2);
+        let node_id = Uuid::from_u128(3);
+        let mut attachment = test_attachment(network_id, task_id, node_id);
+        attachment.set_assignment(
+            Some("10.90.0.10".to_string()),
+            Some("02:00:00:00:00:10".to_string()),
+        );
+        assert!(
+            registry
+                .list_attachments(None)
+                .expect("initialize attachment cache")
+                .is_empty()
+        );
+
+        registry
+            .upsert_attachment(attachment.clone())
+            .await
+            .expect("upsert attachment through registry");
+        {
+            let cache = registry.cache_read();
+            assert_eq!(
+                cache.attachment_generation,
+                registry.attachments.change_clock()
+            );
+            let cached = cache.list_attachments(None);
+            assert_eq!(cached.len(), 1);
+            assert_eq!(cached[0].id, attachment.id);
+            assert_eq!(
+                cache.occupied_addresses_by_network[&network_id]
+                    [&"10.90.0.10".parse::<IpAddr>().expect("parse address")],
+                1
+            );
+        }
+
+        registry
+            .remove_attachment(attachment.id)
+            .await
+            .expect("remove attachment through registry");
+        let cache = registry.cache_read();
+        assert_eq!(
+            cache.attachment_generation,
+            registry.attachments.change_clock()
+        );
+        assert!(cache.list_attachments(None).is_empty());
+        assert!(
+            !cache
+                .occupied_addresses_by_network
+                .contains_key(&network_id)
+        );
+    }
+
+    /// A duplicate address stays reserved until every attachment using it has been removed.
+    #[tokio::test]
+    async fn address_index_counts_duplicate_owners() {
+        let registry = temp_registry();
+        let network = test_network_spec("collision-test", "10.90.0.0/24");
+        let node_id = Uuid::from_u128(10);
+        let first_task = Uuid::from_u128(1);
+        let preferred = crate::network::allocator::allocate_overlay_address(&network, first_task)
+            .expect("allocate preferred address")
+            .assigned_ip;
+        let second_task = (2..10_000u128)
+            .map(Uuid::from_u128)
+            .find(|task_id| {
+                crate::network::allocator::allocate_overlay_address(&network, *task_id)
+                    .is_ok_and(|allocation| allocation.assigned_ip == preferred)
+            })
+            .expect("find a task with the same preferred address");
+
+        let mut first = test_attachment(network.id, first_task, node_id);
+        first.set_assignment(
+            Some(preferred.clone()),
+            Some("02:00:00:00:00:01".to_string()),
+        );
+        let mut second = test_attachment(network.id, second_task, node_id);
+        second.set_assignment(
+            Some(preferred.clone()),
+            Some("02:00:00:00:00:02".to_string()),
+        );
+        registry
+            .list_attachments(None)
+            .expect("initialize attachment cache");
+        registry
+            .upsert_attachment(first.clone())
+            .await
+            .expect("upsert first address owner");
+        registry
+            .upsert_attachment(second.clone())
+            .await
+            .expect("upsert second address owner");
+
+        let while_duplicated = registry
+            .allocate_overlay_address(&network, second_task, second.id)
+            .expect("allocate while another attachment owns the same address");
+        assert_ne!(while_duplicated.assigned_ip, preferred);
+
+        registry
+            .remove_attachment(first.id)
+            .await
+            .expect("remove first address owner");
+        let after_other_owner_removed = registry
+            .allocate_overlay_address(&network, second_task, second.id)
+            .expect("reuse the current attachment address");
+        assert_eq!(after_other_owner_removed.assigned_ip, preferred);
     }
 
     /// Ensure the selector returns the entry with the most recent timestamp so readiness counts do

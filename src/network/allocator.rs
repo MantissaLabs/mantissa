@@ -73,8 +73,12 @@ impl<'a> OverlayAddressAllocator<'a> {
 
     /// Allocate one collision-free task attachment address and reserve it in this allocator.
     pub fn allocate_overlay_address(&mut self, task_id: Uuid) -> Result<AttachmentAllocation> {
-        let allocation =
-            allocate_overlay_address_with_reservations(self.network, task_id, &self.occupied)?;
+        let allocation = allocate_overlay_address_avoiding(
+            self.network,
+            task_id,
+            self.occupied.len() as u128,
+            |address| self.occupied.contains(address),
+        )?;
         let assigned = allocation
             .assigned_ip
             .parse::<IpAddr>()
@@ -92,16 +96,15 @@ pub fn allocate_overlay_address(
     OverlayAddressAllocator::new(network).allocate_overlay_address(task_id)
 }
 
-/// Deterministically allocate an overlay address while avoiding already reserved addresses.
+/// Allocate an address by checking the caller's existing address index directly.
 ///
-/// The task hash provides the preferred slot. If another attachment already owns that slot, the
-/// allocator walks a deterministic probe sequence derived from the same hash. This keeps address
-/// assignment stable without requiring the BPF dataplane or DNS layer to tolerate duplicate
-/// attachment IPs.
-fn allocate_overlay_address_with_reservations(
+/// The registry already knows which addresses are occupied. The callback avoids rebuilding that
+/// set for every task while retaining deterministic collision handling.
+pub(crate) fn allocate_overlay_address_avoiding(
     network: &NetworkSpecValue,
     task_id: Uuid,
-    occupied: &HashSet<IpAddr>,
+    occupied_count: u128,
+    is_occupied: impl Fn(&IpAddr) -> bool,
 ) -> Result<AttachmentAllocation> {
     let layout = overlay_layout(network)?;
 
@@ -123,10 +126,6 @@ fn allocate_overlay_address_with_reservations(
         );
     }
 
-    let occupied_count: u128 = occupied
-        .len()
-        .try_into()
-        .map_err(|_| anyhow!("too many occupied addresses for {}", network.subnet_cidr))?;
     if occupied_count >= layout.task_slots {
         bail!(
             "subnet {} has no free workload addresses",
@@ -136,14 +135,11 @@ fn allocate_overlay_address_with_reservations(
 
     let start_slot = digest_value % layout.task_slots;
     let step = probe_step(&digest, layout.task_slots);
-    let probe_count = occupied.len().saturating_add(1);
+    let probe_count = occupied_count.saturating_add(1);
     for probe in 0..probe_count {
-        let probe_offset: u128 = probe
-            .try_into()
-            .map_err(|_| anyhow!("too many probes for {}", network.subnet_cidr))?;
-        let slot = (start_slot + probe_offset.saturating_mul(step)) % layout.task_slots;
+        let slot = (start_slot + probe.saturating_mul(step)) % layout.task_slots;
         let assigned = layout.address_for_task_slot(slot);
-        if !occupied.contains(&assigned) {
+        if !is_occupied(&assigned) {
             return Ok(allocation_from_digest(assigned, &digest));
         }
     }
