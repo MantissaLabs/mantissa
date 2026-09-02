@@ -40,6 +40,27 @@ struct AttachmentLocation {
     task_id: Uuid,
 }
 
+/// Identifies one peer-state record within a network's sorted cache.
+///
+/// Records are returned in peer-name order. Peer names can repeat, so the record ID prevents two
+/// peers with the same name from overwriting each other.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PeerStateSortKey {
+    peer_name: String,
+    // `NetworkPeerStateValue::id` identifies one peer on one network.
+    peer_state_id: Uuid,
+}
+
+/// Identifies both map keys needed to find a cached peer-state record.
+///
+/// `network_id` selects the network map. `sort_key` selects the record inside that map. Keeping
+/// both under the record ID lets deletion find the record when it receives only that ID.
+#[derive(Clone, Debug)]
+struct CachedPeerStateLocation {
+    network_id: Uuid,
+    sort_key: PeerStateSortKey,
+}
+
 /// Cached projections over network stores keyed by store generation.
 struct NetworkRegistryCache {
     spec_generation: Option<u64>,
@@ -53,8 +74,10 @@ struct NetworkRegistryCache {
     attachment_keys_by_task: HashMap<Uuid, Vec<TaskAttachmentKey>>,
     occupied_addresses_by_network: HashMap<Uuid, HashMap<IpAddr, usize>>,
     peer_generation: u64,
-    peer_states_all: Vec<NetworkPeerStateValue>,
-    peer_states_by_network: HashMap<Uuid, Vec<NetworkPeerStateValue>>,
+    // Groups records by network and keeps each network's records in peer-name order.
+    peer_states_by_network: BTreeMap<Uuid, BTreeMap<PeerStateSortKey, NetworkPeerStateValue>>,
+    // Finds both map keys for a record from its `NetworkPeerStateValue::id`.
+    peer_state_location_by_id: HashMap<Uuid, CachedPeerStateLocation>,
     peer_counts: HashMap<Uuid, (u32, u32)>,
 }
 
@@ -73,8 +96,8 @@ impl NetworkRegistryCache {
             attachment_keys_by_task: HashMap::new(),
             occupied_addresses_by_network: HashMap::new(),
             peer_generation: 0,
-            peer_states_all: Vec::new(),
-            peer_states_by_network: HashMap::new(),
+            peer_states_by_network: BTreeMap::new(),
+            peer_state_location_by_id: HashMap::new(),
             peer_counts: HashMap::new(),
         }
     }
@@ -117,6 +140,117 @@ impl NetworkRegistryCache {
                 self.spec_positions.insert(moved_id, position);
             }
             self.remove_active_subnet(existing.id);
+        }
+    }
+
+    /// Clears and rebuilds the peer-state cache from values read from the store.
+    fn replace_peer_states(&mut self, values: Vec<NetworkPeerStateValue>) {
+        self.peer_states_by_network.clear();
+        self.peer_state_location_by_id.clear();
+        self.peer_counts.clear();
+
+        for value in values {
+            self.apply_peer_state_upsert(value);
+        }
+    }
+
+    /// Adds or replaces one cached peer-state record and updates its network counts.
+    fn apply_peer_state_upsert(&mut self, value: NetworkPeerStateValue) {
+        // The store can contain concurrent versions of the same record. Use its ordering rules so
+        // the cache exposes the same version as a direct store read.
+        let cached_value_is_newer = self
+            .peer_state_by_id(value.id)
+            .is_some_and(|current| compare_peer_state_values(current, &value).is_gt());
+        if cached_value_is_newer {
+            return;
+        }
+
+        self.apply_peer_state_remove(value.id);
+
+        let sort_key = PeerStateSortKey {
+            peer_name: value.peer_name.clone(),
+            peer_state_id: value.id,
+        };
+        // Save where this record was inserted. A later deletion provides only the record ID.
+        self.peer_state_location_by_id.insert(
+            value.id,
+            CachedPeerStateLocation {
+                network_id: value.network_id,
+                sort_key: sort_key.clone(),
+            },
+        );
+
+        let counts = self.peer_counts.entry(value.network_id).or_default();
+        counts.0 = counts.0.saturating_add(1);
+        if value.is_ready() {
+            counts.1 = counts.1.saturating_add(1);
+        }
+
+        self.peer_states_by_network
+            .entry(value.network_id)
+            .or_default()
+            .insert(sort_key, value);
+    }
+
+    /// Removes one cached peer-state record and updates its network's total and ready counts.
+    fn apply_peer_state_remove(&mut self, peer_state_id: Uuid) {
+        let Some(location) = self.peer_state_location_by_id.remove(&peer_state_id) else {
+            return;
+        };
+
+        let (removed, network_is_empty) = self
+            .peer_states_by_network
+            .get_mut(&location.network_id)
+            .map(|states| {
+                let removed = states.remove(&location.sort_key);
+                (removed, states.is_empty())
+            })
+            .unwrap_or((None, false));
+        if network_is_empty {
+            self.peer_states_by_network.remove(&location.network_id);
+        }
+
+        let Some(removed) = removed else {
+            return;
+        };
+        let network_has_no_rows = match self.peer_counts.get_mut(&location.network_id) {
+            Some(counts) => {
+                counts.0 = counts.0.saturating_sub(1);
+                if removed.is_ready() {
+                    counts.1 = counts.1.saturating_sub(1);
+                }
+                counts.0 == 0
+            }
+            None => false,
+        };
+        if network_has_no_rows {
+            self.peer_counts.remove(&location.network_id);
+        }
+    }
+
+    /// Returns the cached record identified by `NetworkPeerStateValue::id`.
+    fn peer_state_by_id(&self, peer_state_id: Uuid) -> Option<&NetworkPeerStateValue> {
+        let location = self.peer_state_location_by_id.get(&peer_state_id)?;
+        self.peer_states_by_network
+            .get(&location.network_id)?
+            .get(&location.sort_key)
+    }
+
+    /// Lists cached peer states for one network or for every network.
+    ///
+    /// Results are ordered by network ID and then peer name.
+    fn list_peer_states(&self, network_filter: Option<Uuid>) -> Vec<NetworkPeerStateValue> {
+        match network_filter {
+            Some(network_id) => self
+                .peer_states_by_network
+                .get(&network_id)
+                .map(|states| states.values().cloned().collect())
+                .unwrap_or_default(),
+            None => self
+                .peer_states_by_network
+                .values()
+                .flat_map(|states| states.values().cloned())
+                .collect(),
         }
     }
 
@@ -454,32 +588,33 @@ impl NetworkRegistry {
             }
         }
 
-        states.sort_by(|a, b| {
-            a.network_id
-                .cmp(&b.network_id)
-                .then(a.peer_name.cmp(&b.peer_name))
-        });
-
-        let mut by_network: HashMap<Uuid, Vec<NetworkPeerStateValue>> = HashMap::new();
-        let mut counts: HashMap<Uuid, (u32, u32)> = HashMap::new();
-        for state in &states {
-            by_network
-                .entry(state.network_id)
-                .or_default()
-                .push(state.clone());
-            let entry = counts.entry(state.network_id).or_insert((0u32, 0u32));
-            entry.0 += 1;
-            if state.is_ready() {
-                entry.1 += 1;
-            }
-        }
-
+        cache.replace_peer_states(states);
         cache.peer_generation = generation;
-        cache.peer_states_all = states;
-        cache.peer_states_by_network = by_network;
-        cache.peer_counts = counts;
 
         Ok(())
+    }
+
+    /// Updates the cache after a peer-state write when no other store write occurred concurrently.
+    ///
+    /// If another write occurred or the cache was already stale, this leaves its clock unchanged.
+    /// The next read will then rebuild the cache from the store.
+    fn update_peer_cache_after_single_write(
+        &self,
+        previous_generation: u64,
+        generation: u64,
+        update: impl FnOnce(&mut NetworkRegistryCache),
+    ) {
+        if generation != previous_generation.saturating_add(1) {
+            return;
+        }
+
+        let mut cache = self.cache_write();
+        if cache.peer_generation != previous_generation {
+            return;
+        }
+
+        update(&mut cache);
+        cache.peer_generation = generation;
     }
 
     /// Refresh cached attachment projections when the underlying store generation advanced.
@@ -634,9 +769,12 @@ impl NetworkRegistry {
         Ok(snapshot.and_then(|snap| Self::select_latest_peer_state(snap.as_slice())))
     }
 
-    /// Retrieve the latest peer state entry by its deterministic row identifier.
-    pub fn get_peer_state_by_id(&self, id: Uuid) -> Result<Option<NetworkPeerStateValue>> {
-        let key = UuidKey::from(id);
+    /// Retrieves a peer-state record by the ID derived from its network and peer IDs.
+    pub fn get_peer_state_by_id(
+        &self,
+        peer_state_id: Uuid,
+    ) -> Result<Option<NetworkPeerStateValue>> {
+        let key = UuidKey::from(peer_state_id);
         let snapshot = self
             .peers
             .get_snapshot(&key)
@@ -662,19 +800,30 @@ impl NetworkRegistry {
     /// Upsert a peer state entry tracking reconciliation of a network on a peer.
     pub async fn upsert_peer_state(&self, mut value: NetworkPeerStateValue) -> Result<()> {
         value.touch();
+        let previous_generation = self.peers.change_clock();
         self.peers
-            .upsert(&UuidKey::from(value.id), value)
+            .upsert(&UuidKey::from(value.id), value.clone())
             .await
-            .map_err(|e| anyhow!("network peer state upsert failed: {e}"))
+            .map_err(|e| anyhow!("network peer state upsert failed: {e}"))?;
+        let generation = self.peers.change_clock();
+        self.update_peer_cache_after_single_write(previous_generation, generation, |cache| {
+            cache.apply_peer_state_upsert(value)
+        });
+        Ok(())
     }
 
     /// Remove a single peer state entry.
     #[allow(dead_code)]
-    pub async fn remove_peer_state(&self, id: Uuid) -> Result<()> {
+    pub async fn remove_peer_state(&self, peer_state_id: Uuid) -> Result<()> {
+        let previous_generation = self.peers.change_clock();
         self.peers
-            .remove(&UuidKey::from(id))
+            .remove(&UuidKey::from(peer_state_id))
             .await
             .map_err(|e| anyhow!("network peer state remove failed: {e}"))?;
+        let generation = self.peers.change_clock();
+        self.update_peer_cache_after_single_write(previous_generation, generation, |cache| {
+            cache.apply_peer_state_remove(peer_state_id)
+        });
         Ok(())
     }
 
@@ -682,10 +831,7 @@ impl NetworkRegistry {
     pub async fn remove_peer_states_for_network(&self, network_id: Uuid) -> Result<()> {
         let states = self.list_peer_states(Some(network_id))?;
         for state in states {
-            self.peers
-                .remove(&UuidKey::from(state.id))
-                .await
-                .map_err(|e| anyhow!("network peer state remove failed: {e}"))?;
+            self.remove_peer_state(state.id).await?;
         }
         Ok(())
     }
@@ -722,14 +868,7 @@ impl NetworkRegistry {
     ) -> Result<Vec<NetworkPeerStateValue>> {
         self.refresh_peer_cache_if_needed()?;
         let cache = self.cache_read();
-        Ok(match network_filter {
-            Some(network_id) => cache
-                .peer_states_by_network
-                .get(&network_id)
-                .cloned()
-                .unwrap_or_default(),
-            None => cache.peer_states_all.clone(),
-        })
+        Ok(cache.list_peer_states(network_filter))
     }
 
     /// Collect remote peers that share at least one participating network with `local_peer_id`.
@@ -923,7 +1062,7 @@ impl NetworkRegistry {
         Ok(cache.peer_counts.clone())
     }
 
-    /// Ensure an idempotent peer state identifier exists for the provided network + peer combo.
+    /// Returns the deterministic peer-state record ID for one network and peer pair.
     #[allow(dead_code)]
     pub fn derive_peer_state_id(&self, network_id: Uuid, peer_id: Uuid) -> Uuid {
         compute_network_peer_state_id(network_id, peer_id)
@@ -936,12 +1075,24 @@ impl NetworkRegistry {
     ) -> Option<NetworkPeerStateValue> {
         snapshot
             .iter()
-            .max_by(|a, b| match a.updated_at.cmp(&b.updated_at) {
-                Ordering::Equal => a.state.precedence_rank().cmp(&b.state.precedence_rank()),
-                other => other,
-            })
+            .max_by(|a, b| compare_peer_state_values(a, b))
             .cloned()
     }
+}
+
+/// Chooses between concurrent versions exactly as peer-state store compaction does.
+fn compare_peer_state_values(
+    left: &NetworkPeerStateValue,
+    right: &NetworkPeerStateValue,
+) -> Ordering {
+    left.updated_at
+        .cmp(&right.updated_at)
+        .then_with(|| {
+            left.state
+                .precedence_rank()
+                .cmp(&right.state.precedence_rank())
+        })
+        .then_with(|| left.cmp(right))
 }
 
 /// Picks the canonical attachment value from concurrent MVReg versions.
@@ -1039,7 +1190,7 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 /// The input is keyed by network so overlapping scopes naturally collapse into one peer entry in
 /// the returned set.
 fn collect_shared_participating_peers(
-    peer_states_by_network: &HashMap<Uuid, Vec<NetworkPeerStateValue>>,
+    peer_states_by_network: &BTreeMap<Uuid, BTreeMap<PeerStateSortKey, NetworkPeerStateValue>>,
     local_peer_id: Uuid,
     network_filter: Option<&HashSet<Uuid>>,
 ) -> HashSet<Uuid> {
@@ -1052,13 +1203,13 @@ fn collect_shared_participating_peers(
             continue;
         }
         let local_participates = states
-            .iter()
+            .values()
             .any(|state| state.peer_id == local_peer_id && state.state.is_participating());
         if !local_participates {
             continue;
         }
 
-        for state in states {
+        for state in states.values() {
             if state.peer_id == local_peer_id || !state.state.is_participating() {
                 continue;
             }
@@ -1492,6 +1643,120 @@ mod tests {
         );
     }
 
+    /// Peer writes keep filtered lists and readiness counts current without reloading the store.
+    #[tokio::test]
+    async fn peer_state_writes_update_initialized_cache() {
+        let registry = temp_registry();
+        let network_id = Uuid::from_u128(1);
+        let peer_id = Uuid::from_u128(2);
+        assert!(
+            registry
+                .list_peer_states(None)
+                .expect("initialize peer cache")
+                .is_empty()
+        );
+
+        registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                network_id,
+                peer_id,
+                "peer-before-rename",
+                NetworkPeerState::Configuring,
+                None,
+            ))
+            .await
+            .expect("insert configuring peer state");
+        {
+            let cache = registry.cache_read();
+            assert_eq!(cache.peer_generation, registry.peers.change_clock());
+            assert_eq!(cache.peer_counts.get(&network_id), Some(&(1, 0)));
+            let states = cache.list_peer_states(Some(network_id));
+            assert_eq!(states.len(), 1);
+            assert_eq!(states[0].state, NetworkPeerState::Configuring);
+        }
+
+        registry
+            .upsert_peer_state(NetworkPeerStateValue::new(
+                network_id,
+                peer_id,
+                "peer-after-rename",
+                NetworkPeerState::Ready,
+                None,
+            ))
+            .await
+            .expect("update ready peer state");
+        {
+            let cache = registry.cache_read();
+            assert_eq!(cache.peer_generation, registry.peers.change_clock());
+            assert_eq!(cache.peer_counts.get(&network_id), Some(&(1, 1)));
+            let states = cache.list_peer_states(Some(network_id));
+            assert_eq!(states.len(), 1);
+            assert_eq!(states[0].peer_name, "peer-after-rename");
+            assert_eq!(states[0].state, NetworkPeerState::Ready);
+        }
+
+        let peer_state_id = compute_network_peer_state_id(network_id, peer_id);
+        registry
+            .remove_peer_state(peer_state_id)
+            .await
+            .expect("remove peer state");
+        let cache = registry.cache_read();
+        assert_eq!(cache.peer_generation, registry.peers.change_clock());
+        assert!(cache.list_peer_states(None).is_empty());
+        assert!(!cache.peer_counts.contains_key(&network_id));
+    }
+
+    /// A store write that bypasses the registry makes the next read rebuild every peer lookup.
+    #[tokio::test]
+    async fn peer_cache_rebuilds_after_untracked_store_write() {
+        let registry = temp_registry();
+        assert!(
+            registry
+                .list_peer_states(None)
+                .expect("initialize peer cache")
+                .is_empty()
+        );
+
+        let network_id = Uuid::from_u128(1);
+        let first = NetworkPeerStateValue::new(
+            network_id,
+            Uuid::from_u128(2),
+            "peer-a",
+            NetworkPeerState::Ready,
+            None,
+        );
+        registry
+            .peers
+            .upsert(&UuidKey::from(first.id), first)
+            .await
+            .expect("write peer state outside registry");
+
+        let second = NetworkPeerStateValue::new(
+            network_id,
+            Uuid::from_u128(3),
+            "peer-b",
+            NetworkPeerState::Ready,
+            None,
+        );
+        registry
+            .upsert_peer_state(second)
+            .await
+            .expect("write peer state through registry");
+        assert_ne!(
+            registry.cache_read().peer_generation,
+            registry.peers.change_clock()
+        );
+
+        let states = registry
+            .list_peer_states(Some(network_id))
+            .expect("rebuild stale peer cache");
+        assert_eq!(states.len(), 2);
+        assert_eq!(
+            registry.cache_read().peer_generation,
+            registry.peers.change_clock()
+        );
+    }
+
     /// A duplicate address stays reserved until every attachment using it has been removed.
     #[tokio::test]
     async fn address_index_counts_duplicate_owners() {
@@ -1597,6 +1862,28 @@ mod tests {
         assert_eq!(chosen.state, NetworkPeerState::Ready);
     }
 
+    /// Equal timestamps and states use the same full-record tie-breaker as store compaction.
+    #[test]
+    fn peer_state_selector_matches_store_tie_breaker() {
+        let network_id = Uuid::new_v4();
+        let peer_id = Uuid::new_v4();
+        let mut first = NetworkPeerStateValue::new(
+            network_id,
+            peer_id,
+            "peer-a",
+            NetworkPeerState::Ready,
+            None,
+        );
+        first.updated_at = "2025-01-01T00:00:00Z".to_string();
+
+        let mut second = first.clone();
+        second.peer_name = "peer-b".to_string();
+
+        let chosen = NetworkRegistry::select_latest_peer_state(&[first, second.clone()])
+            .expect("select tied peer state");
+        assert_eq!(chosen, second);
+    }
+
     /// Ensure attachment selection prefers published traffic state when revisions otherwise tie.
     #[test]
     fn published_attachment_wins_when_other_fields_tie() {
@@ -1699,80 +1986,46 @@ mod tests {
         let network_b = Uuid::new_v4();
         let network_c = Uuid::new_v4();
 
-        let mut by_network = HashMap::new();
-        by_network.insert(
-            network_a,
-            vec![
-                NetworkPeerStateValue::new(
-                    network_a,
-                    local_peer_id,
-                    "local",
-                    NetworkPeerState::Ready,
-                    None,
-                ),
-                NetworkPeerStateValue::new(
-                    network_a,
-                    peer_a,
-                    "peer-a",
-                    NetworkPeerState::Ready,
-                    None,
-                ),
-                NetworkPeerStateValue::new(
-                    network_a,
-                    peer_b,
-                    "peer-b",
-                    NetworkPeerState::Configuring,
-                    None,
-                ),
-            ],
-        );
-        by_network.insert(
-            network_b,
-            vec![
-                NetworkPeerStateValue::new(
-                    network_b,
-                    local_peer_id,
-                    "local",
-                    NetworkPeerState::Ready,
-                    None,
-                ),
-                NetworkPeerStateValue::new(
-                    network_b,
-                    peer_a,
-                    "peer-a",
-                    NetworkPeerState::Ready,
-                    None,
-                ),
-                NetworkPeerStateValue::new(
-                    network_b,
-                    peer_b,
-                    "peer-b",
-                    NetworkPeerState::Error,
-                    None,
-                ),
-            ],
-        );
-        by_network.insert(
-            network_c,
-            vec![
-                NetworkPeerStateValue::new(
-                    network_c,
-                    local_peer_id,
-                    "local",
-                    NetworkPeerState::AwaitingSpec,
-                    None,
-                ),
-                NetworkPeerStateValue::new(
-                    network_c,
-                    peer_c,
-                    "peer-c",
-                    NetworkPeerState::Ready,
-                    None,
-                ),
-            ],
-        );
+        let mut cache = NetworkRegistryCache::new();
+        for state in [
+            NetworkPeerStateValue::new(
+                network_a,
+                local_peer_id,
+                "local",
+                NetworkPeerState::Ready,
+                None,
+            ),
+            NetworkPeerStateValue::new(network_a, peer_a, "peer-a", NetworkPeerState::Ready, None),
+            NetworkPeerStateValue::new(
+                network_a,
+                peer_b,
+                "peer-b",
+                NetworkPeerState::Configuring,
+                None,
+            ),
+            NetworkPeerStateValue::new(
+                network_b,
+                local_peer_id,
+                "local",
+                NetworkPeerState::Ready,
+                None,
+            ),
+            NetworkPeerStateValue::new(network_b, peer_a, "peer-a", NetworkPeerState::Ready, None),
+            NetworkPeerStateValue::new(network_b, peer_b, "peer-b", NetworkPeerState::Error, None),
+            NetworkPeerStateValue::new(
+                network_c,
+                local_peer_id,
+                "local",
+                NetworkPeerState::AwaitingSpec,
+                None,
+            ),
+            NetworkPeerStateValue::new(network_c, peer_c, "peer-c", NetworkPeerState::Ready, None),
+        ] {
+            cache.apply_peer_state_upsert(state);
+        }
 
-        let peers = collect_shared_participating_peers(&by_network, local_peer_id, None);
+        let peers =
+            collect_shared_participating_peers(&cache.peer_states_by_network, local_peer_id, None);
 
         assert_eq!(peers.len(), 2);
         assert!(peers.contains(&peer_a));
