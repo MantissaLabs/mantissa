@@ -439,6 +439,22 @@ where
         }
 
         let _mutation = self.mutation_gate.lock().await;
+
+        // Advancing a frontier and deleting the tombstones it covers are committed
+        // together. New tombstones at or below a stored frontier are also rejected.
+        // An equal or older received frontier therefore cannot delete anything.
+        for (origin_actor, local_sequence) in self.load_tombstone_prune_frontiers()? {
+            if frontier_by_origin
+                .get(&origin_actor)
+                .is_some_and(|received_sequence| *received_sequence <= local_sequence)
+            {
+                frontier_by_origin.remove(&origin_actor);
+            }
+        }
+        if frontier_by_origin.is_empty() {
+            return Ok(0);
+        }
+
         let candidates = {
             let r = self.db.begin_read().map_err(into_err)?;
             let tombs = r.open_table(T::tombs()).map_err(into_err)?;
@@ -3202,6 +3218,73 @@ mod tests {
             .await
             .unwrap();
         assert!(!store.has_tombstone(&key(1)).unwrap());
+    }
+
+    /// Repeated frontiers do nothing while newer frontiers still remove covered tombstones.
+    #[tokio::test]
+    async fn remote_prune_frontiers_ignore_known_sequences_and_apply_newer_ones() {
+        let (_dir, db) = temp_db();
+        let store: CrdtMstStore<Adapter, XXHash128, TestTables> =
+            CrdtMstStore::open(db, actor(1)).unwrap();
+        let repeated_origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(2));
+        let advancing_origin = <Adapter as RegAdapter>::actor_to_bytes(&actor(3));
+
+        store
+            .apply_delta_chunk_update_mst(
+                Vec::new(),
+                vec![
+                    (key(1), TombstoneRecord::new(1, repeated_origin.clone(), 10)),
+                    (key(2), TombstoneRecord::new(3, repeated_origin.clone(), 20)),
+                    (
+                        key(3),
+                        TombstoneRecord::new(2, advancing_origin.clone(), 30),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .apply_tombstone_prune_frontiers(vec![(repeated_origin.clone(), 1)])
+                .await
+                .unwrap(),
+            1
+        );
+        let root_before_second_apply = store.root_hex().await;
+        let change_clock_before_second_apply = store.change_clock();
+
+        assert_eq!(
+            store
+                .apply_tombstone_prune_frontiers(vec![
+                    (repeated_origin.clone(), 1),
+                    (advancing_origin.clone(), 2),
+                ])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.tombstone_prune_frontier(&repeated_origin).unwrap(), 1);
+        assert_eq!(
+            store.tombstone_prune_frontier(&advancing_origin).unwrap(),
+            2
+        );
+        assert!(store.has_tombstone(&key(2)).unwrap());
+        assert!(!store.has_tombstone(&key(3)).unwrap());
+        assert_ne!(store.root_hex().await, root_before_second_apply);
+        assert!(store.change_clock() > change_clock_before_second_apply);
+
+        let root_before_noop = store.root_hex().await;
+        let change_clock_before_noop = store.change_clock();
+        assert_eq!(
+            store
+                .apply_tombstone_prune_frontiers(vec![(repeated_origin, 1), (advancing_origin, 2),])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.root_hex().await, root_before_noop);
+        assert_eq!(store.change_clock(), change_clock_before_noop);
     }
 
     #[tokio::test]
