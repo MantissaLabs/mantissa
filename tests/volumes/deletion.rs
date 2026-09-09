@@ -300,7 +300,17 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
                     .unwrap_or_else(|diagnostic_error| diagnostic_error.to_string())
             );
         }
-        write_unflushed_direct_probe(mount_path.join("volatile-direct-probe.bin")).await?;
+        if let Err(error) =
+            write_unflushed_direct_probe(mount_path.join("volatile-direct-probe.bin")).await
+        {
+            anyhow::bail!(
+                "initial direct-write probe failed: {error:#}; public=[{}]; local=[{}]",
+                replicated_volume_start_diagnostics(&cluster, volume_id),
+                replicated_volume_local_diagnostics(&cluster, volume_id)
+                    .await
+                    .unwrap_or_else(|diagnostic_error| diagnostic_error.to_string())
+            );
+        }
         let attached_node = cluster
             .iter()
             .find(|node| node.id() == attached_node_id)
