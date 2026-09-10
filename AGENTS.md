@@ -43,9 +43,26 @@ The system needs to be:
 - Logging: use `tracing` (`info!`, `warn!`, `debug!`); enable via `RUST_LOG=mantissa=debug`.
 - All methods need to have a header comment describing what it does and its role in a larger context.
 - Code needs to be well-structured and maintainable, following best practices for Rust programming.
+- Write comments for first-time readers. Explain why the code exists, how it fits into the
+  larger flow, and any correctness or safety rule it protects. Never merely restate names,
+  signatures, or types. Avoid unexplained internal jargon and keep the wording short, concrete,
+  and plain.
 - Lines that are ambiguous need to be commented profusely to avoid later confusion.
 - Use variables directly inside print statements, ie. instead of `print!("{}", output);` use `print!("{output}");`.
 - unwrap() is allowed only in tests. Never use in production code.
+- The source code needs to _breathe_. In new and modified code, use blank lines to separate logical steps within methods, such as validation, data transformation, policy handling, and response construction. Readers should be able to locate these groups while reviewing the method.
+- Keep related setup and variables together with the loop or operation that uses them. After that computation, put a blank line before processing its result or starting the next independent step.
+- Keep statements that form one logical step together. Do not add blank lines mechanically after every statement. Use whitespace to show these groups without adding comments that merely label each step.
+- Apply the same grouping to tests: separate fixture setup, execution, and related assertion groups. Expand dense expected values, such as nested JSON objects, across multiple lines so their structure is easy to review.
+
+## Naming, wording and commit messages
+
+- Use the same word for the same idea each time.
+- Avoid abstract words and umbrella terms that could be confusing. Crystal clear words are preferred.
+- Avoid opaque terms like soak, seam, seal, etc. Use proper and easily understood terms, even if they are longer.
+- Do not use idioms, slang, or jargon.
+- Commit messages should not be a boring enumeration of changes: they should be crystal clear and use clear wording on the context behind this change and the reasons we are including it.
+- Code comments should follow the same conventions and standards.
 
 ## Testing Guidelines
 
