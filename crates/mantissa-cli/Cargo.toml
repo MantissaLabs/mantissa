@@ -28,6 +28,7 @@ mantissa-ui = { path = "../mantissa-ui" }
 parking_lot = { workspace = true }
 rpassword = "7.4.0"
 tabwriter = "1"
+textwrap = { version = "0.16.2", default-features = false, features = ["unicode-width"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1.8.1"

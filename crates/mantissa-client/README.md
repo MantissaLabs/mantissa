@@ -19,7 +19,8 @@ Most callers start with `ClientConfig` and then call one of the domain modules:
 - `nodes`: join, leave, list, drain, resume, evict, label, and status helpers.
 - `jobs`: submit, inspect, cancel, delete, list, logs, and wait helpers.
 - `agents`: submit, run, inspect, input, logs, snapshots, and lifecycle helpers.
-- `services`: deploy manifests, list services, stop services, and inspect rollout status.
+- `services`: deploy manifests, list and stop services, inspect full configuration
+  and replica progress, and inspect rollout status.
 - `networks`, `volumes`, `secrets`, `tasks`, `scheduler`, and `clusters`.
 
 ## Runtime Model

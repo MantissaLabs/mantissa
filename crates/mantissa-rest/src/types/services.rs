@@ -11,6 +11,9 @@ use mantissa_client::services::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+mod inspect;
+pub use inspect::*;
+
 /// REST request body for deploying one service manifest.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -47,7 +50,7 @@ fn deploy_outcome_label(outcome: ServiceDeployOutcome) -> &'static str {
     }
 }
 
-/// REST-facing service summary and inspection response.
+/// Keeps service lists compact without decoding every optional template setting.
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ServiceSummary {
     pub id: String,

@@ -3536,6 +3536,141 @@
         ],
         "type": "object"
       },
+      "ServiceDetail": {
+        "description": "Complete service configuration and progress from one daemon status snapshot.",
+        "properties": {
+          "admission": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WorkloadAdmissionPolicy"
+              }
+            ]
+          },
+          "deployment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DeploymentPolicySpec"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "manifest_id": {
+            "type": "string"
+          },
+          "manifest_name": {
+            "type": "string"
+          },
+          "previous_generation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServicePreviousGeneration"
+              }
+            ]
+          },
+          "replica_assignments": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceReplicaAssignment"
+            },
+            "type": "array"
+          },
+          "replica_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replica_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rescheduling": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceRescheduling"
+              }
+            ]
+          },
+          "rollout": {
+            "$ref": "#/components/schemas/ServiceRolloutDetail"
+          },
+          "service_epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "service_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "status_detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_progress": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTaskProgress"
+            },
+            "type": "array"
+          },
+          "task_templates": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTaskTemplate"
+            },
+            "type": "array"
+          },
+          "update": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceUpdateStrategy"
+              }
+            ]
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "service_id",
+          "manifest_id",
+          "manifest_name",
+          "service_name",
+          "updated_at",
+          "service_epoch",
+          "status",
+          "rollout",
+          "replica_ids",
+          "replica_assignments",
+          "replica_count",
+          "task_templates",
+          "task_progress"
+        ],
+        "type": "object"
+      },
       "ServiceManifest": {
         "additionalProperties": false,
         "properties": {
@@ -3585,6 +3720,33 @@
         ],
         "type": "string"
       },
+      "ServicePreviousGeneration": {
+        "description": "Identifies the generation retained for rollback without repeating its full configuration.",
+        "properties": {
+          "manifest_id": {
+            "type": "string"
+          },
+          "service_epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "manifest_id",
+          "service_epoch"
+        ],
+        "type": "object"
+      },
+      "ServicePublicProtocol": {
+        "description": "Transport protocols served by a template's public port.",
+        "enum": [
+          "tcp",
+          "udp",
+          "tcp_udp"
+        ],
+        "type": "string"
+      },
       "ServiceReplicaAssignment": {
         "description": "REST-facing compact service replica assignment segment.",
         "properties": {
@@ -3606,6 +3768,43 @@
           "template_name",
           "first_replica",
           "replica_count"
+        ],
+        "type": "object"
+      },
+      "ServiceRescheduleReason": {
+        "description": "Stable values for the cause of an active rescheduling operation.",
+        "enum": [
+          "missing_replicas",
+          "excess_replicas",
+          "drift"
+        ],
+        "type": "string"
+      },
+      "ServiceRescheduling": {
+        "description": "Describes active rescheduling without exposing the internal lock token.",
+        "properties": {
+          "expires_at": {
+            "type": "string"
+          },
+          "holder_id": {
+            "type": "string"
+          },
+          "holder_name": {
+            "type": "string"
+          },
+          "issued_at": {
+            "type": "string"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/ServiceRescheduleReason"
+          }
+        },
+        "required": [
+          "holder_id",
+          "holder_name",
+          "issued_at",
+          "expires_at",
+          "reason"
         ],
         "type": "object"
       },
@@ -3651,8 +3850,63 @@
         ],
         "type": "object"
       },
+      "ServiceRolloutDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ServiceRollout"
+          },
+          {
+            "properties": {
+              "outcome": {
+                "description": "One of stable, in_progress, blocked, rolled_back, or failed.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "outcome"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "Adds the CLI's derived outcome to the existing rollout counters and diagnostics."
+      },
+      "ServiceSecretFile": {
+        "description": "Describes a projected secret file while keeping its contents out of inspection responses.",
+        "properties": {
+          "mode": {
+            "description": "Numeric Unix permissions; null means the secret policy default.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ownership": {
+            "$ref": "#/components/schemas/FilesystemOwnership"
+          },
+          "path": {
+            "type": "string"
+          },
+          "path_env_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret": {
+            "$ref": "#/components/schemas/SecretReference"
+          }
+        },
+        "required": [
+          "path",
+          "secret",
+          "ownership"
+        ],
+        "type": "object"
+      },
       "ServiceSummary": {
-        "description": "REST-facing service summary and inspection response.",
+        "description": "Keeps service lists compact without decoding every optional template setting.",
         "properties": {
           "id": {
             "type": "string"
@@ -3736,6 +3990,22 @@
           "rollout",
           "public_endpoints",
           "task_progress"
+        ],
+        "type": "object"
+      },
+      "ServiceTaskNetwork": {
+        "description": "Keeps both the manifest alias and the resolved network identity available to consumers.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "network_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "network_id"
         ],
         "type": "object"
       },
@@ -3835,6 +4105,199 @@
         ],
         "type": "object"
       },
+      "ServiceTaskResources": {
+        "description": "Resource requests for a single replica, without display rounding or unit conversion.",
+        "properties": {
+          "cpu_millis": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "gpu_count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memory_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cpu_millis",
+          "memory_bytes",
+          "gpu_count"
+        ],
+        "type": "object"
+      },
+      "ServiceTaskTemplate": {
+        "description": "Full desired settings for each replica, with exact resource and timing units.",
+        "properties": {
+          "autoscale": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskTemplateAutoscalePolicy"
+              }
+            ]
+          },
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "env": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentVariable"
+            },
+            "type": "array"
+          },
+          "image": {
+            "type": "string"
+          },
+          "liveness": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LivenessProbe"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "networks": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTaskNetwork"
+            },
+            "type": "array"
+          },
+          "placement": {
+            "$ref": "#/components/schemas/PlacementSpec"
+          },
+          "ports": {
+            "items": {
+              "$ref": "#/components/schemas/HostPort"
+            },
+            "type": "array"
+          },
+          "pre_stop_command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "public_ingress": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PublicIngressPolicy"
+              }
+            ]
+          },
+          "public_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "public_protocol": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServicePublicProtocol"
+              }
+            ]
+          },
+          "readiness": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadinessProbe"
+              }
+            ]
+          },
+          "replicas": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resources": {
+            "$ref": "#/components/schemas/ServiceTaskResources"
+          },
+          "restart_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskTemplateRestartPolicy"
+              }
+            ]
+          },
+          "secret_files": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceSecretFile"
+            },
+            "type": "array"
+          },
+          "termination_grace_period_secs": {
+            "description": "Null means the runtime default is used.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tty": {
+            "type": "boolean"
+          },
+          "volumes": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceVolumeMount"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "image",
+          "command",
+          "depends_on",
+          "replicas",
+          "resources",
+          "tty",
+          "pre_stop_command",
+          "placement",
+          "ports",
+          "networks",
+          "volumes",
+          "env",
+          "secret_files"
+        ],
+        "type": "object"
+      },
       "ServiceUpdateStrategy": {
         "properties": {
           "mode": {
@@ -3851,6 +4314,30 @@
           "rolling"
         ],
         "type": "string"
+      },
+      "ServiceVolumeMount": {
+        "description": "Resolves a named volume mount without requiring a separate volume lookup.",
+        "properties": {
+          "read_only": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "volume_id": {
+            "type": "string"
+          },
+          "volume_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "volume_name",
+          "volume_id",
+          "target",
+          "read_only"
+        ],
+        "type": "object"
       },
       "SplitCandidate": {
         "description": "REST-facing split candidate row.",
@@ -9822,7 +10309,7 @@
         ]
       },
       "get": {
-        "description": "Fetches one service by UUID text or exact service name.",
+        "description": "Fetches complete service configuration and replica progress by UUID or exact service name.",
         "operationId": "get",
         "parameters": [
           {
@@ -9840,11 +10327,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ServiceSummary"
+                  "$ref": "#/components/schemas/ServiceDetail"
                 }
               }
             },
-            "description": "Service summary."
+            "description": "Complete service configuration and replica progress."
           },
           "400": {
             "content": {
@@ -9915,7 +10402,7 @@
     },
     "/v1/services/{selector}/status": {
       "get": {
-        "description": "Fetches one service status snapshot by UUID text or exact service name.",
+        "description": "Fetches the same complete snapshot as the service resource, including per-template replica state counts.",
         "operationId": "status",
         "parameters": [
           {
@@ -9933,11 +10420,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ServiceSummary"
+                  "$ref": "#/components/schemas/ServiceDetail"
                 }
               }
             },
-            "description": "Service status snapshot."
+            "description": "Complete service configuration and replica progress."
           },
           "400": {
             "content": {

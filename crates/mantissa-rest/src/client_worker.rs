@@ -28,7 +28,7 @@ use crate::types::{
     },
     scheduler::SchedulerSummary,
     secrets::{SecretDeleteResponse, SecretDetail, SecretSummary, SecretUpsertRequest},
-    services::{ServiceDeployRequest, ServiceDeployResponse, ServiceSummary},
+    services::{ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary},
     tasks::{TaskAttachQuery, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary},
     volumes::{
         VolumeCreateRequest, VolumeDeleteResponse, VolumeExpandResponse, VolumeImportRequest,
@@ -234,20 +234,8 @@ impl ClientWorkerHandle {
     }
 
     /// Fetches one service by UUID text or exact service name.
-    pub async fn get_service(&self, selector: String) -> Result<ServiceSummary, ClientWorkerError> {
+    pub async fn get_service(&self, selector: String) -> Result<ServiceDetail, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::GetService {
-            selector,
-            respond_to,
-        })
-        .await
-    }
-
-    /// Fetches one service status snapshot by UUID text or exact service name.
-    pub async fn get_service_status(
-        &self,
-        selector: String,
-    ) -> Result<ServiceSummary, ClientWorkerError> {
-        self.send(|respond_to| ClientCommand::GetServiceStatus {
             selector,
             respond_to,
         })
@@ -909,11 +897,7 @@ enum ClientCommand {
     },
     GetService {
         selector: String,
-        respond_to: oneshot::Sender<Result<ServiceSummary, ClientWorkerError>>,
-    },
-    GetServiceStatus {
-        selector: String,
-        respond_to: oneshot::Sender<Result<ServiceSummary, ClientWorkerError>>,
+        respond_to: oneshot::Sender<Result<ServiceDetail, ClientWorkerError>>,
     },
     DeleteService {
         selector: String,
@@ -1187,12 +1171,6 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                 respond_to,
             } => {
                 let _ignored = respond_to.send(get_service(&config, &selector).await);
-            }
-            ClientCommand::GetServiceStatus {
-                selector,
-                respond_to,
-            } => {
-                let _ignored = respond_to.send(get_service_status(&config, &selector).await);
             }
             ClientCommand::DeleteService {
                 selector,
@@ -1663,27 +1641,21 @@ async fn deploy_service(
         .map_err(invalid_request_error)
 }
 
-/// Fetches one service through the reusable Mantissa client API.
+/// Shares the CLI inspection snapshot so both REST read routes include complete configuration and progress.
 async fn get_service(
     config: &ClientConfig,
     selector: &str,
-) -> Result<ServiceSummary, ClientWorkerError> {
-    services::list::inspect_service_row(config, selector)
-        .await
-        .map(ServiceSummary::from)
-        .map_err(not_found_error)
-}
+) -> Result<ServiceDetail, ClientWorkerError> {
+    let inspection = services::inspect(config, selector).await.map_err(|error| {
+        error
+            .downcast_ref::<ClientError>()
+            .cloned()
+            .map(ClientWorkerError::from)
+            .unwrap_or_else(|| operation_failed_error(error))
+    })?;
 
-/// Fetches one service status through the reusable Mantissa client API.
-async fn get_service_status(
-    config: &ClientConfig,
-    selector: &str,
-) -> Result<ServiceSummary, ClientWorkerError> {
-    get_service(config, selector).await?;
-    services::rollout_status(config, selector)
-        .await
-        .map(ServiceSummary::from)
-        .map_err(operation_failed_error)
+    let snapshot = inspection.snapshot().map_err(operation_failed_error)?;
+    ServiceDetail::from_snapshot(snapshot).map_err(operation_failed_error)
 }
 
 /// Deletes one service through the reusable Mantissa client API.

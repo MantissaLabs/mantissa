@@ -1,0 +1,48 @@
+SERVICE discovery-demo
+  ID                00000000-0000-0000-0000-000000000001
+  Status            running
+  Rollout           stable
+  Updated           2026-09-09T17:51:08.223831604+00:00
+
+REPLICA PROGRESS
+  TEMPLATE  DESIRED  ASSIGNED  RUNNING  OTHER STATES
+  backend   4        4         4        -
+  frontend  1        1         1        -
+
+DEPLOYMENT
+  Manifest ID       00000000-0000-0000-0000-000000000002
+  Generation        0
+  Admission         incremental
+  Update            rolling, start first, parallelism 1
+  Failure policy    maximum failures 1, automatic rollback enabled
+  Deadlines         progress 10m, healthy 10m, minimum healthy 1s
+
+TEMPLATE backend
+  Image             busybox:1.36
+  Replicas          4
+  Resources         200m CPU, 64 MiB memory
+  Placement         spread
+  Readiness         HTTP :8000/; every 2s, timeout 300ms, failure threshold 1
+  Liveness          HTTP :8000/; every 2s, timeout 1s, failure threshold 2, start period 1s
+  Public port       8000/tcp (all nodes)
+  Networks          demo-network (00000000-0000-0000-0000-000000000004)
+  Command           sh
+  Arguments         -c
+                    "mkdir -p /www && hostname >/www/index.html && exec httpd -f -p 8000 -h /www"
+
+TEMPLATE frontend
+  Image             curlimages/curl:8.9.1
+  Replicas          1
+  Resources         200m CPU, 64 MiB memory
+  Depends on        backend
+  Placement         spread
+  Health checks     none
+  Networks          demo-network (00000000-0000-0000-0000-000000000004)
+  Command           sh
+  Arguments         -c
+                    "while true; do printf '\\n---\\n' && date; curl --connect-timeout 5 --max-time
+                    5 --no-keepalive --retry 0 -sS -w '\\n[curl] http=%{http_code}
+                    remote=%{remote_ip} dns=%{time_namelookup}s connect=%{time_connect}s
+                    start=%{time_starttransfer}s total=%{time_total}s\\n'
+                    http://backend.discovery-demo.demo-network.svc.mantissa:8000; rc=$?; echo
+                    \"[curl] rc=$rc\"; sleep 2; done"

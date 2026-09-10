@@ -40,6 +40,39 @@ fn openapi_spec_documents_security_contract() {
     assert!(value["paths"]["/v1/health"]["get"]["responses"]["401"].is_object());
 }
 
+/// Keeps both service read routes on the complete response while service lists remain compact.
+#[test]
+fn openapi_spec_documents_complete_service_inspection() {
+    let value = openapi::json_value(&server::openapi());
+    for path in ["/v1/services/{selector}", "/v1/services/{selector}/status"] {
+        assert_eq!(
+            value["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+                ["$ref"],
+            "#/components/schemas/ServiceDetail"
+        );
+    }
+
+    assert_eq!(
+        value["paths"]["/v1/services"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+            ["items"]["$ref"],
+        "#/components/schemas/ServiceSummary"
+    );
+
+    let schemas = &value["components"]["schemas"];
+    assert_required(
+        &schemas["ServiceTaskResources"],
+        &["cpu_millis", "memory_bytes", "gpu_count"],
+    );
+    assert_required(
+        &schemas["ServiceDetail"],
+        &["task_templates", "task_progress"],
+    );
+    assert_required(
+        &schemas["ServiceTaskTemplate"],
+        &["command", "depends_on", "volumes", "env", "secret_files"],
+    );
+}
+
 /// Ensures retaining volume data remains the documented delete default.
 #[test]
 fn openapi_spec_makes_volume_data_deletion_optional() {

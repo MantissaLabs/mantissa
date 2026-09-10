@@ -80,6 +80,7 @@ local_test!(rest_services_list_and_inspect_deployed_service, {
     let (status, value) = harness
         .json_request(Method::GET, "/v1/services", true, None)
         .await;
+
     assert_eq!(status, StatusCode::OK, "list response body={value}");
     assert!(
         value
@@ -92,15 +93,47 @@ local_test!(rest_services_list_and_inspect_deployed_service, {
     let (status, value) = harness
         .json_request(Method::GET, "/v1/services/rest-service-read", true, None)
         .await;
+
     assert_eq!(status, StatusCode::OK, "get response body={value}");
     assert_eq!(value["service_id"], service_id);
     assert_eq!(value["service_name"], "rest-service-read");
+
     assert_eq!(value["task_templates"][0]["name"], "web");
+    assert_eq!(
+        value["task_templates"][0]["resources"],
+        json!({
+            "cpu_millis": 250,
+            "memory_bytes": 134_217_728,
+            "gpu_count": 0
+        })
+    );
+    assert_eq!(value["task_templates"][0]["env"], json!([]));
+    assert_eq!(value["task_templates"][0]["readiness"], Value::Null);
+
+    assert_eq!(value["admission"]["mode"], "incremental");
+    assert_eq!(value["update"]["rolling"]["order"], "start_first");
+    assert_eq!(value["deployment"]["progress_deadline_secs"], 600);
+
+    assert_eq!(value["task_progress"][0]["name"], "web");
+    assert_eq!(value["task_progress"][0]["desired"], 1);
+
+    let (status, by_id) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/services/{service_id}"),
+            true,
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(by_id["task_templates"], value["task_templates"]);
 });
 
 local_test!(rest_services_status_reports_task_progress, {
     let harness = RestTestHarness::new().await;
     let (service_id, _value) = deploy_service(&harness, "rest-service-status", 250).await;
+    wait_for_service_running(&harness, "rest-service-status").await;
 
     let (status, value) = harness
         .json_request(
@@ -110,9 +143,33 @@ local_test!(rest_services_status_reports_task_progress, {
             None,
         )
         .await;
+
     assert_eq!(status, StatusCode::OK, "status response body={value}");
     assert_eq!(value["service_id"], service_id);
-    assert!(value["task_progress"].as_array().is_some());
+    assert_eq!(
+        value["task_progress"]
+            .as_array()
+            .expect("progress array")
+            .len(),
+        1
+    );
+    assert_eq!(value["task_progress"][0]["name"], "web");
+    assert_eq!(value["task_progress"][0]["desired"], 1);
+    assert_eq!(value["task_progress"][0]["assigned"], 1);
+    assert_eq!(value["task_progress"][0]["running"], 1);
+
+    let (status, by_id) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/services/{service_id}/status"),
+            true,
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(by_id["task_templates"], value["task_templates"]);
+    assert_eq!(by_id["task_progress"], value["task_progress"]);
 });
 
 local_test!(rest_services_redeploy_running_service, {
@@ -164,6 +221,7 @@ local_test!(rest_services_reject_invalid_manifest, {
             Some(json!({"manifest": {"name": "bad"}, "extra": true})),
         )
         .await;
+
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
 
@@ -175,12 +233,29 @@ local_test!(rest_services_reject_invalid_manifest, {
             Some(json!({"manifest": {"name": "bad", "tasks": [{"name": ""}]}})),
         )
         .await;
+
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "bad_request");
 
+    for selector in ["missing-service", "00000000-0000-0000-0000-000000000099"] {
+        for suffix in ["", "/status"] {
+            let (status, value) = harness
+                .json_request(
+                    Method::GET,
+                    &format!("/v1/services/{selector}{suffix}"),
+                    true,
+                    None,
+                )
+                .await;
+
+            assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+            assert_eq!(value["code"], "not_found");
+        }
+    }
+
     let (status, value) = harness
-        .json_request(Method::GET, "/v1/services/missing-service", true, None)
+        .json_request(Method::GET, "/v1/services/%20/status", true, None)
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(value["code"], "not_found");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
 });

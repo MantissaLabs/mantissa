@@ -39,6 +39,15 @@ Submit a service manifest and track deployment progress:
 mantissa services run examples/service.ron
 ```
 
+Inspect a service's configuration and current replica progress:
+
+```sh
+mantissa services inspect my-service
+```
+
+Add `--details` to include unused settings, exact memory byte counts, and replica
+assignments. The default view keeps status and configured settings easy to scan.
+
 Submit a one-shot job:
 
 ```sh

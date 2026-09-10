@@ -424,7 +424,7 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         OperationMethod::Get,
         "/v1/services/{selector}",
         "Get service",
-        "Fetches one service by UUID text or exact service name.",
+        "Fetches complete service configuration and replica progress by UUID or exact service name.",
     ),
     (
         OperationMethod::Delete,
@@ -436,7 +436,7 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         OperationMethod::Get,
         "/v1/services/{selector}/status",
         "Service status",
-        "Fetches one service status snapshot by UUID text or exact service name.",
+        "Fetches the same complete snapshot as the service resource, including per-template replica state counts.",
     ),
     (
         OperationMethod::Get,

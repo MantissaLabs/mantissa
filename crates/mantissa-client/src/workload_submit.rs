@@ -4,7 +4,7 @@ use crate::networks;
 use crate::volumes;
 use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use uuid::Uuid;
@@ -69,7 +69,7 @@ pub struct RequestedNetworkSpec {
 }
 
 /// Shared deployment deadlines declared by workload-owning manifests.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct DeploymentPolicySpec {
     #[serde(default = "default_deployment_progress_deadline_secs")]
@@ -153,7 +153,7 @@ pub struct ManifestPortBinding {
 }
 
 /// Candidate ranking mode applied after hard placement filters pass.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementStrategy {
@@ -163,7 +163,7 @@ pub enum PlacementStrategy {
 }
 
 /// Typed scheduler-visible field used by one hard placement constraint.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementConstraintSelector {
@@ -197,7 +197,7 @@ impl PlacementConstraintSelector {
 }
 
 /// Supported comparison operators for hard placement constraints.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementConstraintOperator {
@@ -207,7 +207,7 @@ pub enum PlacementConstraintOperator {
 }
 
 /// One hard placement predicate interpreted against a candidate node.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlacementConstraint {
     pub selector: PlacementConstraintSelector,
@@ -247,7 +247,7 @@ pub struct PlacementSpec {
 }
 
 /// Admission behavior requested by a manifest-level workload controller.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadAdmissionMode {
@@ -259,7 +259,7 @@ pub enum WorkloadAdmissionMode {
 }
 
 /// Shared manifest-side admission policy for controller-owned workload groups.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WorkloadAdmissionPolicy {
     #[serde(default)]

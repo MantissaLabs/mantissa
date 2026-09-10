@@ -1293,6 +1293,9 @@ pub enum ServicesCommand {
     #[command(alias = "ls")]
     List(ServicesListArgs),
 
+    /// Show service configuration, rollout diagnostics, and task progress
+    Inspect(ServicesInspectArgs),
+
     /// Inspect rollout progress and failure details for one service
     Rollout {
         #[command(subcommand)]
@@ -1325,6 +1328,17 @@ pub struct ServicesRunArgs {
 
 #[derive(Args, Debug, Default)]
 pub struct ServicesListArgs {}
+
+#[derive(Args, Debug)]
+pub struct ServicesInspectArgs {
+    /// Service name or full UUID
+    #[arg(index = 1, value_name = "SERVICE")]
+    pub service: String,
+
+    /// Include unused settings, exact resource values, and replica assignments
+    #[arg(long)]
+    pub details: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct ServicesStopArgs {

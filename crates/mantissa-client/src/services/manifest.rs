@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -81,7 +81,7 @@ pub enum TaskTemplateAutoscaleMetricKind {
     Memory,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TaskTemplateRestartPolicy {
     pub name: RestartPolicyName,
@@ -89,7 +89,7 @@ pub struct TaskTemplateRestartPolicy {
     pub max_retry_count: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RestartPolicyName {
@@ -99,7 +99,7 @@ pub enum RestartPolicyName {
     UnlessStopped,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SecretReference {
     pub name: String,
@@ -107,7 +107,7 @@ pub struct SecretReference {
     pub version: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EnvironmentVariable {
     pub name: String,
@@ -256,7 +256,7 @@ fn default_liveness_start_period_ms() -> u64 {
     30_000
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[derive(Debug, Deserialize, Clone, Copy, Default, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessKind {
@@ -265,7 +265,7 @@ pub enum ReadinessKind {
     Tcp,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ReadinessProbe {
     #[serde(default)]
@@ -281,7 +281,7 @@ pub struct ReadinessProbe {
     pub failure_threshold: u32,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct LivenessProbe {
     #[serde(default)]
@@ -302,7 +302,7 @@ pub struct LivenessProbe {
     pub start_period_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[derive(Debug, Deserialize, Clone, Copy, Default, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LivenessKind {
@@ -313,7 +313,7 @@ pub enum LivenessKind {
 }
 
 /// Service-only placement preference that depends on service replica metadata.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ServicePlacementPreference {
@@ -323,7 +323,7 @@ pub enum ServicePlacementPreference {
     TaskAntiAffinity,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlacementSpec {
     #[serde(default)]
@@ -406,7 +406,7 @@ impl PublicIngressPolicySpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceUpdateStrategyMode {
@@ -414,7 +414,7 @@ pub enum ServiceUpdateStrategyMode {
     Rolling,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RolloutOrder {
@@ -423,7 +423,7 @@ pub enum RolloutOrder {
     StopFirst,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RollingUpdatePolicy {
     #[serde(default = "default_rollout_parallelism")]
@@ -447,7 +447,7 @@ impl Default for RollingUpdatePolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ServiceUpdateStrategy {
     #[serde(default)]

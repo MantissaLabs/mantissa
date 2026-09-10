@@ -4,7 +4,7 @@ use crate::{
     extract::RestJson,
     routes::worker_error_to_rest,
     state::AppState,
-    types::services::{ServiceDeployRequest, ServiceDeployResponse, ServiceSummary},
+    types::services::{ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary},
 };
 use axum::{
     Json,
@@ -57,13 +57,13 @@ pub async fn deploy(
     path = "/v1/services/{selector}",
     tag = "services",
     params(("selector" = String, Path, description = "Service UUID string or exact service name.")),
-    responses((status = 200, description = "Service summary.", body = ServiceSummary))
+    responses((status = 200, description = "Complete service configuration and replica progress.", body = ServiceDetail))
 )]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(selector): Path<String>,
-) -> Result<Json<ServiceSummary>, RestError> {
+) -> Result<Json<ServiceDetail>, RestError> {
     state
         .client()
         .get_service(selector)
@@ -99,16 +99,16 @@ pub async fn delete(
     path = "/v1/services/{selector}/status",
     tag = "services",
     params(("selector" = String, Path, description = "Service UUID string or exact service name.")),
-    responses((status = 200, description = "Service status snapshot.", body = ServiceSummary))
+    responses((status = 200, description = "Complete service configuration and replica progress.", body = ServiceDetail))
 )]
 pub async fn status(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(selector): Path<String>,
-) -> Result<Json<ServiceSummary>, RestError> {
+) -> Result<Json<ServiceDetail>, RestError> {
     state
         .client()
-        .get_service_status(selector)
+        .get_service(selector)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

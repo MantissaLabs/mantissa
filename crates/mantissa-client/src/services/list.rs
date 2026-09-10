@@ -42,9 +42,7 @@ pub async fn fetch_service_row_by_id(cfg: &ClientConfig, service_id: Uuid) -> Re
     request.get().set_service_id(service_id.as_bytes());
     let response = request.send().promise.await?;
     let snapshot = response.get()?.get_snapshot()?;
-    let mut row = ServiceRow::from_reader(snapshot.get_service()?)?;
-    row.task_progress = read_service_task_progress(snapshot.get_tasks()?)?;
-    Ok(row)
+    Ok(ServiceRow::from_snapshot(snapshot)?)
 }
 
 /// Inspects one service row by UUID text or exact service name.
@@ -95,6 +93,16 @@ pub struct ServiceRow {
 }
 
 impl ServiceRow {
+    /// Keeps configuration and replica counters from the same daemon observation together.
+    pub fn from_snapshot(
+        snapshot: mantissa_protocol::services::service_status_snapshot::Reader<'_>,
+    ) -> Result<Self, CapnpError> {
+        let mut row = Self::from_reader(snapshot.get_service()?)?;
+        row.task_progress = read_service_task_progress(snapshot.get_tasks()?)?;
+
+        Ok(row)
+    }
+
     /// Builds a printable service row from one protocol reader payload.
     pub fn from_reader(spec: service_spec::Reader<'_>) -> Result<Self, CapnpError> {
         let service_id = uuid_from_data(spec.get_id()?)?;

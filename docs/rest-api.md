@@ -88,13 +88,13 @@ mantissa init --detach \
 
 Configuration:
 
-| Variable | Meaning |
-| --- | --- |
-| `MANTISSA_REST_ENABLED` | Start embedded REST from `mantissa init`. |
-| `MANTISSA_REST_ADDR` | Bind address, default `127.0.0.1:6579`. |
-| `MANTISSA_REST_TLS_CERT` | PEM server certificate chain for HTTPS. |
-| `MANTISSA_REST_TLS_KEY` | PEM server private key for HTTPS. |
-| `MANTISSA_REST_CLIENT_CA` | PEM client CA bundle used to require mTLS. |
+| Variable                           | Meaning                                                               |
+| ---------------------------------- | --------------------------------------------------------------------- |
+| `MANTISSA_REST_ENABLED`            | Start embedded REST from `mantissa init`.                             |
+| `MANTISSA_REST_ADDR`               | Bind address, default `127.0.0.1:6579`.                               |
+| `MANTISSA_REST_TLS_CERT`           | PEM server certificate chain for HTTPS.                               |
+| `MANTISSA_REST_TLS_KEY`            | PEM server private key for HTTPS.                                     |
+| `MANTISSA_REST_CLIENT_CA`          | PEM client CA bundle used to require mTLS.                            |
 | `MANTISSA_REST_CLIENT_CERT_SHA256` | Comma-separated allowed mTLS client certificate SHA-256 fingerprints. |
 
 The equivalent `mantissa init` flags are `--rest`, `--rest-addr`,
@@ -306,6 +306,11 @@ curl -sS "${AUTH[@]}" "$REST/v1/services/demo-service/status"
 curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/services/demo-service"
 ```
 
+Both single-service GET routes return `ServiceDetail`: the same complete
+configuration and replica progress snapshot used by `mantissa services inspect`.
+They accept an exact service name or full UUID, including retained stopped
+services. The list and delete routes return the compact `ServiceSummary`.
+
 ## Agents
 
 Submit and inspect durable agent sessions:
@@ -377,7 +382,7 @@ curl -N -sS "${AUTH[@]}" \
 Each line is one JSON event:
 
 ```json
-{"type":"frame","stream":"stdout","data_base64":"dGljaw0K"}
+{ "type": "frame", "stream": "stdout", "data_base64": "dGljaw0K" }
 ```
 
 Decode `data_base64` to recover the original bytes. `stream` is one of
@@ -407,29 +412,29 @@ websocat -H "$WS_AUTH" \
 Client-to-server text frames:
 
 ```json
-{"type":"input","data_base64":"ZWNobyBoaQo="}
+{ "type": "input", "data_base64": "ZWNobyBoaQo=" }
 ```
 
 ```json
-{"type":"close_input"}
+{ "type": "close_input" }
 ```
 
 Server-to-client text frames:
 
 ```json
-{"type":"frame","stream":"stdout","data_base64":"aGkK"}
+{ "type": "frame", "stream": "stdout", "data_base64": "aGkK" }
 ```
 
 ```json
-{"type":"result","has_exit_code":true,"exit_code":0}
+{ "type": "result", "has_exit_code": true, "exit_code": 0 }
 ```
 
 ```json
-{"type":"end"}
+{ "type": "end" }
 ```
 
 ```json
-{"type":"error","message":"task stream session is closed"}
+{ "type": "error", "message": "task stream session is closed" }
 ```
 
 Exec sockets close after both the output stream has ended and the result or

@@ -3322,6 +3322,7 @@ dependencies = [
  "sha2",
  "tabwriter",
  "tempfile",
+ "textwrap",
  "tokio",
  "tokio-rustls",
  "uuid",
@@ -5798,6 +5799,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c13547615a44dc9c452a8a534638acdf07120d4b6847c8178705da06306a3057"
 dependencies = [
  "smawk",
+ "unicode-width",
 ]
 
 [[package]]
