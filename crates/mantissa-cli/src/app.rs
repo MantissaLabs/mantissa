@@ -598,7 +598,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             },
             ServicesCommand::Stop(args) => {
                 local
-                    .run_until(crate::services::stop(&cfg, &args.id))
+                    .run_until(crate::services::stop(&cfg, &args.service))
                     .await?;
             }
         },

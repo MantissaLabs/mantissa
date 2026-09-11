@@ -208,6 +208,45 @@ local_test!(rest_services_delete_deployed_service, {
         panic!("delete failed with status={status}; body={value}");
     }
     assert_eq!(value["service_id"], service_id);
+
+    let (service_id, _value) = deploy_service(&harness, "rest-service-delete-by-id", 250).await;
+    let (status, value) = harness
+        .json_request(
+            Method::DELETE,
+            &format!("/v1/services/{service_id}"),
+            true,
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "delete response body={value}");
+    assert_eq!(value["service_id"], service_id);
+    assert_eq!(value["service_name"], "rest-service-delete-by-id");
+});
+
+local_test!(rest_services_delete_rejects_unknown_or_empty_selector, {
+    let harness = RestTestHarness::new().await;
+
+    for selector in ["missing-service", "00000000-0000-0000-0000-000000000099"] {
+        let (status, value) = harness
+            .json_request(
+                Method::DELETE,
+                &format!("/v1/services/{selector}"),
+                true,
+                None,
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+        assert_eq!(value["code"], "not_found");
+    }
+
+    let (status, value) = harness
+        .json_request(Method::DELETE, "/v1/services/%20", true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["code"], "bad_request");
 });
 
 local_test!(rest_services_reject_invalid_manifest, {

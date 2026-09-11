@@ -1342,9 +1342,9 @@ pub struct ServicesInspectArgs {
 
 #[derive(Args, Debug)]
 pub struct ServicesStopArgs {
-    /// Service ID (UUID)
-    #[arg(index = 1, value_name = "ID")]
-    pub id: String,
+    /// Service name or full UUID
+    #[arg(index = 1, value_name = "SERVICE")]
+    pub service: String,
 }
 
 #[derive(Subcommand, Debug)]

@@ -1,14 +1,12 @@
 use crate::config::ClientConfig;
 use crate::connection;
-use crate::services::list::{ServiceRow, fetch_service_row_by_id};
-use anyhow::{Result, anyhow};
-use uuid::Uuid;
+use crate::services::{inspect, list::ServiceRow};
+use anyhow::{Context, Result};
 
-/// Requests service stop and returns the pre-stop service snapshot.
-pub async fn stop(cfg: &ClientConfig, service_id: &str) -> Result<ServiceRow> {
-    let id = Uuid::parse_str(service_id).map_err(|e| anyhow!("invalid service id: {e}"))?;
-
-    let spec = fetch_service(cfg, id).await?;
+/// Resolves a name or UUID before stopping that service and returning its pre-stop snapshot.
+pub async fn stop(cfg: &ClientConfig, selector: &str) -> Result<ServiceRow> {
+    let inspection = inspect(cfg, selector).await?;
+    let spec = ServiceRow::from_snapshot(inspection.snapshot()?)?;
 
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();
@@ -16,15 +14,13 @@ pub async fn stop(cfg: &ClientConfig, service_id: &str) -> Result<ServiceRow> {
     let mut delete = services.delete_request();
     {
         let mut list = delete.get().init_ids(1);
-        list.set(0, id.as_bytes());
+        list.set(0, spec.service_id.as_bytes());
     }
-    delete.send().promise.await?;
+    delete
+        .send()
+        .promise
+        .await
+        .with_context(|| format!("could not stop service '{}'", spec.service_name))?;
 
     Ok(spec)
-}
-
-async fn fetch_service(cfg: &ClientConfig, id: Uuid) -> Result<ServiceRow> {
-    fetch_service_row_by_id(cfg, id)
-        .await
-        .map_err(|err| anyhow!("unknown service {id}: {err}"))
 }

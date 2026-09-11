@@ -48,6 +48,12 @@ mantissa services inspect my-service
 Add `--details` to include unused settings, exact memory byte counts, and replica
 assignments. The default view keeps status and configured settings easy to scan.
 
+Stop a service and all its replicas by exact name or full UUID:
+
+```sh
+mantissa services stop my-service
+```
+
 Submit a one-shot job:
 
 ```sh

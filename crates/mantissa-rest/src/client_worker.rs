@@ -1658,18 +1658,21 @@ async fn get_service(
     ServiceDetail::from_snapshot(snapshot).map_err(operation_failed_error)
 }
 
-/// Deletes one service through the reusable Mantissa client API.
+/// Shares name and UUID selection with the CLI when requesting service stop.
 async fn delete_service(
     config: &ClientConfig,
     selector: &str,
 ) -> Result<ServiceSummary, ClientWorkerError> {
-    let service = services::list::inspect_service_row(config, selector)
-        .await
-        .map_err(not_found_error)?;
-    services::stop(config, &service.service_id.to_string())
+    services::stop(config, selector)
         .await
         .map(ServiceSummary::from)
-        .map_err(operation_failed_error)
+        .map_err(|error| {
+            error
+                .downcast_ref::<ClientError>()
+                .cloned()
+                .map(ClientWorkerError::from)
+                .unwrap_or_else(|| operation_failed_error(error))
+        })
 }
 
 /// Lists networks through the reusable Mantissa client API.

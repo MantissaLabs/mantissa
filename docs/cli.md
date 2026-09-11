@@ -30,7 +30,8 @@ Common commands:
 - `mantissa services run <manifest>` - deploy a RON service manifest and follow service/task progress
 - `mantissa services run <manifest> --detach` - submit a service deployment and print the service id
 - `mantissa services run <manifest> --timeout 10m` - bound how long progress following waits
-- `mantissa services list|stop ...` - inspect or stop services; autoscaled templates render as `api (3x, auto 2-8)`
+- `mantissa services list` - list services; autoscaled templates render as `api (3x, auto 2-8)`
+- `mantissa services stop <name-or-uuid>` - request a service and all its replicas to stop
 - `mantissa services inspect <name-or-uuid> [--details]` - show service configuration, rollout diagnostics, and replica progress
 - `mantissa volumes create|import|list|inspect|status|restore|delete ...` -
   manage named local and replicated volumes
@@ -47,3 +48,7 @@ For cluster view operations, see `docs/cluster-views-and-operations.md`.
 Workload CPU and memory are required admission fields. Ad hoc task, job, and
 agent commands provide bounded defaults, but manifests and direct API payloads
 must declare non-zero CPU and memory values. GPU requests remain optional.
+
+`services stop` accepts an exact service name or a full UUID, just like
+`services inspect`. It requests an asynchronous stop; use `services inspect`
+to follow progress. Unknown services fail before a stop request is sent.
