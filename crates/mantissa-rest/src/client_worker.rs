@@ -216,9 +216,16 @@ impl ClientWorkerHandle {
             .await
     }
 
-    /// Lists services visible through the local services capability.
-    pub async fn list_services(&self) -> Result<Vec<ServiceSummary>, ClientWorkerError> {
-        self.send(ClientCommand::ListServices).await
+    /// Includes stopped services in the list only when explicitly requested.
+    pub async fn list_services(
+        &self,
+        include_stopped: bool,
+    ) -> Result<Vec<ServiceSummary>, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ListServices {
+            include_stopped,
+            respond_to,
+        })
+        .await
     }
 
     /// Deploys or updates one service from a REST manifest request.
@@ -890,7 +897,10 @@ enum ClientCommand {
         job_id: String,
         respond_to: oneshot::Sender<Result<JobSummary, ClientWorkerError>>,
     },
-    ListServices(oneshot::Sender<Result<Vec<ServiceSummary>, ClientWorkerError>>),
+    ListServices {
+        include_stopped: bool,
+        respond_to: oneshot::Sender<Result<Vec<ServiceSummary>, ClientWorkerError>>,
+    },
     DeployService {
         request: Box<ServiceDeployRequest>,
         respond_to: oneshot::Sender<Result<ServiceDeployResponse, ClientWorkerError>>,
@@ -1157,8 +1167,11 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
             ClientCommand::DeleteJob { job_id, respond_to } => {
                 let _ignored = respond_to.send(delete_job(&config, &job_id).await);
             }
-            ClientCommand::ListServices(respond_to) => {
-                let _ignored = respond_to.send(list_services(&config).await);
+            ClientCommand::ListServices {
+                include_stopped,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(list_services(&config, include_stopped).await);
             }
             ClientCommand::DeployService {
                 request,
@@ -1623,8 +1636,11 @@ async fn delete_job(config: &ClientConfig, job_id: &str) -> Result<JobSummary, C
 }
 
 /// Lists services through the reusable Mantissa client API.
-async fn list_services(config: &ClientConfig) -> Result<Vec<ServiceSummary>, ClientWorkerError> {
-    services::list(config)
+async fn list_services(
+    config: &ClientConfig,
+    include_stopped: bool,
+) -> Result<Vec<ServiceSummary>, ClientWorkerError> {
+    services::list(config, include_stopped)
         .await
         .map(|services| services.into_iter().map(ServiceSummary::from).collect())
         .map_err(operation_failed_error)

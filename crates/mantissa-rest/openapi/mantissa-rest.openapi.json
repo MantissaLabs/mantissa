@@ -10043,8 +10043,20 @@
     },
     "/v1/services": {
       "get": {
-        "description": "Lists services visible to the local daemon.",
+        "description": "Lists services visible to the local daemon. Stopped services are excluded unless include_stopped is true.",
         "operationId": "list",
+        "parameters": [
+          {
+            "description": "Include stopped services. Defaults to false.",
+            "in": "query",
+            "name": "include_stopped",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {

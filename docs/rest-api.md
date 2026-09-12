@@ -301,10 +301,16 @@ List, inspect, and stop services:
 
 ```bash
 curl -sS "${AUTH[@]}" "$REST/v1/services"
+curl -sS "${AUTH[@]}" "$REST/v1/services?include_stopped=true"
 curl -sS "${AUTH[@]}" "$REST/v1/services/demo-service"
 curl -sS "${AUTH[@]}" "$REST/v1/services/demo-service/status"
 curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/services/demo-service"
 ```
+
+Service lists exclude stopped services by default. Set `include_stopped=true`
+to include retained stopped services, matching `mantissa services list --all`.
+The `replica_count` field counts recorded assignments, which remain available
+after stopping.
 
 Both single-service GET routes return `ServiceDetail`: the same complete
 configuration and replica progress snapshot used by `mantissa services inspect`.

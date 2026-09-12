@@ -54,6 +54,11 @@ Stop a service and all its replicas by exact name or full UUID:
 mantissa services stop my-service
 ```
 
+Stopped services are hidden from the default list. Use
+`mantissa services list --all` (or `-a`) to include retained stopped services
+and inspect them by name or UUID. Replica counts reflect recorded assignments,
+including those retained after a stop.
+
 Submit a one-shot job:
 
 ```sh

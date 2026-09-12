@@ -3,8 +3,8 @@
 using Workload = import "workload.capnp";
 
 interface Services {
-  list @0 () -> (services :List(ServiceSpec));
-  # List all services with their current specs.
+  list @0 (includeStopped :Bool = false) -> (services :List(ServiceSpec));
+  # List current service specs, excluding stopped services unless requested.
 
   delete @1 (ids :List(Data)); # Each entry is a 16-byte service UUID
   # Delete services by UUID.

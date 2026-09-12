@@ -1,7 +1,7 @@
 use crate::{
     auth::RestAuth,
     error::RestError,
-    extract::RestJson,
+    extract::{RestJson, RestQuery},
     routes::worker_error_to_rest,
     state::AppState,
     types::services::{ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary},
@@ -10,21 +10,36 @@ use axum::{
     Json,
     extract::{Path, State},
 };
+use serde::Deserialize;
+use utoipa::IntoParams;
+
+/// Controls whether the service list includes stopped records retained for inspection.
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct ServiceListQuery {
+    /// Include stopped services. Defaults to false.
+    #[serde(default)]
+    #[param(default = false)]
+    pub include_stopped: bool,
+}
 
 /// Lists services visible to the local daemon.
 #[utoipa::path(
     get,
     path = "/v1/services",
     tag = "services",
+    params(ServiceListQuery),
     responses((status = 200, description = "Services visible to the local daemon.", body = [ServiceSummary]))
 )]
 pub async fn list(
     State(state): State<AppState>,
     _auth: RestAuth,
+    RestQuery(query): RestQuery<ServiceListQuery>,
 ) -> Result<Json<Vec<ServiceSummary>>, RestError> {
     state
         .client()
-        .list_services()
+        .list_services(query.include_stopped)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

@@ -46,9 +46,9 @@ async fn deploy_service(harness: &RestTestHarness, name: &str, cpu_millis: u64) 
     (service_id, value)
 }
 
-/// Waits for a service deployment to reach the running state.
-async fn wait_for_service_running(harness: &RestTestHarness, name: &str) {
-    let deployed = wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
+/// Waits for service state before checking data that depends on deployment or stop completion.
+async fn wait_for_service_status(harness: &RestTestHarness, name: &str, expected: &str) {
+    let reached = wait_until(Duration::from_secs(5), Duration::from_millis(50), || {
         let rest_harness = harness;
         async move {
             let (status, value) = rest_harness
@@ -59,11 +59,13 @@ async fn wait_for_service_running(harness: &RestTestHarness, name: &str) {
                     None,
                 )
                 .await;
-            status == StatusCode::OK && value["status"] == "running"
+
+            status == StatusCode::OK && value["status"] == expected
         }
     })
     .await;
-    assert!(deployed, "service should finish initial deployment");
+
+    assert!(reached, "service {name} should reach {expected}");
 }
 
 local_test!(rest_services_deploy_returns_accepted_operation, {
@@ -72,6 +74,67 @@ local_test!(rest_services_deploy_returns_accepted_operation, {
     let (_service_id, value) = deploy_service(&harness, "rest-service-deploy", 250).await;
     assert_eq!(value["outcome"], "accepted");
 });
+
+local_test!(rest_services_list_can_include_retained_stopped_services, {
+    let harness = RestTestHarness::new().await;
+    deploy_service(&harness, "active", 250).await;
+    wait_for_service_status(&harness, "active", "running").await;
+
+    let (stopped_id, _) = deploy_service(&harness, "retired", 250).await;
+    wait_for_service_status(&harness, "retired", "running").await;
+
+    let (status, value) = harness
+        .json_request(Method::DELETE, "/v1/services/retired", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "stop response body={value}");
+    wait_for_service_status(&harness, "retired", "stopped").await;
+
+    for path in ["/v1/services", "/v1/services?include_stopped=false"] {
+        let (status, value) = harness.json_request(Method::GET, path, true, None).await;
+
+        assert_eq!(status, StatusCode::OK, "list response body={value}");
+        assert_eq!(value.as_array().expect("service list").len(), 1);
+        assert_eq!(value[0]["service_name"], "active");
+    }
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/services?include_stopped=true", true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "list response body={value}");
+    assert_eq!(value.as_array().expect("service list").len(), 2);
+    assert_eq!(value[0]["service_name"], "active");
+    assert_eq!(value[1]["service_name"], "retired");
+    assert_eq!(value[1]["service_id"], stopped_id);
+    assert_eq!(value[1]["status"], "stopped");
+    assert_eq!(value[1]["public_endpoints"], json!([]));
+
+    // Stopped records keep assignment metadata so their tasks remain discoverable.
+    assert_eq!(value[1]["replica_count"], 1);
+});
+
+local_test!(
+    rest_services_list_validates_query_and_preserves_empty_arrays,
+    {
+        let harness = RestTestHarness::new().await;
+
+        let (status, value) = harness
+            .json_request(Method::GET, "/v1/services?include_stopped=true", true, None)
+            .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, json!([]));
+
+        for query in ["include_stopped=yes", "unknown=true"] {
+            let (status, value) = harness
+                .json_request(Method::GET, &format!("/v1/services?{query}"), true, None)
+                .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+            assert_eq!(value["code"], "bad_request");
+        }
+    }
+);
 
 local_test!(rest_services_list_and_inspect_deployed_service, {
     let harness = RestTestHarness::new().await;
@@ -133,7 +196,7 @@ local_test!(rest_services_list_and_inspect_deployed_service, {
 local_test!(rest_services_status_reports_task_progress, {
     let harness = RestTestHarness::new().await;
     let (service_id, _value) = deploy_service(&harness, "rest-service-status", 250).await;
-    wait_for_service_running(&harness, "rest-service-status").await;
+    wait_for_service_status(&harness, "rest-service-status", "running").await;
 
     let (status, value) = harness
         .json_request(
@@ -175,7 +238,7 @@ local_test!(rest_services_status_reports_task_progress, {
 local_test!(rest_services_redeploy_running_service, {
     let harness = RestTestHarness::new().await;
     let (service_id, _value) = deploy_service(&harness, "rest-service-redeploy", 250).await;
-    wait_for_service_running(&harness, "rest-service-redeploy").await;
+    wait_for_service_status(&harness, "rest-service-redeploy", "running").await;
 
     let (status, value) = harness
         .json_request(

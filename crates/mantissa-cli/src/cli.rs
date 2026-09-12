@@ -1327,7 +1327,11 @@ pub struct ServicesRunArgs {
 }
 
 #[derive(Args, Debug, Default)]
-pub struct ServicesListArgs {}
+pub struct ServicesListArgs {
+    /// Include stopped services
+    #[arg(short = 'a', long)]
+    pub all: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct ServicesInspectArgs {

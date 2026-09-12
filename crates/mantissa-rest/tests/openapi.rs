@@ -73,6 +73,24 @@ fn openapi_spec_documents_complete_service_inspection() {
     );
 }
 
+/// Keeps stopped service visibility optional and disabled by default in API documentation.
+#[test]
+fn openapi_spec_documents_stopped_service_list_option() {
+    let value = openapi::json_value(&server::openapi());
+    let parameters = value["paths"]["/v1/services"]["get"]["parameters"]
+        .as_array()
+        .expect("service list parameters");
+    let include_stopped = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "include_stopped")
+        .expect("stopped services option");
+
+    assert_eq!(include_stopped["in"], "query");
+    assert_eq!(include_stopped["required"], false);
+    assert_eq!(include_stopped["schema"]["type"], "boolean");
+    assert_eq!(include_stopped["schema"]["default"], false);
+}
+
 /// Ensures retaining volume data remains the documented delete default.
 #[test]
 fn openapi_spec_makes_volume_data_deletion_optional() {

@@ -8,12 +8,19 @@ pub use mantissa_client::services::list::{
 use std::io::Write;
 use tabwriter::TabWriter;
 
-/// Fetches and renders the active service list.
-pub async fn list(cfg: &ClientConfig) -> Result<()> {
-    let rows = mantissa_client::services::list(cfg).await?;
+/// Renders active services by default and retained stopped services when requested.
+pub async fn list(cfg: &ClientConfig, include_stopped: bool) -> Result<()> {
+    let rows = mantissa_client::services::list(cfg, include_stopped).await?;
 
     if rows.is_empty() {
-        println!("no services registered");
+        if include_stopped {
+            println!("no services registered");
+        } else {
+            println!(
+                "no active services: use `mantissa services list --all` to include stopped services"
+            );
+        }
+
         return Ok(());
     }
 

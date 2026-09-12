@@ -30,7 +30,7 @@ Common commands:
 - `mantissa services run <manifest>` - deploy a RON service manifest and follow service/task progress
 - `mantissa services run <manifest> --detach` - submit a service deployment and print the service id
 - `mantissa services run <manifest> --timeout 10m` - bound how long progress following waits
-- `mantissa services list` - list services; autoscaled templates render as `api (3x, auto 2-8)`
+- `mantissa services list [--all]` - list services; `--all` (`-a`) includes stopped services, and autoscaled templates render as `api (3x, auto 2-8)`
 - `mantissa services stop <name-or-uuid>` - request a service and all its replicas to stop
 - `mantissa services inspect <name-or-uuid> [--details]` - show service configuration, rollout diagnostics, and replica progress
 - `mantissa volumes create|import|list|inspect|status|restore|delete ...` -

@@ -581,8 +581,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     ))
                     .await?;
             }
-            ServicesCommand::List(_) => {
-                local.run_until(crate::services::list(&cfg)).await?;
+            ServicesCommand::List(args) => {
+                local
+                    .run_until(crate::services::list(&cfg, args.all))
+                    .await?;
             }
             ServicesCommand::Inspect(args) => {
                 local

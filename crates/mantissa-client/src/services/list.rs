@@ -17,19 +17,26 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use uuid::Uuid;
 
-/// Fetches and decodes service specs from the daemon into client-facing rows.
-pub async fn fetch_service_rows(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
+/// Requests filtered service rows so excluded records are not transferred or decoded.
+pub async fn fetch_service_rows(
+    cfg: &ClientConfig,
+    include_stopped: bool,
+) -> Result<Vec<ServiceRow>> {
     let client = connection::get_local_session(cfg).await?;
     let request = client.get_services_request();
     let services = request.send().pipeline.get_services();
-    let response = services.list_request().send().promise.await?;
+
+    let mut request = services.list_request();
+    request.get().set_include_stopped(include_stopped);
+    let response = request.send().promise.await?;
+
     let reader = response.get()?;
     let specs = reader.get_services()?;
-
     let mut rows = Vec::with_capacity(specs.len() as usize);
     for spec in specs.iter() {
         rows.push(ServiceRow::from_reader(spec)?);
     }
+
     Ok(rows)
 }
 
@@ -56,21 +63,14 @@ pub async fn inspect_service_row(cfg: &ClientConfig, selector: &str) -> Result<S
     ServiceRow::from_reader(response.get()?.get_service()?).map_err(Into::into)
 }
 
-pub async fn list(cfg: &ClientConfig) -> Result<Vec<ServiceRow>> {
-    let mut rows = fetch_service_rows(cfg).await?;
-
+/// Returns sorted service rows, optionally including stopped services retained for inspection.
+pub async fn list(cfg: &ClientConfig, include_stopped: bool) -> Result<Vec<ServiceRow>> {
+    let mut rows = fetch_service_rows(cfg, include_stopped).await?;
     rows.sort_by(|a, b| a.service_name.cmp(&b.service_name));
 
-    let mut display_rows: Vec<ServiceRow> = rows
-        .into_iter()
-        .filter(|row| row.status != ServiceStatusRow::Stopped)
-        .collect();
+    attach_public_endpoints(cfg, &mut rows).await;
 
-    if !display_rows.is_empty() {
-        attach_public_endpoints(cfg, &mut display_rows).await;
-    }
-
-    Ok(display_rows)
+    Ok(rows)
 }
 
 #[derive(Clone, Debug)]
@@ -598,9 +598,12 @@ impl ServiceRolloutPhaseRow {
     }
 }
 
-/// Best-effort enrichment that attaches node-local public endpoint targets to service rows.
+/// Attaches public endpoints only to non-stopped services, since node cleanup may still be pending.
 async fn attach_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
-    if !rows.iter().any(|row| row.has_public_template()) {
+    if !rows
+        .iter()
+        .any(|row| row.status != ServiceStatusRow::Stopped && row.has_public_template())
+    {
         return;
     }
 
@@ -617,7 +620,10 @@ async fn attach_public_endpoints(cfg: &ClientConfig, rows: &mut [ServiceRow]) {
             .push(render_public_endpoint(endpoint));
     }
 
-    for row in rows.iter_mut() {
+    for row in rows
+        .iter_mut()
+        .filter(|row| row.status != ServiceStatusRow::Stopped)
+    {
         let Some(endpoints) = endpoints_by_service.get_mut(row.id.as_str()) else {
             continue;
         };

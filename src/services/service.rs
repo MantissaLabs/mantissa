@@ -126,16 +126,21 @@ impl services::Server for ServicesRPC {
         Ok(())
     }
 
-    /// Lists every known service spec for operator-facing table output.
+    /// Includes retained stopped services only when an operator explicitly requests them.
     async fn list(
         self: Rc<Self>,
-        _params: services::ListParams,
+        params: services::ListParams,
         mut results: services::ListResults,
     ) -> Result<(), Error> {
-        let services = self
+        let include_stopped = params.get()?.get_include_stopped();
+        let mut services = self
             .manager
-            .list_services()
+            .registry()
+            .list()
             .map_err(|e| Error::failed(e.to_string()))?;
+        if !include_stopped {
+            services.retain(|service| service.status() != ServiceStatus::Stopped);
+        }
 
         let mut list = results.get().init_services(services.len() as u32);
         for (idx, service) in services.iter().enumerate() {

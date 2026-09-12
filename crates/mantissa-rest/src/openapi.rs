@@ -412,7 +412,7 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         OperationMethod::Get,
         "/v1/services",
         "List services",
-        "Lists services visible to the local daemon.",
+        "Lists services visible to the local daemon. Stopped services are excluded unless include_stopped is true.",
     ),
     (
         OperationMethod::Post,
