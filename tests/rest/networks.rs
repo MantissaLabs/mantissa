@@ -177,18 +177,64 @@ local_test!(rest_networks_delete_overlay_network, {
 
 local_test!(rest_networks_delete_missing_network_returns_not_found, {
     let harness = RestTestHarness::new().await;
-    let missing_network_id = uuid::Uuid::new_v4();
+    create_network(&harness, "rest-network-kept").await;
+
+    for selector in [
+        "00000000-0000-0000-0000-000000000099",
+        "missing",
+        "rest-network",
+        "REST-network-kept",
+    ] {
+        let (status, value) = harness
+            .json_request(
+                Method::DELETE,
+                &format!("/v1/networks/{selector}"),
+                true,
+                None,
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{selector}: {value}");
+        assert_eq!(value["code"], "not_found");
+    }
+});
+
+local_test!(rest_networks_delete_overlay_network_by_name, {
+    let harness = RestTestHarness::new().await;
+    let network_id = create_network(&harness, "rest-network-delete-by-name").await;
+    let kept_id = create_network(&harness, "rest-network-kept").await;
 
     let (status, value) = harness
         .json_request(
             Method::DELETE,
-            &format!("/v1/networks/{missing_network_id}"),
+            "/v1/networks/rest-network-delete-by-name",
             true,
             None,
         )
         .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(value["code"], "not_found");
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value, json!({"deleted": 1}));
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/networks", true, None)
+        .await;
+    let networks = value.as_array().expect("networks response is an array");
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!networks.iter().any(|network| network["id"] == network_id));
+    assert!(networks.iter().any(|network| network["id"] == kept_id));
+});
+
+local_test!(rest_networks_delete_empty_name_returns_bad_request, {
+    let harness = RestTestHarness::new().await;
+
+    let (status, value) = harness
+        .json_request(Method::DELETE, "/v1/networks/%20", true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["code"], "bad_request");
 });
 
 local_test!(rest_networks_delete_attached_network_returns_conflict, {
@@ -197,16 +243,32 @@ local_test!(rest_networks_delete_attached_network_returns_conflict, {
     let network_id = create_network(&harness, network_name).await;
     seed_network_attachment(&harness, &network_id).await;
 
+    for selector in [network_name, &network_id] {
+        let (status, value) = harness
+            .json_request(
+                Method::DELETE,
+                &format!("/v1/networks/{selector}"),
+                true,
+                None,
+            )
+            .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(value["code"], "conflict");
+    }
+
     let (status, value) = harness
-        .json_request(
-            Method::DELETE,
-            &format!("/v1/networks/{network_id}"),
-            true,
-            None,
-        )
+        .json_request(Method::GET, "/v1/networks", true, None)
         .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(value["code"], "conflict");
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        value
+            .as_array()
+            .expect("networks response is an array")
+            .iter()
+            .any(|network| network["id"] == network_id)
+    );
 });
 
 local_test!(rest_networks_reject_invalid_driver_and_network_id, {

@@ -314,13 +314,13 @@ impl ClientWorkerHandle {
         .await
     }
 
-    /// Deletes one overlay network by UUID string.
+    /// Deletes one overlay network by exact name or UUID.
     pub async fn delete_network(
         &self,
-        network_id: String,
+        selector: String,
     ) -> Result<NetworkDeleteResponse, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::DeleteNetwork {
-            network_id,
+            selector,
             respond_to,
         })
         .await
@@ -931,7 +931,7 @@ enum ClientCommand {
         respond_to: oneshot::Sender<Result<Vec<NetworkAttachment>, ClientWorkerError>>,
     },
     DeleteNetwork {
-        network_id: String,
+        selector: String,
         respond_to: oneshot::Sender<Result<NetworkDeleteResponse, ClientWorkerError>>,
     },
     ListIngressPools(oneshot::Sender<Result<Vec<IngressPoolSpec>, ClientWorkerError>>),
@@ -1220,10 +1220,10 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                     respond_to.send(list_network_attachments(&config, &network_id).await);
             }
             ClientCommand::DeleteNetwork {
-                network_id,
+                selector,
                 respond_to,
             } => {
-                let _ignored = respond_to.send(delete_network(&config, network_id).await);
+                let _ignored = respond_to.send(delete_network(&config, selector).await);
             }
             ClientCommand::ListIngressPools(respond_to) => {
                 let _ignored = respond_to.send(list_ingress_pools(&config).await);
@@ -1762,11 +1762,9 @@ async fn list_network_attachments(
 /// Deletes one network through the reusable Mantissa client API.
 async fn delete_network(
     config: &ClientConfig,
-    network_id: String,
+    selector: String,
 ) -> Result<NetworkDeleteResponse, ClientWorkerError> {
-    parse_uuid("network id", &network_id)?;
-    ensure_network_exists(config, &network_id).await?;
-    networks::delete_typed(config, &[network_id])
+    networks::delete_typed(config, &[selector])
         .await
         .map(|deleted| NetworkDeleteResponse { deleted })
         .map_err(ClientWorkerError::from)

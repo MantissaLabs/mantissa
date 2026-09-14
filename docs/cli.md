@@ -33,6 +33,7 @@ Common commands:
 - `mantissa services list [--all]` - list services; `--all` (`-a`) includes stopped services, and autoscaled templates render as `api (3x, auto 2-8)`
 - `mantissa services stop <name-or-uuid>` - request a service and all its replicas to stop
 - `mantissa services inspect <name-or-uuid> [--details]` - show service configuration, rollout diagnostics, and replica progress
+- `mantissa networks delete <name-or-uuid>...` - delete one or more networks
 - `mantissa volumes create|import|list|inspect|status|restore|delete ...` -
   manage named local and replicated volumes
 - `mantissa info` - emit local system and capacity diagnostics

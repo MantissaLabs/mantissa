@@ -8340,11 +8340,11 @@
     },
     "/v1/networks/{network_id}": {
       "delete": {
-        "description": "Deletes one overlay network by UUID string.",
+        "description": "Deletes one overlay network by exact name or UUID.",
         "operationId": "delete",
         "parameters": [
           {
-            "description": "Network UUID string.",
+            "description": "Network UUID string or exact network name.",
             "in": "path",
             "name": "network_id",
             "required": true,

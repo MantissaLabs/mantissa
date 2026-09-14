@@ -1574,9 +1574,9 @@ pub struct NetworksCreateArgs {
 
 #[derive(Args, Debug)]
 pub struct NetworksDeleteArgs {
-    /// Network UUIDs to delete
-    #[arg(index = 1, value_name = "ID", required = true, num_args = 1..)]
-    pub ids: Vec<String>,
+    /// Exact network names or UUIDs to delete
+    #[arg(index = 1, value_name = "NAME-OR-UUID", required = true, num_args = 1..)]
+    pub selectors: Vec<String>,
 }
 
 #[derive(Args, Debug, Default)]

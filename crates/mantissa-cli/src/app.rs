@@ -692,7 +692,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
             }
             NetworksCommand::Delete(args) => {
                 local
-                    .run_until(crate::networks::delete(&cfg, &args.ids))
+                    .run_until(crate::networks::delete(&cfg, &args.selectors))
                     .await?;
             }
             NetworksCommand::List(_) => {

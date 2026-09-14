@@ -460,7 +460,7 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         OperationMethod::Delete,
         "/v1/networks/{network_id}",
         "Delete network",
-        "Deletes one overlay network by UUID string.",
+        "Deletes one overlay network by exact name or UUID.",
     ),
     (
         OperationMethod::Get,

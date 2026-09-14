@@ -117,22 +117,22 @@ pub async fn attachments(
         .map_err(worker_error_to_rest)
 }
 
-/// Deletes one overlay network by UUID string.
+/// Deletes one overlay network by exact name or UUID.
 #[utoipa::path(
     delete,
     path = "/v1/networks/{network_id}",
     tag = "networks",
-    params(("network_id" = String, Path, description = "Network UUID string.")),
+    params(("network_id" = String, Path, description = "Network UUID string or exact network name.")),
     responses((status = 200, description = "Deleted network count.", body = NetworkDeleteResponse))
 )]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: RestAuth,
-    Path(network_id): Path<String>,
+    Path(selector): Path<String>,
 ) -> Result<Json<NetworkDeleteResponse>, RestError> {
     state
         .client()
-        .delete_network(network_id)
+        .delete_network(selector)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

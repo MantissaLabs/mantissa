@@ -470,8 +470,16 @@ curl -sS "${AUTH[@]}" "$REST/v1/networks"
 curl -sS "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID"
 curl -sS "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID/peers"
 curl -sS "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID/attachments"
-curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/networks/$NETWORK_ID"
 ```
+
+Delete a network by exact, case-sensitive name or UUID:
+
+```bash
+curl -sS -X DELETE "${AUTH[@]}" "$REST/v1/networks/demo-overlay"
+```
+
+The response is `{"deleted":1}`. Unknown networks return `404`; networks with
+active workload attachments return `409`.
 
 Create a managed local volume:
 
