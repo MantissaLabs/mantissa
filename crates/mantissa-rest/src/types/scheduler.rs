@@ -71,7 +71,7 @@ impl From<ClientSchedulerSlotDetail> for SchedulerSlotDetail {
         Self {
             slot_id: value.slot_id,
             cpu_millis: value.cpu_millis,
-            memory_mib: value.memory_mib,
+            memory_mib: value.memory_bytes / (1024 * 1024),
             state: debug_variant_label(value.state),
             owner: value.owner.map(|id| id.to_string()),
             task_id: value.task_id.map(|id| id.to_string()),

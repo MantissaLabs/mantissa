@@ -41,7 +41,7 @@ impl From<AgentSubmitResult> for AgentSubmitResponse {
             name: value.name,
             image: value.image,
             cpu_millis: value.cpu_millis,
-            memory_mib: value.memory_mib,
+            memory_mib: value.memory_bytes / (1024 * 1024),
             gpu_count: value.gpu_count,
             execution_platform: value.execution_platform,
             isolation_mode: value.isolation_mode,

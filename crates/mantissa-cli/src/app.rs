@@ -790,10 +790,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                             },
                             binding_mode: binding,
                             reclaim_policy: reclaim,
-                            initial_capacity_bytes: args
-                                .capacity_mb
-                                .map(mantissa_client::volumes::capacity_mb_to_bytes)
-                                .transpose()?,
+                            initial_capacity_bytes: args.capacity_bytes,
                             labels: Vec::new(),
                             node_selector: args.node,
                         },
@@ -808,7 +805,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                         &args.name,
                         &args.node,
                         &args.path.to_string_lossy(),
-                        args.capacity_mb,
+                        args.capacity_bytes,
                         &args.labels,
                     ))
                     .await?;
@@ -836,7 +833,7 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .run_until(crate::volumes::expand(
                         &cfg,
                         &args.selector,
-                        args.capacity_mb,
+                        args.capacity_bytes,
                     ))
                     .await?;
             }

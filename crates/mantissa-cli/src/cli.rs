@@ -1,3 +1,4 @@
+use crate::resources::{parse_bytes, parse_cpu};
 use crate::tasks::{TasksListOutput, TasksListState};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
@@ -681,15 +682,16 @@ pub struct TasksStartArgs {
     #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
     pub command: Vec<String>,
 
-    /// CPU requested in milli-CPUs (e.g. 500 = 0.5 vCPU)
-    #[arg(long = "cpu-millis", value_name = "MCPU", default_value = "1000")]
+    /// CPU requested in cores (0.5, 2) or millicores (500m)
+    #[arg(long = "cpu", value_name = "QUANTITY", default_value = "1", value_parser = parse_cpu)]
     pub cpu_millis: u64,
 
-    /// Memory requested in bytes
+    /// Memory requested in bytes or with a unit (512MiB, 1GiB, 500MB)
     #[arg(
-        long = "memory-bytes",
-        value_name = "BYTES",
-        default_value = "536870912"
+        long = "memory",
+        value_name = "QUANTITY",
+        value_parser = parse_bytes,
+        default_value = "512MiB"
     )]
     pub memory_bytes: u64,
 
@@ -741,14 +743,15 @@ pub struct JobsRunArgs {
     #[arg(long = "tty", action = ArgAction::SetTrue, conflicts_with = "manifest")]
     pub tty: bool,
 
-    /// CPU requested in milli-CPUs (e.g. 500 = 0.5 vCPU)
-    #[arg(long = "cpu-millis", value_name = "MCPU", conflicts_with = "manifest")]
+    /// CPU requested in cores (0.5, 2) or millicores (500m)
+    #[arg(long = "cpu", value_name = "QUANTITY", value_parser = parse_cpu, conflicts_with = "manifest")]
     pub cpu_millis: Option<u64>,
 
-    /// Memory requested in bytes
+    /// Memory requested in bytes or with a unit (512MiB, 1GiB, 500MB)
     #[arg(
-        long = "memory-bytes",
-        value_name = "BYTES",
+        long = "memory",
+        value_name = "QUANTITY",
+        value_parser = parse_bytes,
         conflicts_with = "manifest"
     )]
     pub memory_bytes: Option<u64>,
@@ -958,15 +961,16 @@ pub struct AgentsSubmitArgs {
     #[arg(long = "tty", action = ArgAction::SetTrue)]
     pub tty: bool,
 
-    /// CPU requested in milli-CPUs (e.g. 500 = 0.5 vCPU)
-    #[arg(long = "cpu-millis", value_name = "MCPU", default_value = "1000")]
+    /// CPU requested in cores (0.5, 2) or millicores (500m)
+    #[arg(long = "cpu", value_name = "QUANTITY", default_value = "1", value_parser = parse_cpu)]
     pub cpu_millis: u64,
 
-    /// Memory requested in bytes
+    /// Memory requested in bytes or with a unit (512MiB, 1GiB, 500MB)
     #[arg(
-        long = "memory-bytes",
-        value_name = "BYTES",
-        default_value = "536870912"
+        long = "memory",
+        value_name = "QUANTITY",
+        value_parser = parse_bytes,
+        default_value = "512MiB"
     )]
     pub memory_bytes: u64,
 
@@ -1681,9 +1685,9 @@ pub struct VolumesCreateArgs {
     #[arg(long = "reclaim", value_enum, default_value = "retain")]
     pub reclaim: VolumeReclaimOpt,
 
-    /// Optional capacity hint in MiB
-    #[arg(long = "capacity-mb", value_name = "MIB")]
-    pub capacity_mb: Option<u64>,
+    /// Optional capacity hint in bytes or with a unit (1GiB, 10GB)
+    #[arg(long = "capacity", value_name = "QUANTITY", value_parser = parse_bytes)]
+    pub capacity_bytes: Option<u64>,
 
     /// Optional labels in KEY=VALUE form (repeat flag to add multiple labels)
     #[arg(long = "label", value_name = "KEY=VALUE", action = ArgAction::Append)]
@@ -1708,9 +1712,9 @@ pub struct VolumesImportArgs {
     #[arg(long = "path", value_name = "PATH")]
     pub path: PathBuf,
 
-    /// Optional capacity hint in MiB
-    #[arg(long = "capacity-mb", value_name = "MIB")]
-    pub capacity_mb: Option<u64>,
+    /// Optional capacity hint in bytes or with a unit (1GiB, 10GB)
+    #[arg(long = "capacity", value_name = "QUANTITY", value_parser = parse_bytes)]
+    pub capacity_bytes: Option<u64>,
 
     /// Optional labels in KEY=VALUE form (repeat flag to add multiple labels)
     #[arg(long = "label", value_name = "KEY=VALUE", action = ArgAction::Append)]
@@ -1744,9 +1748,9 @@ pub struct VolumesExpandArgs {
     #[arg(index = 1, value_name = "ID-OR-NAME")]
     pub selector: String,
 
-    /// New total capacity in MiB, not the number of MiB to add
-    #[arg(long = "capacity-mb", value_name = "MIB")]
-    pub capacity_mb: u64,
+    /// New total capacity in bytes or with a unit (20GiB)
+    #[arg(long = "capacity", value_name = "QUANTITY", value_parser = parse_bytes)]
+    pub capacity_bytes: u64,
 }
 
 #[derive(Args, Debug)]
@@ -2246,11 +2250,123 @@ mod tests {
         assert!(MantissaCli::try_parse_from(["mantissa", "ingress", "pools", "list"]).is_err());
     }
 
+    /// All ad hoc workload commands convert readable quantities to the same client units.
+    #[test]
+    fn workload_resource_quantities_parse_consistently() {
+        for (group, command) in [("tasks", "start"), ("jobs", "run"), ("agents", "submit")] {
+            let parsed = MantissaCli::try_parse_from([
+                "mantissa",
+                group,
+                command,
+                "demo",
+                "--image",
+                "alpine:3.20",
+                "--cpu",
+                "1.25",
+                "--memory",
+                "512KiB",
+            ])
+            .unwrap();
+
+            let quantities = match parsed.cmd {
+                Command::Tasks {
+                    cmd: TasksCommand::Start(args),
+                } => (args.cpu_millis, args.memory_bytes),
+                Command::Jobs {
+                    cmd: JobsCommand::Run(args),
+                } => (args.cpu_millis.unwrap(), args.memory_bytes.unwrap()),
+                Command::Agents {
+                    cmd: AgentsCommand::Submit(args),
+                } => (args.cpu_millis, args.memory_bytes),
+                _ => panic!("unexpected workload command"),
+            };
+
+            assert_eq!(quantities, (1250, 512 << 10));
+        }
+    }
+
+    /// Renaming flags must preserve default requests and the separation from manifest resources.
+    #[test]
+    fn workload_resource_defaults_and_manifest_conflicts_are_preserved() {
+        for (group, command) in [("tasks", "start"), ("jobs", "run"), ("agents", "submit")] {
+            let parsed = MantissaCli::try_parse_from([
+                "mantissa",
+                group,
+                command,
+                "demo",
+                "--image",
+                "alpine:3.20",
+            ])
+            .unwrap();
+
+            match parsed.cmd {
+                Command::Tasks {
+                    cmd: TasksCommand::Start(args),
+                } => {
+                    assert_eq!((args.cpu_millis, args.memory_bytes), (1000, 512 << 20));
+                }
+                Command::Jobs {
+                    cmd: JobsCommand::Run(args),
+                } => {
+                    assert_eq!((args.cpu_millis, args.memory_bytes), (None, None));
+                }
+                Command::Agents {
+                    cmd: AgentsCommand::Submit(args),
+                } => {
+                    assert_eq!((args.cpu_millis, args.memory_bytes), (1000, 512 << 20));
+                }
+                _ => panic!("unexpected workload command"),
+            }
+        }
+
+        for (flag, value) in [("--cpu", "500m"), ("--memory", "1GiB")] {
+            let parsed = MantissaCli::try_parse_from([
+                "mantissa", "jobs", "run", "--file", "job.ron", flag, value,
+            ]);
+
+            assert_eq!(
+                parsed.unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
+    }
+
+    /// Imported volume capacity uses the same byte parser as create and expand.
+    #[test]
+    fn volume_import_parses_capacity_units() {
+        let parsed = MantissaCli::try_parse_from([
+            "mantissa",
+            "volumes",
+            "import",
+            "--name",
+            "data",
+            "--node",
+            "local",
+            "--path",
+            "/data",
+            "--capacity",
+            "1.5GiB",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            parsed.cmd,
+            Command::Volumes {
+                cmd: VolumesCommand::Import(VolumesImportArgs {
+                    capacity_bytes: Some(1610612736),
+                    ..
+                })
+            }
+        ));
+    }
+
+    /// Create preserves the local default and accepts binary capacity units for replicated volumes.
     #[test]
     fn volume_create_driver_defaults_to_local_and_accepts_replicated() {
         let local =
             MantissaCli::try_parse_from(["mantissa", "volumes", "create", "--name", "data"])
                 .unwrap();
+
         assert!(matches!(
             local.cmd,
             Command::Volumes {
@@ -2269,19 +2385,20 @@ mod tests {
             "data",
             "--driver",
             "replicated",
-            "--capacity-mb",
-            "300",
+            "--capacity",
+            "300MiB",
             "--filesystem",
             "xfs",
         ])
         .unwrap();
+
         assert!(matches!(
             replicated.cmd,
             Command::Volumes {
                 cmd: VolumesCommand::Create(VolumesCreateArgs {
                     driver: VolumeDriverOpt::Replicated,
                     filesystem: ReplicatedVolumeFilesystemOpt::Xfs,
-                    capacity_mb: Some(300),
+                    capacity_bytes: Some(314572800),
                     ..
                 })
             }
@@ -2292,6 +2409,7 @@ mod tests {
     fn volume_restore_and_permanent_delete_parse() {
         let restore =
             MantissaCli::try_parse_from(["mantissa", "volumes", "restore", "database"]).unwrap();
+
         assert!(matches!(
             restore.cmd,
             Command::Volumes {
@@ -2307,6 +2425,7 @@ mod tests {
             "--delete-data",
         ])
         .unwrap();
+
         assert!(matches!(
             delete.cmd,
             Command::Volumes {
@@ -2318,7 +2437,7 @@ mod tests {
         ));
     }
 
-    /// Volume expansion takes one new total in MiB rather than an increment.
+    /// Volume expansion converts the requested total to bytes before dispatch.
     #[test]
     fn volume_expand_parses_the_target_total() {
         let expand = MantissaCli::try_parse_from([
@@ -2326,16 +2445,17 @@ mod tests {
             "volumes",
             "expand",
             "database",
-            "--capacity-mb",
-            "20480",
+            "--capacity",
+            "20GiB",
         ])
         .unwrap();
+
         assert!(matches!(
             expand.cmd,
             Command::Volumes {
                 cmd: VolumesCommand::Expand(VolumesExpandArgs {
                     selector,
-                    capacity_mb: 20480,
+                    capacity_bytes: 21474836480,
                 })
             } if selector == "database"
         ));

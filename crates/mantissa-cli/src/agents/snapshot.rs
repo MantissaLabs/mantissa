@@ -1,3 +1,4 @@
+use crate::resources::{format_bytes, format_cpu};
 use anyhow::Result;
 use mantissa_client::agents::snapshot::{
     AgentSessionDetailView, AgentSessionSnapshotView, AgentVolumeMountView,
@@ -78,6 +79,7 @@ pub fn render_agent_snapshot(snapshot: &AgentSessionSnapshotView) -> Result<Stri
         "status detail\t{}",
         snapshot.status_detail.as_deref().unwrap_or("-")
     )?;
+
     writeln!(&mut tw, "image\t{}", snapshot.image)?;
     writeln!(
         &mut tw,
@@ -88,9 +90,11 @@ pub fn render_agent_snapshot(snapshot: &AgentSessionSnapshotView) -> Result<Stri
             snapshot.command.join(" ")
         }
     )?;
-    writeln!(&mut tw, "cpu (m)\t{}", snapshot.cpu_millis)?;
-    writeln!(&mut tw, "memory (bytes)\t{}", snapshot.memory_bytes)?;
+
+    writeln!(&mut tw, "cpu\t{}", format_cpu(snapshot.cpu_millis))?;
+    writeln!(&mut tw, "memory\t{}", format_bytes(snapshot.memory_bytes))?;
     writeln!(&mut tw, "gpu count\t{}", snapshot.gpu_count)?;
+
     writeln!(
         &mut tw,
         "execution platform\t{}",
@@ -104,6 +108,7 @@ pub fn render_agent_snapshot(snapshot: &AgentSessionSnapshotView) -> Result<Stri
             |profile| format!("{} ({profile})", snapshot.isolation_mode),
         )
     )?;
+
     writeln!(
         &mut tw,
         "active run id\t{}",
@@ -207,8 +212,10 @@ pub fn render_agent_snapshot(snapshot: &AgentSessionSnapshotView) -> Result<Stri
         "liveness\t{}",
         snapshot.liveness.as_deref().unwrap_or("-")
     )?;
+
     writeln!(&mut tw, "created at\t{}", snapshot.created_at)?;
     writeln!(&mut tw, "updated at\t{}", snapshot.updated_at)?;
+
     tw.flush()?;
     Ok(String::from_utf8(tw.into_inner()?)?)
 }

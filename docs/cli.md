@@ -49,6 +49,28 @@ Workload CPU and memory are required admission fields. Ad hoc task, job, and
 agent commands provide bounded defaults, but manifests and direct API payloads
 must declare non-zero CPU and memory values. GPU requests remain optional.
 
+Use `--cpu` and `--memory` to set resource quantities on `tasks start`,
+`jobs run`, and `agents submit`:
+
+```sh
+mantissa tasks start demo --image alpine:3.20 --cpu 500m --memory 512MiB
+mantissa volumes create --name data --capacity 10GiB
+```
+
+CPU accepts cores (`0.5`, `2`) or millicores (`500m`). Memory and volume
+`--capacity` accept bytes without a suffix, decimal units (`MB`, `GB`), or
+binary units (`MiB`, `GiB`; `Mi` and `Gi` also work). Units are case-sensitive:
+`1GB` is 1,000,000,000 bytes and `1GiB` is 1,073,741,824 bytes. Decimal fractions
+such as `1.5GiB` are accepted when they resolve to whole bytes. Quantities must
+be positive and resolve to whole bytes or millicores; invalid or overflowing
+values fail before submission. Volume expansion takes the new total capacity.
+
+These flags replace `--cpu-millis`, `--memory-bytes`, and `--capacity-mb`.
+Manifests and REST payloads keep their existing numeric fields and units.
+CLI output uses millicores below one CPU, cores for larger requests, and
+binary memory and storage units such as `512 MiB` and `1.5 GiB`. Byte displays
+are rounded to one decimal place when needed.
+
 `services stop` accepts an exact service name or a full UUID, just like
 `services inspect`. It requests an asynchronous stop; use `services inspect`
 to follow progress. Unknown services fail before a stop request is sent.

@@ -29,7 +29,7 @@ impl From<TaskRow> for TaskSummary {
             image: value.image,
             slot: value.slot,
             cpu_millis: value.cpu_millis,
-            memory_mib: value.memory_mib,
+            memory_mib: value.memory_bytes / (1024 * 1024),
             gpu_count: value.gpu_count,
             command: value.command,
             node: value.node,

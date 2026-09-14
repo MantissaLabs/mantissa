@@ -1,4 +1,5 @@
 use crate::output;
+use crate::resources::{format_bytes, format_cpu};
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use mantissa_client::scheduler::{SchedulerGpuState, SchedulerSlotState};
@@ -51,19 +52,20 @@ fn render_slot_details(slots: &[mantissa_client::scheduler::SchedulerSlotDetail]
     }
 
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "SLOT\tCPU(m)\tMEM(MiB)\tSTATE\tOWNER\tTASK")?;
+    writeln!(&mut tw, "SLOT\tCPU\tMEMORY\tSTATE\tOWNER\tTASK")?;
     for detail in slots {
         writeln!(
             &mut tw,
             "{}\t{}\t{}\t{}\t{}\t{}",
             detail.slot_id,
-            detail.cpu_millis,
-            detail.memory_mib,
+            format_cpu(detail.cpu_millis),
+            format_bytes(detail.memory_bytes),
             slot_state_label(detail.state),
             optional_uuid(detail.owner),
             optional_uuid(detail.task_id),
         )?;
     }
+
     tw.flush()?;
     let output = String::from_utf8(tw.into_inner()?)?;
     output::emit_block(format!("\nSlot Details:\n{output}"));
@@ -78,20 +80,20 @@ fn render_gpu_details(gpus: &[mantissa_client::scheduler::SchedulerGpuDetail]) -
     }
 
     let mut tw = TabWriter::new(Vec::new());
-    writeln!(&mut tw, "GPU_ID\tNAME\tMEM(GiB)\tSTATE\tOWNER\tTASK")?;
+    writeln!(&mut tw, "GPU_ID\tNAME\tMEMORY\tSTATE\tOWNER\tTASK")?;
     for device in gpus {
-        let mem_gib = device.memory_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         writeln!(
             &mut tw,
-            "{}\t{}\t{:.2}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             device.device_id,
             device.name,
-            mem_gib,
+            format_bytes(device.memory_total_bytes),
             gpu_state_label(device.state),
             optional_uuid(device.owner),
             optional_uuid(device.task_id),
         )?;
     }
+
     tw.flush()?;
     let output = String::from_utf8(tw.into_inner()?)?;
     output::emit_block(format!("\nGPU Devices:\n{output}"));

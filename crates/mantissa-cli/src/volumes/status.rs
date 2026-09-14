@@ -1,8 +1,6 @@
 use crate::output;
-use crate::volumes::{
-    format_bytes,
-    inspect::{format_bound_node, format_task_ids, render_replication},
-};
+use crate::resources::format_optional_bytes;
+use crate::volumes::inspect::{format_bound_node, format_task_ids, render_replication};
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use mantissa_client::volumes::VolumeInspect;
@@ -38,18 +36,18 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
         writeln!(
             &mut rendered,
             "  Initial capacity: {}",
-            format_bytes(volume.spec.initial_capacity_bytes)
+            format_optional_bytes(volume.spec.initial_capacity_bytes)
         )?;
         writeln!(
             &mut rendered,
             "  Desired capacity: {}",
-            format_bytes(volume.desired_capacity_bytes)
+            format_optional_bytes(volume.desired_capacity_bytes)
         )?;
     } else {
         writeln!(
             &mut rendered,
             "  Capacity: {}",
-            format_bytes(volume.spec.initial_capacity_bytes)
+            format_optional_bytes(volume.spec.initial_capacity_bytes)
         )?;
     }
     writeln!(
@@ -77,22 +75,22 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
             writeln!(
                 &mut rendered,
                 "      Reserved capacity: {}",
-                format_bytes(state.reserved_capacity_bytes)
+                format_optional_bytes(state.reserved_capacity_bytes)
             )?;
             writeln!(
                 &mut rendered,
                 "      Prepared capacity: {}",
-                format_bytes(state.prepared_capacity_bytes)
+                format_optional_bytes(state.prepared_capacity_bytes)
             )?;
             writeln!(
                 &mut rendered,
                 "      Served capacity: {}",
-                format_bytes(state.served_capacity_bytes)
+                format_optional_bytes(state.served_capacity_bytes)
             )?;
             writeln!(
                 &mut rendered,
                 "      Device capacity: {}",
-                format_bytes(state.device_capacity_bytes)
+                format_optional_bytes(state.device_capacity_bytes)
             )?;
             writeln!(
                 &mut rendered,
@@ -102,7 +100,7 @@ fn render_status(volume: &VolumeInspect) -> Result<String> {
             writeln!(
                 &mut rendered,
                 "      Used: {}",
-                format_bytes(state.used_bytes)
+                format_optional_bytes(state.used_bytes)
             )?;
             writeln!(
                 &mut rendered,

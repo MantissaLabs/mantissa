@@ -14,6 +14,7 @@ mod jobs;
 mod networks;
 mod nodes;
 mod output;
+mod resources;
 mod rest;
 mod scheduler;
 mod secrets;

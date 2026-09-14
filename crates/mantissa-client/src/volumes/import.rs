@@ -52,15 +52,16 @@ pub async fn import(
     name: &str,
     node_selector: &str,
     path: &str,
-    capacity_mb: Option<u64>,
+    capacity_bytes: Option<u64>,
     labels: &[String],
 ) -> Result<VolumeSpec> {
     let request = VolumeImportRequest {
         name: name.to_string(),
         node_selector: node_selector.to_string(),
         path: path.to_string(),
-        initial_capacity_bytes: capacity_mb.map(super::capacity_mb_to_bytes).transpose()?,
+        initial_capacity_bytes: capacity_bytes,
         labels: parse_volume_labels(labels)?,
     };
+
     import_with_request(cfg, &request).await
 }

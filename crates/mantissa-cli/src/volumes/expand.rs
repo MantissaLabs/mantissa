@@ -1,12 +1,12 @@
-use super::format_bytes;
 use crate::output;
+use crate::resources::format_bytes;
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 
 /// Saves one larger desired total and reports the current replicated capacity.
-pub async fn expand(cfg: &ClientConfig, selector: &str, capacity_mb: u64) -> Result<()> {
-    let target_capacity_bytes = mantissa_client::volumes::capacity_mb_to_bytes(capacity_mb)?;
+pub async fn expand(cfg: &ClientConfig, selector: &str, target_capacity_bytes: u64) -> Result<()> {
     let result = mantissa_client::volumes::expand(cfg, selector, target_capacity_bytes).await?;
+
     output::emit_line(expand_result_message(selector, result));
     output::emit_line(format!(
         "Use `mantissa volumes inspect {selector}` to follow progress."
@@ -19,8 +19,8 @@ fn expand_result_message(
     selector: &str,
     result: mantissa_client::volumes::VolumeExpandResult,
 ) -> String {
-    let replicated = format_bytes(Some(result.replicated_capacity_bytes));
-    let desired = format_bytes(Some(result.desired_capacity_bytes));
+    let replicated = format_bytes(result.replicated_capacity_bytes);
+    let desired = format_bytes(result.desired_capacity_bytes);
     match (
         result.desired_capacity_changed,
         result.desired_capacity_bytes > result.replicated_capacity_bytes,

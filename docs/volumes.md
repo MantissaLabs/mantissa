@@ -43,7 +43,7 @@ Create a managed local volume:
 ```bash
 mantissa volumes create \
   --name cache \
-  --capacity-mb 1024
+  --capacity 1GiB
 ```
 
 Create a replicated volume:
@@ -53,7 +53,7 @@ mantissa volumes create \
   --name dbdata \
   --driver replicated \
   --filesystem xfs \
-  --capacity-mb 10240
+  --capacity 10GiB
 ```
 
 Import an existing path from one node:

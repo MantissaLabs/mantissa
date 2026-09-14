@@ -8,12 +8,13 @@ pub async fn import(
     name: &str,
     node_selector: &str,
     path: &str,
-    capacity_mb: Option<u64>,
+    capacity_bytes: Option<u64>,
     labels: &[String],
 ) -> Result<()> {
     let volume =
-        mantissa_client::volumes::import(cfg, name, node_selector, path, capacity_mb, labels)
+        mantissa_client::volumes::import(cfg, name, node_selector, path, capacity_bytes, labels)
             .await?;
+
     output::emit_line(format!(
         "volume '{}' imported with id {} on {}",
         volume.name,

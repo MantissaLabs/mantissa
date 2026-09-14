@@ -90,8 +90,8 @@ Notes:
 ```bash
 mantissa tasks start my-task \
   --image ghcr.io/org/app:latest \
-  --cpu-millis 1000 \
-  --memory-bytes 1073741824 \
+  --cpu 1 \
+  --memory 1GiB \
   --gpu-count 1
 ```
 

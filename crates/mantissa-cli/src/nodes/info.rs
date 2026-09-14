@@ -1,3 +1,4 @@
+use crate::resources::format_bytes;
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use mantissa_client::nodes::info::PacketCountersView;
@@ -457,25 +458,6 @@ fn format_cache_kib(kib: u64) -> String {
     }
 }
 
-/// Renders a byte count using IEC units with compact Docker-info-style suffixes.
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-
-    if bytes < 1024 {
-        return format!("{bytes}B");
-    }
-
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-
-    let formatted = format!("{value:.1}");
-    format!("{}{}", formatted.trim_end_matches(".0"), UNITS[unit])
-}
-
 /// Renders non-zero NodePort ingress drop reasons for operator diagnostics.
 fn nodeport_drop_reason_fields(reasons: &NodePortIngressDropReasonsView) -> Vec<(&str, u64)> {
     let mut fields = Vec::new();
@@ -681,10 +663,10 @@ mod tests {
     fn render_info_formats_capacity_units() {
         let rendered = render_info(&sample_info());
 
-        assert!(rendered.contains("Memory:\n  total: 31.3GiB\n"));
-        assert!(rendered.contains("  available: 30.4GiB\n"));
-        assert!(rendered.contains("Disk:\n  total: 230.4TiB\n"));
-        assert!(rendered.contains("  l2_cache: 256KiB\n"));
+        assert!(rendered.contains("Memory:\n  total: 31.3 GiB\n"));
+        assert!(rendered.contains("  available: 30.4 GiB\n"));
+        assert!(rendered.contains("Disk:\n  total: 230.4 TiB\n"));
+        assert!(rendered.contains("  l2_cache: 256 KiB\n"));
         assert!(!rendered.contains("Memory (Kb)"));
         assert!(!rendered.contains("Disk (Kb)"));
     }
@@ -699,7 +681,7 @@ mod tests {
         assert!(rendered.contains("  Load Balancer:\n"));
         assert!(!rendered.contains("\nNodePort:\n"));
         assert!(!rendered.contains("\nLoad Balancer:\n"));
-        assert!(rendered.contains("    ingress:\n      packets: 0\n      bytes: 1KiB\n"));
+        assert!(rendered.contains("    ingress:\n      packets: 0\n      bytes: 1 KiB\n"));
         assert!(rendered.contains("    ingress_drop_reasons:\n      invalid_ipv4_headers: 2\n"));
         assert!(rendered.contains("    flow_diagnostics:\n      flow_pairs: 3\n"));
         assert!(rendered.contains("      return_path_bypass_packets: 9\n"));

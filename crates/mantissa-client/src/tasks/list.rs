@@ -14,7 +14,7 @@ pub struct TaskRow {
     pub image: String,
     pub slot: String,
     pub cpu_millis: u64,
-    pub memory_mib: u64,
+    pub memory_bytes: u64,
     pub gpu_count: u32,
     pub command: String,
     pub node: String,
@@ -62,7 +62,7 @@ impl TaskRow {
             image,
             slot,
             cpu_millis: spec.get_cpu_millis(),
-            memory_mib: spec.get_memory_bytes() / (1024 * 1024),
+            memory_bytes: spec.get_memory_bytes(),
             gpu_count: spec.get_gpu_count(),
             command: if command.is_empty() {
                 "-".to_string()

@@ -27,7 +27,7 @@ pub struct SchedulerSlotsSummary {
 pub struct SchedulerSlotDetail {
     pub slot_id: u64,
     pub cpu_millis: u64,
-    pub memory_mib: u64,
+    pub memory_bytes: u64,
     pub state: SchedulerSlotState,
     pub owner: Option<Uuid>,
     pub task_id: Option<Uuid>,
@@ -100,7 +100,7 @@ pub async fn slots(
         slots.push(SchedulerSlotDetail {
             slot_id: detail.get_slot_id(),
             cpu_millis: detail.get_cpu_millis(),
-            memory_mib: detail.get_memory_bytes() / (1024 * 1024),
+            memory_bytes: detail.get_memory_bytes(),
             state: match detail.get_state()? {
                 scheduling::SlotState::Free => SchedulerSlotState::Free,
                 scheduling::SlotState::Reserved => SchedulerSlotState::Reserved,

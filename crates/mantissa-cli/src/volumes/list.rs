@@ -1,5 +1,5 @@
 use crate::output;
-use crate::volumes::format_bytes;
+use crate::resources::format_optional_bytes;
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use std::io::Write;
@@ -30,7 +30,7 @@ pub async fn list(cfg: &ClientConfig) -> Result<()> {
             volume.binding_mode,
             volume.bound_node_name.unwrap_or_else(|| "-".to_string()),
             volume.state,
-            format_bytes(volume.initial_capacity_bytes),
+            format_optional_bytes(volume.initial_capacity_bytes),
             if volume.in_use { "yes" } else { "no" },
             volume.reclaim_policy,
             volume.reason.unwrap_or_else(|| "-".to_string()),

@@ -1,5 +1,5 @@
 use crate::output;
-use crate::volumes::format_bytes;
+use crate::resources::{format_bytes, format_optional_bytes};
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use mantissa_client::volumes::VolumeInspect;
@@ -51,17 +51,17 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         writeln!(
             &mut rendered,
             "    Initial: {}",
-            format_bytes(volume.spec.initial_capacity_bytes)
+            format_optional_bytes(volume.spec.initial_capacity_bytes)
         )?;
         writeln!(
             &mut rendered,
             "    Desired: {}",
-            format_bytes(volume.desired_capacity_bytes)
+            format_optional_bytes(volume.desired_capacity_bytes)
         )?;
         writeln!(
             &mut rendered,
             "    Replicated: {}",
-            format_bytes(
+            format_optional_bytes(
                 volume
                     .group_status
                     .as_ref()
@@ -76,7 +76,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
             Some((state, bytes)) => writeln!(
                 &mut rendered,
                 "    Device: {} on {}",
-                format_bytes(Some(bytes)),
+                format_bytes(bytes),
                 state.node_name
             )?,
             None => writeln!(&mut rendered, "    Device: -")?,
@@ -85,7 +85,7 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         writeln!(
             &mut rendered,
             "  Capacity: {}",
-            format_bytes(volume.spec.initial_capacity_bytes)
+            format_optional_bytes(volume.spec.initial_capacity_bytes)
         )?;
     }
     if let Some(space) = volume.filesystem_space {
@@ -94,17 +94,17 @@ pub(super) fn render_inspect(volume: &VolumeInspect) -> Result<String> {
         writeln!(
             &mut rendered,
             "    Total capacity: {}",
-            format_bytes(Some(space.total_bytes))
+            format_bytes(space.total_bytes)
         )?;
         writeln!(
             &mut rendered,
             "    Used capacity: {}",
-            format_bytes(Some(space.used_bytes))
+            format_bytes(space.used_bytes)
         )?;
         writeln!(
             &mut rendered,
             "    Available capacity: {}",
-            format_bytes(Some(space.available_bytes))
+            format_bytes(space.available_bytes)
         )?;
     } else if matches!(
         volume.spec.driver,

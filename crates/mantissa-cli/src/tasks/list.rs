@@ -1,5 +1,6 @@
 use crate::host_ports::render_host_ports;
 use crate::output;
+use crate::resources::{format_bytes, format_cpu};
 use anyhow::Result;
 use mantissa_client::config::ClientConfig;
 use mantissa_client::tasks::TaskRow;
@@ -59,13 +60,13 @@ pub async fn list(
         TasksListOutput::Table => {
             writeln!(
                 &mut tw,
-                "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATUS\tNODE\tHOST PORTS"
+                "ID\tNAME\tIMAGE\tSLOT\tCPU\tMEMORY\tGPU\tSTATUS\tNODE\tHOST PORTS"
             )?;
         }
         TasksListOutput::Wide => {
             writeln!(
                 &mut tw,
-                "ID\tNAME\tIMAGE\tSLOT\tCPU(m)\tMEM(MiB)\tGPU\tSTATUS\tNODE\tHOST PORTS\tCREATED\tCOMMAND"
+                "ID\tNAME\tIMAGE\tSLOT\tCPU\tMEMORY\tGPU\tSTATUS\tNODE\tHOST PORTS\tCREATED\tCOMMAND"
             )?;
         }
     }
@@ -81,8 +82,8 @@ pub async fn list(
                     rendered.name,
                     rendered.image,
                     rendered.slot,
-                    rendered.cpu_millis,
-                    rendered.memory_mib,
+                    rendered.cpu,
+                    rendered.memory,
                     rendered.gpu_count,
                     rendered.state,
                     rendered.node,
@@ -97,8 +98,8 @@ pub async fn list(
                     rendered.name,
                     rendered.image,
                     rendered.slot,
-                    rendered.cpu_millis,
-                    rendered.memory_mib,
+                    rendered.cpu,
+                    rendered.memory,
                     rendered.gpu_count,
                     rendered.state,
                     rendered.node,
@@ -122,8 +123,8 @@ struct RenderedTaskRow {
     name: String,
     image: String,
     slot: String,
-    cpu_millis: u64,
-    memory_mib: u64,
+    cpu: String,
+    memory: String,
     gpu_count: u32,
     command: String,
     node: String,
@@ -139,8 +140,8 @@ fn render_task_row(row: &TaskRow, no_trunc: bool) -> RenderedTaskRow {
         name: truncate_field(&row.name, TASK_NAME_MAX_CHARS, no_trunc),
         image: truncate_field(&row.image, IMAGE_MAX_CHARS, no_trunc),
         slot: truncate_field(&row.slot, SLOT_MAX_CHARS, no_trunc),
-        cpu_millis: row.cpu_millis,
-        memory_mib: row.memory_mib,
+        cpu: format_cpu(row.cpu_millis),
+        memory: format_bytes(row.memory_bytes),
         gpu_count: row.gpu_count,
         command: truncate_field(&row.command, COMMAND_MAX_CHARS, no_trunc),
         node: truncate_field(&row.node, NODE_MAX_CHARS, no_trunc),

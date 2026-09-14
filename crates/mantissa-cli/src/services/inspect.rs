@@ -1,4 +1,5 @@
 use super::rollout::rollout_phase_label;
+use crate::resources::{format_bytes, format_cpu};
 use crate::{host_ports::render_host_ports, output};
 use anyhow::Result;
 use crossterm::style::Stylize;
@@ -302,9 +303,9 @@ fn render_template(
     out.field("Image", &summary.image)?;
     out.field("Replicas", summary.replicas)?;
 
-    let memory =
-        crate::volumes::format_bytes(Some(template.get_memory_bytes())).replace(".0 ", " ");
-    let mut resources = format!("{}m CPU, {memory} memory", template.get_cpu_millis());
+    let memory = format_bytes(template.get_memory_bytes());
+    let cpu = format_cpu(template.get_cpu_millis());
+    let mut resources = format!("{cpu} CPU, {memory} memory");
     if out.details {
         resources.push_str(&format!(" ({} bytes)", template.get_memory_bytes()));
     }
