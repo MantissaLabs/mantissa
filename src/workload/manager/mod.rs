@@ -2304,6 +2304,14 @@ impl WorkloadManager {
         self.load_spec(id).await
     }
 
+    /// Keeps a missing task distinct from a storage failure for public inspection responses.
+    pub(crate) async fn try_inspect_workload(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<WorkloadSpec>, anyhow::Error> {
+        self.try_load_spec(id).await
+    }
+
     /// Returns the stable local node identifier used by ownership-sensitive workload workflows.
     pub fn local_node_id(&self) -> Uuid {
         self.local_node_id

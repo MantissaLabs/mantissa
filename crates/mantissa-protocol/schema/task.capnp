@@ -23,6 +23,23 @@ interface Task {
 
   exec @6 (request :TaskExecRequest) -> (session :TaskExecSession);
   # Start one command inside a running task and return a session for stdin forwarding/results.
+
+  inspect @7 (selector :Text) -> (result :TaskInspectResult);
+  # Inspect one task by UUID, exact name, or unique UUID prefix, including stopped tasks.
+}
+
+struct TaskInspectResult {
+  # Selection failures remain distinct from transport or storage failures.
+  union {
+    spec @0 :TaskSpec;
+    # The selector resolves to one task: returns its configuration and lifecycle state.
+
+    notFound @1 :Void;
+    # No task matches the selector in this node's replicated state.
+
+    ambiguous @2 :Void;
+    # The exact name or UUID prefix matches multiple tasks: advise using a full UUID.
+  }
 }
 
 interface TaskLogSink {

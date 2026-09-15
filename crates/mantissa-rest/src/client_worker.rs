@@ -29,7 +29,9 @@ use crate::types::{
     scheduler::SchedulerSummary,
     secrets::{SecretDeleteResponse, SecretDetail, SecretSummary, SecretUpsertRequest},
     services::{ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary},
-    tasks::{TaskAttachQuery, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary},
+    tasks::{
+        TaskAttachQuery, TaskDetail, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary,
+    },
     volumes::{
         VolumeCreateRequest, VolumeDeleteResponse, VolumeExpandResponse, VolumeImportRequest,
         VolumeInspect, VolumeSpec, VolumeSummary,
@@ -450,8 +452,8 @@ impl ClientWorkerHandle {
         self.send(ClientCommand::ListTasks).await
     }
 
-    /// Fetches one standalone task by UUID text or exact task name.
-    pub async fn get_task(&self, selector: String) -> Result<TaskSummary, ClientWorkerError> {
+    /// Fetches task configuration and diagnostics by UUID, exact name, or unique UUID prefix.
+    pub async fn get_task(&self, selector: String) -> Result<TaskDetail, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::GetTask {
             selector,
             respond_to,
@@ -985,7 +987,7 @@ enum ClientCommand {
     ListTasks(oneshot::Sender<Result<Vec<TaskSummary>, ClientWorkerError>>),
     GetTask {
         selector: String,
-        respond_to: oneshot::Sender<Result<TaskSummary, ClientWorkerError>>,
+        respond_to: oneshot::Sender<Result<TaskDetail, ClientWorkerError>>,
     },
     TaskLogs {
         selector: String,
@@ -1941,14 +1943,18 @@ async fn list_tasks(config: &ClientConfig) -> Result<Vec<TaskSummary>, ClientWor
         .map_err(operation_failed_error)
 }
 
-/// Fetches one standalone task from the task list response.
-async fn get_task(config: &ClientConfig, selector: &str) -> Result<TaskSummary, ClientWorkerError> {
-    let selector = clean_required_name("task selector", selector)?;
-    let tasks = list_tasks(config).await?;
-    tasks
-        .into_iter()
-        .find(|task| task.id == selector || task.name == selector)
-        .ok_or_else(|| ClientWorkerError::NotFound(format!("task '{selector}' not found")))
+/// Reads one complete task snapshot through the same targeted inspection used by the CLI.
+async fn get_task(config: &ClientConfig, selector: &str) -> Result<TaskDetail, ClientWorkerError> {
+    let inspection = tasks::inspect(config, selector).await.map_err(|error| {
+        error
+            .downcast_ref::<ClientError>()
+            .cloned()
+            .map(ClientWorkerError::from)
+            .unwrap_or_else(|| operation_failed_error(error))
+    })?;
+
+    let spec = inspection.spec().map_err(operation_failed_error)?;
+    TaskDetail::from_spec(spec).map_err(operation_failed_error)
 }
 
 /// Starts one worker-local task log stream and returns its HTTP receiver.
@@ -2236,8 +2242,10 @@ async fn stop_task(
     config: &ClientConfig,
     selector: &str,
 ) -> Result<TaskSummary, ClientWorkerError> {
-    get_task(config, selector).await?;
-    tasks::stop(config, selector)
+    let task = get_task(config, selector).await?;
+
+    // Keep the selected task fixed when a name also matches another task's UUID prefix.
+    tasks::stop(config, &task.id)
         .await
         .map(TaskSummary::from)
         .map_err(conflict_error)

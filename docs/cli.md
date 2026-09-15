@@ -25,6 +25,7 @@ Common commands:
 - `mantissa clusters split --filter-per-gpu NVIDIA,AMD` - shortcut split by GPU vendor on the local active cluster
 - `mantissa clusters split --interactive --left-name blue --right-name green` - interactive left/right node picker with hover details
 - `mantissa tasks list --state running` - filter tasks by lifecycle state
+- `mantissa tasks inspect <task> [--details]` - inspect task configuration, placement, and lifecycle diagnostics
 - `mantissa tasks start <name> --image <img> --command <arg>...` - launch a task with default CPU and memory requests unless overridden
 - `mantissa scheduler slots [peer-id] --details` - inspect reserved slots
 - `mantissa services run <manifest>` - deploy a RON service manifest and follow service/task progress

@@ -1,5 +1,6 @@
 pub mod attach;
 pub mod exec;
+pub mod inspect;
 pub mod list;
 pub mod logs;
 pub mod start;
@@ -8,6 +9,7 @@ mod util;
 
 pub use attach::{TaskAttachOptions, attach};
 pub use exec::{TaskExecOptions, exec};
+pub use inspect::inspect;
 pub use list::{TasksListOptions, TasksListOutput, TasksListState, list};
 pub use logs::{TaskLogsOptions, logs};
 pub use start::{TaskStartOptions, start};

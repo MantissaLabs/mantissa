@@ -1,5 +1,12 @@
-use crate::types::common::HostPort;
+use crate::types::common::{
+    self, HostPort, TaskSecretFile, TaskVolumeMount, text_list, uuid_to_string,
+};
 use mantissa_client::tasks::TaskRow;
+use mantissa_client::{
+    host_ports::decode_host_ports, services::manifest as config,
+    tasks::inspect::state_and_exit_code,
+};
+use mantissa_protocol::{task::task_spec, workload};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use utoipa::{IntoParams, ToSchema};
 
@@ -37,6 +44,153 @@ impl From<TaskRow> for TaskSummary {
             state: value.state,
             created_at: value.created_at,
         }
+    }
+}
+
+/// Complete task configuration and lifecycle diagnostics from one replicated snapshot.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct TaskDetail {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub phase_reason: Option<String>,
+    pub phase_progress: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub image: String,
+    pub command: Vec<String>,
+    pub execution_platform: String,
+    pub isolation_mode: String,
+    pub isolation_profile: Option<String>,
+    pub tty: bool,
+    pub node_id: String,
+    pub node_name: String,
+    pub slot_ids: Vec<u64>,
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
+    pub gpu_count: u32,
+    pub gpu_device_ids: Vec<String>,
+    pub restart_policy: Option<config::TaskTemplateRestartPolicy>,
+    pub termination_grace_period_secs: Option<u32>,
+    pub pre_stop_command: Vec<String>,
+    pub liveness: Option<config::LivenessProbe>,
+    pub networks: Vec<String>,
+    pub ports: Vec<HostPort>,
+    pub volumes: Vec<TaskVolumeMount>,
+    pub env: Vec<config::EnvironmentVariable>,
+    pub secret_files: Vec<TaskSecretFile>,
+    pub task_epoch: u64,
+    pub phase_version: u64,
+    pub launch_attempt: u64,
+    pub last_terminal_observed_launch: Option<u64>,
+    pub lease_id: Option<String>,
+    pub lease_coordinator_node_id: Option<String>,
+}
+
+impl TaskDetail {
+    /// Keeps exact resource units and structured references instead of reusing formatted list fields.
+    pub fn from_spec(spec: task_spec::Reader<'_>) -> capnp::Result<Self> {
+        let (state, exit_code) = state_and_exit_code(spec.get_state()?.to_str()?);
+        let restart_policy = if spec.has_restart_policy() {
+            let policy = spec.get_restart_policy()?;
+            Some(config::TaskTemplateRestartPolicy {
+                name: match policy.get_name()? {
+                    workload::RestartPolicyName::No => config::RestartPolicyName::No,
+                    workload::RestartPolicyName::Always => config::RestartPolicyName::Always,
+                    workload::RestartPolicyName::OnFailure => config::RestartPolicyName::OnFailure,
+                    workload::RestartPolicyName::UnlessStopped => {
+                        config::RestartPolicyName::UnlessStopped
+                    }
+                },
+                max_retry_count: policy.get_max_retry_count().try_into().ok(),
+            })
+        } else {
+            None
+        };
+
+        let liveness = if spec.has_liveness() {
+            let probe = spec.get_liveness()?;
+            Some(config::LivenessProbe {
+                kind: match probe.get_kind()? {
+                    workload::LivenessProbeKind::Exec => config::LivenessKind::Exec,
+                    workload::LivenessProbeKind::Http => config::LivenessKind::Http,
+                    workload::LivenessProbeKind::Tcp => config::LivenessKind::Tcp,
+                },
+                command: text_list(probe.get_command()?)?,
+                port: probe.get_port(),
+                path: optional_text(probe.get_path()?)?,
+                interval_ms: probe.get_interval_ms(),
+                timeout_ms: probe.get_timeout_ms(),
+                failure_threshold: probe.get_failure_threshold(),
+                start_period_ms: probe.get_start_period_ms(),
+            })
+        } else {
+            None
+        };
+
+        let grace = spec.get_termination_grace_period_secs();
+        let terminal = spec.get_last_terminal_observed_launch();
+        Ok(Self {
+            id: uuid_to_string(spec.get_id()?)?,
+            name: spec.get_name()?.to_str()?.to_string(),
+            state: state.to_string(),
+            exit_code,
+            phase_reason: optional_text(spec.get_phase_reason()?)?,
+            phase_progress: optional_text(spec.get_phase_progress()?)?,
+            created_at: spec.get_created_at()?.to_str()?.to_string(),
+            updated_at: spec.get_updated_at()?.to_str()?.to_string(),
+            image: spec.get_image()?.to_str()?.to_string(),
+            command: text_list(spec.get_command()?)?,
+            execution_platform: spec.get_execution_platform()?.to_str()?.to_string(),
+            isolation_mode: spec.get_isolation_mode()?.to_str()?.to_string(),
+            isolation_profile: optional_text(spec.get_isolation_profile()?)?,
+            tty: spec.get_tty(),
+            node_id: uuid_to_string(spec.get_node_id()?)?,
+            node_name: spec.get_node_name()?.to_str()?.to_string(),
+            slot_ids: spec.get_slot_ids()?.iter().collect(),
+            cpu_millis: spec.get_cpu_millis(),
+            memory_bytes: spec.get_memory_bytes(),
+            gpu_count: spec.get_gpu_count(),
+            gpu_device_ids: text_list(spec.get_gpu_device_ids()?)?,
+            restart_policy,
+            termination_grace_period_secs: (grace != 0).then_some(grace),
+            pre_stop_command: text_list(spec.get_pre_stop_command()?)?,
+            liveness,
+            networks: spec
+                .get_networks()?
+                .iter()
+                .map(|id| uuid_to_string(id?))
+                .collect::<capnp::Result<_>>()?,
+            ports: decode_host_ports(spec.get_ports()?)?
+                .into_iter()
+                .map(HostPort::from)
+                .collect(),
+            volumes: common::volumes(spec.get_volumes()?)?,
+            env: common::env(spec.get_env()?)?,
+            secret_files: common::secret_files(spec.get_secret_files()?)?,
+            task_epoch: spec.get_task_epoch(),
+            phase_version: spec.get_phase_version(),
+            launch_attempt: spec.get_launch_attempt(),
+            last_terminal_observed_launch: (terminal != 0).then_some(terminal),
+            lease_id: optional_uuid(spec.get_lease_id()?)?,
+            lease_coordinator_node_id: optional_uuid(spec.get_lease_coordinator_node_id()?)?,
+        })
+    }
+}
+
+/// Represents absent diagnostics as null while retaining nonempty text exactly.
+fn optional_text(value: capnp::text::Reader<'_>) -> capnp::Result<Option<String>> {
+    let value = value.to_str()?;
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
+/// Preserves optional lease identifiers without introducing a nil UUID sentinel.
+fn optional_uuid(bytes: &[u8]) -> capnp::Result<Option<String>> {
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        uuid_to_string(bytes).map(Some)
     }
 }
 

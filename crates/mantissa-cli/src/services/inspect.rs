@@ -1,18 +1,14 @@
 use super::rollout::rollout_phase_label;
+use crate::inspect::{InspectOutput, argument, duration, render_mounts_and_environment};
 use crate::resources::{format_bytes, format_cpu};
 use crate::{host_ports::render_host_ports, output};
 use anyhow::Result;
-use crossterm::style::Stylize;
 use mantissa_client::{
     config::ClientConfig,
     services::{list::ServiceRow, rollout::classify_rollout_outcome},
 };
-use mantissa_protocol::{services as protocol, volumes::filesystem_ownership, workload};
-use std::{
-    fmt::{Display, Write as _},
-    io::{IsTerminal, Write},
-};
-use textwrap::{Options, WordSplitter, WrapAlgorithm};
+use mantissa_protocol::{services as protocol, workload};
+use std::io::Write;
 use uuid::Uuid;
 
 /// Puts current status before configuration so operators can find deployment problems quickly.
@@ -409,7 +405,12 @@ fn render_template(
 
     out.list("Networks", &networks)?;
 
-    render_mounts_and_environment(out, template)?;
+    render_mounts_and_environment(
+        out,
+        template.get_volumes()?,
+        template.get_env()?,
+        template.get_secret_files()?,
+    )?;
 
     // Each argument remains separate; wrapping must not make a shell script look like several arguments.
     if let Some((command, args)) = summary.command.split_first() {
@@ -622,214 +623,10 @@ fn render_probes(
     Ok(())
 }
 
-/// Preserves literal values and secret references without fetching decrypted secret contents.
-fn render_mounts_and_environment(
-    out: &mut InspectOutput,
-    template: protocol::task_template::Reader<'_>,
-) -> Result<()> {
-    let volumes = template
-        .get_volumes()?
-        .iter()
-        .map(|mount| {
-            let access = if mount.get_read_only() {
-                "read-only"
-            } else {
-                "read-write"
-            };
-
-            Ok(format!(
-                "{} ({}) -> {:?}, {access}",
-                mount.get_volume_name()?.to_str()?,
-                Uuid::from_slice(mount.get_volume_id()?)?,
-                mount.get_target()?.to_str()?
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    out.list("Volumes", &volumes)?;
-
-    let env = template
-        .get_env()?
-        .iter()
-        .map(|variable| {
-            let name = variable.get_name()?.to_str()?;
-            if variable.has_secret() {
-                Ok(format!(
-                    "{name} <- {}",
-                    secret_reference(variable.get_secret()?)?
-                ))
-            } else {
-                Ok(format!("{name}={:?}", variable.get_value()?.to_str()?))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    out.list("Environment", &env)?;
-
-    let files = template.get_secret_files()?;
-    if files.is_empty() && out.details {
-        out.field("Secret files", "none")?;
-    }
-    for (index, file) in files.iter().enumerate() {
-        out.field(
-            if index == 0 { "Secret files" } else { "" },
-            format!(
-                "{:?} <- {}",
-                file.get_path()?.to_str()?,
-                secret_reference(file.get_secret()?)?
-            ),
-        )?;
-
-        let mode = if file.get_mode() == 0 {
-            "policy default".to_string()
-        } else {
-            format!("{:04o}", file.get_mode())
-        };
-        let ownership = match file.get_ownership()?.which()? {
-            filesystem_ownership::Which::Daemon(()) => "daemon".to_string(),
-            filesystem_ownership::Which::User(user) => {
-                let user = user?;
-                format!("uid {}, gid {}", user.get_uid(), user.get_gid())
-            }
-            filesystem_ownership::Which::FsGroup(group) => {
-                format!("filesystem group {}", group?.get_gid())
-            }
-        };
-
-        out.field("", format!("mode {mode}, ownership {ownership}"))?;
-
-        let path_env = file.get_path_env_name()?.to_str()?;
-        if !path_env.is_empty() {
-            out.field("", format!("path environment variable {path_env}"))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Distinguishes a fixed secret version from a reference that follows the latest version.
-fn secret_reference(secret: workload::secret_ref::Reader<'_>) -> Result<String> {
-    let name = secret.get_name()?.to_str()?;
-    let version = secret.get_version_id()?;
-    if version.is_empty() {
-        Ok(format!("secret {name} (latest)"))
-    } else {
-        Ok(format!(
-            "secret {name} (version {})",
-            Uuid::from_slice(version)?
-        ))
-    }
-}
-
-/// Keeps empty arguments, quoting, and control characters visible when command lines wrap.
-fn argument(value: &str) -> String {
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch.is_control() || matches!(ch, '\'' | '"' | '\\'))
-    {
-        format!("{value:?}")
-    } else {
-        value.to_string()
-    }
-}
-
 /// Reads argument lists without joining values that must retain their boundaries.
 fn read_text_list(values: capnp::text_list::Reader<'_>) -> Result<Vec<String>> {
     values
         .iter()
         .map(|value| Ok(value?.to_str()?.to_string()))
         .collect()
-}
-
-/// Uses the largest exact unit so shorter timing labels do not lose precision.
-fn duration(milliseconds: impl Into<u128>) -> String {
-    let milliseconds = milliseconds.into();
-    if milliseconds == 0 {
-        return "0s".to_string();
-    }
-
-    for (unit, size) in [("h", 3_600_000), ("m", 60_000), ("s", 1000)] {
-        if milliseconds.is_multiple_of(size) {
-            return format!("{}{unit}", milliseconds / size);
-        }
-    }
-
-    format!("{milliseconds}ms")
-}
-
-/// Keeps field alignment and wrapping consistent across the service inspection sections.
-struct InspectOutput {
-    text: String,
-    details: bool,
-    width: usize,
-    color: bool,
-}
-
-impl InspectOutput {
-    /// Uses terminal width interactively and stable plain text when output is redirected.
-    fn new(details: bool) -> Self {
-        let terminal = std::io::stdout().is_terminal();
-        let width = if terminal {
-            crossterm::terminal::size()
-                .ok()
-                .map(|(width, _)| usize::from(width))
-        } else {
-            None
-        };
-
-        Self {
-            text: String::new(),
-            details,
-            width: width.unwrap_or(100).clamp(40, 120),
-            color: terminal
-                && std::env::var_os("NO_COLOR").is_none()
-                && std::env::var("TERM").as_deref() != Ok("dumb"),
-        }
-    }
-
-    /// Separates major sections without adding borders that compete with the content.
-    fn section(&mut self, title: impl Display) -> Result<()> {
-        if !self.text.is_empty() {
-            self.text.push('\n');
-        }
-
-        let title = title.to_string();
-        if self.color {
-            writeln!(self.text, "{}", title.bold())?;
-        } else {
-            writeln!(self.text, "{title}")?;
-        }
-
-        Ok(())
-    }
-
-    /// Aligns continuation lines while keeping identifiers and long words intact for copying.
-    fn field(&mut self, label: &str, value: impl Display) -> Result<()> {
-        let prefix = format!("  {label:<16}  ");
-        let options = Options::new(self.width)
-            .initial_indent(&prefix)
-            .subsequent_indent("                    ")
-            .word_splitter(WordSplitter::NoHyphenation)
-            .wrap_algorithm(WrapAlgorithm::FirstFit)
-            .break_words(false);
-
-        writeln!(self.text, "{}", textwrap::fill(&value.to_string(), options))?;
-        Ok(())
-    }
-
-    /// Omits unused optional lists normally and shows their absence inline in the expanded view.
-    fn list(&mut self, label: &str, values: &[String]) -> Result<()> {
-        if values.is_empty() {
-            if self.details {
-                self.field(label, "none")?;
-            }
-        } else {
-            for (index, value) in values.iter().enumerate() {
-                self.field(if index == 0 { label } else { "" }, value)?;
-            }
-        }
-
-        Ok(())
-    }
 }

@@ -2,14 +2,16 @@ use super::{
     PublicIngressPolicy, ServiceReplicaAssignment, ServiceRollout, ServiceSummary,
     ServiceTaskProgress, TaskTemplate, TaskTemplateAutoscalePolicy,
 };
-use crate::types::{common::HostPort, volumes::FilesystemOwnership};
+use crate::types::common::{
+    HostPort, TaskSecretFile, TaskVolumeMount, env, secret_files, text_list, uuid_to_string,
+    volumes,
+};
 use mantissa_client::services::{
     list::ServiceRow, manifest as config, rollout::classify_rollout_outcome,
 };
-use mantissa_protocol::{services as protocol, volumes::filesystem_ownership, workload};
+use mantissa_protocol::{services as protocol, workload};
 use serde::Serialize;
 use utoipa::ToSchema;
-use uuid::Uuid;
 
 /// Complete service configuration and progress from one daemon status snapshot.
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -217,9 +219,9 @@ pub struct ServiceTaskTemplate {
     pub public_protocol: Option<ServicePublicProtocol>,
     pub public_ingress: Option<PublicIngressPolicy>,
     pub networks: Vec<ServiceTaskNetwork>,
-    pub volumes: Vec<ServiceVolumeMount>,
+    pub volumes: Vec<TaskVolumeMount>,
     pub env: Vec<config::EnvironmentVariable>,
-    pub secret_files: Vec<ServiceSecretFile>,
+    pub secret_files: Vec<TaskSecretFile>,
 }
 
 impl ServiceTaskTemplate {
@@ -266,73 +268,9 @@ impl ServiceTaskTemplate {
             })
             .collect::<capnp::Result<Vec<_>>>()?;
 
-        let volumes = template
-            .get_volumes()?
-            .iter()
-            .map(|mount| {
-                Ok(ServiceVolumeMount {
-                    volume_name: mount.get_volume_name()?.to_str()?.to_string(),
-                    volume_id: uuid_to_string(mount.get_volume_id()?)?,
-                    target: mount.get_target()?.to_str()?.to_string(),
-                    read_only: mount.get_read_only(),
-                })
-            })
-            .collect::<capnp::Result<Vec<_>>>()?;
-
-        let env = template
-            .get_env()?
-            .iter()
-            .map(|variable| {
-                // A secret reference takes precedence even if a literal value is also present on the wire.
-                let (value, secret) = if variable.has_secret() {
-                    (None, Some(secret_reference(variable.get_secret()?)?))
-                } else {
-                    (Some(variable.get_value()?.to_str()?.to_string()), None)
-                };
-
-                Ok(config::EnvironmentVariable {
-                    name: variable.get_name()?.to_str()?.to_string(),
-                    value,
-                    secret,
-                })
-            })
-            .collect::<capnp::Result<Vec<_>>>()?;
-
-        let secret_files = template
-            .get_secret_files()?
-            .iter()
-            .map(|file| {
-                let ownership = match file.get_ownership()?.which()? {
-                    filesystem_ownership::Which::Daemon(()) => FilesystemOwnership {
-                        kind: "daemon".into(),
-                        uid: None,
-                        gid: None,
-                    },
-                    filesystem_ownership::Which::User(user) => {
-                        let user = user?;
-                        FilesystemOwnership {
-                            kind: "user".into(),
-                            uid: Some(user.get_uid()),
-                            gid: Some(user.get_gid()),
-                        }
-                    }
-                    filesystem_ownership::Which::FsGroup(group) => FilesystemOwnership {
-                        kind: "fs_group".into(),
-                        uid: None,
-                        gid: Some(group?.get_gid()),
-                    },
-                };
-
-                let path_env_name = file.get_path_env_name()?.to_str()?;
-                Ok(ServiceSecretFile {
-                    path: file.get_path()?.to_str()?.to_string(),
-                    secret: secret_reference(file.get_secret()?)?,
-                    mode: (file.get_mode() != 0).then_some(file.get_mode()),
-                    ownership,
-                    path_env_name: (!path_env_name.is_empty()).then(|| path_env_name.to_string()),
-                })
-            })
-            .collect::<capnp::Result<Vec<_>>>()?;
+        let volumes = volumes(template.get_volumes()?)?;
+        let env = env(template.get_env()?)?;
+        let secret_files = secret_files(template.get_secret_files()?)?;
 
         let grace = template.get_termination_grace_period_secs();
         Ok(Self {
@@ -388,26 +326,6 @@ pub enum ServicePublicProtocol {
 pub struct ServiceTaskNetwork {
     pub name: String,
     pub network_id: String,
-}
-
-/// Resolves a named volume mount without requiring a separate volume lookup.
-#[derive(Clone, Debug, Serialize, ToSchema)]
-pub struct ServiceVolumeMount {
-    pub volume_name: String,
-    pub volume_id: String,
-    pub target: String,
-    pub read_only: bool,
-}
-
-/// Describes a projected secret file while keeping its contents out of inspection responses.
-#[derive(Clone, Debug, Serialize, ToSchema)]
-pub struct ServiceSecretFile {
-    pub path: String,
-    pub secret: config::SecretReference,
-    /// Numeric Unix permissions; null means the secret policy default.
-    pub mode: Option<u32>,
-    pub ownership: FilesystemOwnership,
-    pub path_env_name: Option<String>,
 }
 
 /// Keeps selector fields and operators structured using the same types as deployment requests.
@@ -536,34 +454,4 @@ fn liveness(
         failure_threshold: probe.get_failure_threshold(),
         start_period_ms: probe.get_start_period_ms(),
     }))
-}
-
-/// Represents latest-version references with null instead of an artificial version identifier.
-fn secret_reference(
-    secret: workload::secret_ref::Reader<'_>,
-) -> capnp::Result<config::SecretReference> {
-    let version = secret.get_version_id()?;
-    Ok(config::SecretReference {
-        name: secret.get_name()?.to_str()?.to_string(),
-        version: if version.is_empty() {
-            None
-        } else {
-            Some(uuid_to_string(version)?)
-        },
-    })
-}
-
-/// Retains exact text and argument boundaries when converting Cap'n Proto lists to JSON arrays.
-fn text_list(values: capnp::text_list::Reader<'_>) -> capnp::Result<Vec<String>> {
-    values
-        .iter()
-        .map(|value| Ok(value?.to_str()?.to_string()))
-        .collect()
-}
-
-/// Requires full UUIDs so inspection references can be used in other REST requests.
-fn uuid_to_string(bytes: &[u8]) -> capnp::Result<String> {
-    Uuid::from_slice(bytes)
-        .map(|id| id.to_string())
-        .map_err(|error| capnp::Error::failed(error.to_string()))
 }

@@ -386,6 +386,313 @@ local_test!(rest_tasks_list_and_get_started_task, {
     assert_eq!(value["id"], task_id);
 });
 
+local_test!(rest_tasks_inspect_retained_task_by_id_name_and_prefix, {
+    let harness = RestTestHarness::new().await;
+    let task_id = Uuid::parse_str("12345678-1234-4321-8765-000000000001").unwrap();
+    let mut task = seeded_task_value(
+        task_id,
+        harness.node_id,
+        "finished-task",
+        WorkloadPhase::Exited(17),
+    );
+    task.phase_reason = Some("process exited with code 17".into());
+    task.phase_progress = Some("cleanup complete".into());
+    task.memory_bytes = 67_108_895;
+    task.slot_ids = vec![4, 9];
+    task.command = vec!["sh".into(), "-c".into(), "exit 17".into(), "".into()];
+    task.task_epoch = 2;
+    task.phase_version = 5;
+    task.launch_attempt = 3;
+    task.last_terminal_observed_launch = Some(3);
+    let created_at = task.created_at.clone();
+
+    harness
+        .node()
+        .node
+        .workloads
+        .upsert(&UuidKey::from(task_id), task.into())
+        .await
+        .expect("seed retained task");
+
+    for selector in [
+        task_id.to_string(),
+        "finished-task".into(),
+        "12345678".into(),
+        "123456781234".into(),
+    ] {
+        let (status, value) = harness
+            .json_request(Method::GET, &format!("/v1/tasks/{selector}"), true, None)
+            .await;
+
+        assert_eq!(status, StatusCode::OK, "{selector}: {value}");
+        assert_eq!(value["id"], task_id.to_string());
+        assert_eq!(value["state"], "exited");
+        assert_eq!(value["exit_code"], 17);
+        assert_eq!(value["phase_reason"], "process exited with code 17");
+        assert_eq!(value["phase_progress"], "cleanup complete");
+        assert_eq!(value["created_at"], created_at);
+        assert_eq!(value["launch_attempt"], 3);
+        assert_eq!(value["last_terminal_observed_launch"], 3);
+        assert_eq!(value["task_epoch"], 2);
+        assert_eq!(value["phase_version"], 5);
+
+        assert_eq!(value["node_id"], harness.node_id.to_string());
+        assert_eq!(value["slot_ids"], json!([4, 9]));
+        assert_eq!(value["memory_bytes"], 67_108_895_u64);
+        assert_eq!(value["command"], json!(["sh", "-c", "exit 17", ""]));
+        assert_eq!(value["networks"], json!([]));
+        assert_eq!(value["volumes"], json!([]));
+        assert_eq!(value["env"], json!([]));
+        assert_eq!(value["secret_files"], json!([]));
+        assert_eq!(value["restart_policy"], Value::Null);
+        assert_eq!(value["liveness"], Value::Null);
+        assert_eq!(value["lease_id"], Value::Null);
+    }
+});
+
+local_test!(rest_tasks_inspect_rejects_ambiguous_and_empty_selectors, {
+    let harness = RestTestHarness::new().await;
+    let first = Uuid::parse_str("abcdef12-0000-4000-8000-000000000001").unwrap();
+    let second = Uuid::parse_str("abcdef12-0000-4000-8000-000000000002").unwrap();
+    seed_stream_task(&harness, first, "duplicate", WorkloadPhase::Stopped).await;
+    seed_stream_task(&harness, second, "duplicate", WorkloadPhase::Stopped).await;
+
+    for selector in ["duplicate", "abcdef12"] {
+        let (status, value) = harness
+            .json_request(Method::GET, &format!("/v1/tasks/{selector}"), true, None)
+            .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{selector}: {value}");
+        assert_eq!(value["code"], "conflict");
+    }
+
+    for selector in [
+        "%20",
+        "missing",
+        "Duplicate",
+        "dupl",
+        "00000000-0000-0000-0000-000000000099",
+    ] {
+        let (status, value) = harness
+            .json_request(Method::GET, &format!("/v1/tasks/{selector}"), true, None)
+            .await;
+        let expected = if selector == "%20" {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::NOT_FOUND
+        };
+
+        assert_eq!(status, expected, "{selector}: {value}");
+    }
+
+    let (status, value) = harness
+        .json_request(Method::GET, &format!("/v1/tasks/{first}"), true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["id"], first.to_string());
+
+    let named = Uuid::from_u128(99);
+    seed_stream_task(&harness, named, "abcdef12", WorkloadPhase::Stopped).await;
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/tasks/abcdef12", true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        value["id"],
+        named.to_string(),
+        "exact names take precedence over UUID prefixes"
+    );
+});
+
+local_test!(rest_tasks_inspect_preserves_runtime_configuration, {
+    use mantissa::volumes::types::FilesystemOwnership;
+    use mantissa::workload::model::{
+        WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference,
+        WorkloadVolumeMount,
+    };
+    use mantissa::workload::types::{
+        WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadPortBinding,
+        WorkloadPortProtocol, WorkloadRestartPolicy, WorkloadRestartPolicyKind,
+    };
+
+    let harness = RestTestHarness::new().await;
+    let task_id = Uuid::new_v4();
+    let network_id = Uuid::new_v4();
+    let volume_id = Uuid::new_v4();
+    let version_id = Uuid::new_v4();
+    let mut task = seeded_task_value(
+        task_id,
+        harness.node_id,
+        "configured-task",
+        WorkloadPhase::Stopped,
+    );
+    task.tty = true;
+    task.execution_platform = ExecutionPlatform::MicroVm;
+    task.isolation_mode = IsolationMode::Sandboxed;
+    task.isolation_profile = Some("sandbox".into());
+    task.gpu_count = 1;
+    task.gpu_device_ids = vec!["GPU-test".into()];
+    task.termination_grace_period_secs = Some(45);
+    task.pre_stop_command = Some(vec!["sh".into(), "-c".into(), "sync; echo done".into()]);
+    task.restart_policy = Some(WorkloadRestartPolicy {
+        name: WorkloadRestartPolicyKind::OnFailure,
+        max_retry_count: Some(4),
+    });
+    task.liveness = Some(WorkloadLivenessProbe {
+        kind: WorkloadLivenessProbeKind::Tcp,
+        command: Vec::new(),
+        port: 8080,
+        path: None,
+        interval_ms: 2000,
+        timeout_ms: 300,
+        failure_threshold: 2,
+        start_period_ms: 1000,
+    });
+
+    task.networks = vec![network_id];
+    task.volumes = vec![WorkloadVolumeMount {
+        volume_id,
+        volume_name: "data".into(),
+        target: "/data".into(),
+        read_only: true,
+    }];
+    task.ports = vec![WorkloadPortBinding {
+        name: "dns".into(),
+        target_port: 53,
+        host_port: 1053,
+        host_ip: "::1".into(),
+        protocol: WorkloadPortProtocol::Udp,
+    }];
+    task.env = vec![
+        WorkloadEnvironmentVariable {
+            name: "EMPTY".into(),
+            value: Some(String::new()),
+            secret: None,
+        },
+        WorkloadEnvironmentVariable {
+            name: "PASSWORD".into(),
+            value: Some("must-not-appear".into()),
+            secret: Some(WorkloadSecretReference {
+                name: "database".into(),
+                version_id: Some(version_id),
+            }),
+        },
+    ];
+    task.secret_files = vec![WorkloadSecretFile {
+        path: "/run/secrets/database".into(),
+        secret: WorkloadSecretReference {
+            name: "database".into(),
+            version_id: None,
+        },
+        mode: Some(0o440),
+        ownership: FilesystemOwnership::FsGroup { gid: 2000 },
+        path_env_name: Some("DATABASE_FILE".into()),
+    }];
+    harness
+        .node()
+        .node
+        .workloads
+        .upsert(&UuidKey::from(task_id), task.into())
+        .await
+        .expect("seed task configuration");
+
+    let (status, value) = harness
+        .json_request(Method::GET, &format!("/v1/tasks/{task_id}"), true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["tty"], true);
+    assert_eq!(value["execution_platform"], "microvm");
+    assert_eq!(value["isolation_mode"], "sandboxed");
+    assert_eq!(value["isolation_profile"], "sandbox");
+    assert_eq!(value["gpu_count"], 1);
+    assert_eq!(value["gpu_device_ids"], json!(["GPU-test"]));
+    assert_eq!(value["termination_grace_period_secs"], 45);
+    assert_eq!(
+        value["pre_stop_command"],
+        json!(["sh", "-c", "sync; echo done"])
+    );
+    assert_eq!(
+        value["restart_policy"],
+        json!({
+            "name": "on_failure",
+            "max_retry_count": 4
+        })
+    );
+    assert_eq!(
+        value["liveness"],
+        json!({
+            "kind": "tcp",
+            "command": [],
+            "port": 8080,
+            "path": null,
+            "interval_ms": 2000,
+            "timeout_ms": 300,
+            "failure_threshold": 2,
+            "start_period_ms": 1000
+        })
+    );
+
+    assert_eq!(value["networks"], json!([network_id.to_string()]));
+    assert_eq!(
+        value["volumes"],
+        json!([{
+            "volume_id": volume_id.to_string(),
+            "volume_name": "data",
+            "target": "/data",
+            "read_only": true
+        }])
+    );
+    assert_eq!(
+        value["ports"],
+        json!([{
+            "name": "dns",
+            "host_ip": "::1",
+            "host_port": 1053,
+            "target_port": 53,
+            "protocol": "udp"
+        }])
+    );
+    assert_eq!(
+        value["env"],
+        json!([
+            {
+                "name": "EMPTY",
+                "value": "",
+                "secret": null
+            },
+            {
+                "name": "PASSWORD",
+                "value": null,
+                "secret": {
+                    "name": "database",
+                    "version": version_id.to_string()
+                }
+            }
+        ])
+    );
+    assert_eq!(
+        value["secret_files"],
+        json!([{
+            "path": "/run/secrets/database",
+            "secret": {
+                "name": "database",
+                "version": null
+            },
+            "mode": 288,
+            "ownership": {
+                "kind": "fs_group",
+                "uid": null,
+                "gid": 2000
+            },
+            "path_env_name": "DATABASE_FILE"
+        }])
+    );
+    assert!(!value.to_string().contains("must-not-appear"));
+});
+
 local_test!(rest_task_logs_reject_invalid_tail_query, {
     let harness = RestTestHarness::new().await;
     let (status, value) = harness
@@ -714,6 +1021,28 @@ local_test!(rest_tasks_stop_started_task_by_id, {
         panic!("stop failed with status={status}; body={value}");
     }
     assert_eq!(value["id"], task_id);
+});
+
+local_test!(rest_tasks_stop_preserves_exact_name_selection, {
+    let harness = RestTestHarness::new().await;
+    let named_task_id = Uuid::from_u128(1);
+    let prefix_task_id = Uuid::parse_str("abcdef12-0000-4000-8000-000000000002").unwrap();
+    seed_stream_task(&harness, named_task_id, "abcdef12", WorkloadPhase::Stopped).await;
+    seed_stream_task(
+        &harness,
+        prefix_task_id,
+        "other-task",
+        WorkloadPhase::Stopped,
+    )
+    .await;
+
+    let (status, value) = harness
+        .json_request(Method::POST, "/v1/tasks/abcdef12/stop", true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["id"], named_task_id.to_string());
+    assert_eq!(value["name"], "abcdef12");
 });
 
 local_test!(rest_tasks_reject_invalid_start_body, {

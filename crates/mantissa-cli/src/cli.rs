@@ -546,6 +546,9 @@ pub enum TasksCommand {
     #[command(alias = "ls")]
     List(TasksListArgs),
 
+    /// Show one task's configuration, placement, and lifecycle diagnostics
+    Inspect(TasksInspectArgs),
+
     /// Stream logs for a task
     Logs(TasksLogsArgs),
 
@@ -666,6 +669,17 @@ pub struct TasksListArgs {
         value_name = "STATE"
     )]
     pub states: Vec<TasksListStateOpt>,
+}
+
+#[derive(Args, Debug)]
+pub struct TasksInspectArgs {
+    /// Task UUID, exact name, or unique UUID prefix
+    #[arg(index = 1, value_name = "TASK")]
+    pub task: String,
+
+    /// Include unused settings, exact resource values, and internal lifecycle counters
+    #[arg(long)]
+    pub details: bool,
 }
 
 #[derive(Args, Debug)]

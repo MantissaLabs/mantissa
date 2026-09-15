@@ -10,6 +10,7 @@ mod clusters;
 mod daemon;
 mod host_ports;
 mod ingress;
+mod inspect;
 mod jobs;
 mod networks;
 mod nodes;

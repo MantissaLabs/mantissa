@@ -13,7 +13,9 @@ use crate::{
         },
         task_logs::TaskLogEvent,
     },
-    types::tasks::{TaskAttachQuery, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary},
+    types::tasks::{
+        TaskAttachQuery, TaskDetail, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary,
+    },
 };
 use axum::{
     Json,
@@ -66,19 +68,19 @@ pub async fn start(
         .map_err(worker_error_to_rest)
 }
 
-/// Fetches one standalone task by UUID text or exact task name.
+/// Inspects task configuration and lifecycle diagnostics by UUID, exact name, or unique UUID prefix.
 #[utoipa::path(
     get,
     path = "/v1/tasks/{selector}",
     tag = "tasks",
-    params(("selector" = String, Path, description = "Task UUID string or exact task name.")),
-    responses((status = 200, description = "Standalone task summary.", body = TaskSummary))
+    params(("selector" = String, Path, description = "Task UUID, exact task name, or unique UUID prefix.")),
+    responses((status = 200, description = "Task configuration and lifecycle diagnostics.", body = TaskDetail))
 )]
 pub async fn get(
     State(state): State<AppState>,
     _auth: RestAuth,
     Path(selector): Path<String>,
-) -> Result<Json<TaskSummary>, RestError> {
+) -> Result<Json<TaskDetail>, RestError> {
     state
         .client()
         .get_task(selector)

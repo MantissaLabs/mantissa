@@ -3870,41 +3870,6 @@
         ],
         "description": "Adds the CLI's derived outcome to the existing rollout counters and diagnostics."
       },
-      "ServiceSecretFile": {
-        "description": "Describes a projected secret file while keeping its contents out of inspection responses.",
-        "properties": {
-          "mode": {
-            "description": "Numeric Unix permissions; null means the secret policy default.",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "ownership": {
-            "$ref": "#/components/schemas/FilesystemOwnership"
-          },
-          "path": {
-            "type": "string"
-          },
-          "path_env_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "secret": {
-            "$ref": "#/components/schemas/SecretReference"
-          }
-        },
-        "required": [
-          "path",
-          "secret",
-          "ownership"
-        ],
-        "type": "object"
-      },
       "ServiceSummary": {
         "description": "Keeps service lists compact without decoding every optional template setting.",
         "properties": {
@@ -4257,7 +4222,7 @@
           },
           "secret_files": {
             "items": {
-              "$ref": "#/components/schemas/ServiceSecretFile"
+              "$ref": "#/components/schemas/TaskSecretFile"
             },
             "type": "array"
           },
@@ -4275,7 +4240,7 @@
           },
           "volumes": {
             "items": {
-              "$ref": "#/components/schemas/ServiceVolumeMount"
+              "$ref": "#/components/schemas/TaskVolumeMount"
             },
             "type": "array"
           }
@@ -4314,30 +4279,6 @@
           "rolling"
         ],
         "type": "string"
-      },
-      "ServiceVolumeMount": {
-        "description": "Resolves a named volume mount without requiring a separate volume lookup.",
-        "properties": {
-          "read_only": {
-            "type": "boolean"
-          },
-          "target": {
-            "type": "string"
-          },
-          "volume_id": {
-            "type": "string"
-          },
-          "volume_name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "volume_name",
-          "volume_id",
-          "target",
-          "read_only"
-        ],
-        "type": "object"
       },
       "SplitCandidate": {
         "description": "REST-facing split candidate row.",
@@ -4451,6 +4392,232 @@
         "required": [
           "source_view",
           "candidates"
+        ],
+        "type": "object"
+      },
+      "TaskDetail": {
+        "description": "Complete task configuration and lifecycle diagnostics from one replicated snapshot.",
+        "properties": {
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cpu_millis": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "env": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentVariable"
+            },
+            "type": "array"
+          },
+          "execution_platform": {
+            "type": "string"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "gpu_count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "gpu_device_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string"
+          },
+          "isolation_mode": {
+            "type": "string"
+          },
+          "isolation_profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_terminal_observed_launch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "launch_attempt": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lease_coordinator_node_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lease_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "liveness": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LivenessProbe"
+              }
+            ]
+          },
+          "memory_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "networks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "phase_progress": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase_version": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ports": {
+            "items": {
+              "$ref": "#/components/schemas/HostPort"
+            },
+            "type": "array"
+          },
+          "pre_stop_command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "restart_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskTemplateRestartPolicy"
+              }
+            ]
+          },
+          "secret_files": {
+            "items": {
+              "$ref": "#/components/schemas/TaskSecretFile"
+            },
+            "type": "array"
+          },
+          "slot_ids": {
+            "items": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "state": {
+            "type": "string"
+          },
+          "task_epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "termination_grace_period_secs": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tty": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "volumes": {
+            "items": {
+              "$ref": "#/components/schemas/TaskVolumeMount"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "state",
+          "created_at",
+          "updated_at",
+          "image",
+          "command",
+          "execution_platform",
+          "isolation_mode",
+          "tty",
+          "node_id",
+          "node_name",
+          "slot_ids",
+          "cpu_millis",
+          "memory_bytes",
+          "gpu_count",
+          "gpu_device_ids",
+          "pre_stop_command",
+          "networks",
+          "ports",
+          "volumes",
+          "env",
+          "secret_files",
+          "task_epoch",
+          "phase_version",
+          "launch_attempt"
         ],
         "type": "object"
       },
@@ -4619,6 +4786,41 @@
             "type": "object"
           }
         ]
+      },
+      "TaskSecretFile": {
+        "description": "Describes a projected secret file while keeping its contents out of inspection responses.",
+        "properties": {
+          "mode": {
+            "description": "Numeric Unix permissions; null means the secret policy default.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ownership": {
+            "$ref": "#/components/schemas/FilesystemOwnership"
+          },
+          "path": {
+            "type": "string"
+          },
+          "path_env_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret": {
+            "$ref": "#/components/schemas/SecretReference"
+          }
+        },
+        "required": [
+          "path",
+          "secret",
+          "ownership"
+        ],
+        "type": "object"
       },
       "TaskStartRequest": {
         "additionalProperties": false,
@@ -5069,6 +5271,30 @@
           "name",
           "image",
           "resources"
+        ],
+        "type": "object"
+      },
+      "TaskVolumeMount": {
+        "description": "Resolves a named volume mount without requiring a separate volume lookup.",
+        "properties": {
+          "read_only": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "volume_id": {
+            "type": "string"
+          },
+          "volume_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "volume_name",
+          "volume_id",
+          "target",
+          "read_only"
         ],
         "type": "object"
       },
@@ -10682,11 +10908,11 @@
     },
     "/v1/tasks/{selector}": {
       "get": {
-        "description": "Fetches one standalone task by UUID text or exact task name.",
+        "description": "Inspects task configuration and lifecycle diagnostics by UUID, exact name, or unique UUID prefix.",
         "operationId": "get",
         "parameters": [
           {
-            "description": "Task UUID string or exact task name.",
+            "description": "Task UUID, exact task name, or unique UUID prefix.",
             "in": "path",
             "name": "selector",
             "required": true,
@@ -10700,11 +10926,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TaskSummary"
+                  "$ref": "#/components/schemas/TaskDetail"
                 }
               }
             },
-            "description": "Standalone task summary."
+            "description": "Task configuration and lifecycle diagnostics."
           },
           "400": {
             "content": {

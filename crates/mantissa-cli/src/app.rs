@@ -292,6 +292,11 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     ))
                     .await?;
             }
+            TasksCommand::Inspect(args) => {
+                local
+                    .run_until(crate::tasks::inspect(&cfg, &args.task, args.details))
+                    .await?;
+            }
             TasksCommand::Logs(args) => {
                 local
                     .run_until(crate::tasks::logs(

@@ -378,6 +378,12 @@ curl -sS "${AUTH[@]}" \
   "$REST/v1/tasks"
 ```
 
+Inspect a task by UUID, exact case-sensitive name, or unique UUID prefix:
+
+```bash
+curl -sS "${AUTH[@]}" "$REST/v1/tasks/sleepy"
+```
+
 Stream logs:
 
 ```bash

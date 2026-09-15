@@ -568,7 +568,7 @@ const OPERATION_DOCS: &[OperationDoc] = &[
         OperationMethod::Get,
         "/v1/tasks/{selector}",
         "Get task",
-        "Fetches one standalone task by UUID text or exact task name.",
+        "Inspects task configuration and lifecycle diagnostics by UUID, exact name, or unique UUID prefix.",
     ),
     (
         OperationMethod::Get,

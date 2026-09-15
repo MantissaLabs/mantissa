@@ -647,6 +647,58 @@ impl TaskService {
 }
 
 impl task::Server for TaskService {
+    /// Returns one replicated task snapshot without requiring its runtime owner to be reachable.
+    async fn inspect(
+        self: Rc<Self>,
+        params: task::InspectParams,
+        mut results: task::InspectResults,
+    ) -> Result<(), Error> {
+        let selector = params.get()?.get_selector()?.to_str()?.trim();
+        if selector.is_empty() {
+            return Err(Error::failed("task selector must not be empty".to_string()));
+        }
+
+        let mut result = results.get().init_result();
+        if let Ok(id) = Uuid::parse_str(selector) {
+            let spec = self
+                .manager
+                .try_inspect_workload(id)
+                .await
+                .map_err(|error| Error::failed(error.to_string()))?;
+
+            if let Some(spec) = spec {
+                write_spec(result.init_spec(), &project_task_spec(&spec));
+            } else {
+                result.set_not_found(());
+            }
+
+            return Ok(());
+        }
+
+        let specs = self
+            .manager
+            .list_workloads(&TaskStateFilter::all())
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        let has_exact_name = specs.iter().any(|spec| spec.name == selector);
+        let prefix = selector.to_ascii_lowercase().replace('-', "");
+        let mut matches = specs.iter().filter(|spec| {
+            if has_exact_name {
+                spec.name == selector
+            } else {
+                !prefix.is_empty() && spec.id.simple().to_string().starts_with(&prefix)
+            }
+        });
+
+        match (matches.next(), matches.next()) {
+            (Some(spec), None) => write_spec(result.init_spec(), &project_task_spec(spec)),
+            (None, _) => result.set_not_found(()),
+            (Some(_), Some(_)) => result.set_ambiguous(()),
+        }
+
+        Ok(())
+    }
+
     async fn start(
         self: Rc<Self>,
         params: task::StartParams,
