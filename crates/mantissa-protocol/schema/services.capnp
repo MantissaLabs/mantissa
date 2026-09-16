@@ -27,6 +27,60 @@ interface Services {
     detail :Text
   );
   # Internal owner-directed autoscale signal. This is not an operator API.
+
+  tasks @6 (selector :Text) -> (result :ServiceTasksResult);
+  # List observed tasks for a service name or UUID, including retained stopped tasks.
+}
+
+struct ServiceTasksResult {
+  union {
+    tasks @0 :List(ServiceTask);
+    # The service exists; the list is empty when this node sees no task records.
+
+    notFound @1 :Void;
+    # No service matches the exact name or UUID in this node's replicated state.
+  }
+}
+
+struct ServiceTask {
+  id @0 :Data;
+  # Full task UUID for inspection, logs, and other task commands.
+
+  name @1 :Text;
+  # Name recorded on this task instance.
+
+  template @2 :Text;
+  # Service template that created this replica.
+
+  replica @3 :UInt16;
+  # Replica number within the template.
+
+  generation @4 :UInt64;
+  # Service generation that created this task, including older retained generations.
+
+  image @5 :Text;
+  # Image recorded on the task, which may differ from the current service manifest.
+
+  state @6 :Text;
+  # Observed lifecycle state; exited tasks include their code as "exited:<code>".
+
+  nodeId @7 :Data;
+  # Full UUID of the node assigned to run this task.
+
+  nodeName @8 :Text;
+  # Assigned node's recorded name, or empty if unavailable.
+
+  phaseReason @9 :Text;
+  # Explanation of the current lifecycle state, or empty if unavailable.
+
+  phaseProgress @10 :Text;
+  # Latest progress detail, or empty if unavailable.
+
+  createdAt @11 :Text;
+  # Timestamp at which this task record was created.
+
+  updatedAt @12 :Text;
+  # Timestamp of the most recent recorded task update.
 }
 
 struct TaskTemplate {

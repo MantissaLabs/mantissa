@@ -1314,6 +1314,9 @@ pub enum ServicesCommand {
     /// Show service configuration, rollout diagnostics, and task progress
     Inspect(ServicesInspectArgs),
 
+    /// List a service's tasks, including retained stopped and failed tasks
+    Tasks(ServicesTasksArgs),
+
     /// Inspect rollout progress and failure details for one service
     Rollout {
         #[command(subcommand)]
@@ -1360,6 +1363,27 @@ pub struct ServicesInspectArgs {
     /// Include unused settings, exact resource values, and replica assignments
     #[arg(long)]
     pub details: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ServicesTasksArgs {
+    /// Service name or full UUID
+    #[arg(index = 1, value_name = "SERVICE")]
+    pub service: String,
+
+    /// Output format (wide adds task names, images, and timestamps)
+    #[arg(
+        short = 'o',
+        long,
+        value_enum,
+        default_value_t = TasksListOutputOpt::Table,
+        value_name = "FORMAT"
+    )]
+    pub output: TasksListOutputOpt,
+
+    /// Show full task IDs and untruncated fields
+    #[arg(long)]
+    pub no_trunc: bool,
 }
 
 #[derive(Args, Debug)]

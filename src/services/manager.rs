@@ -736,6 +736,14 @@ impl ServiceController {
         Ok(specs)
     }
 
+    /// Returns observed replicas across generations, including retained terminal tasks for diagnosis.
+    pub(crate) async fn tasks_for_service(
+        &self,
+        service_name: &str,
+    ) -> anyhow::Result<Vec<WorkloadSpec>> {
+        self.workload_manager.service_workloads(service_name).await
+    }
+
     /// Builds task-template aggregate progress for one service status request.
     ///
     /// Large service generations publish compact per-node progress records. When those records

@@ -25,7 +25,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
-fn state_to_str(state: &WorkloadPhase) -> String {
+/// Preserves lifecycle labels and terminal exit codes across public task RPC responses.
+pub(crate) fn state_to_str(state: &WorkloadPhase) -> String {
     match state {
         WorkloadPhase::Pending => "pending".to_string(),
         WorkloadPhase::Pulling => "pulling".to_string(),

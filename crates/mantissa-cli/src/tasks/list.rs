@@ -16,16 +16,16 @@ const COMMAND_MAX_CHARS: usize = 64;
 const CREATED_MAX_CHARS: usize = 30;
 const HOST_PORTS_MAX_CHARS: usize = 48;
 
-/// Output presets for `mantissa tasks list`.
+/// Output presets shared by task and service task tables.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TasksListOutput {
     /// Compact table designed to stay readable in narrow terminals.
     Table,
-    /// Extended table that includes created timestamp and container command.
+    /// Extended table with additional task configuration and timestamps.
     Wide,
 }
 
-/// Rendering options for `mantissa tasks list`.
+/// Rendering options shared by task and service task lists.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TasksListOptions {
     pub output: TasksListOutput,
@@ -156,7 +156,7 @@ fn render_task_row(row: &TaskRow, no_trunc: bool) -> RenderedTaskRow {
 }
 
 /// Renders task IDs in short form by default, matching common CLI table conventions.
-fn render_task_id(id: &str, no_trunc: bool) -> String {
+pub(crate) fn render_task_id(id: &str, no_trunc: bool) -> String {
     if no_trunc {
         id.to_string()
     } else {
@@ -165,7 +165,7 @@ fn render_task_id(id: &str, no_trunc: bool) -> String {
 }
 
 /// Truncates long values to keep tables readable while preserving deterministic prefixes.
-fn truncate_field(value: &str, max_chars: usize, no_trunc: bool) -> String {
+pub(crate) fn truncate_field(value: &str, max_chars: usize, no_trunc: bool) -> String {
     if no_trunc {
         return value.to_string();
     }

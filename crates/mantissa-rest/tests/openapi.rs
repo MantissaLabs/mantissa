@@ -329,6 +329,7 @@ fn expected_operations() -> BTreeSet<(String, String)> {
         ("GET", "/v1/services"),
         ("GET", "/v1/services/{selector}"),
         ("GET", "/v1/services/{selector}/status"),
+        ("GET", "/v1/services/{selector}/tasks"),
         ("GET", "/v1/tasks"),
         ("GET", "/v1/tasks/{selector}"),
         ("GET", "/v1/tasks/{selector}/attach"),

@@ -1,10 +1,34 @@
 use axum::http::{Method, StatusCode};
+use mantissa::services::types::{ServiceSpecValue, ServiceStatus};
+use mantissa::workload::model::{WorkloadOwner, WorkloadPhase, WorkloadServiceMetadata};
+use mantissa_store::uuid_key::UuidKey;
 use serde_json::{Value, json};
 use std::time::Duration;
+use uuid::Uuid;
 
 use crate::common;
 use crate::common::convergence::wait_until;
 use crate::harness::RestTestHarness;
+use crate::tasks::seeded_task_value;
+
+/// Seeds a retained service without launching replicas so task-list fixtures stay deterministic.
+async fn seed_retained_service(harness: &RestTestHarness, name: &str) -> Uuid {
+    let mut service = ServiceSpecValue::new(Uuid::new_v4(), name, name, Vec::new(), Vec::new());
+    service.status = ServiceStatus::Stopped;
+    service.service_epoch = 3;
+    let id = service.id;
+
+    harness
+        .node()
+        .node
+        .service_controller
+        .registry()
+        .upsert(service)
+        .await
+        .expect("seed retained service");
+
+    id
+}
 
 /// Returns a minimal service deployment body for the REST facade.
 fn service_manifest(name: &str, cpu_millis: u64) -> Value {
@@ -67,6 +91,215 @@ async fn wait_for_service_status(harness: &RestTestHarness, name: &str, expected
 
     assert!(reached, "service {name} should reach {expected}");
 }
+
+local_test!(
+    rest_services_tasks_distinguish_empty_and_missing_services,
+    {
+        let harness = RestTestHarness::new().await;
+        let id = seed_retained_service(&harness, "empty-service").await;
+
+        for selector in ["empty-service".to_string(), id.to_string()] {
+            let (status, value) = harness
+                .json_request(
+                    Method::GET,
+                    &format!("/v1/services/{selector}/tasks"),
+                    true,
+                    None,
+                )
+                .await;
+
+            assert_eq!(status, StatusCode::OK, "{value}");
+            assert_eq!(value, json!([]));
+        }
+
+        for selector in [
+            "missing",
+            "Empty-service",
+            "empty",
+            "00000000-0000-0000-0000-000000000099",
+            "%20",
+        ] {
+            let (status, value) = harness
+                .json_request(
+                    Method::GET,
+                    &format!("/v1/services/{selector}/tasks"),
+                    true,
+                    None,
+                )
+                .await;
+            let expected = if selector == "%20" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::NOT_FOUND
+            };
+
+            assert_eq!(status, expected, "{selector}: {value}");
+        }
+    }
+);
+
+local_test!(
+    rest_services_tasks_use_ownership_and_retain_previous_generations,
+    {
+        let harness = RestTestHarness::new().await;
+        let service_id = seed_retained_service(&harness, "demo").await;
+        let remote_node = Uuid::new_v4();
+        let current_id = Uuid::new_v4();
+        let previous_id = Uuid::new_v4();
+        let second_replica_id = Uuid::new_v4();
+        let frontend_id = Uuid::new_v4();
+
+        let fixtures = [
+            (frontend_id, "frontend", 1, 3, WorkloadPhase::Running),
+            (previous_id, "backend", 1, 2, WorkloadPhase::Exited(17)),
+            (second_replica_id, "backend", 2, 3, WorkloadPhase::Stopped),
+            (
+                current_id,
+                "backend",
+                1,
+                3,
+                WorkloadPhase::VolumeUnavailable,
+            ),
+        ];
+        for (id, template, replica, generation, phase) in fixtures {
+            let mut task = seeded_task_value(id, remote_node, "unrelated-display-name", phase);
+            let mut owner = WorkloadServiceMetadata::new("demo", template, replica);
+            owner.service_epoch = generation;
+            task.owner = Some(WorkloadOwner::ServiceReplica(owner));
+            task.image = format!("demo:{generation}");
+            if id == current_id {
+                task.phase_reason = Some("volume unavailable".into());
+                task.phase_progress = Some("waiting for replica transfer".into());
+            }
+
+            harness
+                .node()
+                .node
+                .workloads
+                .upsert(&UuidKey::from(id), task.into())
+                .await
+                .expect("seed service task");
+        }
+
+        // Display names must not attach standalone tasks or another service's replicas to this service.
+        for owner in [
+            None,
+            Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+                "demo-other",
+                "backend",
+                1,
+            ))),
+        ] {
+            let id = Uuid::new_v4();
+            let mut task =
+                seeded_task_value(id, remote_node, "demo-backend-1", WorkloadPhase::Running);
+            task.owner = owner;
+
+            harness
+                .node()
+                .node
+                .workloads
+                .upsert(&UuidKey::from(id), task.into())
+                .await
+                .expect("seed unrelated task");
+        }
+
+        for selector in ["demo".to_string(), service_id.to_string()] {
+            let (status, value) = harness
+                .json_request(
+                    Method::GET,
+                    &format!("/v1/services/{selector}/tasks"),
+                    true,
+                    None,
+                )
+                .await;
+
+            assert_eq!(status, StatusCode::OK, "{value}");
+
+            let rows = value.as_array().expect("task list response");
+            let ids: Vec<_> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+
+            assert_eq!(
+                ids,
+                vec![
+                    current_id.to_string(),
+                    previous_id.to_string(),
+                    second_replica_id.to_string(),
+                    frontend_id.to_string()
+                ]
+            );
+            assert_eq!(rows[0]["name"], "unrelated-display-name");
+            assert_eq!(rows[0]["template"], "backend");
+            assert_eq!(rows[0]["replica"], 1);
+            assert_eq!(rows[0]["generation"], 3);
+            assert_eq!(rows[0]["node_id"], remote_node.to_string());
+            assert_eq!(rows[0]["state"], "volume_unavailable");
+            assert_eq!(rows[0]["phase_reason"], "volume unavailable");
+            assert_eq!(rows[0]["phase_progress"], "waiting for replica transfer");
+
+            assert_eq!(rows[1]["generation"], 2);
+            assert_eq!(rows[1]["image"], "demo:2");
+            assert_eq!(rows[1]["state"], "exited");
+            assert_eq!(rows[1]["exit_code"], 17);
+            assert_eq!(rows[2]["state"], "stopped");
+            assert_eq!(rows[3]["template"], "frontend");
+            assert_eq!(rows[3]["exit_code"], Value::Null);
+            assert_eq!(rows[3]["phase_reason"], Value::Null);
+        }
+    }
+);
+
+local_test!(rest_services_tasks_follow_deployment_and_cleanup, {
+    let harness = RestTestHarness::new().await;
+    let (service_id, _) = deploy_service(&harness, "service-tasks", 250).await;
+    wait_for_service_status(&harness, "service-tasks", "running").await;
+
+    let (status, value) = harness
+        .json_request(
+            Method::GET,
+            &format!("/v1/services/{service_id}/tasks"),
+            true,
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value.as_array().unwrap().len(), 1);
+    assert_eq!(value[0]["template"], "web");
+    assert_eq!(value[0]["replica"], 1);
+    assert_eq!(value[0]["state"], "running");
+    let task_id = value[0]["id"].as_str().expect("deployed task ID");
+    let task_path = format!("/v1/tasks/{task_id}");
+
+    let (status, value) = harness
+        .json_request(Method::DELETE, "/v1/services/service-tasks", true, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    wait_for_service_status(&harness, "service-tasks", "stopped").await;
+
+    // Stop completion removes the task record; it does not retain permanent task history.
+    let removed = wait_until(
+        Duration::from_secs(5),
+        Duration::from_millis(50),
+        || async {
+            let (status, _) = harness
+                .json_request(Method::GET, &task_path, true, None)
+                .await;
+
+            status == StatusCode::NOT_FOUND
+        },
+    )
+    .await;
+
+    assert!(removed, "stopped task should be removed after cleanup");
+
+    let (status, value) = harness
+        .json_request(Method::GET, "/v1/services/service-tasks/tasks", true, None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value, json!([]));
+});
 
 local_test!(rest_services_deploy_returns_accepted_operation, {
     let harness = RestTestHarness::new().await;

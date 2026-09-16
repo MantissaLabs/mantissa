@@ -4,7 +4,10 @@ use crate::{
     extract::{RestJson, RestQuery},
     routes::worker_error_to_rest,
     state::AppState,
-    types::services::{ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary},
+    types::services::{
+        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary,
+        ServiceTaskSummary,
+    },
 };
 use axum::{
     Json,
@@ -82,6 +85,27 @@ pub async fn get(
     state
         .client()
         .get_service(selector)
+        .await
+        .map(Json)
+        .map_err(worker_error_to_rest)
+}
+
+/// Lists a service's observed replicas, including retained stopped and failed tasks.
+#[utoipa::path(
+    get,
+    path = "/v1/services/{selector}/tasks",
+    tag = "services",
+    params(("selector" = String, Path, description = "Service UUID string or exact service name.")),
+    responses((status = 200, description = "Observed service tasks, including retained task attempts.", body = [ServiceTaskSummary]))
+)]
+pub async fn tasks(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(selector): Path<String>,
+) -> Result<Json<Vec<ServiceTaskSummary>>, RestError> {
+    state
+        .client()
+        .list_service_tasks(selector)
         .await
         .map(Json)
         .map_err(worker_error_to_rest)

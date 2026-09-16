@@ -1,5 +1,6 @@
 use crate::types::{common::HostPort, common::debug_variant_label};
 use mantissa_client::services::{
+    ServiceTaskRow,
     deploy::{ServiceDeployOutcome, ServiceDeploymentHandle},
     list::{
         ServiceReplicaAssignmentRow, ServiceRolloutRow, ServiceRow, ServiceTaskProgressRow,
@@ -13,6 +14,47 @@ use utoipa::ToSchema;
 
 mod inspect;
 pub use inspect::*;
+
+/// One observed service replica with its generation, placement, and lifecycle diagnostics.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ServiceTaskSummary {
+    pub id: String,
+    pub name: String,
+    pub template: String,
+    pub replica: u16,
+    pub generation: u64,
+    pub image: String,
+    pub state: String,
+    pub exit_code: Option<i32>,
+    pub node_id: String,
+    pub node_name: String,
+    pub phase_reason: Option<String>,
+    pub phase_progress: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<ServiceTaskRow> for ServiceTaskSummary {
+    /// Preserves exact identifiers and separate diagnostics for API clients.
+    fn from(task: ServiceTaskRow) -> Self {
+        Self {
+            id: task.id,
+            name: task.name,
+            template: task.template,
+            replica: task.replica,
+            generation: task.generation,
+            image: task.image,
+            state: task.state,
+            exit_code: task.exit_code,
+            node_id: task.node_id,
+            node_name: task.node_name,
+            phase_reason: task.phase_reason,
+            phase_progress: task.phase_progress,
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+        }
+    }
+}
 
 /// REST request body for deploying one service manifest.
 #[derive(Debug, Deserialize, ToSchema)]

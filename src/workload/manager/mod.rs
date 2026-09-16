@@ -2113,6 +2113,25 @@ impl WorkloadManager {
         Ok(specs)
     }
 
+    /// Selects service-owned tasks before copying specs so unrelated task configuration is not cloned.
+    pub(crate) async fn service_workloads(
+        &self,
+        service_name: &str,
+    ) -> Result<Vec<WorkloadSpec>, anyhow::Error> {
+        let values = self.load_workload_value_index().await?;
+        let specs = values
+            .iter()
+            .filter(|(_, value)| {
+                value
+                    .service_owner()
+                    .is_some_and(|owner| owner.service_name == service_name)
+            })
+            .map(|(id, value)| value_to_spec(*id, value.clone()))
+            .collect();
+
+        Ok(specs)
+    }
+
     /// Applies a batch of assignment rows delivered directly by the coordinating owner.
     ///
     /// Direct assignment delivery is the hot path for remote placements. The owner still keeps a

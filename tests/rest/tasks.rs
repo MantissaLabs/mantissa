@@ -248,8 +248,13 @@ fn runtime_handle(task_id: Uuid) -> String {
     format!("mantissa-{task_id}")
 }
 
-/// Builds a replicated task value owned by the REST harness node.
-fn seeded_task_value(task_id: Uuid, node_id: Uuid, name: &str, phase: WorkloadPhase) -> TaskValue {
+/// Builds a replicated task value for REST tests without starting a runtime instance.
+pub(super) fn seeded_task_value(
+    task_id: Uuid,
+    node_id: Uuid,
+    name: &str,
+    phase: WorkloadPhase,
+) -> TaskValue {
     TaskValue::new(TaskValueDraft {
         id: task_id,
         name: name.to_string(),

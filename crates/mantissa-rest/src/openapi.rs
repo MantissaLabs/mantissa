@@ -440,6 +440,12 @@ const OPERATION_DOCS: &[OperationDoc] = &[
     ),
     (
         OperationMethod::Get,
+        "/v1/services/{selector}/tasks",
+        "List service tasks",
+        "Lists a service's observed replicas, including retained stopped and failed tasks.",
+    ),
+    (
+        OperationMethod::Get,
         "/v1/networks",
         "List networks",
         "Lists overlay networks visible to the local daemon.",

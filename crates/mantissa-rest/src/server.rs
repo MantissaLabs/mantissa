@@ -91,6 +91,7 @@ fn documented_router() -> OpenApiRouter<AppState> {
             routes::services::delete
         ))
         .routes(openapi_routes!(routes::services::status))
+        .routes(openapi_routes!(routes::services::tasks))
         .routes(openapi_routes!(
             routes::networks::list,
             routes::networks::create

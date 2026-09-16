@@ -14,6 +14,7 @@ use crate::services::types::{
     TaskTemplateAutoscalePolicyValue, TaskTemplateNetworkRequirement, TaskTemplateSpecValue,
     compact_service_replica_assignment_segments,
 };
+use crate::task::service::state_to_str;
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
     decode_admission_policy as read_admission_policy,
@@ -26,11 +27,12 @@ use crate::workload::capnp_codec::{
     encode_placement_policy as write_placement_policy, encode_port_bindings, encode_secret_files,
     encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
 };
+use crate::workload::model::WorkloadSpec;
 use crate::workload::types::{ExecutionSpec, WorkloadAdmissionPolicy};
 use capnp::{Error, struct_list};
 use mantissa_protocol::services::{
     autoscale_metric, autoscale_policy, autoscale_signal, replica_assignment_segment,
-    service_event, service_spec, service_task_progress, services, task_template,
+    service_event, service_spec, service_task, service_task_progress, services, task_template,
 };
 use mantissa_store::codec::StoreValueCodec;
 use std::collections::HashSet;
@@ -165,10 +167,47 @@ impl services::Server for ServicesRPC {
         }
 
         let service = self
-            .select_service(&selector)
-            .map_err(|err| Error::failed(err.to_string()))?;
+            .find_service(&selector)
+            .map_err(|err| Error::failed(err.to_string()))?
+            .ok_or_else(|| Error::failed(format!("service '{selector}' not found")))?;
+
         let mut builder = results.get().init_service();
         write_service_spec(&mut builder, &service)?;
+
+        Ok(())
+    }
+
+    /// Lists observed task records using ownership metadata rather than task-name prefixes.
+    async fn tasks(
+        self: Rc<Self>,
+        params: services::TasksParams,
+        mut results: services::TasksResults,
+    ) -> Result<(), Error> {
+        let selector = params.get()?.get_selector()?.to_str()?.trim();
+        if selector.is_empty() {
+            return Err(Error::failed("service selector cannot be empty".into()));
+        }
+
+        let mut result = results.get().init_result();
+        let Some(service) = self
+            .find_service(selector)
+            .map_err(|error| Error::failed(error.to_string()))?
+        else {
+            result.set_not_found(());
+            return Ok(());
+        };
+
+        let tasks = self
+            .manager
+            .tasks_for_service(&service.service_name)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+
+        let mut list = result.init_tasks(tasks.len() as u32);
+        for (index, task) in tasks.iter().enumerate() {
+            write_service_task(list.reborrow().get(index as u32), task)?;
+        }
+
         Ok(())
     }
 
@@ -243,16 +282,41 @@ impl services::Server for ServicesRPC {
 }
 
 impl ServicesRPC {
-    /// Selects exactly one service from the registry using UUID text or exact service name.
-    fn select_service(&self, selector: &str) -> anyhow::Result<ServiceSpecValue> {
-        let service = if let Ok(service_id) = Uuid::parse_str(selector) {
-            self.manager.registry().get(service_id)?
+    /// Keeps missing services distinct from registry failures for name and UUID lookups.
+    fn find_service(&self, selector: &str) -> anyhow::Result<Option<ServiceSpecValue>> {
+        if let Ok(service_id) = Uuid::parse_str(selector) {
+            self.manager.registry().get(service_id)
         } else {
-            self.manager.registry().get_by_name(selector)?
-        };
-
-        service.ok_or_else(|| anyhow::anyhow!("service '{selector}' not found"))
+            self.manager.registry().get_by_name(selector)
+        }
     }
+}
+
+/// Encodes task identity and diagnostics without sending full runtime configuration for every row.
+fn write_service_task(
+    mut builder: service_task::Builder<'_>,
+    task: &WorkloadSpec,
+) -> Result<(), Error> {
+    let owner = task
+        .service_owner()
+        .ok_or_else(|| Error::failed(format!("task '{}' has no service owner", task.id)))?;
+
+    builder.set_id(task.id.as_bytes());
+    builder.set_name(&task.name);
+    builder.set_template(&owner.template);
+    builder.set_replica(owner.replica);
+    builder.set_generation(owner.service_epoch);
+
+    builder.set_image(&task.image);
+    builder.set_state(state_to_str(&task.state));
+    builder.set_node_id(task.node_id.as_bytes());
+    builder.set_node_name(&task.node_name);
+    builder.set_phase_reason(task.phase_reason.as_deref().unwrap_or(""));
+    builder.set_phase_progress(task.phase_progress.as_deref().unwrap_or(""));
+    builder.set_created_at(&task.created_at);
+    builder.set_updated_at(&task.updated_at);
+
+    Ok(())
 }
 
 pub(crate) fn write_service_spec(

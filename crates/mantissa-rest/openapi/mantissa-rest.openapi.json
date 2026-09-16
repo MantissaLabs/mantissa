@@ -4096,6 +4096,81 @@
         ],
         "type": "object"
       },
+      "ServiceTaskSummary": {
+        "description": "One observed service replica with its generation, placement, and lifecycle diagnostics.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "phase_progress": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replica": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "template",
+          "replica",
+          "generation",
+          "image",
+          "state",
+          "node_id",
+          "node_name",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "ServiceTaskTemplate": {
         "description": "Full desired settings for each replica, with exact resource and timing units.",
         "properties": {
@@ -10726,6 +10801,102 @@
           }
         },
         "summary": "Service status",
+        "tags": [
+          "services"
+        ]
+      }
+    },
+    "/v1/services/{selector}/tasks": {
+      "get": {
+        "description": "Lists a service's observed replicas, including retained stopped and failed tasks.",
+        "operationId": "tasks",
+        "parameters": [
+          {
+            "description": "Service UUID string or exact service name.",
+            "in": "path",
+            "name": "selector",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ServiceTaskSummary"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Observed service tasks, including retained task attempts."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "List service tasks",
         "tags": [
           "services"
         ]

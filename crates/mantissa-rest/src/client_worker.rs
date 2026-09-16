@@ -28,7 +28,10 @@ use crate::types::{
     },
     scheduler::SchedulerSummary,
     secrets::{SecretDeleteResponse, SecretDetail, SecretSummary, SecretUpsertRequest},
-    services::{ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary},
+    services::{
+        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary,
+        ServiceTaskSummary,
+    },
     tasks::{
         TaskAttachQuery, TaskDetail, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary,
     },
@@ -245,6 +248,18 @@ impl ClientWorkerHandle {
     /// Fetches one service by UUID text or exact service name.
     pub async fn get_service(&self, selector: String) -> Result<ServiceDetail, ClientWorkerError> {
         self.send(|respond_to| ClientCommand::GetService {
+            selector,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Lists observed replicas and retained task attempts for one service.
+    pub async fn list_service_tasks(
+        &self,
+        selector: String,
+    ) -> Result<Vec<ServiceTaskSummary>, ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ListServiceTasks {
             selector,
             respond_to,
         })
@@ -911,6 +926,10 @@ enum ClientCommand {
         selector: String,
         respond_to: oneshot::Sender<Result<ServiceDetail, ClientWorkerError>>,
     },
+    ListServiceTasks {
+        selector: String,
+        respond_to: oneshot::Sender<Result<Vec<ServiceTaskSummary>, ClientWorkerError>>,
+    },
     DeleteService {
         selector: String,
         respond_to: oneshot::Sender<Result<ServiceSummary, ClientWorkerError>>,
@@ -1186,6 +1205,12 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
                 respond_to,
             } => {
                 let _ignored = respond_to.send(get_service(&config, &selector).await);
+            }
+            ClientCommand::ListServiceTasks {
+                selector,
+                respond_to,
+            } => {
+                let _ignored = respond_to.send(list_service_tasks(&config, &selector).await);
             }
             ClientCommand::DeleteService {
                 selector,
@@ -1674,6 +1699,22 @@ async fn get_service(
 
     let snapshot = inspection.snapshot().map_err(operation_failed_error)?;
     ServiceDetail::from_snapshot(snapshot).map_err(operation_failed_error)
+}
+
+/// Uses the same ownership-based task selection and ordering as the service tasks command.
+async fn list_service_tasks(
+    config: &ClientConfig,
+    selector: &str,
+) -> Result<Vec<ServiceTaskSummary>, ClientWorkerError> {
+    let tasks = services::tasks(config, selector).await.map_err(|error| {
+        error
+            .downcast_ref::<ClientError>()
+            .cloned()
+            .map(ClientWorkerError::from)
+            .unwrap_or_else(|| operation_failed_error(error))
+    })?;
+
+    Ok(tasks.into_iter().map(ServiceTaskSummary::from).collect())
 }
 
 /// Shares name and UUID selection with the CLI when requesting service stop.
