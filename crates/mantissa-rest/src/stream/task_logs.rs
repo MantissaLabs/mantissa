@@ -127,7 +127,7 @@ impl task_log_sink::Server for RestTaskLogSink {
 }
 
 /// Returns the stable REST label for a protocol task log stream.
-fn stream_label(stream: TaskLogStream) -> &'static str {
+pub(super) fn stream_label(stream: TaskLogStream) -> &'static str {
     match stream {
         TaskLogStream::Stdout => "stdout",
         TaskLogStream::Stderr => "stderr",

@@ -446,6 +446,12 @@ const OPERATION_DOCS: &[OperationDoc] = &[
     ),
     (
         OperationMethod::Get,
+        "/v1/services/{selector}/logs",
+        "Service logs",
+        "Streams logs from tasks present at request start, with source identity on each event. Following does not include newly created tasks.",
+    ),
+    (
+        OperationMethod::Get,
         "/v1/networks",
         "List networks",
         "Lists overlay networks visible to the local daemon.",

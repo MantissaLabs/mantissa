@@ -301,6 +301,102 @@ local_test!(rest_services_tasks_follow_deployment_and_cleanup, {
     assert_eq!(value, json!([]));
 });
 
+local_test!(rest_service_logs_validate_selection_before_streaming, {
+    let harness = RestTestHarness::new().await;
+    let id = seed_retained_service(&harness, "empty-logs").await;
+
+    for path in [
+        format!("/v1/services/{id}/logs"),
+        "/v1/services/empty-logs/logs?template=backend&follow=true&tail=5".to_string(),
+    ] {
+        let (status, headers, body) = harness.text_request(Method::GET, &path, true, None).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(headers["content-type"], "application/x-ndjson");
+        assert!(body.is_empty());
+    }
+
+    for (path, expected) in [
+        ("/v1/services/missing/logs", StatusCode::NOT_FOUND),
+        ("/v1/services/%20/logs", StatusCode::BAD_REQUEST),
+        (
+            "/v1/services/empty-logs/logs?template=%20",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/services/empty-logs/logs?tail=never",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/services/empty-logs/logs?extra=true",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, value) = harness.json_request(Method::GET, path, true, None).await;
+
+        assert_eq!(status, expected, "{path}: {value}");
+    }
+});
+
+local_test!(rest_service_logs_report_task_failures_with_source, {
+    let harness = RestTestHarness::new().await;
+    seed_retained_service(&harness, "service-logs").await;
+    let task_id = Uuid::new_v4();
+    let missing_node = Uuid::new_v4();
+    let mut task = seeded_task_value(task_id, missing_node, "backend", WorkloadPhase::Failed);
+    let mut owner = WorkloadServiceMetadata::new("service-logs", "backend", 2);
+    owner.service_epoch = 3;
+    task.owner = Some(WorkloadOwner::ServiceReplica(owner));
+
+    harness
+        .node()
+        .node
+        .workloads
+        .upsert(&UuidKey::from(task_id), task.into())
+        .await
+        .expect("seed service task");
+
+    let (status, _, body) = harness
+        .text_request(
+            Method::GET,
+            "/v1/services/service-logs/logs?template=backend",
+            true,
+            None,
+        )
+        .await;
+    let events: Vec<Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("log event JSON"))
+        .collect();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(events.len(), 1, "{body}");
+    assert_eq!(events[0]["type"], "error");
+    assert!(!events[0]["message"].as_str().unwrap().is_empty());
+    assert_eq!(
+        events[0]["source"],
+        json!({
+            "task_id": task_id.to_string(),
+            "template": "backend",
+            "replica": 2,
+            "generation": 3,
+            "node_id": missing_node.to_string()
+        })
+    );
+
+    let (status, _, body) = harness
+        .text_request(
+            Method::GET,
+            "/v1/services/service-logs/logs?template=frontend",
+            true,
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+});
+
 local_test!(rest_services_deploy_returns_accepted_operation, {
     let harness = RestTestHarness::new().await;
 

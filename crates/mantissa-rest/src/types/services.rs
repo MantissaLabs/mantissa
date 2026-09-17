@@ -10,10 +10,37 @@ use mantissa_client::services::{
     manifest::ServiceManifest,
 };
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 mod inspect;
 pub use inspect::*;
+
+/// Selects logs from tasks present at request start. Following does not discover new tasks.
+#[derive(Clone, Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct ServiceLogsQuery {
+    /// Only include tasks from this service template.
+    pub template: Option<String>,
+    #[serde(default)]
+    #[param(default = false)]
+    pub follow: bool,
+    /// Number of trailing lines per task, or "all".
+    #[serde(default = "crate::types::tasks::default_log_tail")]
+    #[param(default = "all")]
+    pub tail: String,
+    /// Include stdout. Both streams are included when neither stdout nor stderr is selected.
+    #[serde(default)]
+    #[param(default = false)]
+    pub stdout: bool,
+    /// Include stderr. Both streams are included when neither stdout nor stderr is selected.
+    #[serde(default)]
+    #[param(default = false)]
+    pub stderr: bool,
+    #[serde(default)]
+    #[param(default = false)]
+    pub timestamps: bool,
+}
 
 /// One observed service replica with its generation, placement, and lifecycle diagnostics.
 #[derive(Clone, Debug, Serialize, ToSchema)]

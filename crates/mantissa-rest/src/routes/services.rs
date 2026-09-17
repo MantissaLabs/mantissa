@@ -4,14 +4,18 @@ use crate::{
     extract::{RestJson, RestQuery},
     routes::worker_error_to_rest,
     state::AppState,
+    stream::service_logs::ServiceLogEvent,
     types::services::{
-        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceSummary,
-        ServiceTaskSummary,
+        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceLogsQuery,
+        ServiceSummary, ServiceTaskSummary,
     },
 };
 use axum::{
     Json,
+    body::Body,
     extract::{Path, State},
+    http::header::CONTENT_TYPE,
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use utoipa::IntoParams;
@@ -109,6 +113,37 @@ pub async fn tasks(
         .await
         .map(Json)
         .map_err(worker_error_to_rest)
+}
+
+/// Combines logs for a fixed set of service tasks, with task identity on every event.
+#[utoipa::path(
+    get,
+    path = "/v1/services/{selector}/logs",
+    operation_id = "service_logs",
+    tag = "services",
+    params(
+        ("selector" = String, Path, description = "Service UUID string or exact service name."),
+        ServiceLogsQuery
+    ),
+    responses((status = 200, description = "Newline-delimited log events from tasks present at request start. Following does not include newly created tasks.", body = ServiceLogEvent, content_type = "application/x-ndjson"))
+)]
+pub async fn logs(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(selector): Path<String>,
+    RestQuery(query): RestQuery<ServiceLogsQuery>,
+) -> Result<Response, RestError> {
+    let stream = state
+        .client()
+        .service_logs(selector, query)
+        .await
+        .map_err(worker_error_to_rest)?;
+
+    Ok((
+        [(CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }
 
 /// Deletes one service by UUID text or exact service name.

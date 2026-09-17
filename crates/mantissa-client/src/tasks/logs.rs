@@ -1,7 +1,7 @@
 use crate::config::ClientConfig;
 use crate::connection;
 use anyhow::{Result, anyhow};
-use mantissa_protocol::task::task_log_sink;
+use mantissa_protocol::task::{task, task_log_sink};
 
 /// Rendering options for `mantissa tasks logs`.
 pub struct TaskLogsOptions<'a> {
@@ -13,7 +13,7 @@ pub struct TaskLogsOptions<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct NormalizedTaskLogsOptions {
+pub(crate) struct NormalizedTaskLogsOptions {
     follow: bool,
     tail: String,
     stdout: bool,
@@ -23,7 +23,7 @@ struct NormalizedTaskLogsOptions {
 
 impl TaskLogsOptions<'_> {
     /// Normalizes CLI flags into one explicit request payload for the task RPC.
-    fn normalized(&self) -> Result<NormalizedTaskLogsOptions> {
+    pub(crate) fn normalized(&self) -> Result<NormalizedTaskLogsOptions> {
         let tail = self.tail.trim();
         if tail.is_empty() {
             return Err(anyhow!("tail must not be empty"));
@@ -63,6 +63,17 @@ pub async fn logs_with_sink(
 
     let request = client.get_task_request();
     let task = request.send().pipeline.get_task();
+
+    logs_with_client(&task, id, &options, sink).await
+}
+
+/// Shares one task capability across service log requests instead of opening a socket per task.
+pub(crate) async fn logs_with_client(
+    task: &task::Client,
+    id: &str,
+    options: &NormalizedTaskLogsOptions,
+    sink: task_log_sink::Client,
+) -> Result<()> {
     let mut request = task.logs_request();
     {
         let mut builder = request.get().init_request();

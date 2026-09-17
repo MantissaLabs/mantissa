@@ -22,6 +22,7 @@ use mantissa_protocol::task::{
 };
 use std::rc::Rc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -782,6 +783,7 @@ impl task::Server for TaskService {
         Ok(())
     }
 
+    /// Relays task logs and releases the runtime reader when the requesting client disconnects.
     async fn logs(
         self: Rc<Self>,
         params: task::LogsParams,
@@ -812,11 +814,11 @@ impl task::Server for TaskService {
         let (logs_tx, mut logs_rx) = tokio::sync::mpsc::channel(1);
         let manager = self.manager.clone();
         let options_for_task = options.clone();
-        let producer = tokio::task::spawn_local(async move {
+        let producer = AbortOnDropHandle::new(tokio::task::spawn_local(async move {
             manager
                 .stream_local_workload_logs(id, &options_for_task, logs_tx)
                 .await
-        });
+        }));
 
         while let Some(frame) = logs_rx.recv().await {
             if let Err(err) = push_log_frame(&sink, frame).await {

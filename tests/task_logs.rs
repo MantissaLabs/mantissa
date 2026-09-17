@@ -27,6 +27,18 @@ type CapturedTaskLogFrames = Arc<AsyncMutex<Vec<(String, Vec<u8>)>>>;
 struct StaticLogsRuntimeBackend {
     frames: Arc<AsyncMutex<HashMap<String, Vec<RuntimeLogFrame>>>>,
     calls: Arc<AsyncMutex<Vec<LogCall>>>,
+    hold_follow: bool,
+    follow_started: Arc<tokio::sync::Notify>,
+    follow_finished: Arc<tokio::sync::Notify>,
+}
+
+struct FinishedReader(Arc<tokio::sync::Notify>);
+
+impl Drop for FinishedReader {
+    /// Reports that the runtime reader was dropped even if it never emitted a frame.
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
 }
 
 #[async_trait]
@@ -89,6 +101,7 @@ impl RuntimeBackend for StaticLogsRuntimeBackend {
         Ok(())
     }
 
+    /// Supplies seeded frames or holds a quiet reader open to check cancellation.
     async fn stream_instance_logs(
         &self,
         container_id: &str,
@@ -99,6 +112,12 @@ impl RuntimeBackend for StaticLogsRuntimeBackend {
             .lock()
             .await
             .push((container_id.to_string(), options.clone()));
+
+        if self.hold_follow && options.follow {
+            let _finished = FinishedReader(self.follow_finished.clone());
+            self.follow_started.notify_one();
+            std::future::pending::<()>().await;
+        }
 
         let frames = self
             .frames
@@ -193,6 +212,60 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
         last_terminal_observed_launch: Some(1),
     })
 }
+
+local_test!(task_logs_cancellation_stops_quiet_runtime_reader, {
+    let backend = Arc::new(StaticLogsRuntimeBackend {
+        hold_follow: true,
+        ..StaticLogsRuntimeBackend::default()
+    });
+    let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
+    let node = TestNode::new().await;
+    let task_id = Uuid::new_v4();
+    let task = replicated_task_value(task_id, node.id(), "owner-node");
+    node.node
+        .workloads
+        .upsert(&UuidKey::from(task_id), task.into())
+        .await
+        .expect("seed task");
+
+    let socket_dir = tempfile::tempdir().expect("create socket directory");
+    let socket = socket_dir.path().join("mantissa.sock");
+    node.node
+        .start_local_admin_socket_at(socket.clone())
+        .await
+        .expect("start socket");
+    let config = mantissa_client::config::ClientConfig {
+        socket: Some(socket),
+        ..Default::default()
+    };
+    let reader = tokio::task::spawn_local(async move {
+        let options = mantissa_client::tasks::TaskLogsOptions {
+            follow: true,
+            tail: "0",
+            stdout: false,
+            stderr: false,
+            timestamps: false,
+        };
+        let sink = capnp_new_client(CollectingTaskLogSink::default());
+
+        mantissa_client::tasks::logs_with_sink(&config, &task_id.to_string(), &options, sink).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), backend.follow_started.notified())
+        .await
+        .expect("runtime reader starts");
+    reader.abort();
+    assert!(
+        reader
+            .await
+            .expect_err("reader is cancelled")
+            .is_cancelled()
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), backend.follow_finished.notified())
+        .await
+        .expect("quiet runtime reader stops on cancellation");
+});
 
 local_test!(task_logs_relay_over_tcp_sessions, {
     let owner_manager = Arc::new(StaticLogsRuntimeBackend::default());

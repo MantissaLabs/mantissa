@@ -3671,6 +3671,112 @@
         ],
         "type": "object"
       },
+      "ServiceLogEvent": {
+        "description": "Each event identifies its task; errors and completion apply only to that task's stream.",
+        "oneOf": [
+          {
+            "description": "Raw output from one task, encoded without assuming UTF-8 or complete lines.",
+            "properties": {
+              "data_base64": {
+                "type": "string"
+              },
+              "source": {
+                "$ref": "#/components/schemas/ServiceLogSource"
+              },
+              "stream": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "frame"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "source",
+              "stream",
+              "data_base64",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The task's log request completed and will emit no further frames.",
+            "properties": {
+              "source": {
+                "$ref": "#/components/schemas/ServiceLogSource"
+              },
+              "type": {
+                "enum": [
+                  "end"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "source",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The task's log request failed; other task streams can continue.",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "source": {
+                "$ref": "#/components/schemas/ServiceLogSource"
+              },
+              "type": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "source",
+              "message",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ServiceLogSource": {
+        "description": "Identifies a log source even when several generations of a replica are visible.",
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "replica": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "template": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "task_id",
+          "template",
+          "replica",
+          "generation",
+          "node_id"
+        ],
+        "type": "object"
+      },
       "ServiceManifest": {
         "additionalProperties": false,
         "properties": {
@@ -10708,6 +10814,156 @@
           }
         },
         "summary": "Get service",
+        "tags": [
+          "services"
+        ]
+      }
+    },
+    "/v1/services/{selector}/logs": {
+      "get": {
+        "description": "Streams logs from tasks present at request start, with source identity on each event. Following does not include newly created tasks.",
+        "operationId": "service_logs",
+        "parameters": [
+          {
+            "description": "Service UUID string or exact service name.",
+            "in": "path",
+            "name": "selector",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only include tasks from this service template.",
+            "in": "query",
+            "name": "template",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "follow",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Number of trailing lines per task, or \"all\".",
+            "in": "query",
+            "name": "tail",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include stdout. Both streams are included when neither stdout nor stderr is selected.",
+            "in": "query",
+            "name": "stdout",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Include stderr. Both streams are included when neither stdout nor stderr is selected.",
+            "in": "query",
+            "name": "stderr",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timestamps",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceLogEvent"
+                }
+              }
+            },
+            "description": "Newline-delimited log events from tasks present at request start. Following does not include newly created tasks."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Service logs",
         "tags": [
           "services"
         ]

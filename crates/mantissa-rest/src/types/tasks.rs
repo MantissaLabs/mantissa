@@ -315,7 +315,7 @@ fn default_true() -> bool {
 }
 
 /// Returns the default task log tail request.
-fn default_log_tail() -> String {
+pub(crate) fn default_log_tail() -> String {
     "all".to_string()
 }
 

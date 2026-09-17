@@ -91,6 +91,39 @@ fn openapi_spec_documents_stopped_service_list_option() {
     assert_eq!(include_stopped["schema"]["default"], false);
 }
 
+/// API clients must send log options in the query and be able to omit them.
+#[test]
+fn openapi_service_log_options_are_optional_query_parameters() {
+    let value = openapi::json_value(&server::openapi());
+    let operation = &value["paths"]["/v1/services/{selector}/logs"]["get"];
+    let parameters = operation["parameters"]
+        .as_array()
+        .expect("service log parameters");
+
+    assert_eq!(operation["operationId"], "service_logs");
+    for parameter in parameters {
+        if parameter["name"] == "selector" {
+            assert_eq!(parameter["in"], "path");
+            assert_eq!(parameter["required"], true);
+        } else {
+            assert_eq!(parameter["in"], "query", "{parameter}");
+            assert_eq!(parameter["required"], false, "{parameter}");
+        }
+    }
+
+    let tail = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "tail")
+        .expect("tail option");
+    let follow = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "follow")
+        .expect("follow option");
+
+    assert_eq!(tail["schema"]["default"], "all");
+    assert_eq!(follow["schema"]["default"], false);
+}
+
 /// Ensures retaining volume data remains the documented delete default.
 #[test]
 fn openapi_spec_makes_volume_data_deletion_optional() {
@@ -330,6 +363,7 @@ fn expected_operations() -> BTreeSet<(String, String)> {
         ("GET", "/v1/services/{selector}"),
         ("GET", "/v1/services/{selector}/status"),
         ("GET", "/v1/services/{selector}/tasks"),
+        ("GET", "/v1/services/{selector}/logs"),
         ("GET", "/v1/tasks"),
         ("GET", "/v1/tasks/{selector}"),
         ("GET", "/v1/tasks/{selector}/attach"),

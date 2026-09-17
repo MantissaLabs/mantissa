@@ -1317,6 +1317,11 @@ pub enum ServicesCommand {
     /// List a service's tasks, including retained stopped and failed tasks
     Tasks(ServicesTasksArgs),
 
+    /// Read logs from the tasks present when the command starts
+    ///
+    /// Run the command again to include tasks created by scaling or rollouts.
+    Logs(ServicesLogsArgs),
+
     /// Inspect rollout progress and failure details for one service
     Rollout {
         #[command(subcommand)]
@@ -1384,6 +1389,43 @@ pub struct ServicesTasksArgs {
     /// Show full task IDs and untruncated fields
     #[arg(long)]
     pub no_trunc: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ServicesLogsArgs {
+    /// Service name or full UUID
+    #[arg(index = 1, value_name = "SERVICE")]
+    pub service: String,
+
+    /// Only include tasks from this service template
+    #[arg(long, value_name = "TEMPLATE")]
+    pub template: Option<String>,
+
+    /// Follow the selected tasks until their log streams close
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+
+    /// Number of trailing lines per task, or `all`
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "LINES",
+        default_value = "all",
+        value_parser = parse_log_tail
+    )]
+    pub tail: String,
+
+    /// Include stdout log frames
+    #[arg(long)]
+    pub stdout: bool,
+
+    /// Include stderr log frames
+    #[arg(long)]
+    pub stderr: bool,
+
+    /// Include timestamps when supported by the runtime
+    #[arg(long)]
+    pub timestamps: bool,
 }
 
 #[derive(Args, Debug)]
