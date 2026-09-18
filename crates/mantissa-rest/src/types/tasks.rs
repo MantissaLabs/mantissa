@@ -253,16 +253,23 @@ pub struct TaskAttachQuery {
 /// REST WebSocket query parameters for starting one task exec session.
 #[derive(Clone, Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct TaskExecQuery {
+    /// Command arguments as a JSON array, or a single command name.
     #[serde(default, deserialize_with = "deserialize_command_query")]
+    #[param(value_type = String, required = true)]
     pub command: Vec<String>,
     #[serde(default = "default_true")]
+    #[param(default = true)]
     pub stdin: bool,
     #[serde(default = "default_true")]
+    #[param(default = true)]
     pub stdout: bool,
     #[serde(default = "default_true")]
+    #[param(default = true)]
     pub stderr: bool,
     #[serde(default)]
+    #[param(default = false)]
     pub tty: bool,
     #[serde(default)]
     pub detach_keys: Option<String>,
@@ -310,7 +317,7 @@ impl TaskExecQuery {
 }
 
 /// Returns true for enabled-by-default stream options.
-fn default_true() -> bool {
+pub(super) fn default_true() -> bool {
     true
 }
 
@@ -320,7 +327,7 @@ pub(crate) fn default_log_tail() -> String {
 }
 
 /// Decodes the exec command from a URL query field.
-fn deserialize_command_query<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+pub(super) fn deserialize_command_query<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {

@@ -15,6 +15,40 @@ use utoipa::{IntoParams, ToSchema};
 mod inspect;
 pub use inspect::*;
 
+/// Selects one running service task and supplies its command and terminal options.
+#[derive(Clone, Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub struct ServiceExecQuery {
+    /// Required when the service has multiple configured templates.
+    pub template: Option<String>,
+    /// One-based replica number. Omit to select a running replica automatically.
+    #[param(minimum = 1)]
+    pub replica: Option<u16>,
+    /// Command arguments as a JSON array, or a single command name.
+    #[serde(
+        default,
+        deserialize_with = "crate::types::tasks::deserialize_command_query"
+    )]
+    #[param(value_type = String, required = true)]
+    pub command: Vec<String>,
+    #[serde(default = "crate::types::tasks::default_true")]
+    #[param(default = true)]
+    pub stdin: bool,
+    #[serde(default = "crate::types::tasks::default_true")]
+    #[param(default = true)]
+    pub stdout: bool,
+    #[serde(default = "crate::types::tasks::default_true")]
+    #[param(default = true)]
+    pub stderr: bool,
+    #[serde(default)]
+    #[param(default = false)]
+    pub tty: bool,
+    pub detach_keys: Option<String>,
+    pub tty_width: Option<u16>,
+    pub tty_height: Option<u16>,
+}
+
 /// Selects logs from tasks present at request start. Following does not discover new tasks.
 #[derive(Clone, Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]

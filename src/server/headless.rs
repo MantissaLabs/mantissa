@@ -732,6 +732,17 @@ impl HeadlessNode {
         self.topology_runtime.stop_cluster_background_tasks();
     }
 
+    /// Stops background actors before tests seed fixed service and task records.
+    /// RPC handlers and stores remain available for request and stream tests.
+    #[doc(hidden)]
+    pub async fn stop_runtime_background_tasks_for_test(&mut self) {
+        self.topology_runtime.stop_cluster_background_tasks();
+
+        if let Some(runtime_tasks) = self.runtime_tasks.take() {
+            runtime_tasks.abort_and_wait().await;
+        }
+    }
+
     /// Restarts the periodic cluster loops after a test paused them.
     pub fn ensure_cluster_background_tasks(&self) {
         self.topology_runtime.ensure_cluster_background_tasks();

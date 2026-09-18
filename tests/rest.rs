@@ -25,6 +25,8 @@ mod nodes;
 mod scheduler;
 #[path = "rest/secrets.rs"]
 mod secrets;
+#[path = "rest/service_exec.rs"]
+mod service_exec;
 #[path = "rest/services.rs"]
 mod services;
 #[path = "rest/tasks.rs"]

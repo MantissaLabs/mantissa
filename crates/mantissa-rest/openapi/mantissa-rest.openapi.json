@@ -4843,6 +4843,35 @@
         "description": "One JSON event emitted to REST WebSocket clients.",
         "oneOf": [
           {
+            "description": "Service exec identifies its selected task before sending command output.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "replica": {
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "template": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "selected_task"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "template",
+              "replica",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
             "properties": {
               "data_base64": {
                 "type": "string"
@@ -10819,6 +10848,192 @@
         ]
       }
     },
+    "/v1/services/{selector}/exec": {
+      "get": {
+        "description": "Runs a command in one running service task. Selection prefers the newest running generation, then the lowest replica number. Selection errors return HTTP 400, 404, or 409 before upgrade. The first WebSocket event identifies the selected task; execution is never retried on another replica.",
+        "operationId": "service_exec",
+        "parameters": [
+          {
+            "description": "Service UUID string or exact service name.",
+            "in": "path",
+            "name": "selector",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required when the service has multiple configured templates.",
+            "in": "query",
+            "name": "template",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One-based replica number. Omit to select a running replica automatically.",
+            "in": "query",
+            "name": "replica",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Command arguments as a JSON array, or a single command name.",
+            "in": "query",
+            "name": "command",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "stdin",
+            "required": false,
+            "schema": {
+              "default": true,
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "stdout",
+            "required": false,
+            "schema": {
+              "default": true,
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "stderr",
+            "required": false,
+            "schema": {
+              "default": true,
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tty",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "detach_keys",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tty_width",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tty_height",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInteractiveEvent"
+                }
+              }
+            },
+            "description": "WebSocket upgrade. The first event is selected_task, followed by task exec output and exit-result events. Clients send TaskInteractiveClientMessage JSON frames."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Invalid request syntax, query parameters, or resource selector."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Missing or invalid REST bearer token."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Requested resource was not found."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Request conflicts with the current resource state."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Unexpected REST facade or local client failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestErrorBody"
+                }
+              }
+            },
+            "description": "Local daemon or REST worker is unavailable."
+          }
+        },
+        "summary": "Exec service task",
+        "tags": [
+          "services"
+        ]
+      }
+    },
     "/v1/services/{selector}/logs": {
       "get": {
         "description": "Streams logs from tasks present at request start, with source identity on each event. Following does not include newly created tasks.",
@@ -11611,83 +11826,76 @@
             }
           },
           {
-            "in": "path",
+            "description": "Command arguments as a JSON array, or a single command name.",
+            "in": "query",
             "name": "command",
             "required": true,
             "schema": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "stdin",
-            "required": true,
+            "required": false,
             "schema": {
+              "default": true,
               "type": "boolean"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "stdout",
-            "required": true,
+            "required": false,
             "schema": {
+              "default": true,
               "type": "boolean"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "stderr",
-            "required": true,
+            "required": false,
             "schema": {
+              "default": true,
               "type": "boolean"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "tty",
-            "required": true,
+            "required": false,
             "schema": {
+              "default": false,
               "type": "boolean"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "detach_keys",
-            "required": true,
+            "required": false,
             "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "tty_width",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int32",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           },
           {
-            "in": "path",
+            "in": "query",
             "name": "tty_height",
-            "required": true,
+            "required": false,
             "schema": {
               "format": "int32",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             }
           }
         ],

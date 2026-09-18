@@ -452,6 +452,12 @@ const OPERATION_DOCS: &[OperationDoc] = &[
     ),
     (
         OperationMethod::Get,
+        "/v1/services/{selector}/exec",
+        "Exec service task",
+        "Runs a command in one running service task. Selection prefers the newest running generation, then the lowest replica number. Selection errors return HTTP 400, 404, or 409 before upgrade. The first WebSocket event identifies the selected task; execution is never retried on another replica.",
+    ),
+    (
+        OperationMethod::Get,
         "/v1/networks",
         "List networks",
         "Lists overlay networks visible to the local daemon.",

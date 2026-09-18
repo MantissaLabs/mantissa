@@ -1188,6 +1188,13 @@ pub struct TasksExecArgs {
     #[arg(index = 1, value_name = "ID")]
     pub id: String,
 
+    #[command(flatten)]
+    pub options: ExecOptionsArgs,
+}
+
+/// Shares command and terminal flags between task and service execution.
+#[derive(Args, Debug)]
+pub struct ExecOptionsArgs {
     /// Disable stdin forwarding to the exec session
     #[arg(long = "no-stdin", action = ArgAction::SetTrue)]
     pub no_stdin: bool,
@@ -1218,6 +1225,20 @@ pub struct TasksExecArgs {
         value_name = "COMMAND"
     )]
     pub command: Vec<String>,
+}
+
+impl<'a> From<&'a ExecOptionsArgs> for crate::tasks::TaskExecOptions<'a> {
+    /// Keeps service execution consistent with the existing task terminal behavior.
+    fn from(args: &'a ExecOptionsArgs) -> Self {
+        Self {
+            command: &args.command,
+            stdin: !args.no_stdin,
+            stdout: args.stdout,
+            stderr: args.stderr,
+            tty: args.tty,
+            detach_keys: args.detach_keys.as_deref(),
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -1321,6 +1342,12 @@ pub enum ServicesCommand {
     ///
     /// Run the command again to include tasks created by scaling or rollouts.
     Logs(ServicesLogsArgs),
+
+    /// Execute a command inside one running service task
+    ///
+    /// Prefers the newest running generation, then the lowest replica number.
+    /// Prints the selected task to stderr and does not retry on another task.
+    Exec(ServicesExecArgs),
 
     /// Inspect rollout progress and failure details for one service
     Rollout {
@@ -1426,6 +1453,24 @@ pub struct ServicesLogsArgs {
     /// Include timestamps when supported by the runtime
     #[arg(long)]
     pub timestamps: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ServicesExecArgs {
+    /// Service name or full UUID
+    #[arg(index = 1, value_name = "SERVICE")]
+    pub service: String,
+
+    /// Template to execute in (required when the service has multiple templates)
+    #[arg(long, value_name = "TEMPLATE")]
+    pub template: Option<String>,
+
+    /// Replica number within the selected template, starting at 1
+    #[arg(long, value_name = "NUMBER", value_parser = clap::value_parser!(u16).range(1..))]
+    pub replica: Option<u16>,
+
+    #[command(flatten)]
+    pub options: ExecOptionsArgs,
 }
 
 #[derive(Args, Debug)]

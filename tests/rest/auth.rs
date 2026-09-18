@@ -77,6 +77,7 @@ fn protected_routes() -> Vec<ProtectedRoute> {
         route(Method::GET, "/v1/services/demo-service/status"),
         route(Method::GET, "/v1/services/demo-service/tasks"),
         route(Method::GET, "/v1/services/demo-service/logs"),
+        route(Method::GET, "/v1/services/demo-service/exec?command=id"),
         route(Method::GET, "/v1/networks"),
         route(Method::POST, "/v1/networks"),
         route(Method::GET, format!("/v1/networks/{network_id}")),

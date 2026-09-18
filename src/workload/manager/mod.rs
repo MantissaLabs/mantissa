@@ -2132,6 +2132,38 @@ impl WorkloadManager {
         Ok(specs)
     }
 
+    /// Selects one running replica without copying task configurations or sorting the task set.
+    pub(crate) async fn select_service_exec_task(
+        &self,
+        service_name: &str,
+        template: &str,
+        replica: Option<u16>,
+    ) -> Result<Option<(Uuid, u16)>, anyhow::Error> {
+        let values = self.load_workload_value_index().await?;
+        let selected = values
+            .iter()
+            .filter_map(|(id, value)| {
+                let owner = value.service_owner()?;
+                (owner.service_name == service_name
+                    && owner.template == template
+                    && value.state == WorkloadPhase::Running
+                    && replica.is_none_or(|replica| owner.replica == replica))
+                .then_some((id, value, owner))
+            })
+            .min_by(
+                |(left_id, left, left_owner), (right_id, right, right_owner)| {
+                    right_owner
+                        .service_epoch
+                        .cmp(&left_owner.service_epoch)
+                        .then(left_owner.replica.cmp(&right_owner.replica))
+                        .then(right.created_at.cmp(&left.created_at))
+                        .then(left_id.cmp(right_id))
+                },
+            );
+
+        Ok(selected.map(|(id, _, owner)| (*id, owner.replica)))
+    }
+
     /// Applies a batch of assignment rows delivered directly by the coordinating owner.
     ///
     /// Direct assignment delivery is the hot path for remote placements. The owner still keeps a

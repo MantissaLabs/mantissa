@@ -1,4 +1,5 @@
 pub mod deploy;
+pub mod exec;
 pub mod inspect;
 pub mod list;
 pub mod logs;
@@ -8,6 +9,7 @@ pub mod stop;
 pub mod tasks;
 
 pub use deploy::{ServiceDeployOutcome, ServiceDeploymentHandle, deploy_manifest};
+pub use exec::{ServiceExecTask, select_exec_task};
 pub use inspect::{ServiceInspection, inspect};
 pub use list::list;
 pub use logs::{ServiceLogEvent, ServiceLogSource, ServiceLogStream, logs};

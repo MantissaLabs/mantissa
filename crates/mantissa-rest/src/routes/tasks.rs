@@ -142,7 +142,7 @@ pub async fn attach(
         .await
         .map_err(worker_error_to_rest)?;
     Ok(ws
-        .on_upgrade(move |socket| drive_task_websocket(socket, session))
+        .on_upgrade(move |socket| drive_task_websocket(socket, session, None))
         .into_response())
 }
 
@@ -170,7 +170,7 @@ pub async fn exec(
         .await
         .map_err(worker_error_to_rest)?;
     Ok(ws
-        .on_upgrade(move |socket| drive_task_websocket(socket, session))
+        .on_upgrade(move |socket| drive_task_websocket(socket, session, None))
         .into_response())
 }
 
@@ -196,7 +196,20 @@ pub async fn stop(
 }
 
 /// Drives one bidirectional task WebSocket until either side closes.
-async fn drive_task_websocket(mut socket: WebSocket, mut session: TaskInteractiveSession) {
+pub(super) async fn drive_task_websocket(
+    mut socket: WebSocket,
+    mut session: TaskInteractiveSession,
+    initial_event: Option<TaskInteractiveEvent>,
+) {
+    if let Some(event) = initial_event
+        && socket
+            .send(Message::text(event.into_json_text()))
+            .await
+            .is_err()
+    {
+        return;
+    }
+
     let requires_result = session.requires_result();
     let mut end_seen = false;
     let mut result_seen = !requires_result;
@@ -214,7 +227,8 @@ async fn drive_task_websocket(mut socket: WebSocket, mut session: TaskInteractiv
                             result_seen = true;
                         }
                     }
-                    TaskInteractiveEvent::Frame { .. } => {}
+                    TaskInteractiveEvent::Frame { .. }
+                    | TaskInteractiveEvent::SelectedTask { .. } => {}
                 }
                 if socket.send(Message::text(event.into_json_text())).await.is_err() {
                     return;

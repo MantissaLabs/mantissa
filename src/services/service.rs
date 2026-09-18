@@ -211,6 +211,100 @@ impl services::Server for ServicesRPC {
         Ok(())
     }
 
+    /// Resolves a task identity based on a service and template name as well as replica number.
+    /// Used, for example, when a client wants to exec into a task within a service.
+    async fn select_exec_task(
+        self: Rc<Self>,
+        params: services::SelectExecTaskParams,
+        mut results: services::SelectExecTaskResults,
+    ) -> Result<(), Error> {
+        let request = params.get()?;
+        let selector = request.get_selector()?.to_str()?.trim();
+        let template = if request.has_template() {
+            Some(request.get_template()?.to_str()?.trim())
+        } else {
+            None
+        };
+        let replica = request.get_has_replica().then(|| request.get_replica());
+        let mut result = results.get().init_result();
+
+        if selector.is_empty() {
+            result.set_invalid_request("service name or ID must not be empty");
+            return Ok(());
+        }
+        if template == Some("") {
+            result.set_invalid_request("template must not be empty");
+            return Ok(());
+        }
+        if replica == Some(0) {
+            result.set_invalid_request("replica must be at least 1");
+            return Ok(());
+        }
+
+        let Some(service) = self
+            .find_service(selector)
+            .map_err(|error| Error::failed(error.to_string()))?
+        else {
+            result.set_not_found(format!("service '{selector}' not found"));
+            return Ok(());
+        };
+
+        // Retained task records can include removed templates and omit templates awaiting placement.
+        let template = match template {
+            Some(name) => {
+                if !service
+                    .task_templates
+                    .iter()
+                    .any(|template| template.name == name)
+                {
+                    result.set_not_found(format!("service '{selector}' has no template '{name}'"));
+                    return Ok(());
+                }
+                name
+            }
+            None => match service.task_templates.as_slice() {
+                [template] => &template.name,
+                [] => {
+                    result.set_no_running_task(format!("service '{selector}' has no templates"));
+                    return Ok(());
+                }
+                templates => {
+                    let names = templates
+                        .iter()
+                        .map(|template| template.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    result.set_invalid_request(format!(
+                        "service '{selector}' has multiple templates; specify a template ({names})"
+                    ));
+                    return Ok(());
+                }
+            },
+        };
+
+        let selected = self
+            .manager
+            .select_exec_task(&service.service_name, template, replica)
+            .await
+            .map_err(|error| Error::failed(error.to_string()))?;
+        let Some((id, replica)) = selected else {
+            let replica = replica
+                .map(|number| format!(", replica {number}"))
+                .unwrap_or_default();
+            result.set_no_running_task(format!(
+                "no running task for service '{selector}', template '{template}'{replica}"
+            ));
+            return Ok(());
+        };
+
+        let mut task = result.init_task();
+        task.set_id(id.as_bytes());
+        task.set_template(template);
+        task.set_replica(replica);
+
+        Ok(())
+    }
+
     /// Fetches one service plus task-template progress for efficient client-side status polling.
     async fn status(
         self: Rc<Self>,

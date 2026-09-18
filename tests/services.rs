@@ -9,6 +9,8 @@ mod dependencies;
 mod deployment;
 #[path = "services/drain.rs"]
 mod drain;
+#[path = "services/exec.rs"]
+mod exec;
 #[path = "services/gang.rs"]
 mod gang;
 #[path = "services/network_realization.rs"]

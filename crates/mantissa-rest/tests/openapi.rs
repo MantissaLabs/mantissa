@@ -124,6 +124,56 @@ fn openapi_service_log_options_are_optional_query_parameters() {
     assert_eq!(follow["schema"]["default"], false);
 }
 
+/// Describes service selection and the existing exec stream without an extra request body.
+#[test]
+fn openapi_spec_documents_service_exec_selection_and_stream() {
+    let value = openapi::json_value(&server::openapi());
+    let operation = &value["paths"]["/v1/services/{selector}/exec"]["get"];
+    let parameters = operation["parameters"]
+        .as_array()
+        .expect("service exec parameters");
+    let parameter = |name: &str| {
+        parameters
+            .iter()
+            .find(|parameter| parameter["name"] == name)
+            .expect("documented query parameter")
+    };
+
+    assert_eq!(operation["operationId"], "service_exec");
+    assert!(operation.get("requestBody").is_none());
+    assert_eq!(parameter("command")["in"], "query");
+    assert_eq!(parameter("command")["required"], true);
+    assert_eq!(parameter("command")["schema"]["type"], "string");
+    assert_eq!(parameter("template")["required"], false);
+    assert_eq!(parameter("replica")["required"], false);
+    assert_eq!(parameter("replica")["schema"]["minimum"], 1);
+
+    let task_parameters = value["paths"]["/v1/tasks/{selector}/exec"]["get"]["parameters"]
+        .as_array()
+        .expect("task exec parameters");
+    for task_parameter in task_parameters
+        .iter()
+        .filter(|parameter| parameter["name"] != "selector")
+    {
+        let name = task_parameter["name"].as_str().expect("parameter name");
+        assert_eq!(parameter(name), task_parameter, "shared exec option {name}");
+    }
+
+    assert_eq!(
+        operation["responses"]["101"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/TaskInteractiveEvent"
+    );
+    let events = value["components"]["schemas"]["TaskInteractiveEvent"]["oneOf"]
+        .as_array()
+        .expect("interactive event variants");
+    let selected = events
+        .iter()
+        .find(|event| event["properties"]["type"]["enum"][0] == "selected_task")
+        .expect("selected task event");
+
+    assert_required(selected, &["id", "template", "replica", "type"]);
+}
+
 /// Ensures retaining volume data remains the documented delete default.
 #[test]
 fn openapi_spec_makes_volume_data_deletion_optional() {
@@ -364,6 +414,7 @@ fn expected_operations() -> BTreeSet<(String, String)> {
         ("GET", "/v1/services/{selector}/status"),
         ("GET", "/v1/services/{selector}/tasks"),
         ("GET", "/v1/services/{selector}/logs"),
+        ("GET", "/v1/services/{selector}/exec"),
         ("GET", "/v1/tasks"),
         ("GET", "/v1/tasks/{selector}"),
         ("GET", "/v1/tasks/{selector}/attach"),

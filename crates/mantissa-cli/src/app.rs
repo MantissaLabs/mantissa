@@ -329,19 +329,9 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                     .await?;
             }
             TasksCommand::Exec(args) => {
+                let options = (&args.options).into();
                 local
-                    .run_until(crate::tasks::exec(
-                        &cfg,
-                        &args.id,
-                        &crate::tasks::TaskExecOptions {
-                            command: &args.command,
-                            stdin: !args.no_stdin,
-                            stdout: args.stdout,
-                            stderr: args.stderr,
-                            tty: args.tty,
-                            detach_keys: args.detach_keys.as_deref(),
-                        },
-                    ))
+                    .run_until(crate::tasks::exec(&cfg, &args.id, &options))
                     .await?;
             }
             TasksCommand::Start(args) => {
@@ -621,6 +611,18 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                             stderr: args.stderr,
                             timestamps: args.timestamps,
                         },
+                    ))
+                    .await?;
+            }
+            ServicesCommand::Exec(args) => {
+                let options = (&args.options).into();
+                local
+                    .run_until(crate::services::exec(
+                        &cfg,
+                        &args.service,
+                        args.template.as_deref(),
+                        args.replica,
+                        &options,
                     ))
                     .await?;
             }

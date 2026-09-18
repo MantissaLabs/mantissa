@@ -27,15 +27,15 @@ use crate::harness::RestTestHarness;
 type LogCall = (String, RuntimeLogsOptions);
 type AttachCall = (String, RuntimeAttachOptions);
 type ExecCall = (String, RuntimeExecOptions);
-type RestWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(super) type RestWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Clone, Default)]
-struct StaticTaskStreamsRuntimeBackend {
+pub(super) struct StaticTaskStreamsRuntimeBackend {
     frames: Arc<AsyncMutex<HashMap<String, Vec<RuntimeLogFrame>>>>,
     log_calls: Arc<AsyncMutex<Vec<LogCall>>>,
     attach_calls: Arc<AsyncMutex<Vec<AttachCall>>>,
-    exec_calls: Arc<AsyncMutex<Vec<ExecCall>>>,
-    inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
+    pub(super) exec_calls: Arc<AsyncMutex<Vec<ExecCall>>>,
+    pub(super) inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
 }
 
 #[async_trait]
@@ -175,7 +175,7 @@ impl RuntimeBackend for StaticTaskStreamsRuntimeBackend {
 
 impl StaticTaskStreamsRuntimeBackend {
     /// Adds ordered runtime frames for one seeded task id.
-    async fn seed_frames(&self, task_id: Uuid, frames: Vec<RuntimeLogFrame>) {
+    pub(super) async fn seed_frames(&self, task_id: Uuid, frames: Vec<RuntimeLogFrame>) {
         self.frames
             .lock()
             .await
@@ -244,7 +244,7 @@ async fn start_task(harness: &RestTestHarness, name: &str) -> (String, Value) {
 }
 
 /// Returns the runtime handle Mantissa derives for a standalone task.
-fn runtime_handle(task_id: Uuid) -> String {
+pub(super) fn runtime_handle(task_id: Uuid) -> String {
     format!("mantissa-{task_id}")
 }
 
@@ -312,7 +312,10 @@ async fn seed_stream_task(
 }
 
 /// Opens one authenticated REST WebSocket connection.
-async fn connect_websocket(url: String, token: &str) -> (RestWebSocket, Response<Option<Vec<u8>>>) {
+pub(super) async fn connect_websocket(
+    url: String,
+    token: &str,
+) -> (RestWebSocket, Response<Option<Vec<u8>>>) {
     let mut request = url.into_client_request().expect("build WebSocket request");
     request.headers_mut().insert(
         "authorization",
@@ -326,7 +329,7 @@ async fn connect_websocket(url: String, token: &str) -> (RestWebSocket, Response
 }
 
 /// Reads the next text WebSocket message as JSON.
-async fn next_websocket_json(socket: &mut RestWebSocket) -> Value {
+pub(super) async fn next_websocket_json(socket: &mut RestWebSocket) -> Value {
     match socket.next().await.expect("WebSocket message") {
         Ok(Message::Text(text)) => serde_json::from_str(text.as_ref()).expect("JSON event"),
         Ok(Message::Close(frame)) => panic!("WebSocket closed before JSON event: {frame:?}"),
@@ -336,7 +339,7 @@ async fn next_websocket_json(socket: &mut RestWebSocket) -> Value {
 }
 
 /// Builds one REST WebSocket input event from raw bytes.
-fn input_message(bytes: &[u8]) -> Message {
+pub(super) fn input_message(bytes: &[u8]) -> Message {
     Message::Text(
         json!({
             "type": "input",
@@ -348,12 +351,12 @@ fn input_message(bytes: &[u8]) -> Message {
 }
 
 /// Builds the REST WebSocket close-input control event.
-fn close_input_message() -> Message {
+pub(super) fn close_input_message() -> Message {
     Message::Text(json!({"type": "close_input"}).to_string().into())
 }
 
 /// Decodes one REST stream frame data field.
-fn event_data(value: &Value) -> Vec<u8> {
+pub(super) fn event_data(value: &Value) -> Vec<u8> {
     STANDARD
         .decode(value["data_base64"].as_str().expect("event data"))
         .expect("decode event data")

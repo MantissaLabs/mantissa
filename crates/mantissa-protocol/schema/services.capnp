@@ -30,6 +30,39 @@ interface Services {
 
   tasks @6 (selector :Text) -> (result :ServiceTasksResult);
   # List observed tasks for a service name or UUID, including retained stopped tasks.
+
+  selectExecTask @7 (selector :Text, template :Text, hasReplica :Bool, replica :UInt16)
+      -> (result :ServiceExecTaskResult);
+  # Select one running task by service name or UUID without starting a command. Used for
+  # example when a client wants to exec in a task within a service without fetching the
+  # full list of tasks first.
+}
+
+struct ServiceExecTaskResult {
+  union {
+    task @0 :ServiceExecTask;
+    # A running task was selected from this node's replicated state: it can still stop before exec.
+
+    notFound @1 :Text;
+    # The service or explicitly requested template does not exist: text explains which is missing.
+
+    invalidRequest @2 :Text;
+    # A service/template name is empty, a requested replica is zero, or template selection is ambiguous.
+
+    noRunningTask @3 :Text;
+    # The service exists but has no configured templates or no running task matching the selection.
+  }
+}
+
+struct ServiceExecTask {
+  id @0 :Data;
+  # Full task UUID to pass unchanged to Task.exec.
+
+  template @1 :Text;
+  # Configured template that owns the selected task.
+
+  replica @2 :UInt16;
+  # One-based replica number to display with the selected task UUID.
 }
 
 struct ServiceTasksResult {

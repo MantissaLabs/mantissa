@@ -2,18 +2,18 @@ use crate::{
     auth::RestAuth,
     error::RestError,
     extract::{RestJson, RestQuery},
-    routes::worker_error_to_rest,
+    routes::{tasks::drive_task_websocket, worker_error_to_rest},
     state::AppState,
-    stream::service_logs::ServiceLogEvent,
+    stream::{service_logs::ServiceLogEvent, task_exec::TaskInteractiveEvent},
     types::services::{
-        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceLogsQuery,
-        ServiceSummary, ServiceTaskSummary,
+        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceExecQuery,
+        ServiceLogsQuery, ServiceSummary, ServiceTaskSummary,
     },
 };
 use axum::{
     Json,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, State, ws::WebSocketUpgrade},
     http::header::CONTENT_TYPE,
     response::{IntoResponse, Response},
 };
@@ -143,6 +143,41 @@ pub async fn logs(
         [(CONTENT_TYPE, "application/x-ndjson")],
         Body::from_stream(stream),
     )
+        .into_response())
+}
+
+/// Selects one running service task before opening the shared command stream.
+#[utoipa::path(
+    get,
+    path = "/v1/services/{selector}/exec",
+    operation_id = "service_exec",
+    tag = "services",
+    params(
+        ("selector" = String, Path, description = "Service UUID string or exact service name."),
+        ServiceExecQuery
+    ),
+    responses((status = 101, description = "WebSocket upgrade. The first event is selected_task, followed by task exec output and exit-result events. Clients send TaskInteractiveClientMessage JSON frames.", body = TaskInteractiveEvent))
+)]
+pub async fn exec(
+    State(state): State<AppState>,
+    _auth: RestAuth,
+    Path(selector): Path<String>,
+    RestQuery(query): RestQuery<ServiceExecQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, RestError> {
+    let (task, session) = state
+        .client()
+        .service_exec(selector, query)
+        .await
+        .map_err(worker_error_to_rest)?;
+    let selected_task = TaskInteractiveEvent::SelectedTask {
+        id: task.id,
+        template: task.template,
+        replica: task.replica,
+    };
+
+    Ok(ws
+        .on_upgrade(move |socket| drive_task_websocket(socket, session, Some(selected_task)))
         .into_response())
 }
 

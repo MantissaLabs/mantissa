@@ -30,6 +30,12 @@ pub enum TaskInteractiveClientMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskInteractiveEvent {
+    /// Service exec identifies its selected task before sending command output.
+    SelectedTask {
+        id: String,
+        template: String,
+        replica: u16,
+    },
     Frame {
         stream: String,
         data_base64: String,

@@ -30,8 +30,8 @@ use crate::types::{
     scheduler::SchedulerSummary,
     secrets::{SecretDeleteResponse, SecretDetail, SecretSummary, SecretUpsertRequest},
     services::{
-        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceLogsQuery,
-        ServiceSummary, ServiceTaskSummary,
+        ServiceDeployRequest, ServiceDeployResponse, ServiceDetail, ServiceExecQuery,
+        ServiceLogsQuery, ServiceSummary, ServiceTaskSummary,
     },
     tasks::{
         TaskAttachQuery, TaskDetail, TaskExecQuery, TaskLogsQuery, TaskStartRequest, TaskSummary,
@@ -276,6 +276,20 @@ impl ClientWorkerHandle {
         self.send(|respond_to| ClientCommand::ServiceLogs {
             selector,
             request,
+            respond_to,
+        })
+        .await
+    }
+
+    /// Resolves the service task before exposing its identity and exec stream to REST.
+    pub async fn service_exec(
+        &self,
+        selector: String,
+        request: ServiceExecQuery,
+    ) -> Result<(services::ServiceExecTask, TaskInteractiveSession), ClientWorkerError> {
+        self.send(|respond_to| ClientCommand::ServiceExec {
+            selector,
+            request: Box::new(request),
             respond_to,
         })
         .await
@@ -950,6 +964,13 @@ enum ClientCommand {
         request: ServiceLogsQuery,
         respond_to: oneshot::Sender<Result<ServiceLogHttpStream, ClientWorkerError>>,
     },
+    ServiceExec {
+        selector: String,
+        request: Box<ServiceExecQuery>,
+        respond_to: oneshot::Sender<
+            Result<(services::ServiceExecTask, TaskInteractiveSession), ClientWorkerError>,
+        >,
+    },
     DeleteService {
         selector: String,
         respond_to: oneshot::Sender<Result<ServiceSummary, ClientWorkerError>>,
@@ -1239,6 +1260,14 @@ async fn client_worker_loop(config: ClientConfig, mut receiver: mpsc::Receiver<C
             } => {
                 let _ignored =
                     respond_to.send(start_service_logs(&config, &selector, request).await);
+            }
+            ClientCommand::ServiceExec {
+                selector,
+                request,
+                respond_to,
+            } => {
+                let _ignored =
+                    respond_to.send(start_service_exec(&config, &selector, *request).await);
             }
             ClientCommand::DeleteService {
                 selector,
@@ -1769,6 +1798,45 @@ async fn start_service_logs(
         })?;
 
     Ok(ServiceLogHttpStream(stream))
+}
+
+/// Keeps selection failures as HTTP errors and executes only the returned task UUID.
+async fn start_service_exec(
+    config: &ClientConfig,
+    selector: &str,
+    request: ServiceExecQuery,
+) -> Result<(services::ServiceExecTask, TaskInteractiveSession), ClientWorkerError> {
+    let options = TaskExecQuery {
+        command: request.command,
+        stdin: request.stdin,
+        stdout: request.stdout,
+        stderr: request.stderr,
+        tty: request.tty,
+        detach_keys: request.detach_keys,
+        tty_width: request.tty_width,
+        tty_height: request.tty_height,
+    };
+    options
+        .validate()
+        .map_err(ClientWorkerError::InvalidRequest)?;
+
+    let task = services::select_exec_task(
+        config,
+        selector,
+        request.template.as_deref(),
+        request.replica,
+    )
+    .await
+    .map_err(|error| {
+        error
+            .downcast_ref::<ClientError>()
+            .cloned()
+            .map(ClientWorkerError::from)
+            .unwrap_or_else(|| operation_failed_error(error))
+    })?;
+
+    let session = start_task_exec(config, task.id.clone(), options)?;
+    Ok((task, session))
 }
 
 /// Shares name and UUID selection with the CLI when requesting service stop.

@@ -744,6 +744,18 @@ impl ServiceController {
         self.workload_manager.service_workloads(service_name).await
     }
 
+    /// Reuses the workload index to return only the identity needed for service exec.
+    pub(crate) async fn select_exec_task(
+        &self,
+        service_name: &str,
+        template: &str,
+        replica: Option<u16>,
+    ) -> anyhow::Result<Option<(Uuid, u16)>> {
+        self.workload_manager
+            .select_service_exec_task(service_name, template, replica)
+            .await
+    }
+
     /// Builds task-template aggregate progress for one service status request.
     ///
     /// Large service generations publish compact per-node progress records. When those records

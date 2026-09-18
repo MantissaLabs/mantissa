@@ -47,6 +47,17 @@ impl RestTestHarness {
         Self::from_nodes(runtime_guard, vec![node]).await
     }
 
+    /// Keeps seeded task records stable while exercising the real RPC and REST stream paths.
+    pub async fn new_without_background_tasks(
+        backend: Arc<dyn RuntimeBackend + Send + Sync>,
+    ) -> Self {
+        let runtime_guard = RuntimeBackendOverrideGuard::install(backend);
+        let mut node = TestNode::new().await;
+        node.node.stop_runtime_background_tasks_for_test().await;
+
+        Self::from_nodes(runtime_guard, vec![node]).await
+    }
+
     /// Starts an in-process test cluster and exposes REST from the first node.
     pub async fn new_cluster(size: usize) -> Self {
         let runtime_guard = RuntimeBackendOverrideGuard::install_default();

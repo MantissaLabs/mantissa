@@ -1,4 +1,5 @@
 pub mod deploy;
+pub mod exec;
 pub mod inspect;
 pub mod list;
 pub mod logs;
@@ -8,6 +9,7 @@ pub mod tasks;
 mod wait;
 
 pub use deploy::{ServiceRunOptions, run_manifest};
+pub use exec::exec;
 pub use inspect::inspect;
 pub use list::list;
 pub use logs::logs;
