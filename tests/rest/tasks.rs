@@ -3,6 +3,7 @@ use axum::http::{Method, Response, StatusCode, header::CONTENT_TYPE};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
     RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream,
@@ -459,7 +460,9 @@ local_test!(rest_tasks_inspect_retained_task_by_id_name_and_prefix, {
 });
 
 local_test!(rest_tasks_inspect_rejects_ambiguous_and_empty_selectors, {
-    let harness = RestTestHarness::new().await;
+    // Keep stopped task records present while checking name and UUID prefix selection.
+    let harness =
+        RestTestHarness::new_without_background_tasks(new_in_memory_runtime_backend()).await;
     let first = Uuid::parse_str("abcdef12-0000-4000-8000-000000000001").unwrap();
     let second = Uuid::parse_str("abcdef12-0000-4000-8000-000000000002").unwrap();
     seed_stream_task(&harness, first, "duplicate", WorkloadPhase::Stopped).await;
@@ -525,7 +528,9 @@ local_test!(rest_tasks_inspect_preserves_runtime_configuration, {
         WorkloadPortProtocol, WorkloadRestartPolicy, WorkloadRestartPolicyKind,
     };
 
-    let harness = RestTestHarness::new().await;
+    // Prevent cleanup from removing this stopped task before its configuration is read.
+    let harness =
+        RestTestHarness::new_without_background_tasks(new_in_memory_runtime_backend()).await;
     let task_id = Uuid::new_v4();
     let network_id = Uuid::new_v4();
     let volume_id = Uuid::new_v4();
@@ -1032,7 +1037,9 @@ local_test!(rest_tasks_stop_started_task_by_id, {
 });
 
 local_test!(rest_tasks_stop_preserves_exact_name_selection, {
-    let harness = RestTestHarness::new().await;
+    // Stop background cleanup before seeding so both stopped tasks remain selectable.
+    let harness =
+        RestTestHarness::new_without_background_tasks(new_in_memory_runtime_backend()).await;
     let named_task_id = Uuid::from_u128(1);
     let prefix_task_id = Uuid::parse_str("abcdef12-0000-4000-8000-000000000002").unwrap();
     seed_stream_task(&harness, named_task_id, "abcdef12", WorkloadPhase::Stopped).await;
