@@ -71,6 +71,10 @@ The system needs to be:
 - Scope tests by name: `cargo test register_node_tcp`.
 - Never trigger multiple test runs (ie. multiple instances of `cargo test`) at the same time.
 
+## Review
+
+- Before finishing a patch, review every new or modified comment. A method comment must explain what the method does and why it exists in the surrounding code. Name the relevant data and components directly. When it protects correctness, explain the specific failure it prevents. Use well-written comments from the repository as references. Rewrite comments that merely restate the method name or rely on vague terms that require reading the implementation to understand.
+
 ## Commit & Pull Request Guidelines
 
 - Run `cargo fmt`, `cargo clippy`, and `cargo test` before marking work as complete. Note protocol/schema changes explicitly.

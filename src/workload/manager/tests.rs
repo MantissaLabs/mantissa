@@ -233,6 +233,9 @@ struct FakeReplicatedVolumeAccess {
     mount_path: std::path::PathBuf,
     mount_calls: AtomicUsize,
     unmount_calls: AtomicUsize,
+    // Pauses mount and unmount so the test can save a capacity update before they return.
+    // The first wait signals that the call started; the second waits for the update.
+    lifecycle_barrier: parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[async_trait]
@@ -268,6 +271,11 @@ impl super::volumes::ReplicatedVolumeAccess for FakeReplicatedVolumeAccess {
         if self.fail_mount.load(Ordering::Acquire) {
             anyhow::bail!("test mount failure");
         }
+        let barrier = self.lifecycle_barrier.lock().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+            barrier.wait().await;
+        }
         self.mounted.store(true, Ordering::Release);
         Ok(self.mount_path.clone())
     }
@@ -277,6 +285,11 @@ impl super::volumes::ReplicatedVolumeAccess for FakeReplicatedVolumeAccess {
         self.unmount_calls.fetch_add(1, Ordering::AcqRel);
         if self.fail_unmount.load(Ordering::Acquire) {
             anyhow::bail!("test unmount failure");
+        }
+        let barrier = self.lifecycle_barrier.lock().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+            barrier.wait().await;
         }
         self.mounted.store(false, Ordering::Release);
         Ok(())
@@ -10999,6 +11012,7 @@ async fn replicated_volume_detaches_after_its_last_local_task() {
         mount_path: mount_root.path().to_path_buf(),
         mount_calls: AtomicUsize::new(0),
         unmount_calls: AtomicUsize::new(0),
+        lifecycle_barrier: parking_lot::Mutex::new(None),
     });
     let runtime_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = runtime.clone();
     manager.volumes.replicated = Some(Arc::downgrade(&runtime_access));
@@ -11142,6 +11156,7 @@ async fn late_task_detach_does_not_replace_retention_status() {
         mount_path: mount_root.path().to_path_buf(),
         mount_calls: AtomicUsize::new(0),
         unmount_calls: AtomicUsize::new(0),
+        lifecycle_barrier: parking_lot::Mutex::new(None),
     });
     let runtime_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = runtime.clone();
     manager.volumes.replicated = Some(Arc::downgrade(&runtime_access));
@@ -11251,12 +11266,95 @@ async fn setup_replicated_shutdown_test(
         mount_path: mount_root.path().to_path_buf(),
         mount_calls: AtomicUsize::new(0),
         unmount_calls: AtomicUsize::new(0),
+        lifecycle_barrier: parking_lot::Mutex::new(None),
     });
     let replicated_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = replicated.clone();
     manager.volumes.replicated = Some(Arc::downgrade(&replicated_access));
     let volume = create_ready_replicated_volume(&manager, volume_name).await;
 
     (manager, mock_runtime, replicated, mount_root, volume)
+}
+
+/// A capacity update saved while mount or unmount is waiting must survive the workload
+/// manager's final write of the mount path and task list.
+#[tokio::test]
+async fn replicated_volume_publication_preserves_capacity_during_mount_and_unmount() {
+    let (manager, _runtime, replicated, mount_root, volume) =
+        setup_replicated_shutdown_test(1, "concurrent-capacity-report").await;
+    let registry = &manager.volumes.volume_registry;
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    *replicated.lifecycle_barrier.lock() = Some(barrier.clone());
+    let task_id = Uuid::new_v4();
+    let capacity = volume.initial_capacity_bytes;
+    let mounts = vec![crate::workload::model::WorkloadVolumeMount {
+        volume_id: volume.id,
+        volume_name: volume.name.clone(),
+        target: "/data".to_string(),
+        read_only: false,
+    }];
+
+    for published in [true, false] {
+        let publication = async {
+            if published {
+                manager
+                    .publish_task_volume_mounts_for_task(task_id, &mounts)
+                    .await
+            } else {
+                manager
+                    .unpublish_task_volume_mounts_for_task(task_id, &mounts)
+                    .await
+            }
+        };
+        let observation = async {
+            barrier.wait().await;
+            let mut state = registry
+                .get_node_state(volume.id, manager.local_node_id)
+                .unwrap()
+                .unwrap();
+            state.served_capacity_bytes = capacity;
+            state.device_capacity_bytes = published.then_some(capacity.unwrap());
+            state.updated_at = Utc::now().to_rfc3339();
+            registry.upsert_node_state(state.clone()).await.unwrap();
+            barrier.wait().await;
+            state
+        };
+        let (publication, observation) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(publication, observation)
+            })
+            .await
+            .expect("mount publication and capacity observation complete");
+        publication.expect("publish mount ownership");
+
+        let state = registry
+            .get_node_state(volume.id, manager.local_node_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.served_capacity_bytes,
+            observation.served_capacity_bytes
+        );
+        assert_eq!(
+            state.device_capacity_bytes,
+            observation.device_capacity_bytes
+        );
+        assert_eq!(
+            state.published_task_ids,
+            if published { vec![task_id] } else { Vec::new() },
+        );
+        assert_eq!(
+            state.local_path,
+            published.then(|| mount_root.path().to_string_lossy().to_string()),
+        );
+        assert_eq!(
+            state.state,
+            if published {
+                VolumeNodeState::Published
+            } else {
+                VolumeNodeState::Ready
+            },
+        );
+    }
 }
 
 /// A running container must be killed before a failed replicated mount can expose its bare path.
@@ -11761,6 +11859,7 @@ async fn replicated_mount_failure_returns_one_blocked_task_and_keeps_its_slots_f
         mount_path: mount_root.path().to_path_buf(),
         mount_calls: AtomicUsize::new(0),
         unmount_calls: AtomicUsize::new(0),
+        lifecycle_barrier: parking_lot::Mutex::new(None),
     });
     let runtime_access: Arc<dyn super::volumes::ReplicatedVolumeAccess> = runtime.clone();
     manager.volumes.replicated = Some(Arc::downgrade(&runtime_access));

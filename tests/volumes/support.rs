@@ -3740,7 +3740,8 @@ pub(crate) async fn run_replicated_volume_public_flow(
     Ok(())
 }
 
-/// Proves an impossible reservation leaves the mounted current capacity usable.
+/// Requests an expansion larger than the available disk space and checks that the
+/// mounted volume keeps its current capacity and remains writable.
 pub(crate) async fn run_insufficient_space_expansion_flow(
     cluster: &[TestNode],
 ) -> anyhow::Result<()> {
@@ -3759,6 +3760,33 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
     .await?;
     let (attached_node_id, host_mount) =
         wait_for_attached_volume(cluster, volume_id, Duration::from_secs(90)).await?;
+    let attached = cluster
+        .iter()
+        .find(|node| node.id() == attached_node_id)
+        .context("insufficient-space writer is not in the cluster")?;
+    let status_deadline = Instant::now() + Duration::from_secs(90);
+    let mut status_poll = tokio::time::interval(Duration::from_millis(100));
+
+    // Mounting can finish before the controller saves the served and device capacities.
+    // Wait for both values before requesting expansion, then require them to stay
+    // unchanged so missing startup values are not mistaken for an expansion failure.
+    loop {
+        status_poll.tick().await;
+        let state = attached
+            .node
+            .volume_registry
+            .get_node_state(volume_id, attached_node_id)?;
+        if state.as_ref().is_some_and(|state| {
+            state.served_capacity_bytes == Some(REAL_REPLICATED_VOLUME_BYTES)
+                && state.device_capacity_bytes == Some(REAL_REPLICATED_VOLUME_BYTES)
+        }) {
+            break;
+        }
+        if Instant::now() >= status_deadline {
+            anyhow::bail!("initial insufficient-space writer capacity did not converge: {state:?}");
+        }
+    }
+
     write_synced_probe(
         host_mount.join("before-insufficient-expansion.txt"),
         b"current capacity remains writable",
@@ -3809,6 +3837,26 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
                     );
                 }
             }
+            let writer_state = attached
+                .node
+                .volume_registry
+                .get_node_state(volume_id, attached_node_id)?
+                .context("insufficient-space writer has no local status")?;
+            let filesystem_capacity = mounted_filesystem_capacity(&host_mount)?;
+            if writer_state.served_capacity_bytes != Some(REAL_REPLICATED_VOLUME_BYTES)
+                || writer_state.device_capacity_bytes != Some(REAL_REPLICATED_VOLUME_BYTES)
+                || filesystem_capacity != initial_filesystem_capacity
+            {
+                anyhow::bail!(
+                    "insufficient-space expansion changed a usable local capacity: \
+                     served={:?}, device={:?}, expected={REAL_REPLICATED_VOLUME_BYTES}; \
+                     filesystem={filesystem_capacity}, initial filesystem={initial_filesystem_capacity}; \
+                     writer status={writer_state:?}",
+                    writer_state.served_capacity_bytes,
+                    writer_state.device_capacity_bytes,
+                );
+            }
+
             if Instant::now() >= deadline {
                 break request_seen_everywhere;
             }
@@ -3817,21 +3865,6 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
             anyhow::bail!("insufficient-space desired capacity did not converge");
         }
 
-        let attached = cluster
-            .iter()
-            .find(|node| node.id() == attached_node_id)
-            .context("insufficient-space writer stopped unexpectedly")?;
-        let writer_state = attached
-            .node
-            .volume_registry
-            .get_node_state(volume_id, attached_node_id)?
-            .context("insufficient-space writer has no local status")?;
-        if writer_state.served_capacity_bytes != Some(REAL_REPLICATED_VOLUME_BYTES)
-            || writer_state.device_capacity_bytes != Some(REAL_REPLICATED_VOLUME_BYTES)
-            || mounted_filesystem_capacity(&host_mount)? != initial_filesystem_capacity
-        {
-            anyhow::bail!("insufficient-space expansion changed a usable local capacity");
-        }
         let mut request = attached.node.volumes_client.get_status_request();
         request.get().set_selector("insufficient-space-expand");
         let response = request.send().promise.await?;
@@ -3845,6 +3878,9 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
     .await;
     stop.store(true, Ordering::Release);
     let writer_result = join_volume_writer(writer).await;
+    if let (Err(check_error), Err(writer_error)) = (&check, &writer_result) {
+        anyhow::bail!("{check_error:#}; filesystem writer also failed: {writer_error:#}");
+    }
     check?;
     let writer_result = writer_result.context("write during insufficient-space expansion")?;
     if writer_result.rounds == 0 {

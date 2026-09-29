@@ -168,8 +168,95 @@ impl VolumeRegistry {
         Ok(specs)
     }
 
-    /// Upserts one untrusted node observation, even when its spec and plan arrive later.
+    /// Saves a volume status report if it is newer than the saved report for that node.
+    /// Delayed gossip must not replace newer mount or capacity information. Reports
+    /// may arrive before the volume's spec or plan, so validation uses what is known.
     pub async fn upsert_node_state(&self, value: VolumeNodeStateValue) -> Result<()> {
+        self.validate_node_state(&value)?;
+        let changed = self
+            .nodes
+            .update_value(&UuidKey::from(value.id), |snapshot| {
+                let current = snapshot
+                    .and_then(|snapshot| select_matching_node_state(snapshot.as_slice(), &value));
+
+                // Saving a gossip report creates a new CRDT write that replaces the
+                // stored status. Check its age under the write lock so delayed gossip
+                // cannot erase a newer mount or capacity update saved while it waited.
+                if current
+                    .is_some_and(|current| !compare_volume_node_states(&value, current).is_gt())
+                {
+                    return None;
+                }
+
+                Some(value)
+            })
+            .await
+            .map_err(|e| anyhow!("volume node-state upsert failed: {e}"))?;
+
+        if changed {
+            self.record_change();
+        }
+        Ok(())
+    }
+
+    /// Updates a node's volume status while holding the store's write lock.
+    ///
+    /// The workload manager records the mount path and task IDs: the replica controller
+    /// records capacity and health in the same status. Read the latest status and apply
+    /// the caller's changes under one lock so each keeps the fields saved by the other.
+    /// Use `initial` only when no matching status exists. Return the saved status for
+    /// gossip, or `None` if nothing changed.
+    pub(crate) async fn update_node_state<F>(
+        &self,
+        initial: VolumeNodeStateValue,
+        update: F,
+    ) -> Result<Option<VolumeNodeStateValue>>
+    where
+        F: FnOnce(&mut VolumeNodeStateValue),
+    {
+        self.validate_node_state(&initial)?;
+        let mut published = None;
+        self.nodes
+            .update_value(&UuidKey::from(initial.id), |snapshot| {
+                let current = snapshot
+                    .and_then(|snapshot| select_matching_node_state(snapshot.as_slice(), &initial));
+                let mut value = current.cloned().unwrap_or(initial);
+                update(&mut value);
+
+                if current == Some(&value) {
+                    return None;
+                }
+
+                // Give this update a later timestamp than the saved status even if
+                // the system clock moved backwards. Peers can then recognize it as
+                // newer when gossip delivers the reports out of order.
+                let now = chrono::Utc::now();
+                let next = current
+                    .and_then(|current| {
+                        chrono::DateTime::parse_from_rfc3339(&current.updated_at).ok()
+                    })
+                    .and_then(|previous| {
+                        previous.checked_add_signed(chrono::Duration::nanoseconds(1))
+                    })
+                    .map(|next| next.with_timezone(&chrono::Utc));
+                value.updated_at = next.map_or(now, |next| now.max(next)).to_rfc3339();
+                published = Some(value.clone());
+                Some(value)
+            })
+            .await
+            .map_err(|e| anyhow!("volume node-state update failed: {e}"))?;
+
+        if published.is_some() {
+            self.record_change();
+        }
+        Ok(published)
+    }
+
+    /// Checks the report's ID and rejects status for volumes marked as deleted.
+    /// For replicated volumes, also checks the generation and Raft group against the
+    /// saved spec and plan so an old report cannot describe a recreated volume.
+    /// Reports may arrive before the spec or plan; only known information is checked.
+    fn validate_node_state(&self, value: &VolumeNodeStateValue) -> Result<()> {
         if value.id
             != compute_volume_node_state_id(value.volume_id, value.node_id, value.volume_epoch)
         {
@@ -214,11 +301,6 @@ impl VolumeRegistry {
             }
             Some(_) | None => {}
         }
-        self.nodes
-            .upsert(&UuidKey::from(value.id), value)
-            .await
-            .map_err(|e| anyhow!("volume node-state upsert failed: {e}"))?;
-        self.record_change();
         Ok(())
     }
 
@@ -916,7 +998,28 @@ fn node_state_matches_spec(
     }
 }
 
-/// Compares two concurrent node-state rows to choose a deterministic canonical value.
+/// Finds the newest saved status for the same node, volume generation, and Raft group.
+/// Status can arrive before the volume's plan, when its Raft group cannot yet be
+/// checked. Exclude reports for other groups so their mount paths and capacities
+/// cannot be copied into the status being updated.
+fn select_matching_node_state<'a>(
+    values: &'a [VolumeNodeStateValue],
+    expected: &VolumeNodeStateValue,
+) -> Option<&'a VolumeNodeStateValue> {
+    values
+        .iter()
+        .filter(|value| {
+            value.id == expected.id
+                && value.volume_id == expected.volume_id
+                && value.node_id == expected.node_id
+                && value.volume_epoch == expected.volume_epoch
+                && value.group_id == expected.group_id
+        })
+        .max_by(|left, right| compare_volume_node_states(left, right))
+}
+
+/// Orders volume status reports by generation and update time. Breaks ties using
+/// their contents so nodes receiving the same reports choose the same status.
 fn compare_volume_node_states(
     left: &VolumeNodeStateValue,
     right: &VolumeNodeStateValue,
@@ -1024,6 +1127,130 @@ mod tests {
             capacity_store: capacity_requests,
             _dir: dir,
         }
+    }
+
+    /// Delayed gossip must keep the newer capacities saved by sync while the gossip
+    /// write was waiting for the store lock.
+    #[tokio::test]
+    async fn node_state_gossip_preserves_newer_capacity_observations() {
+        let test = test_registry().await;
+        let stale = VolumeNodeStateValue::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "writer",
+            None,
+            VolumeNodeState::Ready,
+            Some(4096),
+            0,
+        );
+        test.registry
+            .upsert_node_state(stale.clone())
+            .await
+            .unwrap();
+        let key = UuidKey::from(stale.id);
+        let mut newer = stale.clone();
+        newer.updated_at = "2099-01-01T00:00:00Z".to_string();
+        newer.served_capacity_bytes = Some(4096);
+        newer.device_capacity_bytes = Some(4096);
+        let mut register = test.node_store.get_reg(&key).unwrap().unwrap();
+        register.write(Uuid::new_v4(), newer.clone());
+
+        let sync = test.node_store.begin_delta_apply().await;
+        let mut delayed = std::pin::pin!(test.registry.upsert_node_state(stale));
+        std::future::poll_fn(|context| {
+            use std::future::Future;
+            assert!(delayed.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        sync.apply_chunk(vec![(key, register)], Vec::new()).unwrap();
+        sync.commit().await.unwrap();
+        let root = test.node_store.root_digest().await;
+        let clock = test.node_store.change_clock();
+        delayed.await.unwrap();
+        test.registry
+            .upsert_node_state(newer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(test.node_store.root_digest().await, root);
+        assert_eq!(test.node_store.change_clock(), clock);
+        assert_eq!(
+            test.node_store
+                .get_snapshot(&key)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            &[newer],
+        );
+    }
+
+    /// A capacity update must keep the mount path and task IDs saved while the update
+    /// was waiting for the store lock, even when that saved status has a future timestamp.
+    #[tokio::test]
+    async fn local_node_state_update_preserves_concurrent_mount_publication() {
+        let test = test_registry().await;
+        let initial = VolumeNodeStateValue::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "writer",
+            None,
+            VolumeNodeState::Ready,
+            Some(4096),
+            0,
+        );
+        test.registry
+            .upsert_node_state(initial.clone())
+            .await
+            .unwrap();
+        let key = UuidKey::from(initial.id);
+        let mut mounted = initial.clone();
+        mounted.updated_at = "2099-01-01T00:00:00Z".to_string();
+        mounted.local_path = Some("/volumes/writer".to_string());
+        mounted.published_task_ids = vec![Uuid::new_v4()];
+        mounted.state = VolumeNodeState::Published;
+        let mut register = test.node_store.get_reg(&key).unwrap().unwrap();
+        register.write(Uuid::new_v4(), mounted.clone());
+
+        let sync = test.node_store.begin_delta_apply().await;
+        let mut publication = std::pin::pin!(test.registry.update_node_state(initial, |state| {
+            state.served_capacity_bytes = Some(4096);
+            state.device_capacity_bytes = Some(4096);
+        }));
+        std::future::poll_fn(|context| {
+            use std::future::Future;
+            assert!(publication.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        sync.apply_chunk(vec![(key, register)], Vec::new()).unwrap();
+        sync.commit().await.unwrap();
+        let published = publication.await.unwrap().unwrap();
+
+        assert_eq!(published.local_path, mounted.local_path);
+        assert_eq!(published.published_task_ids, mounted.published_task_ids);
+        assert_eq!(published.state, VolumeNodeState::Published);
+        assert_eq!(published.served_capacity_bytes, Some(4096));
+        assert_eq!(published.device_capacity_bytes, Some(4096));
+        assert!(compare_volume_timestamps(&published.updated_at, &mounted.updated_at).is_gt());
+        assert_eq!(
+            test.node_store
+                .get_snapshot(&key)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&published),
+        );
+
+        let root = test.node_store.root_digest().await;
+        assert!(
+            test.registry
+                .update_node_state(published, |_| {})
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(test.node_store.root_digest().await, root);
     }
 
     /// Builds one deterministic desired-capacity row for direct merge tests.
@@ -1550,8 +1777,19 @@ mod tests {
             test.registry
                 .get_node_state(current_node.volume_id, current_node.node_id)
                 .expect("read current node status"),
-            Some(current_node)
+            Some(current_node.clone())
         );
+
+        let updated = test
+            .registry
+            .update_node_state(current_node, |state| {
+                state.served_capacity_bytes = Some(8 * 4096);
+            })
+            .await
+            .expect("update current group observation")
+            .expect("capacity observation changed");
+        assert_eq!(updated.group_id, Some(group_id));
+        assert_eq!(updated.state, VolumeNodeState::Ready);
     }
 
     /// Delayed status gossip must not recreate records after deletion completes.

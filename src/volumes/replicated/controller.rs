@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use futures::future::join_all;
 use mantissa_health::{HealthMonitor, Status as HealthStatus};
 use mantissa_volume::catalog::{LocalReplicaOrigin, ReplicaHealth, ReplicaState};
@@ -1304,7 +1303,9 @@ impl ReplicatedVolumeController {
             .collect()
     }
 
-    /// Publishes this node's local replica level without changing control state.
+    /// Saves this replica's capacity and health in the volume status and gossips changes.
+    /// The workload manager also writes to this status when tasks mount or unmount the
+    /// volume, so the update keeps its latest mount path and task IDs.
     async fn publish_local_replica_observation(
         &self,
         spec: &VolumeSpecValue,
@@ -1316,47 +1317,42 @@ impl ReplicatedVolumeController {
             plan.descriptor.volume_id,
             plan.descriptor.generation,
         );
-        let current = self
-            .registry
-            .get_node_state(spec.id, self.runtime.node_id())?;
-        let mut observation = current.clone().unwrap_or_else(|| {
-            VolumeNodeStateValue::new(
-                spec.id,
-                self.runtime.node_id(),
-                self.runtime.node_id().to_string(),
-                None,
-                VolumeNodeState::Pending,
-                spec.initial_capacity_bytes,
-                spec.volume_epoch,
-            )
-            .with_group_id(group_id)
-        });
+        let initial = VolumeNodeStateValue::new(
+            spec.id,
+            self.runtime.node_id(),
+            self.runtime.node_id().to_string(),
+            None,
+            VolumeNodeState::Pending,
+            spec.initial_capacity_bytes,
+            spec.volume_epoch,
+        )
+        .with_group_id(group_id);
         let group_initialized =
             local.control_state_initialized || group.is_some_and(group_observation_is_initialized);
-        let (state, error) = local_replica_public_level(
-            local.exists,
-            local.state,
-            local.health,
-            group_initialized,
-            !observation.published_task_ids.is_empty(),
-        );
-        observation.group_id = Some(group_id);
-        observation.capacity_bytes = Some(local.served_capacity_bytes);
-        observation.reserved_capacity_bytes = Some(local.reserved_capacity_bytes);
-        observation.prepared_capacity_bytes = Some(local.prepared_capacity_bytes);
-        observation.served_capacity_bytes = Some(local.served_capacity_bytes);
-        observation.device_capacity_bytes = local.device_capacity_bytes;
-        observation.filesystem_expansion_pending = local.filesystem_expansion_pending;
-        observation.state = state;
-        observation.last_error = error;
-        if current
-            .as_ref()
-            .is_some_and(|current| same_node_observation(current, &observation))
-        {
+        let observation = self
+            .registry
+            .update_node_state(initial, |observation| {
+                let (state, error) = local_replica_public_level(
+                    local.exists,
+                    local.state,
+                    local.health,
+                    group_initialized,
+                    !observation.published_task_ids.is_empty(),
+                );
+                observation.group_id = Some(group_id);
+                observation.capacity_bytes = Some(local.served_capacity_bytes);
+                observation.reserved_capacity_bytes = Some(local.reserved_capacity_bytes);
+                observation.prepared_capacity_bytes = Some(local.prepared_capacity_bytes);
+                observation.served_capacity_bytes = Some(local.served_capacity_bytes);
+                observation.device_capacity_bytes = local.device_capacity_bytes;
+                observation.filesystem_expansion_pending = local.filesystem_expansion_pending;
+                observation.state = state;
+                observation.last_error = error;
+            })
+            .await?;
+        let Some(observation) = observation else {
             return Ok(());
-        }
-        observation.updated_at = Utc::now().to_rfc3339();
-        self.registry.upsert_node_state(observation.clone()).await?;
+        };
         if let Err(error) = try_enqueue_volume_gossip(
             &self.gossip_tx,
             VolumeEvent::NodeUpsert(Box::new(observation)),
@@ -1731,27 +1727,6 @@ fn local_replica_public_level(
         ReplicaState::Deleting | ReplicaState::Retiring => VolumeNodeState::Deleting,
     };
     (state, None)
-}
-
-/// Compares node-observation content while ignoring its publication timestamp.
-fn same_node_observation(left: &VolumeNodeStateValue, right: &VolumeNodeStateValue) -> bool {
-    left.id == right.id
-        && left.volume_id == right.volume_id
-        && left.node_id == right.node_id
-        && left.node_name == right.node_name
-        && left.local_path == right.local_path
-        && left.state == right.state
-        && left.capacity_bytes == right.capacity_bytes
-        && left.reserved_capacity_bytes == right.reserved_capacity_bytes
-        && left.prepared_capacity_bytes == right.prepared_capacity_bytes
-        && left.served_capacity_bytes == right.served_capacity_bytes
-        && left.device_capacity_bytes == right.device_capacity_bytes
-        && left.filesystem_expansion_pending == right.filesystem_expansion_pending
-        && left.used_bytes == right.used_bytes
-        && left.published_task_ids == right.published_task_ids
-        && left.last_error == right.last_error
-        && left.volume_epoch == right.volume_epoch
-        && left.group_id == right.group_id
 }
 
 /// Compares report content while ignoring its publication timestamp.

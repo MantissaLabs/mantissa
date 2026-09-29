@@ -973,7 +973,9 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Updates one replicated volume and detaches it after its last local task stops.
+    /// Mounts a replicated volume for a task and records which local tasks use it.
+    /// When a task stops, removes its ID and unmounts only if no other local task uses it.
+    /// Keeps the task recorded until unmount succeeds so failed cleanup can be retried.
     async fn update_replicated_volume_publication(
         &self,
         task_id: Uuid,
@@ -1004,7 +1006,7 @@ impl WorkloadManager {
             plan.descriptor.volume_id,
             plan.descriptor.generation,
         );
-        let mut state = self
+        let state = self
             .volumes
             .volume_registry
             .get_node_state(volume.id, self.local_node_id)
@@ -1048,10 +1050,13 @@ impl WorkloadManager {
                     ))
                 })?;
             if !state.published_task_ids.contains(&task_id) {
-                state.published_task_ids.push(task_id);
-                state.published_task_ids.sort_unstable();
-                state.updated_at = Utc::now().to_rfc3339();
-                self.upsert_volume_node_state(state.clone()).await?;
+                self.update_volume_node_state(state.clone(), |current| {
+                    if !current.published_task_ids.contains(&task_id) {
+                        current.published_task_ids.push(task_id);
+                        current.published_task_ids.sort_unstable();
+                    }
+                })
+                .await?;
             }
             if already_mounted {
                 self.update_replicated_volume_status(volume.id, true)
@@ -1067,11 +1072,14 @@ impl WorkloadManager {
                         volume.name
                     ))
                 })?;
-            state.local_path = Some(path.to_string_lossy().to_string());
-            state.state = VolumeNodeState::Published;
-            state.last_error = None;
-            state.updated_at = Utc::now().to_rfc3339();
-            self.upsert_volume_node_state(state).await?;
+            // The replica controller may have saved new capacities while mount() was
+            // waiting. Apply the mount path to the latest status to keep those values.
+            self.update_volume_node_state(state, |current| {
+                current.local_path = Some(path.to_string_lossy().to_string());
+                current.state = VolumeNodeState::Published;
+                current.last_error = None;
+            })
+            .await?;
             self.update_replicated_volume_status(volume.id, true)
                 .await?;
             return Ok(());
@@ -1082,30 +1090,35 @@ impl WorkloadManager {
             return Ok(());
         }
         if state.published_task_ids.len() > 1 {
-            state
-                .published_task_ids
-                .retain(|published_task_id| *published_task_id != task_id);
-            state.updated_at = Utc::now().to_rfc3339();
-            self.upsert_volume_node_state(state).await?;
+            self.update_volume_node_state(state, |current| {
+                current
+                    .published_task_ids
+                    .retain(|published_task_id| *published_task_id != task_id);
+            })
+            .await?;
             return Ok(());
         }
 
         // Keep the last task recorded until unmount succeeds so its cleanup can be retried.
-        state.state = VolumeNodeState::Published;
-        state.updated_at = Utc::now().to_rfc3339();
-        self.upsert_volume_node_state(state.clone()).await?;
+        self.update_volume_node_state(state.clone(), |current| {
+            current.state = VolumeNodeState::Published;
+        })
+        .await?;
         runtime.unmount(key).await.map_err(|error| {
             VolumeAccessError::unavailable(format!(
                 "failed to unmount replicated volume '{}': {error:#}",
                 volume.name
             ))
         })?;
-        state.published_task_ids.clear();
-        state.local_path = None;
-        state.state = VolumeNodeState::Ready;
-        state.last_error = None;
-        state.updated_at = Utc::now().to_rfc3339();
-        self.upsert_volume_node_state(state).await?;
+        self.update_volume_node_state(state, |current| {
+            current
+                .published_task_ids
+                .retain(|published_task_id| *published_task_id != task_id);
+            current.local_path = None;
+            current.state = VolumeNodeState::Ready;
+            current.last_error = None;
+        })
+        .await?;
         self.update_replicated_volume_status(volume.id, false).await
     }
 
@@ -1131,12 +1144,41 @@ impl WorkloadManager {
         Ok(())
     }
 
-    /// Stores and broadcasts one volume node-state update without routing through the RPC surface.
+    /// Saves a volume status report for this node and queues it for gossip so peers
+    /// can see which tasks use the volume and where it is mounted.
     async fn upsert_volume_node_state(&self, state: VolumeNodeStateValue) -> Result<()> {
         self.volumes
             .volume_registry
             .upsert_node_state(state.clone())
             .await?;
+        self.broadcast_volume_node_state(state).await
+    }
+
+    /// Saves changes to the volume's mount path and task list, then gossips the result.
+    /// The registry applies the changes to the latest status under its write lock,
+    /// preserving capacities saved by the replica controller during mount or unmount.
+    async fn update_volume_node_state<F>(
+        &self,
+        initial: VolumeNodeStateValue,
+        update: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut VolumeNodeStateValue),
+    {
+        if let Some(state) = self
+            .volumes
+            .volume_registry
+            .update_node_state(initial, update)
+            .await?
+        {
+            self.broadcast_volume_node_state(state).await?;
+        }
+        Ok(())
+    }
+
+    /// Queues a volume status report for gossip to other nodes. Callers save the status
+    /// first, then send the complete report with both mount and capacity information.
+    async fn broadcast_volume_node_state(&self, state: VolumeNodeStateValue) -> Result<()> {
         self.core
             .tx
             .send(Message::Volume {
