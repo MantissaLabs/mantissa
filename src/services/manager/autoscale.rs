@@ -2301,6 +2301,7 @@ mod tests {
                 pre_stop_command: None,
                 liveness: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),

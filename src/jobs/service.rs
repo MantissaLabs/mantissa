@@ -4,10 +4,10 @@ use crate::topology::Topology;
 use crate::workload::capnp_codec::{
     decode_admission_policy, decode_deployment_policy as read_job_deployment_policy,
     decode_env_vars, decode_network_requirements, decode_placement_policy, decode_port_bindings,
-    decode_secret_files, decode_task_liveness_probe, decode_volume_mounts, encode_admission_policy,
-    encode_deployment_policy as write_job_deployment_policy, encode_env_vars,
-    encode_placement_policy, encode_port_bindings, encode_secret_files, encode_task_liveness_probe,
-    encode_volume_mounts,
+    decode_secret_files, decode_secret_ref, decode_task_liveness_probe, decode_volume_mounts,
+    encode_admission_policy, encode_deployment_policy as write_job_deployment_policy,
+    encode_env_vars, encode_placement_policy, encode_port_bindings, encode_secret_files,
+    encode_secret_ref, encode_task_liveness_probe, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
 use crate::workload::network_prerequisites::WorkloadNetworkRequirement;
@@ -224,6 +224,9 @@ fn write_job_execution(
         .reborrow()
         .init_secret_files(execution.secret_files.len() as u32);
     encode_secret_files(&mut secret_files, &execution.secret_files);
+    if let Some(auth) = &execution.registry_auth {
+        encode_secret_ref(builder.reborrow().init_registry_auth(), auth);
+    }
 
     let mut volumes = builder
         .reborrow()
@@ -270,6 +273,11 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
         }
     }
     let env = decode_env_vars(reader.get_env()?)?;
+    let registry_auth = if reader.has_registry_auth() {
+        Some(decode_secret_ref(reader.get_registry_auth()?)?)
+    } else {
+        None
+    };
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
     let volumes = decode_volume_mounts(reader.get_volumes()?)?;
     let mut networks = Vec::new();
@@ -300,6 +308,7 @@ fn read_job_execution(reader: job_execution::Reader<'_>) -> Result<ResolvedExecu
         pre_stop_command: (!pre_stop_command.is_empty()).then_some(pre_stop_command),
         liveness,
         env,
+        registry_auth,
         secret_files,
         volumes,
         networks,
@@ -724,6 +733,10 @@ mod tests {
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: Some(crate::workload::model::WorkloadSecretReference {
+                name: "application-registry".to_string(),
+                version_id: Some(Uuid::new_v4()),
+            }),
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),

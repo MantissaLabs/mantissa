@@ -111,6 +111,8 @@ pub struct AgentExecutionSpec {
     #[serde(default)]
     pub env: Vec<EnvironmentVariable>,
     #[serde(default)]
+    pub registry_auth: Option<crate::jobs::manifest::SecretReference>,
+    #[serde(default)]
     pub secret_files: Vec<SecretFileProjection>,
     #[serde(default)]
     pub volumes: Vec<VolumeMount>,
@@ -402,6 +404,14 @@ fn validate_execution(
     execution: &AgentExecutionSpec,
     declared_volume_names: &HashSet<String>,
 ) -> Result<()> {
+    if let Some(auth) = &execution.registry_auth
+        && auth.name.trim().is_empty()
+    {
+        return Err(anyhow!(
+            "registry_auth must reference a secret with a non-empty name"
+        ));
+    }
+
     validate_required_cpu_memory(
         "agent manifest",
         execution.resources.cpu_millis,
@@ -786,6 +796,7 @@ mod tests {
                         version: None,
                     }),
                 }],
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),

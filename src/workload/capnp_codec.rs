@@ -248,7 +248,8 @@ pub fn encode_secret_ref(
     }
 }
 
-/// Decodes one secret reference from the task schema payload.
+/// Decodes a secret reference and rejects malformed version identifiers.
+/// A malformed version pin must not silently select the latest secret version.
 pub fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<WorkloadSecretReference, Error> {
     let name = reader.get_name()?.to_str()?.to_string();
     let data = reader.get_version_id()?;
@@ -256,8 +257,12 @@ pub fn decode_secret_ref(reader: secret_ref::Reader<'_>) -> Result<WorkloadSecre
         let mut bytes = [0u8; 16];
         bytes.copy_from_slice(data);
         Some(Uuid::from_bytes(bytes))
-    } else {
+    } else if data.is_empty() {
         None
+    } else {
+        return Err(Error::failed(
+            "invalid secret version id length".to_string(),
+        ));
     };
 
     Ok(WorkloadSecretReference { name, version_id })
@@ -718,4 +723,22 @@ pub fn decode_service_restart_policy(
         name,
         max_retry_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A malformed version pin must fail instead of selecting the latest secret version.
+    #[test]
+    fn secret_reference_rejects_malformed_version_pin() {
+        let mut message = capnp::message::Builder::new_default();
+        let mut reference = message.init_root::<secret_ref::Builder<'_>>();
+        reference.set_name("application-registry");
+        reference.set_version_id(&[1; 15]);
+
+        let error = decode_secret_ref(reference.into_reader()).unwrap_err();
+
+        assert!(error.to_string().contains("invalid secret version id"));
+    }
 }

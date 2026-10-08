@@ -221,6 +221,7 @@ pub struct ServiceTaskTemplate {
     pub networks: Vec<ServiceTaskNetwork>,
     pub volumes: Vec<TaskVolumeMount>,
     pub env: Vec<config::EnvironmentVariable>,
+    pub registry_auth: Option<mantissa_client::services::manifest::SecretReference>,
     pub secret_files: Vec<TaskSecretFile>,
 }
 
@@ -270,6 +271,13 @@ impl ServiceTaskTemplate {
 
         let volumes = volumes(template.get_volumes()?)?;
         let env = env(template.get_env()?)?;
+        let registry_auth = if template.has_registry_auth() {
+            Some(crate::types::common::secret_reference(
+                template.get_registry_auth()?,
+            )?)
+        } else {
+            None
+        };
         let secret_files = secret_files(template.get_secret_files()?)?;
 
         let grace = template.get_termination_grace_period_secs();
@@ -299,6 +307,7 @@ impl ServiceTaskTemplate {
             networks,
             volumes,
             env,
+            registry_auth,
             secret_files,
         })
     }

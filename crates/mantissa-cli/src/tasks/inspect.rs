@@ -1,6 +1,6 @@
 use crate::{
     host_ports::render_host_ports,
-    inspect::{InspectOutput, argument, duration, render_mounts_and_environment},
+    inspect::{InspectOutput, argument, duration, render_mounts_and_environment, secret_reference},
     output,
     resources::{format_bytes, format_cpu},
 };
@@ -145,6 +145,14 @@ fn render_inspect(out: &mut InspectOutput, spec: task_spec::Reader<'_>) -> Resul
 fn render_runtime(out: &mut InspectOutput, spec: task_spec::Reader<'_>) -> Result<()> {
     out.section("RUNTIME")?;
     out.field("Image", spec.get_image()?.to_str()?)?;
+    if spec.has_registry_auth() {
+        out.field(
+            "Registry auth",
+            secret_reference(spec.get_registry_auth()?)?,
+        )?;
+    } else if out.details {
+        out.field("Registry auth", "node credentials or anonymous")?;
+    }
 
     let command = text_list(spec.get_command()?)?;
     if !command.is_empty() || out.details {

@@ -79,6 +79,7 @@ pub struct TaskDetail {
     pub ports: Vec<HostPort>,
     pub volumes: Vec<TaskVolumeMount>,
     pub env: Vec<config::EnvironmentVariable>,
+    pub registry_auth: Option<mantissa_client::services::manifest::SecretReference>,
     pub secret_files: Vec<TaskSecretFile>,
     pub task_epoch: u64,
     pub phase_version: u64,
@@ -168,6 +169,11 @@ impl TaskDetail {
                 .collect(),
             volumes: common::volumes(spec.get_volumes()?)?,
             env: common::env(spec.get_env()?)?,
+            registry_auth: if spec.has_registry_auth() {
+                Some(common::secret_reference(spec.get_registry_auth()?)?)
+            } else {
+                None
+            },
             secret_files: common::secret_files(spec.get_secret_files()?)?,
             task_epoch: spec.get_task_epoch(),
             phase_version: spec.get_phase_version(),
@@ -200,6 +206,8 @@ fn optional_uuid(bytes: &[u8]) -> capnp::Result<Option<String>> {
 pub struct TaskStartRequest {
     pub name: String,
     pub image: String,
+    #[serde(default)]
+    pub registry_auth: Option<mantissa_client::jobs::manifest::SecretReference>,
     #[serde(default)]
     pub command: Vec<String>,
     #[schema(minimum = 1)]

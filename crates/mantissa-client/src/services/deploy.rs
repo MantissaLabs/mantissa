@@ -407,6 +407,13 @@ fn write_task_template(
         .reborrow()
         .init_secret_files(template.secret_files.len() as u32);
     write_secret_files(&mut files_builder, &template.secret_files, &template.name)?;
+    if let Some(auth) = &template.registry_auth {
+        write_secret_reference(
+            builder.reborrow().init_registry_auth(),
+            auth,
+            "registry_auth",
+        )?;
+    }
     let mut volume_builder = builder
         .reborrow()
         .init_volumes(template.volumes.len() as u32);

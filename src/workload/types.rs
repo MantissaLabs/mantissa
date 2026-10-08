@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::scheduler::placement::PlacementPolicy;
 use crate::workload::model::{
-    WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadVolumeMount,
+    WorkloadEnvironmentVariable, WorkloadSecretFile, WorkloadSecretReference, WorkloadVolumeMount,
 };
 
 /// Validates that one schedulable workload declares bounded CPU and memory resources.
@@ -98,6 +98,8 @@ pub struct ExecutionSpec<N> {
     #[serde(default)]
     pub env: Vec<WorkloadEnvironmentVariable>,
     #[serde(default)]
+    pub registry_auth: Option<WorkloadSecretReference>,
+    #[serde(default)]
     pub secret_files: Vec<WorkloadSecretFile>,
     #[serde(default)]
     pub volumes: Vec<WorkloadVolumeMount>,
@@ -127,6 +129,7 @@ impl<N> ExecutionSpec<N> {
             pre_stop_command: self.pre_stop_command.clone(),
             liveness: self.liveness.clone(),
             env: self.env.clone(),
+            registry_auth: self.registry_auth.clone(),
             secret_files: self.secret_files.clone(),
             volumes: self.volumes.clone(),
             networks: self.networks.iter().map(&mut mapper).collect(),

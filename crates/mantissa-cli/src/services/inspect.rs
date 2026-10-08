@@ -1,5 +1,7 @@
 use super::rollout::rollout_phase_label;
-use crate::inspect::{InspectOutput, argument, duration, render_mounts_and_environment};
+use crate::inspect::{
+    InspectOutput, argument, duration, render_mounts_and_environment, secret_reference,
+};
 use crate::resources::{format_bytes, format_cpu};
 use crate::{host_ports::render_host_ports, output};
 use anyhow::Result;
@@ -91,7 +93,7 @@ fn render_inspect(
             out.field("Task ID", id)?;
         }
 
-        // These ranges identify replica slots, not literal task IDs; do not expand them for display.
+        // Display replica slot ranges directly without treating them as lists of task IDs.
         for assignment in &summary.replica_assignments {
             let first = assignment.first_replica;
             let last = u32::from(first) + u32::from(assignment.replica_count) - 1;
@@ -297,6 +299,14 @@ fn render_template(
 ) -> Result<()> {
     out.section(format!("TEMPLATE {}", summary.name))?;
     out.field("Image", &summary.image)?;
+    if template.has_registry_auth() {
+        out.field(
+            "Registry auth",
+            secret_reference(template.get_registry_auth()?)?,
+        )?;
+    } else if out.details {
+        out.field("Registry auth", "node credentials or anonymous")?;
+    }
     out.field("Replicas", summary.replicas)?;
 
     let memory = format_bytes(template.get_memory_bytes());
@@ -412,7 +422,7 @@ fn render_template(
         template.get_secret_files()?,
     )?;
 
-    // Each argument remains separate; wrapping must not make a shell script look like several arguments.
+    // Preserve argument boundaries when wrapping so one shell script still appears as one argument.
     if let Some((command, args)) = summary.command.split_first() {
         out.field("Command", argument(command))?;
         let args = args.iter().map(|arg| argument(arg)).collect::<Vec<_>>();

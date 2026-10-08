@@ -498,6 +498,10 @@ struct WorkloadSpec {
 
   admissionState @37 :AdmissionState;
   # Runtime adoption barrier state for grouped workload admission.
+
+  registryAuth @38 :SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct WorkloadStatus {
@@ -635,6 +639,10 @@ struct WorkloadStartRequest {
 
   dependencies @25 :List(ServiceDependencyRequirement);
   # Service-template backends this workload must see locally before target admission succeeds.
+
+  registryAuth @26 :SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct ServiceDependencyRequirement {
@@ -684,7 +692,7 @@ struct ServiceShardAssignmentResponse {
 
 enum ServiceShardAssignmentFailureKind {
   hard @0;
-  # Deterministic scheduler/application rejection; do not treat as RPC handoff loss.
+  # Deterministic scheduler/application rejection, distinct from RPC handoff loss.
 
   retryable @1;
   # Coordinator accepted the request but scheduling prerequisites are still converging.

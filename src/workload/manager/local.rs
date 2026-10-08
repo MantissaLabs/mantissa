@@ -242,6 +242,7 @@ impl WorkloadManager {
                 pre_stop_command: plan.pre_stop_command.clone(),
                 liveness: plan.liveness.clone(),
                 env: plan.env.clone(),
+                registry_auth: plan.registry_auth.clone(),
                 secret_files: plan.secret_files.clone(),
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),
@@ -345,6 +346,7 @@ impl WorkloadManager {
                 plan.execution_platform,
                 plan.isolation_mode,
                 plan.isolation_profile.as_deref(),
+                plan.registry_auth.as_ref(),
             )
             .await?;
             self.update_task_phase(plan.id, WorkloadPhase::Creating, None, None)
@@ -454,6 +456,7 @@ impl WorkloadManager {
                 pre_stop_command: plan.pre_stop_command.clone(),
                 liveness: plan.liveness.clone(),
                 env: plan.env.clone(),
+                registry_auth: plan.registry_auth.clone(),
                 secret_files: plan.secret_files.clone(),
                 volumes: plan.volumes.clone(),
                 networks: plan.networks.clone(),

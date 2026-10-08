@@ -74,6 +74,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub env: Vec<TaskEnvironmentVariable>,
     #[serde(default)]
+    pub registry_auth: Option<TaskSecretReference>,
+    #[serde(default)]
     pub secret_files: Vec<TaskSecretFile>,
     #[serde(default)]
     pub volumes: Vec<TaskVolumeMount>,
@@ -125,6 +127,7 @@ impl TaskSpec {
             pre_stop_command: spec.pre_stop_command.clone(),
             liveness: spec.liveness.clone(),
             env: spec.env.clone(),
+            registry_auth: spec.registry_auth.clone(),
             secret_files: spec.secret_files.clone(),
             volumes: spec.volumes.clone(),
             networks: spec.networks.clone(),

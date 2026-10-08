@@ -580,7 +580,7 @@ impl WorkloadOwner {
     }
 }
 
-/// Secret reference resolved by one workload environment variable or mounted secret file.
+/// Names a cluster secret used for image pulls, environment variables, or mounted files.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkloadSecretReference {
     pub name: String,
@@ -660,6 +660,8 @@ pub struct WorkloadSpec {
     pub liveness: Option<WorkloadLivenessProbe>,
     #[serde(default)]
     pub env: Vec<WorkloadEnvironmentVariable>,
+    #[serde(default)]
+    pub registry_auth: Option<WorkloadSecretReference>,
     #[serde(default)]
     pub secret_files: Vec<WorkloadSecretFile>,
     #[serde(default)]
@@ -1043,6 +1045,8 @@ pub struct WorkloadValue {
     #[serde(default)]
     pub env: Vec<WorkloadEnvironmentVariable>,
     #[serde(default)]
+    pub registry_auth: Option<WorkloadSecretReference>,
+    #[serde(default)]
     pub secret_files: Vec<WorkloadSecretFile>,
     #[serde(default)]
     pub volumes: Vec<WorkloadVolumeMount>,
@@ -1100,6 +1104,7 @@ pub struct WorkloadValueDraft {
     pub pre_stop_command: Option<Vec<String>>,
     pub liveness: Option<WorkloadLivenessProbe>,
     pub env: Vec<WorkloadEnvironmentVariable>,
+    pub registry_auth: Option<WorkloadSecretReference>,
     pub secret_files: Vec<WorkloadSecretFile>,
     pub volumes: Vec<WorkloadVolumeMount>,
     pub ports: Vec<WorkloadPortBinding>,
@@ -1144,6 +1149,7 @@ impl WorkloadValue {
             pre_stop_command: draft.pre_stop_command,
             liveness: draft.liveness,
             env: draft.env,
+            registry_auth: draft.registry_auth,
             secret_files: draft.secret_files,
             volumes: draft.volumes,
             ports: draft.ports,
@@ -1670,6 +1676,7 @@ struct WorkloadValueMatch<'a> {
     pre_stop_command: &'a Option<Vec<String>>,
     liveness: &'a Option<WorkloadLivenessProbe>,
     env: &'a Vec<WorkloadEnvironmentVariable>,
+    registry_auth: &'a Option<WorkloadSecretReference>,
     secret_files: &'a Vec<WorkloadSecretFile>,
     volumes: &'a Vec<WorkloadVolumeMount>,
     networks: &'a Vec<Uuid>,
@@ -1716,6 +1723,7 @@ impl<'a> From<&'a WorkloadValue> for WorkloadValueMatch<'a> {
             pre_stop_command,
             liveness,
             env,
+            registry_auth,
             secret_files,
             volumes,
             networks,
@@ -1758,6 +1766,7 @@ impl<'a> From<&'a WorkloadValue> for WorkloadValueMatch<'a> {
             pre_stop_command,
             liveness,
             env,
+            registry_auth,
             secret_files,
             volumes,
             networks,
@@ -1836,6 +1845,7 @@ pub(crate) fn value_to_spec(id: Uuid, value: WorkloadValue) -> WorkloadSpec {
         pre_stop_command: value.pre_stop_command,
         liveness: value.liveness,
         env: value.env,
+        registry_auth: value.registry_auth,
         secret_files: value.secret_files,
         volumes: value.volumes,
         networks: value.networks,
@@ -1911,6 +1921,7 @@ pub(crate) fn merge_status_into_value(
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
+        registry_auth: None,
         secret_files: Vec::new(),
         volumes: Vec::new(),
         ports: Vec::new(),
@@ -1972,6 +1983,7 @@ pub(crate) fn spec_to_value(spec: &WorkloadSpec) -> WorkloadValue {
         pre_stop_command: spec.pre_stop_command.clone(),
         liveness: spec.liveness.clone(),
         env: spec.env.clone(),
+        registry_auth: spec.registry_auth.clone(),
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),
         ports: spec.ports.clone(),
@@ -2034,6 +2046,7 @@ mod tests {
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
@@ -2246,6 +2259,7 @@ mod tests {
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),

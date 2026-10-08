@@ -136,6 +136,7 @@ fn service_with_ingress_pool(network_id: Uuid, pool: &str) -> ServiceSpecValue {
                 pre_stop_command: None,
                 liveness: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![TaskTemplateNetworkRequirement::new("frontend", network_id)],

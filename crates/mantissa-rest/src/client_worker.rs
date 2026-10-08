@@ -1774,7 +1774,7 @@ async fn list_service_tasks(
     Ok(tasks.into_iter().map(ServiceTaskSummary::from).collect())
 }
 
-/// Validates selection before returning HTTP 200; subsequent task failures arrive as stream events.
+/// Validates selection before returning HTTP 200, then reports task failures as stream events.
 async fn start_service_logs(
     config: &ClientConfig,
     selector: &str,
@@ -2388,6 +2388,7 @@ async fn start_task(
     let options = tasks::TaskStartOptions {
         name: &request.name,
         image: &request.image,
+        registry_auth: request.registry_auth,
         command: &request.command,
         cpu_millis: request.cpu_millis,
         memory_bytes: request.memory_bytes,

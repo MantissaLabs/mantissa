@@ -20,6 +20,10 @@ interface Secrets {
 
   rotateMasterKey @5 () -> (keyId :Data, generation :UInt64);
   # Rotate the master key and return the new key identity.
+
+  checkAvailable @6 (references :List(SecretRef)) -> (available :Bool);
+  # Let a workload coordinator check that this node has the required secret versions and keys.
+  # The response contains only availability, never decrypted secret values.
 }
 
 struct SecretMetadataEntry {

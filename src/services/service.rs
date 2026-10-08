@@ -20,12 +20,13 @@ use crate::workload::capnp_codec::{
     decode_admission_policy as read_admission_policy,
     decode_deployment_policy as read_deployment_policy, decode_env_vars,
     decode_network_requirements, decode_placement_policy as read_placement_policy,
-    decode_port_bindings, decode_secret_files, decode_service_liveness_probe,
+    decode_port_bindings, decode_secret_files, decode_secret_ref, decode_service_liveness_probe,
     decode_service_restart_policy, decode_volume_mounts,
     encode_admission_policy as write_admission_policy,
     encode_deployment_policy as write_deployment_policy, encode_env_vars,
     encode_placement_policy as write_placement_policy, encode_port_bindings, encode_secret_files,
-    encode_service_liveness_probe, encode_service_restart_policy, encode_volume_mounts,
+    encode_secret_ref, encode_service_liveness_probe, encode_service_restart_policy,
+    encode_volume_mounts,
 };
 use crate::workload::model::WorkloadSpec;
 use crate::workload::types::{ExecutionSpec, WorkloadAdmissionPolicy};
@@ -1234,6 +1235,11 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
     };
 
     let env = decode_env_vars(reader.get_env()?)?;
+    let registry_auth = if reader.has_registry_auth() {
+        Some(decode_secret_ref(reader.get_registry_auth()?)?)
+    } else {
+        None
+    };
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
     let volumes = decode_volume_mounts(reader.get_volumes()?)?;
 
@@ -1356,6 +1362,7 @@ fn read_task_template(reader: task_template::Reader<'_>) -> Result<TaskTemplateS
             pre_stop_command,
             liveness,
             env,
+            registry_auth,
             secret_files,
             volumes,
             networks,
@@ -1650,6 +1657,9 @@ fn write_task_template(
         .reborrow()
         .init_secret_files(template.secret_files.len() as u32);
     encode_secret_files(&mut files_builder, &template.secret_files);
+    if let Some(auth) = &template.registry_auth {
+        encode_secret_ref(builder.reborrow().init_registry_auth(), auth);
+    }
     let mut volume_builder = builder
         .reborrow()
         .init_volumes(template.volumes.len() as u32);
@@ -1801,6 +1811,7 @@ mod tests {
                     pre_stop_command: None,
                     liveness: None,
                     env: Vec::new(),
+                    registry_auth: None,
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
@@ -1844,6 +1855,10 @@ mod tests {
                 pre_stop_command: None,
                 liveness: None,
                 env: Vec::new(),
+                registry_auth: Some(crate::workload::model::WorkloadSecretReference {
+                    name: "application-registry".to_string(),
+                    version_id: Some(Uuid::new_v4()),
+                }),
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],
@@ -1882,6 +1897,7 @@ mod tests {
             .into_reader();
         let decoded = read_task_template(reader).expect("decode task template");
 
+        assert_eq!(decoded.registry_auth, template.registry_auth);
         assert_eq!(
             decoded.networks, template.networks,
             "task-template network requirements should preserve their explicit network ids"
@@ -1948,6 +1964,7 @@ mod tests {
                         version_id: Some(secret_version),
                     }),
                 }],
+                registry_auth: None,
                 secret_files: vec![TaskSecretFile {
                     path: "/run/secrets/api-token".to_string(),
                     secret: TaskSecretReference {
@@ -2022,6 +2039,7 @@ mod tests {
                     pre_stop_command: None,
                     liveness: None,
                     env: Vec::new(),
+                    registry_auth: None,
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: vec![TaskTemplateNetworkRequirement::new(

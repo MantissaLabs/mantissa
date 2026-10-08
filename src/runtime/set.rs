@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 use tracing::warn;
 
+use crate::runtime::registry_auth::RegistryAuth;
 use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
     RuntimeEvent, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeInstanceRef,
@@ -461,14 +462,19 @@ impl RuntimeSet {
         .await
     }
 
-    /// Pulls one image into the backend selected by the requested execution contract.
+    /// Checks that credentials match the image before pulling it through the selected backend.
     pub async fn pull_image(
         &self,
         image: &str,
         execution_platform: ExecutionPlatform,
         isolation_mode: IsolationMode,
         isolation_profile: Option<&str>,
+        registry_auth: Option<&RegistryAuth>,
     ) -> RuntimeResult<()> {
+        if let Some(auth) = registry_auth {
+            auth.validate_image(image)?;
+        }
+
         self.select_backend_for_requirements(
             execution_platform,
             isolation_mode,
@@ -476,7 +482,7 @@ impl RuntimeSet {
             &[],
         )?
         .backend
-        .pull_image(image)
+        .pull_image(image, registry_auth)
         .await
     }
 
@@ -664,7 +670,11 @@ mod tests {
             })
         }
 
-        async fn pull_image(&self, _image: &str) -> RuntimeResult<()> {
+        async fn pull_image(
+            &self,
+            _image: &str,
+            _registry_auth: Option<&RegistryAuth>,
+        ) -> RuntimeResult<()> {
             Ok(())
         }
 

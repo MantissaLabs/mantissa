@@ -97,7 +97,7 @@ pub struct EnvironmentVariable {
     pub secret: Option<SecretReference>,
 }
 
-/// Secret reference declared by one environment variable or secret file.
+/// Names a cluster secret used for image pulls, environment variables, or mounted files.
 #[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SecretReference {
@@ -277,6 +277,8 @@ pub struct JobExecutionSpec {
     pub pre_stop_command: Option<Vec<String>>,
     #[serde(default)]
     pub env: Vec<EnvironmentVariable>,
+    #[serde(default)]
+    pub registry_auth: Option<SecretReference>,
     #[serde(default)]
     pub secret_files: Vec<SecretFileProjection>,
     #[serde(default)]
@@ -499,6 +501,14 @@ fn validate_execution(
     execution: &JobExecutionSpec,
     declared_volume_names: &HashSet<String>,
 ) -> Result<()> {
+    if let Some(auth) = &execution.registry_auth
+        && auth.name.trim().is_empty()
+    {
+        return Err(anyhow!(
+            "registry_auth must reference a secret with a non-empty name"
+        ));
+    }
+
     validate_required_cpu_memory(
         "job manifest",
         execution.resources.cpu_millis,
@@ -776,6 +786,7 @@ mod tests {
                 termination_grace_period_secs: Some(30),
                 pre_stop_command: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: vec![VolumeMount {
                     source: "workspace".to_string(),

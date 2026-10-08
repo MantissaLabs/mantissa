@@ -1088,6 +1088,7 @@ fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         pre_stop_command: spec.pre_stop_command.clone(),
         liveness: spec.liveness.clone(),
         env: spec.env.clone(),
+        registry_auth: spec.registry_auth.clone(),
         secret_files: spec.secret_files.clone(),
         volumes: spec.volumes.clone(),
         networks: spec.networks.clone(),
@@ -1491,8 +1492,12 @@ impl RuntimeBackend for ControllableExitRuntimeBackend {
         Ok(info)
     }
 
-    async fn pull_image(&self, image: &str) -> Result<(), RuntimeError> {
-        self.inner.pull_image(image).await
+    async fn pull_image(
+        &self,
+        image: &str,
+        registry_auth: Option<&mantissa::runtime::registry_auth::RegistryAuth>,
+    ) -> Result<(), RuntimeError> {
+        self.inner.pull_image(image, registry_auth).await
     }
 
     fn capabilities(&self) -> RuntimeCapabilities {

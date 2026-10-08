@@ -232,7 +232,11 @@ impl RuntimeBackend for RecordingRuntimeBackend {
         })
     }
 
-    async fn pull_image(&self, _image: &str) -> RuntimeResult<()> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _registry_auth: Option<&mantissa::runtime::registry_auth::RegistryAuth>,
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 }
@@ -2050,9 +2054,8 @@ fn public_group_reflects_failed_copy_recovery(
     }
 
     match group.copy_node_ids.len() {
-        // Beginning a rebuild is a monotonic successor to two-copy recovery;
-        // requiring the preceding no-replacement state makes publication race
-        // the controller's next reconciliation pass.
+        // A rebuild advances two-copy recovery. Requiring the earlier state with no
+        // replacement would race the controller's next reconciliation pass.
         2 => group.degraded,
         3 => {
             group.replacement_id.is_none()
@@ -4294,6 +4297,7 @@ pub(crate) fn standalone_volume_task_request(
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: vec![TaskVolumeMount {
                 volume_id,

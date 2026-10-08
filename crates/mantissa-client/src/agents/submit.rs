@@ -21,6 +21,7 @@ use uuid::Uuid;
 pub struct AgentSubmitOptions<'a> {
     pub name: &'a str,
     pub image: &'a str,
+    pub registry_auth: Option<crate::jobs::manifest::SecretReference>,
     pub command: &'a [String],
     pub tty: bool,
     pub cpu_millis: u64,
@@ -88,6 +89,7 @@ pub(crate) struct PreparedAgentExecution {
     pub termination_grace_period_secs: Option<u32>,
     pub pre_stop_command: Option<Vec<String>>,
     pub env: Vec<EnvironmentVariable>,
+    pub registry_auth: Option<crate::jobs::manifest::SecretReference>,
     pub secret_files: Vec<SecretFileProjection>,
     pub volumes: Vec<PreparedVolumeMount>,
     pub networks: Vec<Uuid>,
@@ -148,6 +150,12 @@ async fn prepare_raw_submit_spec(
         return Err(anyhow!("agents submit requires --image"));
     }
 
+    if let Some(auth) = &options.registry_auth
+        && auth.name.trim().is_empty()
+    {
+        anyhow::bail!("registry_auth secret name must not be empty");
+    }
+
     let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
     let workspace_mount = resolve_optional_mount(cfg, options.workspace_mount).await?;
     let checkpoint_mount = resolve_optional_mount(cfg, options.checkpoint_mount).await?;
@@ -164,6 +172,7 @@ async fn prepare_raw_submit_spec(
             termination_grace_period_secs: None,
             pre_stop_command: None,
             env: Vec::new(),
+            registry_auth: options.registry_auth.clone(),
             secret_files: Vec::new(),
             volumes: resolved_volumes
                 .iter()
@@ -303,6 +312,9 @@ fn write_agent_execution(
         .reborrow()
         .init_secret_files(execution.secret_files.len() as u32);
     write_secret_files(&mut secret_files, &execution.secret_files);
+    if let Some(auth) = &execution.registry_auth {
+        crate::workload_wire::write_secret_reference(builder.reborrow().init_registry_auth(), auth);
+    }
 
     let mut volumes = builder
         .reborrow()

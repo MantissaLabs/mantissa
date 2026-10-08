@@ -85,7 +85,7 @@ impl InspectOutput {
 }
 
 /// Distinguishes a fixed secret version from a reference that follows the latest version.
-fn secret_reference(secret: workload::secret_ref::Reader<'_>) -> Result<String> {
+pub(crate) fn secret_reference(secret: workload::secret_ref::Reader<'_>) -> Result<String> {
     let name = secret.get_name()?.to_str()?;
     let version = secret.get_version_id()?;
     if version.is_empty() {

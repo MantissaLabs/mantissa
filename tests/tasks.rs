@@ -43,6 +43,7 @@ fn replicated_service_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
+        registry_auth: None,
         secret_files: Vec::new(),
         volumes: Vec::new(),
         ports: Vec::new(),
@@ -89,6 +90,7 @@ async fn start_task_via_cli_path(client_config: &ClientConfig, name: &str) {
         client_config,
         &TaskStartOptions {
             name,
+            registry_auth: None,
             image: "alpine:3.20",
             command: &command,
             cpu_millis: 250,
@@ -137,6 +139,7 @@ local_test!(task_start_rejects_missing_resource_request, {
         &client_config,
         &TaskStartOptions {
             name: "missing-resource-task",
+            registry_auth: None,
             image: "alpine:3.20",
             command: &command,
             cpu_millis: 0,
@@ -264,3 +267,60 @@ local_test!(
         }
     }
 );
+
+local_test!(task_client_sends_registry_auth_secret_reference, {
+    let node = TestNode::new().await;
+    let socket_dir = common::temp_db_dir();
+    let socket_path = socket_dir.path().join("mantissa.sock");
+    node.node
+        .start_local_admin_socket_at(socket_path.clone())
+        .await
+        .expect("start local admin socket");
+    let config = ClientConfig {
+        socket: Some(socket_path),
+        ..ClientConfig::default()
+    };
+    let credentials = serde_json::to_vec(&serde_json::json!({
+        "auths": {
+            "registry.example": {
+                "username": "reader",
+                "password": "registry-password",
+            },
+        },
+    }))
+    .expect("serialize registry secret");
+    mantissa_client::secrets::create(&config, "application-registry", &credentials, None, &[])
+        .await
+        .expect("create registry secret through client");
+    let command = vec!["/bin/true".to_string()];
+    let options = TaskStartOptions {
+        name: "private-image-task",
+        image: "registry.example/team/api:1",
+        registry_auth: Some(mantissa_client::jobs::manifest::SecretReference {
+            name: "application-registry".to_string(),
+            version: None,
+        }),
+        command: &command,
+        cpu_millis: 250,
+        memory_bytes: 128 * 1_024 * 1_024,
+        gpu_count: 0,
+        volumes: &[],
+    };
+
+    let task = client_tasks::start(&config, &options)
+        .await
+        .expect("start private-image task through client");
+    let id = Uuid::parse_str(&task.id).expect("task UUID");
+    let spec = node
+        .node
+        .workload_manager
+        .inspect_workload(id)
+        .await
+        .expect("inspect private-image task");
+
+    let reference = spec
+        .registry_auth
+        .expect("persist registry authentication reference");
+    assert_eq!(reference.name, "application-registry");
+    assert!(reference.version_id.is_none());
+});

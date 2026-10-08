@@ -51,6 +51,7 @@ async fn main() -> Result<()> {
                 manifest_path: Some(Path::new("examples/job.ron")),
                 name: None,
                 image: None,
+                registry_auth: None,
                 command: &[],
                 tty: false,
                 cpu_millis: None,

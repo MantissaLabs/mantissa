@@ -68,7 +68,7 @@ struct ServiceExecTask {
 struct ServiceTasksResult {
   union {
     tasks @0 :List(ServiceTask);
-    # The service exists; the list is empty when this node sees no task records.
+    # An existing service has an empty list when this node sees no task records.
 
     notFound @1 :Void;
     # No service matches the exact name or UUID in this node's replicated state.
@@ -95,7 +95,7 @@ struct ServiceTask {
   # Image recorded on the task, which may differ from the current service manifest.
 
   state @6 :Text;
-  # Observed lifecycle state; exited tasks include their code as "exited:<code>".
+  # Observed lifecycle state. Exited tasks include their code as "exited:<code>".
 
   nodeId @7 :Data;
   # Full UUID of the node assigned to run this task.
@@ -194,6 +194,10 @@ struct TaskTemplate {
 
   autoscale @23 :AutoscalePolicy;
   # Optional horizontal autoscale policy. Empty means autoscaling is disabled.
+
+  registryAuth @26 :Workload.SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct AutoscalePolicy {

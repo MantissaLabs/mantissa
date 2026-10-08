@@ -61,6 +61,7 @@ fn backend_task(id: u128, replica: u16, generation: u64, state: WorkloadPhase) -
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
+        registry_auth: None,
         secret_files: Vec::new(),
         volumes: Vec::new(),
         ports: Vec::new(),

@@ -18,8 +18,11 @@ use crate::runtime::types::{
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
 mod conversions;
+mod credentials;
 mod images;
 mod interactive;
+#[cfg(test)]
+mod registry_tests;
 mod runtime;
 mod sandbox;
 #[cfg(test)]
@@ -173,6 +176,7 @@ pub struct DockerRuntimeBackend {
     docker: Docker,
     mode: DockerRuntimeMode,
     nono_helper_host_path: Option<PathBuf>,
+    docker_config_path: Option<PathBuf>,
 }
 
 impl DockerRuntimeBackend {
@@ -267,6 +271,7 @@ impl DockerRuntimeBackend {
             docker,
             mode,
             nono_helper_host_path,
+            docker_config_path: credentials::docker_config_path(),
         }
     }
 

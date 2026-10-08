@@ -87,6 +87,8 @@ const IMAGE_PULL_MAX_CONCURRENCY: usize = 2;
 const WORKLOAD_START_MAX_ATTEMPTS: usize = 5;
 /// Backoff before retrying a start when remote secret material has not converged yet.
 const REMOTE_SECRET_RETRY_DELAY: Duration = Duration::from_millis(200);
+/// Stops a stalled secret readiness RPC from blocking workload admission indefinitely.
+const REMOTE_SECRET_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum time one dirty workload update may wait before it is flushed into the shared gossip queue.
 const WORKLOAD_GOSSIP_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// Number of fanout rounds one logical workload update should survive before it ages out.
@@ -239,7 +241,7 @@ fn validate_existing_service_shard_assignment(
     }
     // The pinned target must be honored for rows produced by this start
     // attempt. For an already-existing deterministic service replica row, the
-    // target in the request is only the latest placement proposal; the durable
+    // target in the request is only the latest placement proposal. The durable
     // row's identity/owner/execution fields are the idempotency contract.
     if require_target_node_match && spec.node_id != target_node {
         return Err(anyhow!(
@@ -284,6 +286,7 @@ fn validate_existing_service_shard_execution(
         || spec.pre_stop_command != execution.pre_stop_command
         || spec.liveness != execution.liveness
         || spec.env != execution.env
+        || spec.registry_auth != execution.registry_auth
         || spec.secret_files != execution.secret_files
         || spec.volumes != execution.volumes
         || spec.networks != execution.networks
@@ -1028,6 +1031,7 @@ impl WorkloadManager {
                 pre_stop_command: None,
                 liveness: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
@@ -2728,7 +2732,7 @@ impl WorkloadManager {
     ///
     /// Inactive-service reconciliation uses this to keep draining lingering local `Stopping`
     /// rows after the service registry entry has already transitioned into teardown. Callers that
-    /// need this to be non-blocking should spawn it; the helper itself stays synchronous so tests
+    /// need this to run in the background should spawn it. Direct callers await completion so tests
     /// and narrow callers can drive the cleanup directly.
     pub(crate) async fn reconcile_requested_stop(&self, id: Uuid) -> Result<(), anyhow::Error> {
         let spec = self.load_spec(id).await?;
@@ -2784,7 +2788,7 @@ impl WorkloadManager {
         if changed {
             if let Some(sender) = &self.networking.forwarding_events {
                 for network_id in changed_networks {
-                    // Discovery refresh is best-effort; ignore send failures if the network
+                    // Discovery refresh is best-effort, so ignore send failures if the network
                     // controller has already shut down.
                     let _ = sender.send(ForwardingEvent::TrafficPublicationChanged { network_id });
                 }
@@ -3052,6 +3056,7 @@ impl WorkloadManager {
         (expected_by_task, expected_networked_slots)
     }
 
+    /// Checks that target nodes can decrypt workload secrets before reserving their resources.
     async fn ensure_remote_secret_availability(
         &self,
         plans: &[RemoteStartPlan],
@@ -3060,16 +3065,29 @@ impl WorkloadManager {
             return Ok(());
         }
 
-        let mut required: HashMap<Uuid, HashSet<String>> = HashMap::new();
+        let mut required: HashMap<Uuid, HashMap<String, Option<Uuid>>> = HashMap::new();
         for plan in plans {
-            let entry = required.entry(plan.peer_id).or_default();
+            let peer_secrets = required.entry(plan.peer_id).or_default();
+
+            // Env vars and files must not replace a version already required by registry_auth.
             for env in &plan.env {
                 if let Some(secret) = &env.secret {
-                    entry.insert(secret.name.clone());
+                    peer_secrets
+                        .entry(secret.name.trim().to_string())
+                        .or_default();
                 }
             }
             for file in &plan.secret_files {
-                entry.insert(file.secret.name.clone());
+                peer_secrets
+                    .entry(file.secret.name.trim().to_string())
+                    .or_default();
+            }
+
+            if let Some(reference) = &plan.registry_auth {
+                // An unpinned registry_auth secret still needs the current version seen here,
+                // rather than older credentials that have already reached the target.
+                let secret = self.load_registry_auth_value(reference)?;
+                peer_secrets.insert(secret.name, Some(secret.current_version.version_id));
             }
         }
 
@@ -3083,43 +3101,39 @@ impl WorkloadManager {
                 .registry
                 .session_for_peer(*peer_id)
                 .await
-                .ok_or_else(|| anyhow::anyhow!("no active session for peer {peer_id}"))?;
+                .ok_or_else(|| anyhow!("no active session for peer {peer_id}"))?;
             let request = session.get_secrets_request();
             let secrets_client = request.send().pipeline.get_secrets();
 
-            let response = secrets_client
-                .list_request()
-                .send()
-                .promise
+            let mut request = secrets_client.check_available_request();
+            {
+                let mut references = request.get().init_references(secrets.len() as u32);
+                for (index, (name, version)) in secrets.iter().enumerate() {
+                    let mut reference = references.reborrow().get(index as u32);
+                    reference.set_name(name);
+                    if let Some(version) = version {
+                        reference.set_version_id(version.as_bytes());
+                    }
+                }
+            }
+
+            let response = timeout(REMOTE_SECRET_CHECK_TIMEOUT, request.send().promise)
                 .await
+                .with_context(|| format!("secret readiness check timed out on peer {peer_id}"))?
                 .context(format!(
                     "failed to query secrets on peer {peer_id} while verifying availability"
                 ))?;
-            let reader = response
+            let available = response
                 .get()
                 .context(format!(
                     "invalid secrets response from peer {peer_id} while verifying availability"
                 ))?
-                .get_secrets()
-                .context(format!(
-                    "failed to decode secrets list from peer {peer_id} while verifying availability"
-                ))?;
+                .get_available();
 
-            let mut available: HashSet<String> = HashSet::new();
-            for entry in reader.iter() {
-                let name = entry
-                    .get_name()
-                    .context("secrets list missing name entry")?
-                    .to_str()
-                    .context("secrets list name is not utf8")?
-                    .to_string();
-                available.insert(name);
-            }
-
-            for name in secrets {
-                if !available.contains(name) {
-                    return Err(anyhow::anyhow!("peer {peer_id} missing secret '{name}'"));
-                }
+            if !available {
+                return Err(anyhow!(
+                    "peer {peer_id} secrets are not ready for workload admission"
+                ));
             }
         }
 

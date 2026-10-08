@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use mantissa::secrets::master_key::envelope::SecretPassphrase;
 use mantissa_client::config::ClientConfig;
+use mantissa_client::jobs::manifest::SecretReference;
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 use tokio::task::LocalSet;
@@ -341,6 +342,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                         &crate::tasks::TaskStartOptions {
                             name: &args.name,
                             image: &args.image,
+                            registry_auth: args.registry_auth.map(|name| SecretReference {
+                                name,
+                                version: None,
+                            }),
                             command: &args.command,
                             cpu_millis: args.cpu_millis,
                             memory_bytes: args.memory_bytes,
@@ -392,6 +397,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                             manifest_path: args.manifest.as_deref(),
                             name: args.name.as_deref(),
                             image: args.image.as_deref(),
+                            registry_auth: args.registry_auth.map(|name| SecretReference {
+                                name,
+                                version: None,
+                            }),
                             command: &args.command,
                             tty: args.tty,
                             cpu_millis: args.cpu_millis,
@@ -461,6 +470,10 @@ pub async fn run_cli_with_args(args: MantissaCli) -> Result<()> {
                         &crate::agents::AgentSubmitOptions {
                             name: &args.name,
                             image: &args.image,
+                            registry_auth: args.registry_auth.map(|name| SecretReference {
+                                name,
+                                version: None,
+                            }),
                             command: &args.command,
                             tty: args.tty,
                             cpu_millis: args.cpu_millis,

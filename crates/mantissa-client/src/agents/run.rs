@@ -115,6 +115,7 @@ fn prepared_execution_from_manifest(
         termination_grace_period_secs: manifest.execution.termination_grace_period_secs,
         pre_stop_command: manifest.execution.pre_stop_command.clone(),
         env: manifest.execution.env.clone(),
+        registry_auth: manifest.execution.registry_auth.clone(),
         secret_files: manifest.execution.secret_files.clone(),
         volumes: manifest
             .execution

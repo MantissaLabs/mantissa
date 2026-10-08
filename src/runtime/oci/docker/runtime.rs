@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use bollard::auth::DockerCredentials;
 use bollard::container::AttachContainerResults;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
@@ -23,6 +24,7 @@ use futures::StreamExt;
 use log::{debug, info, trace, warn};
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 
+use crate::runtime::registry_auth::RegistryAuth;
 use crate::runtime::types::{
     RestartPolicyType, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities,
     RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions, RuntimeExecResult,
@@ -388,16 +390,32 @@ impl RuntimeBackend for DockerRuntimeBackend {
         }
     }
 
-    /// Pulls one image from the configured Docker registry.
-    async fn pull_image(&self, image: &str) -> RuntimeResult<()> {
+    /// Pulls with explicit workload credentials or the node's Docker login when none are supplied.
+    async fn pull_image(
+        &self,
+        image: &str,
+        registry_auth: Option<&RegistryAuth>,
+    ) -> RuntimeResult<()> {
         debug!("Pulling image: {image}");
+
+        let credentials = match registry_auth {
+            Some(auth) => {
+                auth.validate_image(image)?;
+                Some(DockerCredentials::from(auth))
+            }
+            None => {
+                let node_auth =
+                    super::credentials::resolve(self.docker_config_path.as_deref(), image).await?;
+                node_auth.as_ref().map(DockerCredentials::from)
+            }
+        };
 
         let options = Some(CreateImageOptions {
             from_image: Some(image.to_string()),
             ..Default::default()
         });
 
-        let mut stream = self.docker.create_image(options, None, None);
+        let mut stream = self.docker.create_image(options, None, credentials);
         let mut last_updates: HashMap<Option<String>, PullProgressLogState> = HashMap::new();
 
         // Process the stream of updates

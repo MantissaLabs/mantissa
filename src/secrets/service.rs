@@ -370,6 +370,63 @@ fn plaintext_from_reader(reader: capnp::data::Reader<'_>) -> Vec<u8> {
 }
 
 impl secrets::Server for SecretsService {
+    /// Reports whether this node can decrypt the requested secrets before remote workload admission.
+    async fn check_available(
+        self: Rc<Self>,
+        params: secrets::CheckAvailableParams,
+        mut results: secrets::CheckAvailableResults,
+    ) -> Result<(), Error> {
+        let references = params.get()?.get_references()?;
+        let keyring = self.keyring.read().await;
+
+        for reference in references.iter() {
+            let name = reference.get_name()?.to_str()?.trim();
+            if name.is_empty() {
+                return Err(Error::failed("secret name cannot be empty".to_string()));
+            }
+
+            let version = reference.get_version_id()?;
+            if !version.is_empty() && version.len() != 16 {
+                return Err(Error::failed(
+                    "secret version id must be 16 bytes".to_string(),
+                ));
+            }
+
+            let Some(value) = self
+                .registry
+                .get_by_name(name)
+                .map_err(|error| Error::failed(error.to_string()))?
+            else {
+                results.get().set_available(false);
+                return Ok(());
+            };
+            if !version.is_empty() && version != value.current_version.version_id.as_bytes() {
+                results.get().set_available(false);
+                return Ok(());
+            }
+
+            // A secret can arrive before its decryption key. Metadata alone does not prove readiness.
+            match keyring.decrypt(
+                value.id,
+                value.current_version.version_id,
+                &value.current_version.ciphertext,
+            ) {
+                // The coordinator needs only availability, so clear the decrypted bytes immediately.
+                Ok(plaintext) => drop(zeroize::Zeroizing::new(plaintext)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    results.get().set_available(false);
+                    return Ok(());
+                }
+                Err(_) => {
+                    return Err(Error::failed(format!("cannot decrypt secret '{name}'")));
+                }
+            }
+        }
+
+        results.get().set_available(true);
+        Ok(())
+    }
+
     async fn list(
         self: Rc<Self>,
         _params: secrets::ListParams,

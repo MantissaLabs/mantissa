@@ -136,6 +136,10 @@ struct AgentSessionSpec {
 
   deploymentPolicy @35 :Workload.DeploymentPolicy;
   # Controller-owned deadline policy for runs launched from this session.
+
+  registryAuth @36 :Workload.SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct AgentRunSpec {
@@ -240,6 +244,10 @@ struct AgentRunSpec {
 
   deploymentPolicy @33 :Workload.DeploymentPolicy;
   # Controller-owned deadline policy for this run.
+
+  registryAuth @34 :Workload.SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct AgentWorkspacePolicy {

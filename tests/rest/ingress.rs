@@ -211,6 +211,7 @@ fn rest_ingress_endpoint_service(network_id: Uuid) -> ServiceSpecValue {
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: vec![TaskTemplateNetworkRequirement::new("default", network_id)],

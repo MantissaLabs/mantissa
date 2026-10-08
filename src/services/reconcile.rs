@@ -131,6 +131,7 @@ fn template_attributes_changed(
         || current.termination_grace_period_secs != desired.termination_grace_period_secs
         || current.pre_stop_command != desired.pre_stop_command
         || current.env != desired.env
+        || current.registry_auth != desired.registry_auth
         || current.secret_files != desired.secret_files
         || current.volumes != desired.volumes
         || current.networks != desired.networks
@@ -164,6 +165,7 @@ mod tests {
                 pre_stop_command: None,
                 liveness: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: vec![TaskTemplateNetworkRequirement::new(

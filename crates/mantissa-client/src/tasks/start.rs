@@ -7,6 +7,7 @@ use anyhow::Result;
 pub struct TaskStartOptions<'a> {
     pub name: &'a str,
     pub image: &'a str,
+    pub registry_auth: Option<crate::jobs::manifest::SecretReference>,
     pub command: &'a [String],
     pub cpu_millis: u64,
     pub memory_bytes: u64,
@@ -16,6 +17,12 @@ pub struct TaskStartOptions<'a> {
 
 /// Starts one standalone task and returns its created task snapshot.
 pub async fn start(cfg: &ClientConfig, options: &TaskStartOptions<'_>) -> Result<TaskRow> {
+    if let Some(auth) = &options.registry_auth
+        && auth.name.trim().is_empty()
+    {
+        anyhow::bail!("registry_auth secret name must not be empty");
+    }
+
     let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
     let client = connection::get_local_session(cfg).await?;
 
@@ -27,6 +34,13 @@ pub async fn start(cfg: &ClientConfig, options: &TaskStartOptions<'_>) -> Result
         let mut builder = request.get().init_request();
         builder.set_name(options.name);
         builder.set_image(options.image);
+        if let Some(auth) = &options.registry_auth {
+            crate::workload_wire::write_secret_reference(
+                builder.reborrow().init_registry_auth(),
+                auth,
+            );
+        }
+
         let mut cmd_builder = builder
             .reborrow()
             .init_command(options.command.len() as u32);

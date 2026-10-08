@@ -25,7 +25,7 @@ use crate::scheduler::{
 use crate::services::types::{ServicePortProtocol, ServiceSpecValue, ServiceStatus};
 use crate::workload::model::{
     ExecutionPlatform, IsolationMode, WorkloadEnvironmentVariable as TaskEnvironmentVariable,
-    WorkloadOwner, WorkloadPhase, WorkloadSecretFile, WorkloadValue,
+    WorkloadOwner, WorkloadPhase, WorkloadSecretFile, WorkloadSecretReference, WorkloadValue,
     WorkloadVolumeMount as TaskVolumeMount,
 };
 use crate::workload::types::{
@@ -146,6 +146,7 @@ pub(super) struct BatchStartPlan {
     pub(super) pre_stop_command: Option<Vec<String>>,
     pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
+    pub(super) registry_auth: Option<WorkloadSecretReference>,
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
@@ -185,6 +186,7 @@ pub(super) struct StartIntent {
     pub(super) pre_stop_command: Option<Vec<String>>,
     pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
+    pub(super) registry_auth: Option<WorkloadSecretReference>,
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
@@ -535,7 +537,7 @@ impl Candidate {
 
             let slot = &self.slots[best_idx];
             if slot.capacity.cpu_millis == 0 && slot.capacity.memory_bytes == 0 {
-                // Slot contributes nothing; abort allocation to avoid infinite loop.
+                // Abort allocation when a slot contributes nothing to avoid an infinite loop.
                 return None;
             }
 
@@ -1163,6 +1165,7 @@ pub(super) struct RemoteStartPlan {
     pub(super) pre_stop_command: Option<Vec<String>>,
     pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
+    pub(super) registry_auth: Option<WorkloadSecretReference>,
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
@@ -1195,6 +1198,7 @@ pub(super) struct PreparedRemoteStartPlan {
     pub(super) pre_stop_command: Option<Vec<String>>,
     pub(super) liveness: Option<WorkloadLivenessProbe>,
     pub(super) env: Vec<TaskEnvironmentVariable>,
+    pub(super) registry_auth: Option<WorkloadSecretReference>,
     pub(super) secret_files: Vec<WorkloadSecretFile>,
     pub(super) volumes: Vec<TaskVolumeMount>,
     pub(super) networks: Vec<Uuid>,
@@ -1359,6 +1363,7 @@ impl WorkloadManager {
                 pre_stop_command: execution.pre_stop_command,
                 liveness: execution.liveness,
                 env: execution.env,
+                registry_auth: execution.registry_auth,
                 secret_files: execution.secret_files,
                 volumes: execution.volumes,
                 networks: execution.networks,
@@ -1694,6 +1699,7 @@ impl WorkloadManager {
                 pre_stop_command: intent.pre_stop_command.clone(),
                 liveness: intent.liveness.clone(),
                 env: intent.env.clone(),
+                registry_auth: intent.registry_auth.clone(),
                 secret_files: intent.secret_files.clone(),
                 volumes: intent.volumes.clone(),
                 networks: intent.networks.clone(),
@@ -2370,6 +2376,7 @@ impl WorkloadManager {
                     pre_stop_command: intent.pre_stop_command.clone(),
                     liveness: intent.liveness.clone(),
                     env: intent.env.clone(),
+                    registry_auth: intent.registry_auth.clone(),
                     secret_files: intent.secret_files.clone(),
                     volumes: intent.volumes.clone(),
                     networks: intent.networks.clone(),
@@ -2398,6 +2405,7 @@ impl WorkloadManager {
                     pre_stop_command: intent.pre_stop_command.clone(),
                     liveness: intent.liveness.clone(),
                     env: intent.env.clone(),
+                    registry_auth: intent.registry_auth.clone(),
                     secret_files: intent.secret_files.clone(),
                     volumes: intent.volumes.clone(),
                     networks: intent.networks.clone(),
@@ -2503,6 +2511,7 @@ mod tests {
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: vec![required_network],
@@ -2604,6 +2613,7 @@ mod tests {
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
@@ -2722,6 +2732,7 @@ mod tests {
                     pre_stop_command: None,
                     liveness: None,
                     env: Vec::new(),
+                    registry_auth: None,
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: vec![TaskTemplateNetworkRequirement::new(

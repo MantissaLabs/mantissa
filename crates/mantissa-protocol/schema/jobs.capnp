@@ -64,6 +64,10 @@ struct JobExecution {
 
   placement @14 :Workload.PlacementPolicy;
   # Generic workload placement policy for each job attempt.
+
+  registryAuth @15 :Workload.SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct JobRetryPolicy {

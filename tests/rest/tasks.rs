@@ -121,7 +121,11 @@ impl RuntimeBackend for StaticTaskStreamsRuntimeBackend {
     }
 
     /// Treats all images as pullable in the synthetic backend.
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _registry_auth: Option<&mantissa::runtime::registry_auth::RegistryAuth>,
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -282,6 +286,7 @@ pub(super) fn seeded_task_value(
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
+        registry_auth: None,
         secret_files: Vec::new(),
         volumes: Vec::new(),
         ports: Vec::new(),
@@ -593,6 +598,10 @@ local_test!(rest_tasks_inspect_preserves_runtime_configuration, {
             }),
         },
     ];
+    task.registry_auth = Some(WorkloadSecretReference {
+        name: "application-registry".into(),
+        version_id: Some(version_id),
+    });
     task.secret_files = vec![WorkloadSecretFile {
         path: "/run/secrets/database".into(),
         secret: WorkloadSecretReference {
@@ -649,6 +658,13 @@ local_test!(rest_tasks_inspect_preserves_runtime_configuration, {
     );
 
     assert_eq!(value["networks"], json!([network_id.to_string()]));
+    assert_eq!(
+        value["registry_auth"],
+        json!({
+            "name": "application-registry",
+            "version": version_id.to_string(),
+        })
+    );
     assert_eq!(
         value["volumes"],
         json!([{

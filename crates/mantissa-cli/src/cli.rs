@@ -593,7 +593,7 @@ pub enum JobsCommand {
     Wait(JobsWaitArgs),
 
     /// Submit one finite job
-    Run(JobsRunArgs),
+    Run(Box<JobsRunArgs>),
 
     /// Request cancellation for one first-class job
     Cancel(JobsCancelArgs),
@@ -692,6 +692,10 @@ pub struct TasksStartArgs {
     #[arg(short = 'i', long = "image", value_name = "IMAGE")]
     pub image: String,
 
+    /// Secret containing inline registry credentials for image pulls
+    #[arg(long = "registry-auth", value_name = "SECRET")]
+    pub registry_auth: Option<String>,
+
     /// Command arguments for the task runtime instance (repeat flag to add arguments)
     #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
     pub command: Vec<String>,
@@ -742,6 +746,14 @@ pub struct JobsRunArgs {
         conflicts_with = "manifest"
     )]
     pub image: Option<String>,
+
+    /// Secret containing inline registry credentials for image pulls
+    #[arg(
+        long = "registry-auth",
+        value_name = "SECRET",
+        conflicts_with = "manifest"
+    )]
+    pub registry_auth: Option<String>,
 
     /// Command arguments for the job workload (repeat flag to add arguments)
     #[arg(
@@ -966,6 +978,10 @@ pub struct AgentsSubmitArgs {
     /// Runtime image to run for each agent turn
     #[arg(short = 'i', long = "image", value_name = "IMAGE")]
     pub image: String,
+
+    /// Secret containing inline registry credentials for image pulls
+    #[arg(long = "registry-auth", value_name = "SECRET")]
+    pub registry_auth: Option<String>,
 
     /// Command arguments for the run entrypoint (repeat flag to add arguments)
     #[arg(short = 'c', long = "command", value_name = "ARG", action = ArgAction::Append)]
@@ -1786,11 +1802,11 @@ pub struct VolumesCreateArgs {
     #[arg(long = "filesystem", value_enum, default_value = "ext4")]
     pub filesystem: ReplicatedVolumeFilesystemOpt,
 
-    /// Explicit uid ownership for managed volumes; requires --gid
+    /// Explicit uid ownership for managed volumes. Requires --gid
     #[arg(long = "uid", value_name = "UID")]
     pub uid: Option<u32>,
 
-    /// Explicit gid ownership for managed volumes; requires --uid
+    /// Explicit gid ownership for managed volumes. Requires --uid
     #[arg(long = "gid", value_name = "GID")]
     pub gid: Option<u32>,
 

@@ -1,9 +1,10 @@
 use crate::network::types::NetworkServiceDependencyRequirement;
 use crate::workload::capnp_codec::{
     decode_env_vars, decode_placement_policy, decode_port_bindings, decode_secret_files,
-    decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts, encode_env_vars,
-    encode_placement_policy, encode_port_bindings, encode_secret_files, encode_task_liveness_probe,
-    encode_task_restart_policy, encode_volume_mounts,
+    decode_secret_ref, decode_task_liveness_probe, decode_task_restart_policy,
+    decode_volume_mounts, encode_env_vars, encode_placement_policy, encode_port_bindings,
+    encode_secret_files, encode_secret_ref, encode_task_liveness_probe, encode_task_restart_policy,
+    encode_volume_mounts,
 };
 use crate::workload::manager::{
     OwnedWorkloadStatus, ServiceShardAssignmentFailure, ServiceShardAssignmentFailureClass,
@@ -651,6 +652,9 @@ pub fn write_spec(mut builder: workload_spec::Builder<'_>, spec: &WorkloadSpec) 
         .reborrow()
         .init_secret_files(spec.secret_files.len() as u32);
     encode_secret_files(&mut secret_files, &spec.secret_files);
+    if let Some(auth) = &spec.registry_auth {
+        encode_secret_ref(builder.reborrow().init_registry_auth(), auth);
+    }
 
     let mut volumes = builder.reborrow().init_volumes(spec.volumes.len() as u32);
     encode_volume_mounts(&mut volumes, &spec.volumes);
@@ -756,6 +760,11 @@ pub fn read_spec(reader: workload_spec::Reader<'_>) -> Result<WorkloadSpec, Erro
             None
         },
         env: decode_env_vars(reader.get_env()?)?,
+        registry_auth: if reader.has_registry_auth() {
+            Some(decode_secret_ref(reader.get_registry_auth()?)?)
+        } else {
+            None
+        },
         secret_files: decode_secret_files(reader.get_secret_files()?)?,
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks,
@@ -841,6 +850,9 @@ pub(crate) fn write_start_request(
         .reborrow()
         .init_secret_files(request.execution.secret_files.len() as u32);
     encode_secret_files(&mut secret_files, &request.execution.secret_files);
+    if let Some(auth) = &request.execution.registry_auth {
+        encode_secret_ref(builder.reborrow().init_registry_auth(), auth);
+    }
 
     let mut networks = builder
         .reborrow()
@@ -969,6 +981,11 @@ fn read_start_request(
                 None
             },
             env: decode_env_vars(reader.get_env()?)?,
+            registry_auth: if reader.has_registry_auth() {
+                Some(decode_secret_ref(reader.get_registry_auth()?)?)
+            } else {
+                None
+            },
             secret_files: decode_secret_files(reader.get_secret_files()?)?,
             volumes: decode_volume_mounts(reader.get_volumes()?)?,
             networks,
@@ -1528,6 +1545,10 @@ mod tests {
                     }),
                 },
             ],
+            registry_auth: Some(crate::workload::model::WorkloadSecretReference {
+                name: "application-registry".to_string(),
+                version_id: Some(Uuid::new_v4()),
+            }),
             secret_files: vec![WorkloadSecretFile {
                 path: "/run/secrets/token".to_string(),
                 secret: WorkloadSecretReference {

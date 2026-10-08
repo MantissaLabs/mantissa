@@ -208,6 +208,7 @@ pub(crate) fn empty_service_execution(
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
+        registry_auth: None,
         secret_files: Vec::new(),
         volumes: Vec::new(),
         networks: Vec::new(),
@@ -1441,7 +1442,11 @@ impl RuntimeBackend for SlowCreateRuntimeBackend {
         self.inner.sample_instance_usage(container_id).await
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _registry_auth: Option<&mantissa::runtime::registry_auth::RegistryAuth>,
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 }
@@ -1539,7 +1544,11 @@ impl RuntimeBackend for ExitSignalRuntimeBackend {
         self.inner.inspect_instance(container_id).await
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _registry_auth: Option<&mantissa::runtime::registry_auth::RegistryAuth>,
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -1638,8 +1647,12 @@ impl RuntimeBackend for CreateFailureAfterBaselineRuntimeBackend {
         self.inner.inspect_instance(container_id).await
     }
 
-    async fn pull_image(&self, image: &str) -> Result<(), RuntimeError> {
-        self.inner.pull_image(image).await
+    async fn pull_image(
+        &self,
+        image: &str,
+        registry_auth: Option<&mantissa::runtime::registry_auth::RegistryAuth>,
+    ) -> Result<(), RuntimeError> {
+        self.inner.pull_image(image, registry_auth).await
     }
 }
 
@@ -1719,6 +1732,7 @@ pub(crate) fn task_spec_to_value(spec: &WorkloadSpec) -> TaskValue {
         pre_stop_command: None,
         liveness: None,
         env: spec.env.clone(),
+        registry_auth: spec.registry_auth.clone(),
         secret_files: spec.secret_files.clone(),
         volumes: Vec::new(),
         networks: spec.networks.clone(),
@@ -2131,6 +2145,7 @@ pub(crate) fn manifest_to_task_templates(manifest: &ServiceManifest) -> Vec<Task
                             }),
                         })
                         .collect(),
+                    registry_auth: None,
                     secret_files: task
                         .secret_files
                         .iter()

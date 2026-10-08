@@ -295,6 +295,10 @@ struct TaskSpec {
 
   ports @34 :List(Workload.PortBinding);
   # Node-local host port bindings requested by the task.
+
+  registryAuth @35 :Workload.SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct TaskStartRequest {
@@ -359,6 +363,10 @@ struct TaskStartRequest {
 
   isolationProfile @19 :Text;
   # Optional named isolation profile requested for sandboxed task execution.
+
+  registryAuth @20 :Workload.SecretRef;
+  # Name and optional version of the secret used to authenticate image pulls.
+  # When unset, use node credentials or anonymous access.
 }
 
 struct TaskStopRequest {

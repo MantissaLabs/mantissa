@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 
+use crate::runtime::registry_auth::RegistryAuth;
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
 /// Errors returned by runtime backends.
@@ -957,8 +958,12 @@ pub trait RuntimeBackend {
         Ok(false)
     }
 
-    /// Pulls one image into the local backend image store.
-    async fn pull_image(&self, image: &str) -> RuntimeResult<()>;
+    /// Pulls with workload credentials, or the backend's node credentials when none are supplied.
+    async fn pull_image(
+        &self,
+        image: &str,
+        registry_auth: Option<&RegistryAuth>,
+    ) -> RuntimeResult<()>;
 
     /// Reports the optional capabilities implemented by this runtime backend.
     fn capabilities(&self) -> RuntimeCapabilities {

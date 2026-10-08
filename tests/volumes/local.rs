@@ -249,6 +249,7 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
                 pre_stop_command: None,
                 liveness: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: vec![
                     TaskVolumeMount {

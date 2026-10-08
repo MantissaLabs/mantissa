@@ -1,9 +1,11 @@
 use super::{WorkloadManager, WorkloadStartRequest};
+use crate::runtime::registry_auth::RegistryAuth;
 use crate::secrets::crypto::SecretKeyring;
 use crate::secrets::types::SecretValue;
 use crate::volumes::types::FilesystemOwnership;
 use crate::workload::model::{
     WorkloadEnvironmentVariable as TaskEnvironmentVariable, WorkloadSecretFile,
+    WorkloadSecretReference,
 };
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
@@ -14,6 +16,7 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// On-disk artifacts populated when staging secret material for a runtime launch.
 #[derive(Clone)]
@@ -43,12 +46,16 @@ pub(super) struct ResolvedTaskSecrets {
 }
 
 impl WorkloadManager {
-    /// Ensures every task start request references secrets that exist locally with compatible versions.
+    /// Checks that requested secrets exist locally and validates registry_auth version pins.
     pub(super) fn ensure_secret_dependencies(
         &self,
         requests: &[WorkloadStartRequest],
     ) -> Result<()> {
         for request in requests {
+            if let Some(reference) = &request.registry_auth {
+                self.load_registry_auth_value(reference)?;
+            }
+
             for var in &request.env {
                 if let Some(secret) = &var.secret {
                     self.load_secret_value(&secret.name)?;
@@ -59,6 +66,59 @@ impl WorkloadManager {
             }
         }
         Ok(())
+    }
+
+    /// Loads the registry_auth secret and rejects a version pin that rotation has made unavailable.
+    pub(super) fn load_registry_auth_value(
+        &self,
+        reference: &WorkloadSecretReference,
+    ) -> Result<SecretValue> {
+        let value = self.load_secret_value(&reference.name)?;
+        if let Some(version) = reference.version_id
+            && version != value.current_version.version_id
+        {
+            return Err(anyhow!(
+                "registry_auth secret '{}' version {version} is unavailable",
+                reference.name
+            ));
+        }
+
+        Ok(value)
+    }
+
+    /// Selects image-pull credentials from the registry_auth secret.
+    /// Decrypted values stay in memory and are never passed into the container.
+    pub(super) async fn resolve_registry_auth(
+        &self,
+        reference: Option<&WorkloadSecretReference>,
+        image: &str,
+    ) -> Result<Option<RegistryAuth>> {
+        let Some(reference) = reference else {
+            return Ok(None);
+        };
+
+        let value = self.load_registry_auth_value(reference)?;
+        let plaintext = {
+            let keyring = self.secrets.secret_keyring.read().await;
+            Zeroizing::new(
+                keyring
+                    .decrypt(
+                        value.id,
+                        value.current_version.version_id,
+                        &value.current_version.ciphertext,
+                    )
+                    .map_err(|error| {
+                        anyhow!(
+                            "cannot decrypt registry_auth secret '{}': {error}",
+                            reference.name
+                        )
+                    })?,
+            )
+        };
+
+        RegistryAuth::from_config(&plaintext, image)
+            .map(Some)
+            .with_context(|| format!("registry_auth secret '{}'", reference.name))
     }
 
     /// Resolves environment variables and secret file projections into concrete runtime artifacts.

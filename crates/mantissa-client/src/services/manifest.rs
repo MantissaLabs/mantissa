@@ -358,6 +358,8 @@ pub struct TaskTemplateSpec {
     #[serde(default)]
     pub env: Vec<EnvironmentVariable>,
     #[serde(default)]
+    pub registry_auth: Option<SecretReference>,
+    #[serde(default)]
     pub secret_files: Vec<SecretFileProjection>,
     #[serde(default)]
     pub volumes: Vec<VolumeMount>,
@@ -813,6 +815,17 @@ impl ServiceManifest {
                             )
                         })?;
                     }
+                }
+            }
+
+            if let Some(auth) = &template.registry_auth {
+                if auth.name.trim().is_empty() {
+                    return Err(anyhow!(
+                        "registry_auth must reference a secret with a non-empty name"
+                    ));
+                }
+                if let Some(version) = &auth.version {
+                    Uuid::parse_str(version).context("registry_auth version must be a UUID")?;
                 }
             }
 
@@ -2133,6 +2146,7 @@ mod tests {
                 termination_grace_period_secs: None,
                 pre_stop_command: Some(Vec::new()),
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
@@ -2175,6 +2189,7 @@ mod tests {
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
@@ -2226,6 +2241,7 @@ mod tests {
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
@@ -2279,6 +2295,7 @@ mod tests {
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: vec![VolumeMount {
                     source: "pgdata".into(),
@@ -2327,6 +2344,7 @@ mod tests {
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: Vec::new(),
                 networks: Vec::new(),
@@ -2385,6 +2403,7 @@ mod tests {
                 termination_grace_period_secs: None,
                 pre_stop_command: None,
                 env: Vec::new(),
+                registry_auth: None,
                 secret_files: Vec::new(),
                 volumes: vec![VolumeMount {
                     source: "pgdata".into(),
@@ -2498,6 +2517,7 @@ mod tests {
                     termination_grace_period_secs: None,
                     pre_stop_command: None,
                     env: Vec::new(),
+                    registry_auth: None,
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),
@@ -2521,6 +2541,7 @@ mod tests {
                     termination_grace_period_secs: None,
                     pre_stop_command: None,
                     env: Vec::new(),
+                    registry_auth: None,
                     secret_files: Vec::new(),
                     volumes: Vec::new(),
                     networks: Vec::new(),

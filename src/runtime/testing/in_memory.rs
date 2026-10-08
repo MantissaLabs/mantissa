@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 
+use crate::runtime::registry_auth::RegistryAuth;
 use crate::runtime::types::{
     RuntimeAttachmentTarget, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest,
     RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame,
@@ -329,7 +330,11 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
     }
 
     /// Treats image pulls as no-ops because the in-memory backend has no image store.
-    async fn pull_image(&self, _image: &str) -> RuntimeResult<()> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _registry_auth: Option<&RegistryAuth>,
+    ) -> RuntimeResult<()> {
         Ok(())
     }
 

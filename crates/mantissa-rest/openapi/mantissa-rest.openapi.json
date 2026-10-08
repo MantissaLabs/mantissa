@@ -139,6 +139,16 @@
               "null"
             ]
           },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretReference"
+              }
+            ]
+          },
           "resources": {
             "$ref": "#/components/schemas/AgentExecutionResources"
           },
@@ -1557,6 +1567,16 @@
             "type": [
               "array",
               "null"
+            ]
+          },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretReference"
+              }
             ]
           },
           "resources": {
@@ -4383,6 +4403,16 @@
               }
             ]
           },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretReference"
+              }
+            ]
+          },
           "replicas": {
             "format": "int32",
             "minimum": 0,
@@ -4718,6 +4748,16 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretReference"
+              }
+            ]
           },
           "restart_policy": {
             "oneOf": [
@@ -5062,6 +5102,16 @@
           },
           "name": {
             "type": "string"
+          },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretReference"
+              }
+            ]
           },
           "volumes": {
             "items": {
@@ -5432,6 +5482,16 @@
               },
               {
                 "$ref": "#/components/schemas/ReadinessProbe"
+              }
+            ]
+          },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SecretReference"
               }
             ]
           },

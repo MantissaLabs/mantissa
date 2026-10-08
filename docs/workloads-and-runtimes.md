@@ -161,7 +161,7 @@ runtime instance, and it is recorded in the shared workload layer as
 without pinning compute, which is important for human-in-the-loop workflows.
 
 Once scheduled, an agent run records the bound shared workload row through its
-`workload_id`. The run remains the controller-owned record; the shared workload
+`workload_id`. The run remains the controller-owned record. The shared workload
 row remains the generic schedulable execution beneath it.
 
 ### Summary Table
@@ -171,7 +171,7 @@ row remains the generic schedulable execution beneath it.
 | Task | Standalone user-submitted execution | Yes | `src/task`, `src/workload` |
 | Service | Desired state for replicated long-lived work | No | `src/services` |
 | Service replica | One schedulable execution owned by a service | Yes | `src/services`, `src/workload` |
-| Job | Durable finite-work controller with retries | No by itself; it launches attempts | `src/jobs` |
+| Job | Durable finite-work controller with retries | Its attempts consume capacity | `src/jobs` |
 | Agent session | Durable agent identity, policy, and event record | No | `src/agents` |
 | Agent run | One schedulable execution slice of an agent session | Yes | `src/agents`, `src/workload` |
 
@@ -248,9 +248,9 @@ MicroVM-backed sandbox. Today only OCI-backed sandboxing is implemented.
 
 That is why "sandbox" and "MicroVM" are not synonyms. A sandbox may be
 implemented on top of OCI or on top of a MicroVM backend. The execution
-platform expresses where the workload runs; the isolation mode expresses how
-strongly isolated that execution should be; the backend expresses how that
-request is actually fulfilled on a node.
+platform expresses where the workload runs. The isolation mode expresses how
+strongly isolated that execution should be. The backend fulfills that request
+on a node.
 
 ### Capabilities and Support Profiles
 
@@ -278,11 +278,154 @@ This table reflects what exists in the repository today.
 
 The important reading of this table is that support is advertised per backend,
 not implied by the shared model. The presence of `ExecutionPlatform::MicroVm` in the
-model means the scheduler and runtime APIs can express that family; it does not
+model means the scheduler and runtime APIs can express that family. It does not
 mean a MicroVM engine is already wired into the runtime layer. It also means a
 node only advertises `docker-sandboxed` when it can actually honor that
 contract. If the `nono` helper cannot be resolved at startup, the node keeps
 `docker-standard` and does not publish sandboxed OCI support.
+
+### Private Registry Images
+
+Image pulls select credentials in this order:
+
+1. A workload's optional `registry_auth` secret.
+2. The executing node's Docker configuration when no secret is specified.
+3. Anonymous access when neither source supplies credentials for that registry.
+
+Public images work without configuration. An explicit secret overrides node
+credentials. A missing, malformed, or rejected secret fails the launch instead
+of falling back to a different login.
+
+#### Credentials attached to a workload
+
+Store Docker-compatible inline `auths` JSON in a Mantissa secret. For example,
+`registry-auth.json` can contain:
+
+```json
+{
+  "auths": {
+    "registry.example.com": {
+      "username": "reader",
+      "password": "YOUR_REGISTRY_TOKEN"
+    }
+  }
+}
+```
+
+The usual base64 `auth` value containing `username:password` is also supported,
+as are `identitytoken` and `registrytoken` entries. Keys must match the image's
+registry, including its port when specified. One secret can contain several
+registry entries. Only the matching credentials are passed to the runtime.
+
+```bash
+mantissa secrets create application-registry < registry-auth.json
+mantissa tasks start api --image registry.example.com/team/api:1.2.3 \
+  --registry-auth application-registry
+```
+
+`jobs run` and `agents submit` also accept `--registry-auth SECRET`. In service
+manifests, add this field to the task template. In job and agent manifests, add
+it to `execution`:
+
+```ron
+registry_auth: Some((
+    name: "application-registry",
+    version: None,
+)),
+```
+
+REST submissions use the corresponding JSON reference:
+`"registry_auth": {"name": "application-registry", "version": null}`.
+
+The reference follows the workload through scheduling, replacement, and daemon
+restarts. Mantissa replicates the existing encrypted secret and decrypts it
+in memory on the executing node. Registry credentials are used only for pulling.
+They are not added to container environment variables or mounted as files.
+
+Registry secrets use Mantissa's existing cluster trust model. Joined nodes and
+administrators with access to the local admin socket or an authorized REST token
+can read cluster secrets. An explicit `secrets show` command or secret GET request
+returns their contents. Workload inspection shows only the secret reference.
+
+Before reserving remote resources, the coordinator checks that the target can
+decrypt the required secret version. Missing versions or keys are retried through
+the existing bounded admission retry path. The readiness check never returns
+credentials.
+
+With `version: None`, each pull attempt reads the current secret version, so
+rotating the secret affects future pulls without changing the manifest. A UUID
+version pins the current version and fails if it is no longer available. The
+secret store retains only the current version. Rotation does not restart
+existing containers.
+
+Secret payloads require inline credentials. `credsStore` and `credHelpers` belong
+to node configuration because they depend on local programs and credential
+stores. Do not import a helper-only Docker configuration as a workload secret.
+For short-lived cloud tokens, use a node credential helper that refreshes them,
+or rotate the inline secret before its token expires.
+
+#### Credentials configured on the node
+
+Mantissa reads `config.json` from the directory named by `DOCKER_CONFIG`, or from
+the daemon user's `~/.docker` directory when that variable is unset. A login
+performed as another user does not configure the daemon's credentials. Configure
+every node that may run the workload, including new and replacement nodes.
+
+For a root daemon, one explicit configuration directory can be shared by Docker
+login and Mantissa:
+
+```bash
+sudo install -d -m 0700 /etc/mantissa/docker
+sudo docker --config /etc/mantissa/docker login registry.example.com
+sudo env DOCKER_CONFIG=/etc/mantissa/docker mantissa init
+```
+
+Mantissa supports `auths`, registry-specific `credHelpers`, and the default
+`credsStore`. Helper programs must be available on the daemon's `PATH` and usable
+by its user. A registry-specific helper takes precedence over the default store
+and file credentials. Helper failures are reported without including their
+output. The standard credentials-not-found response allows anonymous pulls.
+Helper lookup has a ten-second timeout and a 64 KiB response limit. Configuration
+is reread for each pull, so login, logout, and rotation need no daemon restart.
+
+#### Registry trust and cached images
+
+Registry authentication and TLS trust are separate. Configure private CA and
+client certificates in Docker on each executing node. For native Linux Engine,
+a private CA normally goes in
+`/etc/docker/certs.d/registry.example.com[:port]/ca.crt`. Rootless Docker and
+Docker Desktop use different locations. See Docker's
+[registry certificate configuration](https://docs.docker.com/engine/security/certificates/).
+Mantissa does not disable certificate verification. An HTTP registry needs
+explicit insecure-registry configuration in Docker.
+
+Credentials also pass to Docker through its Engine API. Use the local Unix
+socket or a protected tunnel to a remote Engine. An Engine configured through
+`tcp://` or `http://` receives credentials over plain HTTP. Registry TLS does
+not protect that connection.
+
+Locally cached images skip pulling. A configured `registry_auth` secret is still
+checked for existence, version, and credentials matching the image's registry.
+A cached image does not contact the registry to verify permission or token
+expiry. Logging out or revoking credentials does not remove cached images or
+stop running containers.
+Registry credentials therefore do not provide isolation between workloads
+sharing a node's image cache.
+
+The shared runtime interface accepts provider-independent `RegistryAuth`
+credentials. Docker converts them to its Engine API format inside its backend.
+Future Podman or containerd backends can convert the same credentials to their
+own pull requests. Docker is currently the implemented container provider.
+
+The authenticated-registry test uses a disposable registry bound to loopback
+and verifies anonymous rejection, Docker login/logout, explicit credentials
+without node login, and rejection without credential fallback:
+
+```bash
+docker pull registry:3
+docker pull busybox:1.36
+cargo test -p mantissa --lib private_registry_pull_real_docker -- --ignored
+```
 
 ### Sandboxed Agents with `nono`
 
@@ -365,7 +508,7 @@ The public surface may still speak in controller-specific terms. For example,
 the task API sends a `TaskStartRequest`, and the task service converts it into
 a `WorkloadStartRequest` before handing it to the shared workload manager. It
 still returns a `TaskSpec` because the caller is creating a direct task. The
-internal request shape is generic; the resulting durable record is exposed
+internal request shape is generic. The resulting durable record is exposed
 through the task surface.
 
 The service controller builds service-owned replica requests, the job

@@ -103,6 +103,7 @@ fn bootstrap_workload_value(id: Uuid, node_id: Uuid, index: u64) -> WorkloadValu
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
+        registry_auth: None,
         secret_files: Vec::new(),
         volumes: Vec::new(),
         ports: Vec::new(),

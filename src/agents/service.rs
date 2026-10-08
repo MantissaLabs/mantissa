@@ -7,10 +7,10 @@ use crate::agents::types::{
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
     decode_admission_policy, decode_deployment_policy as read_deployment_policy, decode_env_vars,
-    decode_network_requirements, decode_placement_policy, decode_secret_files,
+    decode_network_requirements, decode_placement_policy, decode_secret_files, decode_secret_ref,
     decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts,
     encode_admission_policy, encode_deployment_policy as write_deployment_policy, encode_env_vars,
-    encode_placement_policy, encode_secret_files, encode_task_liveness_probe,
+    encode_placement_policy, encode_secret_files, encode_secret_ref, encode_task_liveness_probe,
     encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
@@ -493,6 +493,9 @@ fn write_session_execution(
         .reborrow()
         .init_secret_files(execution.secret_files.len() as u32);
     encode_secret_files(&mut secret_files, &execution.secret_files);
+    if let Some(auth) = &execution.registry_auth {
+        encode_secret_ref(builder.reborrow().init_registry_auth(), auth);
+    }
 
     let mut volumes = builder
         .reborrow()
@@ -549,6 +552,11 @@ fn read_session_execution(
             None
         },
         env: decode_env_vars(reader.get_env()?)?,
+        registry_auth: if reader.has_registry_auth() {
+            Some(decode_secret_ref(reader.get_registry_auth()?)?)
+        } else {
+            None
+        },
         secret_files: decode_secret_files(reader.get_secret_files()?)?,
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks: read_uuid_list(reader.get_networks()?)?,
@@ -584,6 +592,9 @@ fn write_run_execution(
         .reborrow()
         .init_secret_files(execution.secret_files.len() as u32);
     encode_secret_files(&mut secret_files, &execution.secret_files);
+    if let Some(auth) = &execution.registry_auth {
+        encode_secret_ref(builder.reborrow().init_registry_auth(), auth);
+    }
 
     let mut volumes = builder
         .reborrow()
@@ -638,6 +649,11 @@ fn read_run_execution(reader: agent_run_spec::Reader<'_>) -> Result<ResolvedExec
             None
         },
         env: decode_env_vars(reader.get_env()?)?,
+        registry_auth: if reader.has_registry_auth() {
+            Some(decode_secret_ref(reader.get_registry_auth()?)?)
+        } else {
+            None
+        },
         secret_files: decode_secret_files(reader.get_secret_files()?)?,
         volumes: decode_volume_mounts(reader.get_volumes()?)?,
         networks: read_uuid_list(reader.get_networks()?)?,
@@ -982,6 +998,10 @@ mod tests {
             pre_stop_command: None,
             liveness: None,
             env: Vec::new(),
+            registry_auth: Some(crate::workload::model::WorkloadSecretReference {
+                name: "application-registry".to_string(),
+                version_id: Some(Uuid::new_v4()),
+            }),
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),

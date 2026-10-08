@@ -58,6 +58,7 @@ fn standard_backend_advertises_only_standard_oci_contracts() {
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::Standard,
         nono_helper_host_path: None,
+        docker_config_path: None,
     };
     let support = manager.advertised_support();
 
@@ -88,6 +89,7 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::NonoSandbox,
         nono_helper_host_path: Some("/tmp/mantissa-sandbox-init".into()),
+        docker_config_path: None,
     };
     let support = manager.advertised_support();
 
@@ -254,6 +256,7 @@ async fn create_instance_preserves_conflict_status_code() {
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::Standard,
         nono_helper_host_path: None,
+        docker_config_path: None,
     };
 
     let result = manager
@@ -351,7 +354,7 @@ async fn usage_sample_real_docker_reports_cpu_delta_and_memory() {
         return;
     };
     manager
-        .pull_image("busybox:1.36")
+        .pull_image("busybox:1.36", None)
         .await
         .expect("pull busybox image");
 
@@ -505,6 +508,7 @@ async fn tty_attach_forwards_initial_prompt_without_waiting_for_newline() {
             .expect("construct docker http client"),
         mode: DockerRuntimeMode::Standard,
         nono_helper_host_path: None,
+        docker_config_path: None,
     };
     let options = RuntimeAttachOptions {
         tty: true,
@@ -543,7 +547,7 @@ async fn tty_attach_real_docker_emits_prompt_before_input() {
         return;
     };
     manager
-        .pull_image("busybox:1.36")
+        .pull_image("busybox:1.36", None)
         .await
         .expect("pull busybox image");
 
@@ -613,7 +617,7 @@ async fn tty_attach_real_docker_reattach_redraws_prompt_after_disconnect() {
         return;
     };
     manager
-        .pull_image("busybox:1.36")
+        .pull_image("busybox:1.36", None)
         .await
         .expect("pull busybox image");
 
@@ -717,7 +721,7 @@ async fn tty_attach_rejects_exited_container() {
         return;
     };
     manager
-        .pull_image("busybox:1.36")
+        .pull_image("busybox:1.36", None)
         .await
         .expect("pull busybox image");
 

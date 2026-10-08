@@ -98,6 +98,7 @@ data-encoding = "2.9.0"
 ron = "0.10.1"
 serde = { version = "1.0.190", features = ["derive"] }
 serde_bytes = "0.11"
+serde_json = "1"
 
 # Cap'n Proto wire codecs and RPC support.
 capnp = { workspace = true }
@@ -168,7 +169,6 @@ axum = "0.8"
 mantissa-rest = { path = "crates/mantissa-rest" }
 rcgen = { version = "0.14", features = ["pem"] }
 rustls = "0.23"
-serde_json = "1"
 tokio-tungstenite = "0.27"
 tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }

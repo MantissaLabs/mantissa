@@ -6,10 +6,10 @@ use crate::runtime::types::{
 use crate::task::types::{TaskSpec, TaskStateFilter, TaskStateKind};
 use crate::topology::Topology;
 use crate::workload::capnp_codec::{
-    decode_env_vars, decode_port_bindings, decode_secret_files, decode_task_liveness_probe,
-    decode_task_restart_policy, decode_volume_mounts, encode_env_vars, encode_port_bindings,
-    encode_secret_files, encode_task_liveness_probe, encode_task_restart_policy,
-    encode_volume_mounts,
+    decode_env_vars, decode_port_bindings, decode_secret_files, decode_secret_ref,
+    decode_task_liveness_probe, decode_task_restart_policy, decode_volume_mounts, encode_env_vars,
+    encode_port_bindings, encode_secret_files, encode_secret_ref, encode_task_liveness_probe,
+    encode_task_restart_policy, encode_volume_mounts,
 };
 use crate::workload::manager::{WorkloadManager, WorkloadStartRequest, match_task_id_prefix};
 use crate::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase, WorkloadSpec};
@@ -156,6 +156,9 @@ pub fn write_spec(mut builder: task_spec::Builder, spec: &TaskSpec) {
         .reborrow()
         .init_secret_files(spec.secret_files.len() as u32);
     encode_secret_files(&mut files_builder, &spec.secret_files);
+    if let Some(auth) = &spec.registry_auth {
+        encode_secret_ref(builder.reborrow().init_registry_auth(), auth);
+    }
     let mut volume_builder = builder.reborrow().init_volumes(spec.volumes.len() as u32);
     encode_volume_mounts(&mut volume_builder, &spec.volumes);
 }
@@ -248,6 +251,11 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
     };
 
     let env = decode_env_vars(reader.get_env()?)?;
+    let registry_auth = if reader.has_registry_auth() {
+        Some(decode_secret_ref(reader.get_registry_auth()?)?)
+    } else {
+        None
+    };
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
     let volumes = decode_volume_mounts(reader.get_volumes()?)?;
 
@@ -304,6 +312,7 @@ pub fn read_spec(reader: task_spec::Reader) -> Result<TaskSpec, Error> {
         pre_stop_command,
         liveness,
         env,
+        registry_auth,
         secret_files,
         volumes,
         networks,
@@ -1127,6 +1136,11 @@ fn read_task_start_request(
     };
 
     let env = decode_env_vars(reader.get_env()?)?;
+    let registry_auth = if reader.has_registry_auth() {
+        Some(decode_secret_ref(reader.get_registry_auth()?)?)
+    } else {
+        None
+    };
     let secret_files = decode_secret_files(reader.get_secret_files()?)?;
     let volumes = decode_volume_mounts(reader.get_volumes()?)?;
 
@@ -1155,6 +1169,7 @@ fn read_task_start_request(
             pre_stop_command,
             liveness,
             env,
+            registry_auth,
             secret_files,
             volumes,
             networks,

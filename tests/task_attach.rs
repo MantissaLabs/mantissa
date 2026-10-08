@@ -102,7 +102,11 @@ impl RuntimeBackend for StaticAttachRuntimeBackend {
         })
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _registry_auth: Option<&mantissa::runtime::registry_auth::RegistryAuth>,
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -218,6 +222,7 @@ fn replicated_task_value(task_id: Uuid, owner_id: Uuid, owner_name: &str) -> Tas
         pre_stop_command: None,
         liveness: None,
         env: Vec::new(),
+        registry_auth: None,
         secret_files: Vec::new(),
         volumes: Vec::new(),
         ports: Vec::new(),

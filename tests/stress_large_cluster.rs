@@ -393,6 +393,7 @@ fn stress_manifest(name: &str, replicas: u16) -> ServiceManifest {
             termination_grace_period_secs: None,
             pre_stop_command: None,
             env: Vec::new(),
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),

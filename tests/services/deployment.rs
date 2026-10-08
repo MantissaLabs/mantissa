@@ -61,6 +61,7 @@ local_test!(services_gossip_propagates_across_peers, {
                         value: None,
                         secret: Some(secret_ref.clone()),
                     }],
+                    registry_auth: None,
                     secret_files: vec![TaskSecretFile {
                         path: "/run/secrets/demo-service-secret".into(),
                         secret: secret_ref.clone(),
@@ -160,6 +161,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
                 value: None,
                 secret: Some(secret_ref.clone()),
             }],
+            registry_auth: None,
             secret_files: vec![TaskSecretFile {
                 path: "/run/secrets/ack-demo-secret".into(),
                 secret: secret_ref,
@@ -426,6 +428,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
                         value: None,
                         secret: Some(secret_ref.clone()),
                     }],
+                    registry_auth: None,
                     secret_files: vec![TaskSecretFile {
                         path: "/run/secrets/capacity-secret".into(),
                         secret: secret_ref,

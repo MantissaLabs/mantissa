@@ -45,6 +45,7 @@ pub struct JobRunOptions<'a> {
     pub manifest_path: Option<&'a Path>,
     pub name: Option<&'a str>,
     pub image: Option<&'a str>,
+    pub registry_auth: Option<crate::jobs::manifest::SecretReference>,
     pub command: &'a [String],
     pub tty: bool,
     pub cpu_millis: Option<u64>,
@@ -97,6 +98,7 @@ struct PreparedJobExecution {
     termination_grace_period_secs: Option<u32>,
     pre_stop_command: Option<Vec<String>>,
     env: Vec<EnvironmentVariable>,
+    registry_auth: Option<crate::jobs::manifest::SecretReference>,
     secret_files: Vec<SecretFileProjection>,
     volumes: Vec<PreparedVolumeMount>,
     networks: Vec<Uuid>,
@@ -180,6 +182,12 @@ async fn prepare_raw_submit_spec(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("jobs run requires --image unless --file is used"))?;
 
+    if let Some(auth) = &options.registry_auth
+        && auth.name.trim().is_empty()
+    {
+        anyhow::bail!("registry_auth secret name must not be empty");
+    }
+
     let resolved_volumes = volumes::resolve_cli_volume_mounts(cfg, options.volumes).await?;
     let execution_platform = normalize_execution_platform(options.execution_platform)?;
     let isolation_mode = normalize_isolation_mode(options.isolation_mode)?;
@@ -197,6 +205,7 @@ async fn prepare_raw_submit_spec(
             termination_grace_period_secs: None,
             pre_stop_command: None,
             env: Vec::new(),
+            registry_auth: options.registry_auth.clone(),
             secret_files: Vec::new(),
             volumes: resolved_volumes
                 .iter()
@@ -288,6 +297,7 @@ fn prepared_execution_from_manifest(
         termination_grace_period_secs: execution.termination_grace_period_secs,
         pre_stop_command: execution.pre_stop_command.clone(),
         env: execution.env.clone(),
+        registry_auth: execution.registry_auth.clone(),
         secret_files: execution.secret_files.clone(),
         volumes: prepared_volumes,
         networks: execution
@@ -363,6 +373,9 @@ fn write_job_execution(
         .reborrow()
         .init_secret_files(execution.secret_files.len() as u32);
     write_secret_files(&mut secret_files, &execution.secret_files);
+    if let Some(auth) = &execution.registry_auth {
+        crate::workload_wire::write_secret_reference(builder.reborrow().init_registry_auth(), auth);
+    }
 
     let mut volumes = builder
         .reborrow()

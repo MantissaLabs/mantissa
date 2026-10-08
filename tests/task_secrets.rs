@@ -9,6 +9,7 @@ use mantissa::cluster::ClusterViewId;
 use mantissa::gossip::Message;
 use mantissa::network::registry::NetworkRegistry;
 use mantissa::registry::Registry;
+use mantissa::runtime::registry_auth::RegistryAuth;
 use mantissa::runtime::set::RuntimeSet;
 use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::types::{RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo};
@@ -46,17 +47,20 @@ use mantissa::volumes::VolumeRegistry;
 use mantissa::volumes::types::FilesystemOwnership;
 use mantissa::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadStartRequest};
 use mantissa::workload::model::ExecutionPlatform;
-use mantissa::workload::types::ResolvedExecutionSpec;
+use mantissa::workload::types::{ResolvedExecutionSpec, WorkloadAdmissionMode};
 use mantissa_net::noise::NoiseKeys;
 use mantissa_protocol::secrets::secrets;
+use mantissa_protocol::server::cluster_session;
 use mantissa_store::uuid_key::UuidKey;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::tempdir;
 use tokio::fs;
-use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, oneshot};
 use tokio::task::spawn_local;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -100,6 +104,8 @@ async fn temp_master_key_replication(
 
 #[derive(Default)]
 struct RecordingRuntimeBackend {
+    pulls: Arc<AsyncMutex<Vec<Option<RegistryAuth>>>>,
+    cached_image: AtomicBool,
     created: Arc<AsyncMutex<Vec<String>>>,
     envs: Arc<AsyncMutex<Vec<Vec<String>>>>,
     volumes: Arc<AsyncMutex<Vec<Vec<String>>>>,
@@ -177,8 +183,19 @@ impl RuntimeBackend for RecordingRuntimeBackend {
         ))
     }
 
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    /// Captures credentials at the pull boundary to detect accidental injection into containers.
+    async fn pull_image(
+        &self,
+        _image: &str,
+        registry_auth: Option<&RegistryAuth>,
+    ) -> Result<(), RuntimeError> {
+        self.pulls.lock().await.push(registry_auth.cloned());
         Ok(())
+    }
+
+    /// Lets secret validation tests verify that a warm image cache cannot hide invalid references.
+    async fn image_present(&self, _image: &str) -> Result<bool, RuntimeError> {
+        Ok(self.cached_image.load(Ordering::Relaxed))
     }
 }
 
@@ -534,6 +551,7 @@ local_test!(workload_manager_stages_secret_env_and_files, {
                     version_id: None,
                 }),
             }],
+            registry_auth: None,
             secret_files: vec![TaskSecretFile {
                 path: "/run/secrets/db-password".into(),
                 secret: TaskSecretReference {
@@ -712,6 +730,7 @@ local_test!(workload_manager_rejects_missing_secret_reference, {
                     version_id: None,
                 }),
             }],
+            registry_auth: None,
             secret_files: Vec::new(),
             volumes: Vec::new(),
             networks: Vec::new(),
@@ -1115,3 +1134,769 @@ fn drain_master_key_gossip(gossip_rx: &async_channel::Receiver<Message>) -> usiz
     }
     drained
 }
+
+/// Builds inline credentials with distinct passwords so tests can observe secret rotation.
+fn registry_auth_config(password: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "auths": {
+            "registry.example": {
+                "username": "reader",
+                "password": password,
+            },
+        },
+    }))
+    .expect("serialize registry credentials")
+}
+
+/// Encrypts a registry configuration through the same store used by replicated workload secrets.
+async fn seed_registry_auth(harness: &TestHarness, plaintext: &[u8]) -> Uuid {
+    let name = "application-registry";
+    let secret_id = compute_secret_id(name);
+    let version_id = Uuid::new_v4();
+    let ciphertext = harness
+        .secret_keyring
+        .encrypt(secret_id, version_id, plaintext)
+        .expect("encrypt registry credentials");
+    let now = Utc::now().to_rfc3339();
+    let version = SecretVersion::new(
+        version_id,
+        ciphertext.clone(),
+        now.clone(),
+        None,
+        ciphertext.master_key_id,
+        ciphertext.master_key_generation,
+    );
+    let value = SecretValue::new(name.to_string(), SecretMetadata::default(), now, version);
+    harness
+        .secret_registry
+        .upsert(value)
+        .await
+        .expect("store encrypted registry secret");
+    version_id
+}
+
+/// Creates a private-image request with no env or file projections that could receive credentials.
+fn registry_auth_request(name: &str, version_id: Option<Uuid>) -> WorkloadStartRequest {
+    WorkloadStartRequest {
+        name: name.to_string(),
+        execution: ResolvedExecutionSpec {
+            image: "registry.example/team/api:1".to_string(),
+            command: vec!["/bin/true".to_string()],
+            tty: false,
+            cpu_millis: 200,
+            memory_bytes: 64 * 1_024 * 1_024,
+            gpu_count: 0,
+            restart_policy: None,
+            termination_grace_period_secs: None,
+            pre_stop_command: None,
+            liveness: None,
+            env: Vec::new(),
+            registry_auth: Some(TaskSecretReference {
+                name: "application-registry".to_string(),
+                version_id,
+            }),
+            secret_files: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            ports: Vec::new(),
+            placement: Default::default(),
+        },
+        execution_platform: ExecutionPlatform::Oci,
+        isolation_mode: mantissa::workload::model::IsolationMode::Standard,
+        isolation_profile: None,
+        gpu_device_ids: Vec::new(),
+        id: None,
+        slot_ids: Vec::new(),
+        owner: None,
+        dependency_requirements: Vec::new(),
+        service_placement_preferences: Vec::new(),
+        target_node: None,
+    }
+}
+
+type SecretReadinessNotification = oneshot::Sender<Vec<(String, Uuid)>>;
+
+/// Holds the first readiness response so a test can inspect admission before replication completes.
+struct DelayedSecretAvailability {
+    inner: secrets::Client,
+    first_check: RefCell<Option<SecretReadinessNotification>>,
+    release: RefCell<Option<oneshot::Receiver<()>>>,
+}
+
+impl secrets::Server for DelayedSecretAvailability {
+    /// Reports one unavailable check before delegating to the target's real encrypted secret store.
+    async fn check_available(
+        self: Rc<Self>,
+        params: secrets::CheckAvailableParams,
+        mut results: secrets::CheckAvailableResults,
+    ) -> Result<(), capnp::Error> {
+        let references = params.get()?.get_references()?;
+        let first_check = self.first_check.borrow_mut().take();
+        if let Some(first_check) = first_check {
+            let observed = references
+                .iter()
+                .map(|reference| {
+                    Ok((
+                        reference.get_name()?.to_str()?.to_string(),
+                        read_uuid_bytes(reference.get_version_id()?),
+                    ))
+                })
+                .collect::<Result<Vec<_>, capnp::Error>>()?;
+            first_check
+                .send(observed)
+                .expect("report readiness request");
+            let release = self.release.borrow_mut().take().expect("readiness release");
+            release.await.expect("release delayed readiness response");
+
+            results.get().set_available(false);
+            return Ok(());
+        }
+
+        let mut request = self.inner.check_available_request();
+        request.get().set_references(references)?;
+        let response = request.send().promise.await?;
+        results.get().set_available(response.get()?.get_available());
+        Ok(())
+    }
+}
+
+/// Replaces only secret readiness while keeping remote scheduler and workload RPCs real.
+struct SecretAvailabilitySession {
+    inner: cluster_session::Client,
+    secrets: secrets::Client,
+}
+
+impl cluster_session::Server for SecretAvailabilitySession {
+    /// Keeps the peer session live while only secret readiness is delayed.
+    async fn ping(
+        self: Rc<Self>,
+        _params: cluster_session::PingParams,
+        _results: cluster_session::PingResults,
+    ) -> Result<(), capnp::Error> {
+        self.inner.ping_request().send().promise.await?;
+        Ok(())
+    }
+
+    /// Preserves anti-entropy so real secret and key replication can finish during admission retries.
+    async fn get_sync(
+        self: Rc<Self>,
+        _params: cluster_session::GetSyncParams,
+        mut results: cluster_session::GetSyncResults,
+    ) -> Result<(), capnp::Error> {
+        let response = self.inner.get_sync_request().send().promise.await?;
+        results.get().set_sync(response.get()?.get_sync()?);
+        Ok(())
+    }
+
+    /// Preserves secret gossip while the owner sees delayed readiness.
+    async fn get_gossip(
+        self: Rc<Self>,
+        _params: cluster_session::GetGossipParams,
+        mut results: cluster_session::GetGossipResults,
+    ) -> Result<(), capnp::Error> {
+        let response = self.inner.get_gossip_request().send().promise.await?;
+        results.get().set_gossip(response.get()?.get_gossip()?);
+        Ok(())
+    }
+
+    /// Keeps assignment repair notifications available to normal remote admission.
+    async fn notify_workload_rows_available(
+        self: Rc<Self>,
+        _params: cluster_session::NotifyWorkloadRowsAvailableParams,
+        _results: cluster_session::NotifyWorkloadRowsAvailableResults,
+    ) -> Result<(), capnp::Error> {
+        self.inner
+            .notify_workload_rows_available_request()
+            .send()
+            .promise
+            .await?;
+        Ok(())
+    }
+
+    /// Keeps cached peer capability discovery usable while the test delays secret readiness.
+    async fn get_capabilities(
+        self: Rc<Self>,
+        _params: cluster_session::GetCapabilitiesParams,
+        mut results: cluster_session::GetCapabilitiesResults,
+    ) -> Result<(), capnp::Error> {
+        let response = self.inner.get_capabilities_request().send().promise.await?;
+        results.get().set_caps(response.get()?.get_caps()?)?;
+        results.get().get_caps()?.set_secrets(self.secrets.clone());
+        Ok(())
+    }
+
+    /// Supplies the controlled readiness capability used by owner-side admission.
+    async fn get_secrets(
+        self: Rc<Self>,
+        _params: cluster_session::GetSecretsParams,
+        mut results: cluster_session::GetSecretsResults,
+    ) -> Result<(), capnp::Error> {
+        results.get().set_secrets(self.secrets.clone());
+        Ok(())
+    }
+
+    /// Preserves the real target scheduler so readiness is checked before resource reservation.
+    async fn get_scheduler(
+        self: Rc<Self>,
+        _params: cluster_session::GetSchedulerParams,
+        mut results: cluster_session::GetSchedulerResults,
+    ) -> Result<(), capnp::Error> {
+        let response = self.inner.get_scheduler_request().send().promise.await?;
+        results
+            .get()
+            .set_scheduler(response.get()?.get_scheduler()?);
+        Ok(())
+    }
+
+    /// Preserves assignment delivery and observation through the real workload service.
+    async fn get_workload(
+        self: Rc<Self>,
+        _params: cluster_session::GetWorkloadParams,
+        mut results: cluster_session::GetWorkloadResults,
+    ) -> Result<(), capnp::Error> {
+        let response = self.inner.get_workload_request().send().promise.await?;
+        results.get().set_workload(response.get()?.get_workload()?);
+        Ok(())
+    }
+}
+
+local_test!(registry_auth_secret_reaches_only_image_pull, {
+    let harness = setup_workload_manager().await;
+    harness
+        .scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 256 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("initialize registry test slots");
+    let config = registry_auth_config("SENSITIVE-REGISTRY-PASSWORD");
+    let version = seed_registry_auth(&harness, &config).await;
+    let request = registry_auth_request("private-image", Some(version));
+    let reference = request.registry_auth.clone();
+
+    let specs = harness
+        .manager
+        .start_workloads_batch(vec![request])
+        .await
+        .expect("start private-image workload");
+    let spec = harness
+        .manager
+        .inspect_workload(specs[0].id)
+        .await
+        .expect("inspect persisted private-image workload");
+    let pulls = harness.runtime_backend.pulls.lock().await;
+    let auth = pulls[0]
+        .as_ref()
+        .expect("capture workload pull credentials");
+
+    assert_eq!(auth.username.as_deref(), Some("reader"));
+    assert_eq!(
+        auth.password.as_deref(),
+        Some("SENSITIVE-REGISTRY-PASSWORD")
+    );
+    assert_eq!(spec.registry_auth, reference);
+    assert!(!format!("{spec:?}").contains("SENSITIVE-REGISTRY-PASSWORD"));
+    assert!(
+        harness
+            .runtime_backend
+            .last_env()
+            .await
+            .expect("capture container environment")
+            .is_empty()
+    );
+    assert!(
+        harness
+            .runtime_backend
+            .last_volumes()
+            .await
+            .expect("capture container mounts")
+            .is_empty()
+    );
+});
+
+local_test!(registry_auth_latest_version_follows_rotation, {
+    let harness = setup_workload_manager().await;
+    harness
+        .scheduler
+        .init_slots(vec![
+            SlotSpec::new(1, SlotCapacity::new(500, 256 * 1_024 * 1_024, 0)),
+            SlotSpec::new(2, SlotCapacity::new(500, 256 * 1_024 * 1_024, 0)),
+            SlotSpec::new(3, SlotCapacity::new(500, 256 * 1_024 * 1_024, 0)),
+        ])
+        .await
+        .expect("initialize rotation test slots");
+    seed_registry_auth(&harness, &registry_auth_config("first")).await;
+    harness
+        .manager
+        .start_workloads_batch(vec![registry_auth_request("first-pull", None)])
+        .await
+        .expect("start workload before secret rotation");
+
+    seed_registry_auth(&harness, &registry_auth_config("rotated")).await;
+    harness
+        .manager
+        .start_workloads_batch(vec![registry_auth_request("second-pull", None)])
+        .await
+        .expect("start workload after secret rotation");
+    let mut public = registry_auth_request("public-image", None);
+    public.execution.registry_auth = None;
+    public.execution.image = "busybox:latest".to_string();
+    harness
+        .manager
+        .start_workloads_batch(vec![public])
+        .await
+        .expect("start anonymous public-image workload");
+
+    let pulls = harness.runtime_backend.pulls.lock().await;
+    assert_eq!(pulls.len(), 3);
+    assert_eq!(
+        pulls[0]
+            .as_ref()
+            .expect("capture credentials before rotation")
+            .password
+            .as_deref(),
+        Some("first")
+    );
+    assert_eq!(
+        pulls[1]
+            .as_ref()
+            .expect("capture credentials after rotation")
+            .password
+            .as_deref(),
+        Some("rotated")
+    );
+    assert!(pulls[2].is_none());
+});
+
+local_test!(registry_auth_invalid_secrets_fail_before_runtime_launch, {
+    let harness = setup_workload_manager().await;
+    harness
+        .scheduler
+        .init_slots(vec![SlotSpec::new(
+            1,
+            SlotCapacity::new(500, 256 * 1_024 * 1_024, 0),
+        )])
+        .await
+        .expect("initialize invalid-secret test slots");
+    harness
+        .runtime_backend
+        .cached_image
+        .store(true, Ordering::Relaxed);
+
+    let missing = harness
+        .manager
+        .start_workloads_batch(vec![registry_auth_request("missing-auth", None)])
+        .await;
+    assert!(missing.is_err());
+
+    for (name, config, expected) in [
+        (
+            "invalid-json",
+            b"SENSITIVE-INVALID-JSON".as_slice(),
+            "invalid registry authentication",
+        ),
+        (
+            "missing-registry",
+            br#"{
+                "auths": {
+                    "other.example": {
+                        "username": "reader",
+                        "password": "SENSITIVE"
+                    }
+                }
+            }"#
+            .as_slice(),
+            "no credentials",
+        ),
+        (
+            "node-helper",
+            br#"{"credsStore":"secretservice"}"#.as_slice(),
+            "inline auths",
+        ),
+        (
+            "empty-credentials",
+            br#"{"auths":{"registry.example":{}}}"#.as_slice(),
+            "no credentials",
+        ),
+    ] {
+        seed_registry_auth(&harness, config).await;
+
+        let error = harness
+            .manager
+            .start_workloads_batch(vec![registry_auth_request(name, None)])
+            .await
+            .expect_err("invalid registry secret must prevent workload launch");
+
+        assert!(!format!("{error:#}").contains("SENSITIVE"));
+        assert!(format!("{error:#}").contains(expected), "{name}: {error:#}");
+        assert!(harness.runtime_backend.pulls.lock().await.is_empty());
+        assert_eq!(harness.runtime_backend.create_calls().await, 0);
+    }
+
+    let old_version = seed_registry_auth(&harness, &registry_auth_config("old")).await;
+    seed_registry_auth(&harness, &registry_auth_config("new")).await;
+    let error = harness
+        .manager
+        .start_workloads_batch(vec![registry_auth_request(
+            "unavailable-pin",
+            Some(old_version),
+        )])
+        .await
+        .expect_err("unavailable version pin must prevent workload launch");
+
+    assert!(format!("{error:#}").contains("unavailable"));
+    assert!(harness.runtime_backend.pulls.lock().await.is_empty());
+    assert_eq!(harness.runtime_backend.create_calls().await, 0);
+});
+
+/// Proves remote admission waits for registry credentials even with no env or file secrets.
+async fn check_remote_registry_auth_readiness(
+    pin_version: bool,
+    admission_mode: WorkloadAdmissionMode,
+) {
+    use common::convergence::wait_until;
+    use common::testkit::{ClusterConfig, TestNode};
+
+    let cluster = TestNode::new_cluster_inproc_with_config(
+        2,
+        ClusterConfig {
+            sync_tick_ms: Some(100),
+            gossip_tick_ms: Some(100),
+            ..ClusterConfig::default()
+        },
+    )
+    .await
+    .expect("start two-node registry test cluster");
+    TestNode::wait_cluster_ready_all(&cluster, 2, Duration::from_secs(10))
+        .await
+        .expect("wait for registry test cluster readiness");
+    let config = registry_auth_config("private-registry-password");
+    let mut create = cluster[0].node.secrets_client.create_request();
+    {
+        let mut request = create.get().init_request();
+        request.set_name("application-registry");
+        request.set_plaintext(&config);
+    }
+    let created = create
+        .send()
+        .promise
+        .await
+        .expect("create registry secret through RPC");
+    let version = read_uuid_bytes(
+        created
+            .get()
+            .expect("read created registry secret")
+            .get_secret()
+            .expect("read registry secret metadata")
+            .get_current_version()
+            .expect("read registry secret version")
+            .get_version_id()
+            .expect("read registry secret version id"),
+    );
+
+    let target = &cluster[1];
+    let (first_check_tx, first_check_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let secrets = capnp_new_client(DelayedSecretAvailability {
+        inner: target.node.secrets_client.clone(),
+        first_check: RefCell::new(Some(first_check_tx)),
+        release: RefCell::new(Some(release_rx)),
+    });
+    let owner = &cluster[0];
+    let inner = owner
+        .node
+        .registry
+        .session_for_peer(target.id())
+        .await
+        .expect("obtain real target session");
+    owner
+        .node
+        .registry
+        .attach_handle_and_session(
+            target.id(),
+            target.node.server_client.clone(),
+            capnp_new_client(SecretAvailabilitySession { inner, secrets }),
+        )
+        .await;
+    let mut request = registry_auth_request("remote-private-image", pin_version.then_some(version));
+    let id = Uuid::new_v4();
+    request.id = Some(id);
+    request.target_node = Some(target.id());
+    let reference = request.registry_auth.clone();
+    let manager = owner.node.workload_manager.clone();
+    let launch = spawn_local(async move {
+        match admission_mode {
+            WorkloadAdmissionMode::Gang => {
+                manager
+                    .start_workloads_gang(Uuid::new_v4(), vec![request])
+                    .await
+            }
+            WorkloadAdmissionMode::Incremental => {
+                manager.start_workloads_batch(vec![request]).await
+            }
+        }
+    });
+
+    let observed = tokio::time::timeout(Duration::from_secs(5), first_check_rx)
+        .await
+        .expect("remote admission must query registry secret readiness")
+        .expect("receive first readiness request");
+
+    assert_eq!(
+        observed,
+        vec![("application-registry".to_string(), version)]
+    );
+    assert!(!launch.is_finished());
+    assert!(
+        owner
+            .node
+            .workload_manager
+            .inspect_workload(id)
+            .await
+            .is_err()
+    );
+    assert!(
+        target
+            .node
+            .workload_manager
+            .inspect_workload(id)
+            .await
+            .is_err()
+    );
+    let snapshot = target
+        .node
+        .scheduler
+        .snapshot()
+        .await
+        .expect("target scheduler snapshot");
+    assert!(
+        snapshot
+            .slots
+            .iter()
+            .all(|slot| matches!(slot.state, mantissa::scheduler::SlotState::Free))
+    );
+
+    release_tx
+        .send(())
+        .expect("release first unavailable response");
+    let specs = tokio::time::timeout(Duration::from_secs(10), launch)
+        .await
+        .expect("remote admission should retry secret readiness")
+        .expect("join remote launch")
+        .expect("place private-image workload remotely");
+    assert_eq!(specs[0].id, id);
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async {
+                target
+                    .node
+                    .workload_manager
+                    .inspect_workload(id)
+                    .await
+                    .is_ok_and(|spec| {
+                        matches!(
+                            spec.state,
+                            mantissa::workload::model::WorkloadPhase::Running
+                        )
+                    })
+            }
+        )
+        .await,
+        "the remote private-image workload should start after assignment adoption"
+    );
+
+    let remote = target
+        .node
+        .workload_manager
+        .inspect_workload(specs[0].id)
+        .await
+        .expect("inspect private-image workload on target node");
+
+    assert_eq!(remote.node_id, target.id());
+    assert_eq!(remote.registry_auth, reference);
+    assert_eq!(
+        remote.state,
+        mantissa::workload::model::WorkloadPhase::Running
+    );
+}
+
+local_test!(registry_auth_reference_survives_remote_placement, {
+    check_remote_registry_auth_readiness(false, WorkloadAdmissionMode::Incremental).await;
+});
+
+local_test!(registry_auth_pinned_version_waits_for_remote_readiness, {
+    check_remote_registry_auth_readiness(true, WorkloadAdmissionMode::Incremental).await;
+});
+
+local_test!(registry_auth_gang_waits_for_remote_readiness, {
+    check_remote_registry_auth_readiness(true, WorkloadAdmissionMode::Gang).await;
+});
+
+/// Exposes the real readiness RPC over an isolated encrypted store without starting replication.
+async fn secret_readiness_client(harness: &TestHarness) -> (tempfile::TempDir, secrets::Client) {
+    let (gossip_tx, _gossip_rx) = async_channel::unbounded();
+    let (_secret_tx, secret_rx) = async_channel::unbounded();
+    let noise_keys = Arc::new(NoiseKeys::from_private_bytes([9; 32]));
+    let (directory, _store, master_key_publisher) =
+        temp_master_key_replication(harness.node_id, gossip_tx.clone(), noise_keys.clone()).await;
+    let service = SecretsService::new(SecretsServiceConfig {
+        registry: harness.secret_registry.clone(),
+        keyring: harness.secret_keyring_handle.clone(),
+        master_store: harness.secret_master_store.clone(),
+        master_key_publisher,
+        topology: None,
+        replicator: SecretReplicator::new(harness.secret_registry.clone(), gossip_tx, secret_rx),
+        local_node_id: harness.node_id,
+        noise_keys,
+    });
+
+    (directory, capnp_new_client(service))
+}
+
+/// Queries readiness with raw version bytes so malformed pins can exercise the RPC boundary.
+async fn secret_ready(
+    client: &secrets::Client,
+    name: &str,
+    version: &[u8],
+) -> Result<bool, capnp::Error> {
+    let mut request = client.check_available_request();
+    {
+        let mut references = request.get().init_references(1);
+        let mut reference = references.reborrow().get(0);
+        reference.set_name(name);
+        reference.set_version_id(version);
+    }
+
+    let response = request.send().promise.await?;
+    Ok(response.get()?.get_available())
+}
+
+local_test!(secret_readiness_waits_for_versions_and_keys, {
+    let source = setup_workload_manager().await;
+    let target = setup_workload_manager().await;
+    let (_directory, client) = secret_readiness_client(&target).await;
+    let name = "application-registry";
+    let first = seed_registry_auth(&source, &registry_auth_config("first")).await;
+    let value = source
+        .secret_registry
+        .get_by_name(name)
+        .expect("load source secret")
+        .expect("source secret exists");
+
+    assert!(
+        !secret_ready(&client, name, first.as_bytes())
+            .await
+            .expect("query missing secret")
+    );
+
+    target
+        .secret_registry
+        .upsert(value)
+        .await
+        .expect("replicate ciphertext before its key");
+
+    assert!(
+        target
+            .secret_registry
+            .get_by_name(name)
+            .expect("load target secret metadata")
+            .is_some()
+    );
+    assert!(
+        !secret_ready(&client, name, first.as_bytes())
+            .await
+            .expect("query pinned secret without its key")
+    );
+    assert!(
+        !secret_ready(&client, name, &[])
+            .await
+            .expect("query latest secret without its key")
+    );
+
+    let key = source
+        .secret_keyring
+        .current_record()
+        .expect("load source master key");
+    target
+        .secret_master_store
+        .import_key(&key)
+        .expect("deliver decryption key to target");
+
+    assert!(
+        secret_ready(&client, name, first.as_bytes())
+            .await
+            .expect("query decrypted pinned secret")
+    );
+    assert!(
+        secret_ready(&client, name, &[])
+            .await
+            .expect("query decrypted latest secret")
+    );
+
+    let second = seed_registry_auth(&source, &registry_auth_config("rotated")).await;
+
+    assert!(
+        !secret_ready(&client, name, second.as_bytes())
+            .await
+            .expect("query rotated version before replication")
+    );
+
+    let rotated = source
+        .secret_registry
+        .get_by_name(name)
+        .expect("load rotated secret")
+        .expect("rotated secret exists");
+    target
+        .secret_registry
+        .upsert(rotated)
+        .await
+        .expect("deliver rotated ciphertext");
+
+    assert!(
+        secret_ready(&client, name, second.as_bytes())
+            .await
+            .expect("query replicated rotated version")
+    );
+    assert!(
+        !secret_ready(&client, name, first.as_bytes())
+            .await
+            .expect("query retired version pin")
+    );
+});
+
+local_test!(secret_readiness_rejects_invalid_requests_and_ciphertext, {
+    let harness = setup_workload_manager().await;
+    let (_directory, client) = secret_readiness_client(&harness).await;
+    let name = "application-registry";
+    let version = seed_registry_auth(&harness, &registry_auth_config("SENSITIVE-TOKEN")).await;
+
+    assert!(
+        secret_ready(&client, name, version.as_bytes())
+            .await
+            .expect("query intact ciphertext")
+    );
+    assert!(secret_ready(&client, name, &[1; 15]).await.is_err());
+    assert!(secret_ready(&client, " ", &[]).await.is_err());
+
+    let mut value = harness
+        .secret_registry
+        .get_by_name(name)
+        .expect("load ciphertext fixture")
+        .expect("ciphertext fixture exists");
+    value.current_version.ciphertext.ciphertext[0] ^= 1;
+    harness
+        .secret_registry
+        .upsert(value)
+        .await
+        .expect("store corrupted ciphertext");
+
+    let error = secret_ready(&client, name, version.as_bytes())
+        .await
+        .expect_err("corrupted ciphertext must fail readiness");
+
+    assert!(error.to_string().contains("cannot decrypt secret"));
+    assert!(!error.to_string().contains("SENSITIVE-TOKEN"));
+});

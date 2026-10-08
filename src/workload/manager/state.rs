@@ -23,12 +23,12 @@ use crate::scheduler::{
 use crate::services::types::compute_service_id;
 use crate::volumes::VolumeAccessError;
 use crate::workload::model::{
-    ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase, WorkloadAdmissionGroupRecord,
-    WorkloadAdmissionState, WorkloadEvent, WorkloadOwner, WorkloadPhase, WorkloadRemoval,
-    WorkloadServiceMetadata, WorkloadSpec, WorkloadStoreValue, WorkloadValue,
-    compute_service_generation_progress_id, parse_workload_timestamp as parse_task_timestamp,
-    select_best_admission_group_record, select_best_workload_value, select_removed_task_epoch,
-    workload_event_id,
+    ExecutionPlatform, IsolationMode, ServiceGenerationProgressRecord, WorkloadAdmissionGroupPhase,
+    WorkloadAdmissionGroupRecord, WorkloadAdmissionState, WorkloadEvent, WorkloadOwner,
+    WorkloadPhase, WorkloadRemoval, WorkloadSecretReference, WorkloadServiceMetadata, WorkloadSpec,
+    WorkloadStoreValue, WorkloadValue, compute_service_generation_progress_id,
+    parse_workload_timestamp as parse_task_timestamp, select_best_admission_group_record,
+    select_best_workload_value, select_removed_task_epoch, workload_event_id,
 };
 use crate::workload::types::{
     WorkloadLivenessProbe, WorkloadLivenessProbeKind, WorkloadRestartPolicyKind,
@@ -1129,8 +1129,8 @@ impl WorkloadManager {
     ///
     /// Repeated in-flight progress changes remain locally persisted on the owner, but they are
     /// not broadcast as new logical gossip updates once the task is already in `Pulling` or
-    /// `Creating`. Only lifecycle transitions are cluster-visible; dissemination breadth is then
-    /// handled by the dirty gossip buffer retaining the latest transition for a few fanout rounds.
+    /// `Creating`. Only lifecycle transitions are cluster-visible. The dirty gossip buffer keeps
+    /// the latest transition for a few fanout rounds so it reaches more peers.
     pub(super) async fn update_task_phase(
         &self,
         task_id: Uuid,
@@ -1233,10 +1233,15 @@ impl WorkloadManager {
         &self,
         task_id: Uuid,
         image: &str,
-        execution_platform: crate::workload::model::ExecutionPlatform,
-        isolation_mode: crate::workload::model::IsolationMode,
+        execution_platform: ExecutionPlatform,
+        isolation_mode: IsolationMode,
         isolation_profile: Option<&str>,
+        registry_auth: Option<&WorkloadSecretReference>,
     ) -> Result<(), anyhow::Error> {
+        // Validate the registry_auth secret before checking the image cache so a cached image
+        // cannot hide a missing secret or invalid registry credential configuration.
+        let mut auth = self.resolve_registry_auth(registry_auth, image).await?;
+
         match self
             .runtime
             .runtime_set
@@ -1274,6 +1279,12 @@ impl WorkloadManager {
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 1..=IMAGE_PULL_MAX_ATTEMPTS {
+            // The first pull reuses the registry credentials validated above.
+            // Retries reload the registry_auth secret to pick up credential rotation.
+            if attempt > 1 {
+                auth = self.resolve_registry_auth(registry_auth, image).await?;
+            }
+
             let _ = self
                 .update_task_phase(
                     task_id,
@@ -1290,6 +1301,7 @@ impl WorkloadManager {
                     execution_platform,
                     isolation_mode,
                     isolation_profile,
+                    auth.as_ref(),
                 ),
             )
             .await
@@ -2574,7 +2586,7 @@ impl WorkloadManager {
         if let Ok(current) = self.load_spec(task_id).await {
             // This failure belongs to the launch and owner carried by `spec`. A stop request,
             // task replacement, or later launch that became durable while cleanup was running
-            // must win permanently; otherwise this stale failure can turn `Stopping` back into
+            // must win permanently. Otherwise this stale failure can turn `Stopping` back into
             // `VolumeUnavailable` and delay removal until a later service safety sweep.
             if current.task_epoch != spec.task_epoch
                 || current.node_id != spec.node_id
@@ -2902,6 +2914,7 @@ impl WorkloadManager {
                 working.execution_platform,
                 working.isolation_mode,
                 working.isolation_profile.as_deref(),
+                working.registry_auth.as_ref(),
             )
             .await
         {
@@ -3226,8 +3239,8 @@ impl WorkloadManager {
     pub(super) async fn resolve_existing_runtime_instance(
         &self,
         instance_name: &str,
-        execution_platform: crate::workload::model::ExecutionPlatform,
-        isolation_mode: crate::workload::model::IsolationMode,
+        execution_platform: ExecutionPlatform,
+        isolation_mode: IsolationMode,
         isolation_profile: Option<&str>,
     ) -> Result<Option<RuntimeInstanceRef>, RuntimeError> {
         self.runtime
