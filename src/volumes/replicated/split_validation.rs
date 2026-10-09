@@ -227,7 +227,13 @@ impl ReplicatedVolumeSplitValidator {
         .buffer_unordered(SPLIT_GROUP_READ_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
-        placements.sort_by_key(|placement| (placement.volume_name.clone(), placement.volume_id));
+
+        placements.sort_by(|left, right| {
+            left.volume_name
+                .cmp(&right.volume_name)
+                .then_with(|| left.volume_id.cmp(&right.volume_id))
+        });
+
         Ok(placements)
     }
 

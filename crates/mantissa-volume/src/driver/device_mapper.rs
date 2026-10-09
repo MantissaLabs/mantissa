@@ -1303,7 +1303,14 @@ mod platform {
                     underlying_device_numbers,
                 });
             }
-            owned.sort_by_key(|device| (device.node_id, device.key, device.name.clone()));
+
+            owned.sort_by(|left, right| {
+                left.node_id
+                    .cmp(&right.node_id)
+                    .then_with(|| left.key.cmp(&right.key))
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+
             Ok(owned)
         }
 
