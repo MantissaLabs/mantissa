@@ -738,7 +738,6 @@ mod tests {
             master_key_generation: generation,
             nonce: [1; 12],
             ciphertext: vec![2, 3, 4],
-            digest: [5; 32],
         };
         let version = SecretVersion::new(
             uuid::Uuid::from_u128(50),

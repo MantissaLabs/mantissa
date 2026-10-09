@@ -61,6 +61,13 @@ replicating them through the control plane. The master key itself is stored as a
 local envelope: Redb contains only encrypted master-key records plus metadata,
 not the plaintext 32-byte key.
 
+Secret payloads use ChaCha20-Poly1305 authenticated encryption. Its tag detects
+changes to the encrypted bytes, nonce, secret and version identifiers, and
+master-key identity. Stored records and gossip messages contain no plaintext
+hash that would let someone check guessed secret values without the key.
+Each encryption uses a fresh random nonce, so equal secret values produce
+different ciphertext.
+
 The first envelope provider is passphrase-backed. On `mantissa init`, Mantissa
 prompts for the master-key passphrase when attached to a terminal. For
 non-interactive starts, provide the passphrase through one of these sources:
@@ -78,7 +85,7 @@ systemd credentials, named pipes, or secret-manager wrappers. On Unix, regular
 passphrase files are rejected if they are readable by group or other users.
 
 Every node may use a different local passphrase. The passphrase protects only
-that node's at-rest master-key envelope; it is not the cluster master key. When
+that node's at-rest master-key envelope. It is not the cluster master key. When
 a node joins or receives a master-key rotation, the current cluster master key
 is transferred in an authenticated envelope encrypted to the recipient node's
 Noise static key, then re-wrapped locally with the recipient's passphrase.

@@ -1,4 +1,3 @@
-use blake3::Hash;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -12,28 +11,18 @@ pub struct SecretMetadata {
     pub labels: BTreeMap<String, String>,
 }
 
-/// Authenticated ciphertext envelope for a single secret version.
+/// Authenticated ciphertext for one secret version, with no stored hash of its plaintext.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SecretCiphertext {
     /// Globally unique identifier of the master key used for encryption.
     pub master_key_id: Uuid,
-    /// Human-readable generation for diagnostics; not a unique key identity.
+    /// Generation number for diagnostics. The key UUID identifies the encryption key.
     pub master_key_generation: u64,
     /// Random nonce used for ChaCha20-Poly1305.
     pub nonce: [u8; 12],
-    /// AEAD ciphertext bytes (contains the Poly1305 tag).
+    /// Encrypted payload and Poly1305 tag, which detects tampering without a plaintext hash.
     #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
-    /// Blake3 digest of the plaintext to detect tampering once decrypted.
-    pub digest: [u8; 32],
-}
-
-impl SecretCiphertext {
-    /// Returns the Blake3 digest recorded when encrypting the plaintext.
-    #[allow(dead_code)]
-    pub fn digest(&self) -> Hash {
-        Hash::from_bytes(self.digest)
-    }
 }
 
 /// Versioned payload for a secret, including authorship and timestamps.
@@ -159,7 +148,6 @@ mod tests {
             master_key_generation: 1,
             nonce: [0u8; 12],
             ciphertext: vec![1, 2, 3],
-            digest: [9u8; 32],
         };
         let version = SecretVersion::new(
             uuid::Uuid::new_v4(),
@@ -191,7 +179,6 @@ mod tests {
                 master_key_generation: 2,
                 nonce: [1u8; 12],
                 ciphertext: vec![4, 5, 6],
-                digest: [8u8; 32],
             },
             "2024-02-02T00:00:00Z",
             Some(uuid::Uuid::new_v4()),

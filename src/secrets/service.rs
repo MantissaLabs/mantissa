@@ -190,6 +190,7 @@ fn write_secret_spec(mut builder: secret_spec::Builder<'_>, value: &SecretValue)
     version_builder.set_master_key_generation(value.current_version.master_key_generation);
 }
 
+/// Writes encrypted payloads and key metadata into gossip messages and durable secret records.
 fn write_secret_ciphertext(
     mut builder: secret_ciphertext::Builder<'_>,
     ciphertext: &SecretCiphertext,
@@ -198,7 +199,6 @@ fn write_secret_ciphertext(
     builder.set_master_key_generation(ciphertext.master_key_generation);
     builder.set_nonce(&ciphertext.nonce);
     builder.set_ciphertext(&ciphertext.ciphertext);
-    builder.set_digest(&ciphertext.digest);
 }
 
 /// Serializes a secret registry event into the Cap’n Proto gossip envelope.
@@ -326,6 +326,7 @@ fn read_secret_spec_value(
     })
 }
 
+/// Reads encrypted secret records and validates the nonce before the keyring decrypts them.
 fn read_secret_ciphertext(
     reader: secret_ciphertext::Reader<'_>,
 ) -> Result<SecretCiphertext, Error> {
@@ -336,19 +337,11 @@ fn read_secret_ciphertext(
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(nonce_reader);
 
-    let digest_reader = reader.get_digest()?;
-    if digest_reader.len() != 32 {
-        return Err(Error::failed("secret digest must be 32 bytes".into()));
-    }
-    let mut digest = [0u8; 32];
-    digest.copy_from_slice(digest_reader);
-
     Ok(SecretCiphertext {
         master_key_id: read_uuid(reader.get_master_key_id()?)?,
         master_key_generation: reader.get_master_key_generation(),
         nonce,
         ciphertext: reader.get_ciphertext()?.to_vec(),
-        digest,
     })
 }
 
@@ -765,7 +758,6 @@ mod tests {
             master_key_generation: 7,
             nonce: [1u8; 12],
             ciphertext: vec![2, 3, 4, 5],
-            digest: [6u8; 32],
         };
         let version = SecretVersion::new(
             Uuid::new_v4(),

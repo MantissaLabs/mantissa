@@ -3,7 +3,6 @@ use crate::secrets::master_key::envelope::{
 };
 use crate::secrets::types::SecretCiphertext;
 use crate::store::local::{MasterKeyRecord, SecretMasterStore};
-use blake3::Hash;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
@@ -133,7 +132,7 @@ impl SecretKeyring {
         f(entry.as_bytes())
     }
 
-    /// Encrypts `plaintext` for the provided secret/version identifiers.
+    /// Encrypts a secret version and authenticates its identifiers for storage and replication.
     pub fn encrypt(
         &self,
         secret_id: Uuid,
@@ -148,6 +147,7 @@ impl SecretKeyring {
             descriptor.key_id,
             descriptor.generation,
         );
+
         let ciphertext = self.with_master_key(descriptor.key_id, |master_key| {
             let aead = ChaCha20Poly1305::new(Key::from_slice(master_key));
             aead.encrypt(
@@ -160,18 +160,16 @@ impl SecretKeyring {
             .map_err(|_| io::Error::other("secret encryption failed"))
         })?;
 
-        let digest = Self::digest_bytes(blake3::hash(plaintext));
-
         Ok(SecretCiphertext {
             master_key_id: descriptor.key_id,
             master_key_generation: descriptor.generation,
             nonce,
             ciphertext,
-            digest,
         })
     }
 
-    /// Decrypts an encrypted payload and verifies the recorded digest.
+    /// Returns plaintext only after verifying the encrypted payload and its secret version.
+    /// ChaCha20-Poly1305 detects tampering without storing a hash of the plaintext.
     pub fn decrypt(
         &self,
         secret_id: Uuid,
@@ -184,7 +182,8 @@ impl SecretKeyring {
             envelope.master_key_id,
             envelope.master_key_generation,
         );
-        let plaintext = self.with_master_key(envelope.master_key_id, |master_key| {
+
+        self.with_master_key(envelope.master_key_id, |master_key| {
             let aead = ChaCha20Poly1305::new(Key::from_slice(master_key));
             aead.decrypt(
                 Nonce::from_slice(&envelope.nonce),
@@ -194,17 +193,7 @@ impl SecretKeyring {
                 },
             )
             .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "secret decrypt failed"))
-        })?;
-
-        let digest = blake3::hash(&plaintext);
-        if Self::digest_bytes(digest) != envelope.digest {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "secret digest mismatch after decrypt",
-            ));
-        }
-
-        Ok(plaintext)
+        })
     }
 
     /// Generates one random nonce for ChaCha20-Poly1305 secret payloads.
@@ -214,7 +203,7 @@ impl SecretKeyring {
         Ok(nonce)
     }
 
-    /// Builds AAD that binds ciphertext to both the secret and the selected master key.
+    /// Builds authenticated metadata so ciphertext cannot be moved to another secret, version, or key.
     fn aad(
         secret_id: Uuid,
         version_id: Uuid,
@@ -228,13 +217,6 @@ impl SecretKeyring {
         aad.extend_from_slice(master_key_id.as_bytes());
         aad.extend_from_slice(&master_key_generation.to_be_bytes());
         aad
-    }
-
-    /// Converts a Blake3 digest into the fixed-size digest field used in secret ciphertext.
-    fn digest_bytes(hash: Hash) -> [u8; MASTER_KEY_SIZE] {
-        let mut out = [0u8; MASTER_KEY_SIZE];
-        out.copy_from_slice(hash.as_bytes());
-        out
     }
 }
 
@@ -258,6 +240,7 @@ mod tests {
         (store, dir)
     }
 
+    /// Secret consumers must receive the original bytes after encryption and decryption.
     #[test]
     fn encrypt_decrypt_roundtrip() {
         let (store, _dir) = temp_store();
@@ -276,6 +259,7 @@ mod tests {
         assert_eq!(plaintext, b"super-secret");
     }
 
+    /// Authenticated secret identifiers prevent copying ciphertext into another secret.
     #[test]
     fn decrypt_rejects_wrong_secret_id() {
         let (store, _dir) = temp_store();
@@ -293,8 +277,9 @@ mod tests {
         );
     }
 
+    /// The authentication tag binds ciphertext to the recorded master-key generation.
     #[test]
-    fn decrypt_rejects_tampered_master_key_identity() {
+    fn decrypt_rejects_tampered_master_key_generation() {
         let (store, _dir) = temp_store();
         let record = store.ensure_current().expect("ensure master");
         let keyring = SecretKeyring::new(store, record);
@@ -308,6 +293,85 @@ mod tests {
         assert!(keyring.decrypt(secret_id, version_id, &ciphertext).is_err());
     }
 
+    /// Altered payloads, authentication tags, and nonces must be rejected
+    /// before any plaintext reaches secret consumers.
+    #[test]
+    fn decrypt_rejects_tampered_ciphertext_tag_and_nonce() {
+        let (store, _dir) = temp_store();
+        let record = store.ensure_current().expect("ensure master");
+        let keyring = SecretKeyring::new(store, record);
+        let secret_id = Uuid::new_v4();
+        let version_id = Uuid::new_v4();
+        let ciphertext = keyring
+            .encrypt(secret_id, version_id, b"super-secret")
+            .expect("encrypt");
+
+        let mut changed_payload = ciphertext.clone();
+        changed_payload.ciphertext[0] ^= 1;
+        let mut changed_tag = ciphertext.clone();
+        *changed_tag
+            .ciphertext
+            .last_mut()
+            .expect("authentication tag") ^= 1;
+        let mut changed_nonce = ciphertext;
+        changed_nonce.nonce[0] ^= 1;
+
+        for (component, changed) in [
+            ("payload", changed_payload),
+            ("authentication tag", changed_tag),
+            ("nonce", changed_nonce),
+        ] {
+            let error = keyring
+                .decrypt(secret_id, version_id, &changed)
+                .expect_err("tampering must be rejected");
+
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{component}"
+            );
+        }
+    }
+
+    /// Authenticated version identifiers prevent treating old ciphertext as a newer secret version.
+    #[test]
+    fn decrypt_rejects_wrong_version_id() {
+        let (store, _dir) = temp_store();
+        let record = store.ensure_current().expect("ensure master");
+        let keyring = SecretKeyring::new(store, record);
+        let secret_id = Uuid::new_v4();
+        let ciphertext = keyring
+            .encrypt(secret_id, Uuid::new_v4(), b"super-secret")
+            .expect("encrypt");
+
+        let error = keyring
+            .decrypt(secret_id, Uuid::new_v4(), &ciphertext)
+            .expect_err("wrong version must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// Fresh nonces keep repeated secret values from producing matching ciphertext.
+    #[test]
+    fn encrypt_randomizes_repeated_plaintext() {
+        let (store, _dir) = temp_store();
+        let record = store.ensure_current().expect("ensure master");
+        let keyring = SecretKeyring::new(store, record);
+        let secret_id = Uuid::new_v4();
+        let version_id = Uuid::new_v4();
+
+        let first = keyring
+            .encrypt(secret_id, version_id, b"super-secret")
+            .expect("first encryption");
+        let second = keyring
+            .encrypt(secret_id, version_id, b"super-secret")
+            .expect("second encryption");
+
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.ciphertext, second.ciphertext);
+    }
+
+    /// Master-key rotation must preserve decryption of secret versions encrypted with older keys.
     #[test]
     fn decrypt_uses_historical_key_after_rotation() {
         let (store, _dir) = temp_store();

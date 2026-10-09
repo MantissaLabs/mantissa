@@ -66,13 +66,10 @@ struct SecretCiphertext {
   ciphertext @1 :Data;
   # Encrypted payload bytes (includes Poly1305 tag).
 
-  digest @2 :Data;
-  # 32-byte Blake3 digest of plaintext.
-
-  masterKeyId @3 :Data;
+  masterKeyId @2 :Data;
   # 16-byte UUID of the master key used to encrypt this payload.
 
-  masterKeyGeneration @4 :UInt64;
+  masterKeyGeneration @3 :UInt64;
   # Human-readable generation for the master key. Not a unique key identity.
 }
 

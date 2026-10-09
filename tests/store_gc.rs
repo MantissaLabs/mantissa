@@ -340,7 +340,6 @@ fn secret_value(name: &str, version: u8) -> SecretValue {
         master_key_generation: u64::from(version),
         nonce: [version; 12],
         ciphertext: vec![version; 4],
-        digest: [version; 32],
     };
     let secret_version = SecretVersion::new(
         Uuid::from_u128(10_000 + u128::from(version)),
