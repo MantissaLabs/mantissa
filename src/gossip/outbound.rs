@@ -447,15 +447,16 @@ async fn dispatch_gossip_plane<C>(
 
             // Filter out messages that describe the peer itself so we never hand
             // its exported capability back to the same connection.
-            let outbound: Vec<Message> = batch
+            // The batch remains alive until all sends finish, so its payloads can be borrowed.
+            let outbound: Vec<&Message> = batch
                 .iter()
                 .filter(|msg| !message_targets_peer(msg, peer.id))
-                .cloned()
                 .collect();
 
             if outbound.is_empty() {
                 continue;
             }
+
             inflight.push(send_gossip_to_peer(
                 outbound,
                 peer,
@@ -469,6 +470,7 @@ async fn dispatch_gossip_plane<C>(
                 let _ = inflight.next().await;
             }
         }
+
         while inflight.next().await.is_some() {}
     }
 }
@@ -478,7 +480,7 @@ async fn dispatch_gossip_plane<C>(
 /// The timeout is applied per RPC chunk so one stalled peer cannot indefinitely delay
 /// the dispatch loop for the rest of the selected fanout peers.
 async fn send_gossip_to_peer<C>(
-    outbound: Vec<Message>,
+    outbound: Vec<&Message>,
     peer: &PeerHandle,
     context: &C,
     rpc_batch_max: usize,
@@ -534,8 +536,9 @@ async fn send_gossip_to_peer<C>(
     }
 }
 
+/// Encodes one message chunk and sends it using the selected gossip plane.
 async fn send_gossip<C>(
-    messages: &[Message],
+    messages: &[&Message],
     peer: &PeerHandle,
     ctx: &C,
     plane: GossipPlane,
@@ -561,7 +564,7 @@ where
     let list = req.get().init_messages();
     let mut msgs = list.init_messages(message_count);
 
-    for (idx, msg) in messages.iter().enumerate() {
+    for (idx, &msg) in messages.iter().enumerate() {
         let mut builder = msgs.reborrow().get(idx as u32);
         builder.set_id(msg.id().as_bytes());
         cluster_view.write_capnp(builder.reborrow().init_view());
