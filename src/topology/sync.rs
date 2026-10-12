@@ -129,10 +129,15 @@ impl Topology {
         self.ensure_health_probes();
     }
 
-    /// Stop all leave-sensitive background cluster loops.
+    /// Stops cluster work before leave or shutdown so join bootstrap cannot restore
+    /// an outdated local peer row after this node stops participating.
     pub fn stop_cluster_background_tasks(&self) {
         self.stop_periodic_sync();
         self.stop_health_probes();
+
+        if let Some(bootstrap) = self.runtime.join_bootstrap.borrow_mut().take() {
+            bootstrap.abort();
+        }
     }
 
     /// Obtains a cached snapshot of peers without hitting storage on every tick.

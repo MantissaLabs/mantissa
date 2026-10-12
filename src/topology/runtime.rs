@@ -717,6 +717,9 @@ pub(super) struct TopologyRuntime {
     /// Gossip channels and dedupe bookkeeping for topology messages.
     pub(super) gossip: GossipState,
 
+    /// Lets shutdown cancel bootstrap before it restores an outdated local peer row.
+    pub(super) join_bootstrap: Rc<RefCell<Option<JoinHandle<()>>>>,
+
     /// Cached peers snapshot to avoid hitting storage on every tick.
     pub(super) peer_snapshot_cache: Arc<AsyncMutex<PeerSnapshotCache>>,
 

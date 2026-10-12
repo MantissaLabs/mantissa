@@ -227,6 +227,7 @@ impl Topology {
             stores,
             runtime: TopologyRuntime {
                 gossip: runtime::GossipState::new(gossip_receiver, gossip_sender),
+                join_bootstrap: Rc::new(std::cell::RefCell::new(None)),
                 peer_snapshot_cache: Arc::new(tokio::sync::Mutex::new(PeerSnapshotCache::new())),
                 gossip_warm_set: Arc::new(tokio::sync::Mutex::new(GossipWarmSetState::default())),
                 immediate_sync: ImmediateSyncState::new(),

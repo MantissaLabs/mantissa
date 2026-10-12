@@ -827,7 +827,7 @@ impl topology::Server for Topology {
             response.peer_value.address.clone(),
             "join",
         );
-        tokio::task::spawn_local({
+        let bootstrap = tokio::task::spawn_local({
             let topology = self.clone();
             let cluster_view = self.active_cluster_view();
             let trace = sync_trace;
@@ -882,6 +882,10 @@ impl topology::Server for Topology {
                 }
             }
         });
+
+        if let Some(previous) = self.runtime.join_bootstrap.borrow_mut().replace(bootstrap) {
+            previous.abort();
+        }
 
         self.ensure_cluster_background_tasks();
         self.sync_once_now();

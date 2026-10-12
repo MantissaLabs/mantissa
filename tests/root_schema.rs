@@ -643,7 +643,7 @@ local_test!(
         );
         let local_volume_root = state_dir.path().join("volumes");
 
-        let mut peer = TestNode {
+        let peer = TestNode {
             node: Box::new(
                 create_restartable_node_with_root_schema(
                     db.clone(),
@@ -663,8 +663,11 @@ local_test!(
             .await;
         assert_eq!(stored_peer_root_schema(&anchor, self_id), (1, 2));
 
-        peer.stop().await.expect("stop restartable peer");
-        drop(peer);
+        // Stop pending join writes before the restarted node reuses the same database.
+        (*peer.node)
+            .shutdown()
+            .await
+            .expect("shut down restartable peer");
 
         let restarted = TestNode {
             node: Box::new(
@@ -680,6 +683,8 @@ local_test!(
             ),
         };
 
+        assert_eq!(stored_peer_root_schema(&restarted, self_id), (1, 1));
+
         anchor.node.sync_once_now();
         restarted.node.sync_once_now();
 
@@ -693,5 +698,6 @@ local_test!(
             updated,
             "anchor did not learn the downgraded root schema range after same-identity restart"
         );
+        assert_eq!(stored_peer_root_schema(&restarted, self_id), (1, 1));
     }
 );

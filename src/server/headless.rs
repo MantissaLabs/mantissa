@@ -970,8 +970,11 @@ impl HeadlessNode {
 }
 
 impl Drop for HeadlessNode {
+    /// Stops connections and background peer writes before a test discards this runtime.
     fn drop(&mut self) {
         self.server.set_online(false);
+        self.topology_runtime.stop_cluster_background_tasks();
+
         match &self.transport {
             HeadlessTransport::Inproc => {
                 #[cfg(any(test, feature = "testkit"))]
