@@ -1267,6 +1267,17 @@ struct SecretAvailabilitySession {
 }
 
 impl cluster_session::Server for SecretAvailabilitySession {
+    /// Forwards the cluster view so background sync keeps the delayed readiness session.
+    async fn get_cluster_view(
+        self: Rc<Self>,
+        _params: cluster_session::GetClusterViewParams,
+        mut results: cluster_session::GetClusterViewResults,
+    ) -> Result<(), capnp::Error> {
+        let response = self.inner.get_cluster_view_request().send().promise.await?;
+        results.get().set_view(response.get()?.get_view()?)?;
+        Ok(())
+    }
+
     /// Keeps the peer session live while only secret readiness is delayed.
     async fn ping(
         self: Rc<Self>,
@@ -1619,6 +1630,20 @@ async fn check_remote_registry_auth_readiness(
             capnp_new_client(SecretAvailabilitySession { inner, secrets }),
         )
         .await;
+
+    // Run background sync's session lookup before admission. A missing cluster-view
+    // method would discard the delayed readiness handler before it receives a request.
+    assert!(
+        owner
+            .node
+            .registry
+            .fetch_sync_capability_unscoped(target.id())
+            .await
+            .expect("resolve sync through the delayed readiness session")
+            .is_some(),
+        "background sync must preserve the delayed readiness session"
+    );
+
     let mut request = registry_auth_request("remote-private-image", pin_version.then_some(version));
     let id = Uuid::new_v4();
     request.id = Some(id);
