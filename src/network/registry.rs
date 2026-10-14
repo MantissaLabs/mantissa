@@ -703,6 +703,42 @@ impl NetworkRegistry {
         Ok(())
     }
 
+    /// Saves controller changes only while the durable spec is still active and unchanged.
+    ///
+    /// Comparing under the store's mutation lock prevents normalization and ready promotion
+    /// from overwriting a deletion or user update. Returns the saved spec for gossip.
+    pub(super) async fn update_spec_if_current(
+        &self,
+        expected: &NetworkSpecValue,
+        mut value: NetworkSpecValue,
+    ) -> Result<Option<NetworkSpecValue>> {
+        let previous_generation = self.specs.change_clock();
+        let changed = self
+            .specs
+            .update_value(&UuidKey::from(value.id), |snapshot| {
+                let current = snapshot.and_then(|snapshot| snapshot.as_slice().last());
+                if current != Some(expected) || expected.is_deleted() {
+                    return None;
+                }
+
+                value.touch();
+                Some(value.clone())
+            })
+            .await
+            .map_err(|e| anyhow!("conditional network spec update failed: {e}"))?;
+
+        if !changed {
+            return Ok(None);
+        }
+
+        self.write_through_spec_upsert_cache(
+            value.clone(),
+            previous_generation,
+            self.specs.change_clock(),
+        );
+        Ok(Some(value))
+    }
+
     /// Retrieve a network specification by identifier, returning the last committed value.
     pub fn get_spec(&self, id: Uuid) -> Result<Option<NetworkSpecValue>> {
         let key = UuidKey::from(id);
@@ -1258,6 +1294,113 @@ mod tests {
             sealed: false,
             bpf_programs: Vec::new(),
         })
+    }
+
+    /// Accepted controller updates must publish the saved timestamp and refresh cached listings.
+    #[tokio::test]
+    async fn conditional_spec_update_returns_saved_value_and_updates_cache() {
+        let registry = temp_registry();
+        let spec = test_network_spec("normalized", "10.42.0.0/24");
+        registry.upsert_spec(spec.clone()).await.unwrap();
+        let observed = registry.get_spec(spec.id).unwrap().unwrap();
+        registry.list_specs().unwrap();
+        let generation = registry.specs.change_clock();
+        let mut normalized = observed.clone();
+        normalized.vni = 1234;
+        normalized.mtu = 1450;
+
+        let saved = registry
+            .update_spec_if_current(&observed, normalized)
+            .await
+            .unwrap()
+            .expect("unchanged spec accepts normalization");
+
+        assert_eq!(saved.vni, 1234);
+        assert_eq!(saved.mtu, 1450);
+        assert_eq!(registry.get_spec(spec.id).unwrap(), Some(saved.clone()));
+        assert_eq!(registry.list_specs().unwrap(), vec![saved]);
+        assert_eq!(registry.specs.change_clock(), generation + 1);
+        assert_eq!(registry.cache_read().spec_generation, Some(generation + 1));
+    }
+
+    /// Check under the mutation lock so sync can save deletion or user settings before a queued write.
+    #[tokio::test]
+    async fn conditional_spec_update_preserves_changes_applied_while_waiting() {
+        let registry = temp_registry();
+
+        for deleted in [true, false] {
+            let name = if deleted { "deleted" } else { "updated" };
+            let spec = test_network_spec(name, "10.42.0.0/24");
+            registry.upsert_spec(spec.clone()).await.unwrap();
+            let observed = registry.get_spec(spec.id).unwrap().unwrap();
+            registry.list_specs().unwrap();
+            let mut normalized = observed.clone();
+            normalized.vni = 1234;
+            normalized.mtu = 1450;
+
+            let key = UuidKey::from(spec.id);
+            let mut current = observed.clone();
+            if deleted {
+                current.mark_deleted();
+            } else {
+                current.mtu = 1300;
+                current.description = "newer user settings".to_string();
+            }
+            let mut register = registry.specs.get_reg(&key).unwrap().unwrap();
+            register.write(Uuid::new_v4(), current.clone());
+
+            // Hold the real store lock while the controller's update starts waiting.
+            let sync = registry.specs.begin_delta_apply().await;
+            let mut delayed =
+                std::pin::pin!(registry.update_spec_if_current(&observed, normalized));
+            std::future::poll_fn(|context| {
+                use std::future::Future;
+                assert!(delayed.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            sync.apply_chunk(vec![(key, register)], Vec::new()).unwrap();
+            sync.commit().await.unwrap();
+            let root = registry.specs.root_digest().await;
+            let generation = registry.specs.change_clock();
+
+            assert_eq!(delayed.await.unwrap(), None);
+            assert_eq!(registry.get_spec(spec.id).unwrap(), Some(current.clone()));
+            assert_eq!(
+                registry
+                    .list_specs()
+                    .unwrap()
+                    .into_iter()
+                    .find(|value| value.id == spec.id),
+                Some(current),
+            );
+            assert_eq!(registry.specs.root_digest().await, root);
+            assert_eq!(registry.specs.change_clock(), generation);
+        }
+    }
+
+    /// A controller snapshot retained past physical removal must not recreate the network row.
+    #[tokio::test]
+    async fn conditional_spec_update_does_not_recreate_removed_spec() {
+        let registry = temp_registry();
+        let spec = test_network_spec("removed", "10.42.0.0/24");
+        registry.upsert_spec(spec.clone()).await.unwrap();
+        let observed = registry.get_spec(spec.id).unwrap().unwrap();
+        registry.remove_spec(spec.id).await.unwrap();
+        let root = registry.specs.root_digest().await;
+        let generation = registry.specs.change_clock();
+
+        let saved = registry
+            .update_spec_if_current(&observed, observed.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(saved, None);
+        assert_eq!(registry.get_spec(spec.id).unwrap(), None);
+        assert!(registry.list_specs().unwrap().is_empty());
+        assert_eq!(registry.specs.root_digest().await, root);
+        assert_eq!(registry.specs.change_clock(), generation);
     }
 
     /// Builds one attachment row for registry projection tests.

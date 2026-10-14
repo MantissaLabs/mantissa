@@ -5,11 +5,14 @@ use crate::network::types::{
     NetworkRealizationPolicy, NetworkSpecDraft, NetworkSpecValue, NetworkStatus,
 };
 use crate::network::wireguard::WireGuardUnderlayState;
+use crate::runtime::set::RuntimeSet;
+use crate::runtime::testing::{IN_MEMORY_RUNTIME_BACKEND_KIND, new_in_memory_runtime_backend};
 use crate::runtime::types::RuntimeSupportProfile;
 use crate::scheduler::placement::{
     PlacementConstraint, PlacementConstraintSelector, PlacementNode, PlacementPolicy,
     PlacementStrategy,
 };
+use crate::server::headless::{HeadlessConfig, HeadlessNode};
 use crate::services::types::{
     PublicIngressPolicy, ServiceSpecValue, ServiceStatus, TaskTemplateNetworkRequirement,
     TaskTemplateSpecValue,
@@ -324,6 +327,137 @@ fn successful_reconcile_preserves_non_pending_spec_status() {
         &mut deleted
     ));
     assert_eq!(deleted.status, NetworkStatus::Deleted);
+}
+
+/// Starts a real controller with background actors stopped so tests control each spec write.
+async fn stopped_network_node() -> HeadlessNode {
+    let mut node = HeadlessNode::new_with_config(HeadlessConfig {
+        runtime_set: Some(RuntimeSet::singleton(
+            IN_MEMORY_RUNTIME_BACKEND_KIND,
+            new_in_memory_runtime_backend(),
+        )),
+        ..Default::default()
+    })
+    .await
+    .expect("start in-memory node");
+    node.stop_runtime_background_tasks_for_test().await;
+
+    node
+}
+
+/// Normalizing an older snapshot must preserve a deletion or user update saved after it was read.
+#[tokio::test(flavor = "current_thread")]
+async fn stale_network_normalization_preserves_concurrent_changes() {
+    tokio::task::LocalSet::new()
+        .run_until(Box::pin(async {
+            let node = stopped_network_node().await;
+
+            for deleted in [true, false] {
+                let name = if deleted { "deleted" } else { "updated" };
+                let mut spec = test_network_spec(name, NetworkRealizationPolicy::AllNodes);
+                spec.set_status(NetworkStatus::Ready);
+                node.network_registry
+                    .upsert_spec(spec.clone())
+                    .await
+                    .unwrap();
+                let observed = node.network_registry.get_spec(spec.id).unwrap().unwrap();
+
+                let mut current = observed.clone();
+                if deleted {
+                    current.mark_deleted();
+                } else {
+                    current.mtu = 1300;
+                    current.vni = 1234;
+                    current.description = "newer user settings".to_string();
+                    current.sealed = true;
+                }
+                node.network_registry.upsert_spec(current).await.unwrap();
+                let expected = node.network_registry.get_spec(spec.id).unwrap();
+
+                let result = node.network_controller.reconcile_network(observed).await;
+
+                assert_eq!(node.network_registry.get_spec(spec.id).unwrap(), expected);
+                assert!(result.is_ok(), "outdated reconciliation should be skipped");
+                assert_eq!(
+                    node.network_registry
+                        .list_specs()
+                        .unwrap()
+                        .into_iter()
+                        .find(|value| value.id == spec.id),
+                    expected,
+                );
+
+                assert!(
+                    node.network_registry
+                        .list_peer_states(Some(spec.id))
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    !node
+                        .network_controller
+                        .inner
+                        .active_networks
+                        .lock()
+                        .await
+                        .contains(&spec.id)
+                );
+                assert!(
+                    node.network_controller
+                        .inner
+                        .pending_specs
+                        .lock()
+                        .await
+                        .contains(&spec.id)
+                );
+            }
+        }))
+        .await;
+}
+
+/// Ready promotion must use the reconciled snapshot rather than accepting newer pending intent.
+#[tokio::test(flavor = "current_thread")]
+async fn stale_ready_promotion_preserves_concurrent_changes() {
+    tokio::task::LocalSet::new()
+        .run_until(Box::pin(async {
+            let node = stopped_network_node().await;
+
+            for deleted in [true, false] {
+                let name = if deleted { "deleted" } else { "updated" };
+                let spec = test_network_spec(name, NetworkRealizationPolicy::AllNodes);
+                node.network_registry
+                    .upsert_spec(spec.clone())
+                    .await
+                    .unwrap();
+                let observed = node.network_registry.get_spec(spec.id).unwrap().unwrap();
+
+                let mut current = observed.clone();
+                if deleted {
+                    current.mark_deleted();
+                } else {
+                    current.mtu = 1300;
+                    current.description = "newer pending user settings".to_string();
+                }
+                node.network_registry.upsert_spec(current).await.unwrap();
+                let expected = node.network_registry.get_spec(spec.id).unwrap();
+
+                node.network_controller
+                    .mark_spec_ready_after_reconcile(observed)
+                    .await
+                    .unwrap();
+
+                assert_eq!(node.network_registry.get_spec(spec.id).unwrap(), expected);
+                assert!(
+                    node.network_controller
+                        .inner
+                        .pending_specs
+                        .lock()
+                        .await
+                        .contains(&spec.id)
+                );
+            }
+        }))
+        .await;
 }
 
 #[test]

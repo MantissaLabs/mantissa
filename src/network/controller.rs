@@ -2042,8 +2042,10 @@ impl NetworkController {
         Ok(())
     }
 
-    /// Reconcile one active network from replicated spec through local dataplane readiness.
+    /// Reconcile one active network, discarding normalized plans if the stored intent changed.
     async fn reconcile_network(&self, mut spec: NetworkSpecValue) -> Result<()> {
+        // Underlay work can yield to deletion or edits. Keep the snapshot normalization used.
+        let observed = spec.clone();
         let (mut plan, spec_changed) = self.prepare_plan(&mut spec)?;
         if spec.driver.requires_wireguard_underlay() {
             self.apply_wireguard_overrides(&mut plan).await?;
@@ -2052,12 +2054,20 @@ impl NetworkController {
                 .apply_plan_underlay_constraints(&mut plan)
                 .await?;
         }
+
         if spec_changed {
-            self.inner
+            let Some(saved) = self
+                .inner
                 .registry
-                .upsert_spec(spec.clone())
+                .update_spec_if_current(&observed, spec)
                 .await
-                .context("persist network spec update")?;
+                .context("persist network spec update")?
+            else {
+                self.schedule_spec_change(plan.network_id).await;
+                return Ok(());
+            };
+
+            spec = saved;
             self.send_event(NetworkEvent::Upsert(spec.clone())).await;
         }
 
@@ -2189,8 +2199,7 @@ impl NetworkController {
             self.clear_forwarding_caches(plan.network_id).await;
         }
         self.mark_peer_ready(plan.network_id).await?;
-        self.mark_spec_ready_after_reconcile(plan.network_id)
-            .await?;
+        self.mark_spec_ready_after_reconcile(spec).await?;
 
         self.refresh_publication(plan.network_id).await;
 
@@ -2744,27 +2753,25 @@ impl NetworkController {
         Ok(())
     }
 
-    /// Promote a successfully reconciled network spec from pending intent to accepted state.
-    async fn mark_spec_ready_after_reconcile(&self, network_id: Uuid) -> Result<()> {
-        let Some(mut spec) = self
-            .inner
-            .registry
-            .get_spec(network_id)
-            .context("load network spec before ready promotion")?
-        else {
-            return Ok(());
-        };
-
+    /// Marks the reconciled spec ready only if no later write changed its network settings.
+    async fn mark_spec_ready_after_reconcile(&self, mut spec: NetworkSpecValue) -> Result<()> {
+        let observed = spec.clone();
         if !Self::promote_spec_status_after_reconcile(&mut spec) {
             return Ok(());
         }
 
-        self.inner
+        let Some(saved) = self
+            .inner
             .registry
-            .upsert_spec(spec.clone())
+            .update_spec_if_current(&observed, spec)
             .await
-            .context("persist network spec ready status")?;
-        self.send_event(NetworkEvent::Upsert(spec)).await;
+            .context("persist network spec ready status")?
+        else {
+            self.schedule_spec_change(observed.id).await;
+            return Ok(());
+        };
+
+        self.send_event(NetworkEvent::Upsert(saved)).await;
         Ok(())
     }
 
