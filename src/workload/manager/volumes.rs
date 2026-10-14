@@ -1,3 +1,4 @@
+use crate::runtime::types::RuntimeListScope;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -818,7 +819,7 @@ impl WorkloadManager {
         let instances = self
             .runtime
             .runtime_set
-            .list_instances(None)
+            .list_instances(RuntimeListScope::All)
             .await
             .map_err(anyhow::Error::from)
             .context("list runtime instances while reconciling volume publications")?;

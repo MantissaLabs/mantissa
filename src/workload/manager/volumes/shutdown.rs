@@ -1,3 +1,4 @@
+use crate::runtime::types::RuntimeListScope;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -179,7 +180,12 @@ impl WorkloadManager {
         task_runtime_names: &HashSet<String>,
         replicated_mount_paths: &HashSet<PathBuf>,
     ) -> RuntimeUseCheck {
-        let instances = match self.runtime.runtime_set.list_instances(None).await {
+        let instances = match self
+            .runtime
+            .runtime_set
+            .list_instances(RuntimeListScope::All)
+            .await
+        {
             Ok(instances) => instances,
             Err(error) => {
                 return RuntimeUseCheck {

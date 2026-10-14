@@ -12,10 +12,12 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::runtime::types::{
-    RuntimeAttachOptions, RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeLogStream,
+    RuntimeAttachOptions, RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeListScope,
+    RuntimeLogStream, RuntimeSandboxPolicy,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
+use super::DockerRuntimeBackend;
 use super::conversions::classify_runtime_error;
 use super::sandbox::{parse_sandboxed_container_metadata, resolve_effective_sandbox_command_parts};
 use super::{
@@ -23,7 +25,6 @@ use super::{
     MANTISSA_SANDBOX_ENABLED_LABEL, MANTISSA_SANDBOX_POLICY_ENV_VAR,
     NonoSandboxBackendAvailability,
 };
-use super::{DockerRuntimeBackend, DockerRuntimeMode};
 
 #[test]
 fn classify_runtime_error_maps_404_to_not_found() {
@@ -56,7 +57,6 @@ fn standard_backend_advertises_only_standard_oci_contracts() {
     let manager = DockerRuntimeBackend {
         docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
-        mode: DockerRuntimeMode::Standard,
         nono_helper_host_path: None,
         docker_config_path: None,
     };
@@ -83,11 +83,10 @@ fn standard_backend_advertises_only_standard_oci_contracts() {
 }
 
 #[test]
-fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
+fn docker_backend_with_helper_advertises_both_execution_modes() {
     let manager = DockerRuntimeBackend {
         docker: Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
-        mode: DockerRuntimeMode::NonoSandbox,
         nono_helper_host_path: Some("/tmp/mantissa-sandbox-init".into()),
         docker_config_path: None,
     };
@@ -111,12 +110,210 @@ fn sandbox_backend_advertises_only_sandboxed_oci_contracts() {
         Some(DOCKER_NONO_PROFILE),
         &[],
     ));
-    assert!(!support.supports_requirements(
+    assert!(support.supports_requirements(
         ExecutionPlatform::Oci,
         IsolationMode::Standard,
         None,
         &[],
     ));
+    assert!(!support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Standard,
+        Some(DOCKER_NONO_PROFILE),
+        &[],
+    ));
+    assert!(!support.supports_requirements(
+        ExecutionPlatform::Oci,
+        IsolationMode::Sandboxed,
+        Some(DOCKER_STANDARD_PROFILE),
+        &[],
+    ));
+}
+
+/// Workload filtering must happen in Docker; full scans must still expose foreign mount users.
+#[tokio::test]
+async fn docker_inventory_scope_preserves_full_scans_and_filters_workloads() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+
+    /// Capture the engine query so the test checks the actual HTTP selector.
+    async fn list(
+        State(tx): State<mpsc::UnboundedSender<HashMap<String, String>>>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Vec<serde_json::Value>> {
+        tx.send(query).expect("record list query");
+        Json(Vec::new())
+    }
+
+    let (tx, mut queries) = mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Docker");
+    let endpoint = format!("http://{}", listener.local_addr().expect("Docker address"));
+    let app = Router::new()
+        .route("/containers/json", get(list))
+        .with_state(tx);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve Docker");
+    });
+    let backend = DockerRuntimeBackend {
+        docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
+            .expect("Docker client"),
+        nono_helper_host_path: None,
+        docker_config_path: None,
+    };
+
+    backend
+        .list_instances(RuntimeListScope::All)
+        .await
+        .expect("full inventory");
+    backend
+        .list_instances(RuntimeListScope::Workloads)
+        .await
+        .expect("workload inventory");
+    let full = queries.recv().await.expect("full query");
+    let workloads = queries.recv().await.expect("workload query");
+    assert_eq!(full.get("all").map(String::as_str), Some("true"));
+    assert!(!full.contains_key("filters"));
+    assert_eq!(workloads.get("all").map(String::as_str), Some("true"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&workloads["filters"]).expect("filter JSON"),
+        serde_json::json!({"label": ["mantissa.workload_id"]})
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// A shared Docker backend must wrap sandboxed exec from container metadata, not registration mode.
+#[tokio::test]
+async fn docker_exec_uses_each_containers_sandbox_metadata() {
+    use axum::{Json, Router, extract::Path, routing::get};
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Docker");
+    let endpoint = format!("http://{}", listener.local_addr().expect("Docker address"));
+    let app = Router::new().route("/containers/{name}/json", get(|Path(name): Path<String>| async move {
+        let sandboxed = name == "sandboxed";
+        Json(serde_json::json!({"Config": {
+            "Labels": if sandboxed { serde_json::json!({"mantissa.sandbox.enabled": "true"}) } else { serde_json::json!({}) },
+            "Env": if sandboxed { vec![format!("{MANTISSA_SANDBOX_POLICY_ENV_VAR}=encoded-policy")] } else { Vec::new() },
+            "WorkingDir": "/workspace"
+        }}))
+    }));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve Docker");
+    });
+    let backend = DockerRuntimeBackend {
+        docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
+            .expect("Docker client"),
+        nono_helper_host_path: None,
+        docker_config_path: None,
+    };
+    let command = vec!["/bin/tool".to_string()];
+
+    let standard = backend
+        .prepare_sandboxed_exec("standard", &command)
+        .await
+        .expect("standard exec");
+    let sandboxed = backend
+        .prepare_sandboxed_exec("sandboxed", &command)
+        .await
+        .expect("sandboxed exec");
+    assert_eq!(standard.command, command);
+    assert!(standard.env_vars.is_none());
+    assert_eq!(
+        sandboxed.command,
+        vec!["/mantissa-sandbox-init", "/bin/tool"]
+    );
+    assert_eq!(
+        sandboxed.env_vars,
+        Some(vec![format!(
+            "{MANTISSA_SANDBOX_POLICY_ENV_VAR}=encoded-policy"
+        )])
+    );
+    assert_eq!(sandboxed.working_dir.as_deref(), Some("/workspace"));
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// One daemon must preserve both launch paths even when both receive a sandbox policy.
+#[tokio::test]
+async fn docker_create_selects_sandboxing_from_each_request() {
+    use axum::{
+        Json, Router,
+        extract::State,
+        routing::{get, post},
+    };
+
+    /// Retain the create body so helper injection is checked at the Docker API boundary.
+    async fn create(
+        State(tx): State<mpsc::UnboundedSender<serde_json::Value>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+        tx.send(body).expect("record create body");
+        (
+            axum::http::StatusCode::CREATED,
+            Json(serde_json::json!({"Id": "container", "Warnings": []})),
+        )
+    }
+
+    let (tx, mut bodies) = mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Docker");
+    let endpoint = format!("http://{}", listener.local_addr().expect("Docker address"));
+    let app = Router::new()
+        .route("/containers/create", post(create))
+        .route(
+            "/images/{image}/json",
+            get(|| async { Json(serde_json::json!({"Config": {"WorkingDir": "/workspace"}})) }),
+        )
+        .with_state(tx);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve Docker");
+    });
+    let backend = DockerRuntimeBackend {
+        docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
+            .expect("Docker client"),
+        nono_helper_host_path: Some("/host/mantissa-sandbox-init".into()),
+        docker_config_path: None,
+    };
+
+    for isolation_mode in [IsolationMode::Standard, IsolationMode::Sandboxed] {
+        backend
+            .create_instance(RuntimeCreateRequest {
+                name: isolation_mode.as_str().to_string(),
+                image: "test-image".to_string(),
+                isolation_mode,
+                sandbox_policy: Some(RuntimeSandboxPolicy::default()),
+                command: Some(vec!["/bin/tool".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .expect("create instance");
+    }
+    let standard = bodies.recv().await.expect("standard create");
+    let sandboxed = bodies.recv().await.expect("sandboxed create");
+    assert!(standard["Entrypoint"].is_null());
+    assert!(standard["Labels"]["mantissa.sandbox.enabled"].is_null());
+    assert_eq!(
+        sandboxed["Entrypoint"],
+        serde_json::json!(["/mantissa-sandbox-init"])
+    );
+    assert_eq!(sandboxed["Labels"]["mantissa.sandbox.enabled"], "true");
+    assert_eq!(
+        sandboxed["HostConfig"]["Binds"],
+        serde_json::json!(["/host/mantissa-sandbox-init:/mantissa-sandbox-init:ro"])
+    );
+
+    server.abort();
+    let _ = server.await;
 }
 
 #[test]
@@ -254,7 +451,6 @@ async fn create_instance_preserves_conflict_status_code() {
     let manager = DockerRuntimeBackend {
         docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
-        mode: DockerRuntimeMode::Standard,
         nono_helper_host_path: None,
         docker_config_path: None,
     };
@@ -506,7 +702,6 @@ async fn tty_attach_forwards_initial_prompt_without_waiting_for_newline() {
     let manager = DockerRuntimeBackend {
         docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
             .expect("construct docker http client"),
-        mode: DockerRuntimeMode::Standard,
         nono_helper_host_path: None,
         docker_config_path: None,
     };

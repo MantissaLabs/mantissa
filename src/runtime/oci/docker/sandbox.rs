@@ -18,9 +18,9 @@ use crate::runtime::types::{
 };
 
 use super::{
-    DockerRuntimeBackend, DockerRuntimeMode, MANTISSA_SANDBOX_ENABLED_LABEL,
-    MANTISSA_SANDBOX_HELPER_BINARY_NAME, MANTISSA_SANDBOX_HELPER_CONTAINER_PATH,
-    MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR, MANTISSA_SANDBOX_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS,
+    DockerRuntimeBackend, MANTISSA_SANDBOX_ENABLED_LABEL, MANTISSA_SANDBOX_HELPER_BINARY_NAME,
+    MANTISSA_SANDBOX_HELPER_CONTAINER_PATH, MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR,
+    MANTISSA_SANDBOX_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS,
 };
 
 /// Fully prepared Docker create settings after optional `nono` helper injection.
@@ -100,16 +100,6 @@ impl DockerRuntimeBackend {
             });
         };
 
-        if !matches!(self.mode, DockerRuntimeMode::NonoSandbox) {
-            return Ok(PreparedSandboxedCreate {
-                entrypoint: None,
-                command,
-                env_vars,
-                labels,
-                volumes,
-            });
-        }
-
         let helper_path = self.ensure_nono_helper_host_path()?;
         let launch_target = self
             .resolve_effective_sandbox_launch_target(image, command.as_deref())
@@ -143,20 +133,12 @@ impl DockerRuntimeBackend {
         })
     }
 
-    /// Rewrites one Docker exec request so late commands re-enter through the helper when needed.
+    /// Reads the container's sandbox marker so exec preserves its policy after inventory adoption.
     pub(super) async fn prepare_sandboxed_exec(
         &self,
         container_id: &str,
         command: &[String],
     ) -> RuntimeResult<PreparedSandboxedExec> {
-        if !matches!(self.mode, DockerRuntimeMode::NonoSandbox) {
-            return Ok(PreparedSandboxedExec {
-                command: command.to_vec(),
-                env_vars: None,
-                working_dir: None,
-            });
-        }
-
         let Some(metadata) = self
             .inspect_sandboxed_container_metadata(container_id)
             .await?

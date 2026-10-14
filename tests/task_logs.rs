@@ -7,7 +7,7 @@ use chrono::Utc;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeInfo,
-    RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
+    RuntimeListScope, RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
 };
 use mantissa::task::types::{TaskValue, TaskValueDraft};
 use mantissa::workload::model::WorkloadPhase;
@@ -86,9 +86,10 @@ impl RuntimeBackend for StaticLogsRuntimeBackend {
         Ok(())
     }
 
+    /// Leaves inventory empty so this fixture isolates log streaming from runtime repair.
     async fn list_instances(
         &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
+        _scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
         Ok(Vec::new())
     }

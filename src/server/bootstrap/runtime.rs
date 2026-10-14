@@ -1371,20 +1371,10 @@ async fn build_runtime_set(options: &BootstrapOptions) -> BootstrapResult<Runtim
         ));
     }
 
-    let (docker_standard, docker_sandboxed) = DockerRuntimeBackend::new_pair()
+    let docker = DockerRuntimeBackend::new()
         .await
         .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
-    match docker_sandboxed {
-        Some(docker_sandboxed) => RuntimeSet::new([
-            ("docker-standard", Arc::new(docker_standard) as _),
-            ("docker-sandboxed", Arc::new(docker_sandboxed) as _),
-        ])
-        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) }),
-        None => Ok(RuntimeSet::singleton(
-            "docker-standard",
-            Arc::new(docker_standard),
-        )),
-    }
+    Ok(RuntimeSet::singleton("docker", Arc::new(docker)))
 }
 
 /// Builds the exported `Server` capability with all dependencies injected.

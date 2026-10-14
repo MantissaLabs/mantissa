@@ -8,8 +8,8 @@ pub(crate) use mantissa::runtime::testing::{
     IN_MEMORY_RUNTIME_BACKEND_KIND, new_in_memory_runtime_backend,
 };
 pub(crate) use mantissa::runtime::types::{
-    RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo, RuntimeResult,
-    RuntimeStateInfo,
+    RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo, RuntimeListScope,
+    RuntimeResult, RuntimeStateInfo,
 };
 pub(crate) use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode};
 pub(crate) use mantissa::services::types::ServiceStatus;
@@ -163,10 +163,8 @@ impl RuntimeBackend for RecordingRuntimeBackend {
         Ok(())
     }
 
-    async fn list_instances(
-        &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> RuntimeResult<Vec<RuntimeInfo>> {
+    /// Exposes fixture lifecycle state for volume publication and cleanup reconciliation.
+    async fn list_instances(&self, _scope: RuntimeListScope) -> RuntimeResult<Vec<RuntimeInfo>> {
         let containers = self.containers.lock().await;
         let names = self.names.lock().await;
         let labels = self.labels.lock().await;

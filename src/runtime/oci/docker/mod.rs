@@ -12,10 +12,7 @@ use bollard::errors::Error as BollardError;
 use log::info;
 
 use crate::config;
-use crate::runtime::types::{
-    RuntimeCapabilities, RuntimeError, RuntimeResult, RuntimeSupportContract, RuntimeSupportProfile,
-};
-use crate::workload::model::{ExecutionPlatform, IsolationMode};
+use crate::runtime::types::{RuntimeError, RuntimeResult};
 
 mod conversions;
 mod credentials;
@@ -62,15 +59,6 @@ pub(super) const MANTISSA_SANDBOX_ENABLED_LABEL: &str = "mantissa.sandbox.enable
 pub const NONO_EXEC_READONLY_DIRS: &[&str] = &[
     "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc",
 ];
-
-/// One exact Docker runtime contract exposed through the node-local runtime registry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DockerRuntimeMode {
-    /// Standard Docker-backed OCI execution with no elevated sandbox contract.
-    Standard,
-    /// Dedicated sandboxed OCI execution slot that will be backed by `nono`.
-    NonoSandbox,
-}
 
 /// Host-side availability decision for the `nono`-backed Docker sandbox contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,152 +115,39 @@ impl NonoSandboxBackendAvailability {
     }
 }
 
-impl DockerRuntimeMode {
-    /// Returns the exact runtime support profile exposed by this backend registration.
-    fn advertised_support(self, capabilities: RuntimeCapabilities) -> RuntimeSupportProfile {
-        match self {
-            Self::Standard => RuntimeSupportProfile::from_exact_contracts(
-                [
-                    RuntimeSupportContract::new(
-                        ExecutionPlatform::Oci,
-                        IsolationMode::Standard,
-                        None,
-                    ),
-                    RuntimeSupportContract::new(
-                        ExecutionPlatform::Oci,
-                        IsolationMode::Standard,
-                        Some(DOCKER_STANDARD_PROFILE),
-                    ),
-                ],
-                capabilities.feature_flags(),
-            ),
-            Self::NonoSandbox => RuntimeSupportProfile::from_exact_contracts(
-                [
-                    RuntimeSupportContract::new(
-                        ExecutionPlatform::Oci,
-                        IsolationMode::Sandboxed,
-                        None,
-                    ),
-                    RuntimeSupportContract::new(
-                        ExecutionPlatform::Oci,
-                        IsolationMode::Sandboxed,
-                        Some(DOCKER_SANDBOXED_PROFILE),
-                    ),
-                    RuntimeSupportContract::new(
-                        ExecutionPlatform::Oci,
-                        IsolationMode::Sandboxed,
-                        Some(DOCKER_NONO_PROFILE),
-                    ),
-                ],
-                capabilities.feature_flags(),
-            ),
-        }
-    }
-}
-
 /// Docker runtime backend implementation.
 #[derive(Clone)]
 pub struct DockerRuntimeBackend {
     docker: Docker,
-    mode: DockerRuntimeMode,
     nono_helper_host_path: Option<PathBuf>,
     docker_config_path: Option<PathBuf>,
 }
 
 impl DockerRuntimeBackend {
-    /// Creates one Docker-backed runtime backend after verifying daemon
-    /// connectivity.
+    /// Connects one Docker daemon and enables sandbox contracts when its helper is available.
     pub async fn new() -> RuntimeResult<Self> {
-        Self::new_with_mode(DockerRuntimeMode::Standard).await
-    }
-
-    /// Creates one Docker-backed runtime backend for the provided exact contract.
-    pub async fn new_with_mode(mode: DockerRuntimeMode) -> RuntimeResult<Self> {
         let (docker, endpoint) = Self::connect_verified().await?;
-        let nono_helper_host_path = match mode {
-            DockerRuntimeMode::Standard => None,
-            DockerRuntimeMode::NonoSandbox => {
-                let availability = NonoSandboxBackendAvailability::detect();
-                match availability.helper_host_path() {
-                    Some(path) => Some(path.clone()),
-                    None => {
-                        return Err(RuntimeError::OperationFailed(
-                            availability.unavailable_reason().unwrap_or_else(|| {
-                                "sandboxed Docker backend is unavailable".to_string()
-                            }),
-                        ));
-                    }
-                }
-            }
-        };
-        Ok(Self::from_client(
-            docker,
-            mode,
-            &endpoint,
-            nono_helper_host_path,
-        ))
-    }
-
-    /// Creates the standard Docker runtime plus the optional sandboxed registration.
-    pub async fn new_pair() -> RuntimeResult<(Self, Option<Self>)> {
-        let (docker, endpoint) = Self::connect_verified().await?;
-        let sandbox_availability = NonoSandboxBackendAvailability::detect();
-        let standard =
-            Self::from_client(docker.clone(), DockerRuntimeMode::Standard, &endpoint, None);
-        let sandboxed = match sandbox_availability.helper_host_path() {
-            Some(path) => Some(Self::from_client(
-                docker,
-                DockerRuntimeMode::NonoSandbox,
-                &endpoint,
-                Some(path.clone()),
-            )),
-            None => {
-                if let Some(reason) = sandbox_availability.unavailable_reason() {
-                    info!(
-                        target: "task",
-                        "Skipping sandboxed Docker backend registration: {reason}"
-                    );
-                }
-                None
-            }
-        };
-
-        Ok((standard, sandboxed))
-    }
-
-    /// Returns whether the current Mantissa host can run `nono`-sandboxed workloads.
-    fn host_supports_nono_sandbox() -> bool {
-        cfg!(any(target_os = "linux", target_os = "macos"))
-    }
-
-    /// Builds one Docker runtime backend around one already-verified client.
-    fn from_client(
-        docker: Docker,
-        mode: DockerRuntimeMode,
-        endpoint: &str,
-        nono_helper_host_path: Option<PathBuf>,
-    ) -> Self {
-        info!(
-            target: "task",
-            "Connected to Docker endpoint {endpoint} for {:?} OCI backend",
-            mode
-        );
-        if matches!(mode, DockerRuntimeMode::NonoSandbox)
-            && let Some(path) = nono_helper_host_path.as_ref()
-        {
-            info!(
-                target: "task",
-                "Resolved sandbox helper for sandboxed Docker backend: {}",
-                path.display()
-            );
+        let availability = NonoSandboxBackendAvailability::detect();
+        let nono_helper_host_path = availability.helper_host_path().cloned();
+        if let Some(reason) = availability.unavailable_reason() {
+            info!(target: "task", "Docker sandbox support is unavailable: {reason}");
         }
 
-        Self {
+        info!(target: "task", "Connected to Docker endpoint {endpoint}");
+        if let Some(path) = &nono_helper_host_path {
+            info!(target: "task", "Resolved Docker sandbox helper: {}", path.display());
+        }
+
+        Ok(Self {
             docker,
-            mode,
             nono_helper_host_path,
             docker_config_path: credentials::docker_config_path(),
-        }
+        })
+    }
+
+    /// Returns whether the current host can run the Docker sandbox helper.
+    fn host_supports_nono_sandbox() -> bool {
+        cfg!(any(target_os = "linux", target_os = "macos"))
     }
 
     /// Connects to Docker and verifies the daemon is reachable before the backend is registered.

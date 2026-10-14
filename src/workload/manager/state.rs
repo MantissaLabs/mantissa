@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::gossip::Message;
 use crate::network::types::{NetworkAttachmentState, NetworkAttachmentValue};
 use crate::runtime::set::RuntimeDiscoveredInstance;
-use crate::runtime::types::{RuntimeError, RuntimeInfo, RuntimeInstanceRef};
+use crate::runtime::types::{RuntimeError, RuntimeInfo, RuntimeInstanceRef, RuntimeListScope};
 use crate::scheduler::{
     GpuReservationRequest, LeaseReservation, SchedulerError, SlotId, SlotReservationRequest,
     SlotState,
@@ -35,15 +35,49 @@ use crate::workload::types::{
 };
 
 use super::{
-    LocalServiceRuntimeReplica, LocalServiceRuntimeUsageSample, WorkloadManager,
+    LocalServiceReplica, LocalServiceRuntimeUsageSample, WorkloadManager,
     instance_remove_in_progress, launch::InstanceLaunchRequest,
     reservation::DEFAULT_PREPARED_LEASE_TTL_MS, spec_to_status, spec_to_value, value_to_spec,
 };
 
 /// Snapshot of instances currently known by the local runtime.
-struct RuntimeInventory {
+pub(super) struct RuntimeInventory {
     task_instances: HashMap<Uuid, RuntimeInstanceRef>,
     instance_ids: HashSet<RuntimeInstanceRef>,
+}
+
+impl RuntimeInventory {
+    /// Indexes one fresh listing for running-task repair without another runtime request.
+    fn from_instances(instances: &[RuntimeDiscoveredInstance]) -> Self {
+        let mut task_instances = HashMap::new();
+        let mut instance_ids = HashSet::new();
+        for instance in instances {
+            if !WorkloadManager::instance_is_running(&instance.info) {
+                continue;
+            }
+            let runtime = canonicalize_runtime_ref(&instance.runtime, &instance.info);
+            instance_ids.insert(runtime.clone());
+            if let Some(task_id) = WorkloadManager::runtime_workload_id(&instance.info) {
+                task_instances.insert(task_id, runtime);
+            }
+        }
+
+        Self {
+            task_instances,
+            instance_ids,
+        }
+    }
+
+    /// Excludes an instance being removed so later repair cannot adopt its old running state.
+    fn remove(&mut self, instance: &RuntimeDiscoveredInstance) {
+        let runtime = canonicalize_runtime_ref(&instance.runtime, &instance.info);
+        self.instance_ids.remove(&runtime);
+        if let Some(task_id) = WorkloadManager::runtime_workload_id(&instance.info)
+            && self.task_instances.get(&task_id) == Some(&runtime)
+        {
+            self.task_instances.remove(&task_id);
+        }
+    }
 }
 
 /// Per-attempt timeout applied to one image pull request.
@@ -2692,14 +2726,14 @@ impl WorkloadManager {
         Ok(servers)
     }
 
-    /// Lists local running service replicas that have an addressable runtime instance.
+    /// Lists local running service metadata without contacting the runtime before policy selection.
     ///
     /// Autoscale sampling only needs the local service slice, so this walks the cached workload
-    /// index and skips non-service rows, remote rows, non-running rows, and rows whose runtime
-    /// instance has already disappeared.
+    /// index and skips non-service, remote and non-running rows. Runtime liveness is checked
+    /// only when an eligible replica is sampled.
     pub(crate) async fn list_local_running_service_replicas(
         &self,
-    ) -> anyhow::Result<Vec<LocalServiceRuntimeReplica>> {
+    ) -> anyhow::Result<Vec<LocalServiceReplica>> {
         let values = self.load_workload_value_index().await?;
         let mut replicas = Vec::new();
 
@@ -2710,23 +2744,11 @@ impl WorkloadManager {
             let Some(owner) = value.service_owner() else {
                 continue;
             };
-            let owner = owner.clone();
-
-            let spec = value_to_spec(value.id, value.clone());
-            let Some(runtime) = self
-                .resolve_live_or_named_runtime_for_task(&spec)
-                .await
-                .with_context(|| format!("failed to resolve runtime for task {}", value.id))?
-            else {
-                continue;
-            };
-
-            replicas.push(LocalServiceRuntimeReplica {
+            replicas.push(LocalServiceReplica {
                 service_id: compute_service_id(&owner.service_name),
                 service_name: owner.service_name.clone(),
                 template_name: owner.template.clone(),
                 task_id: value.id,
-                runtime,
                 cpu_requested_millis: value.cpu_millis,
                 memory_requested_bytes: value.memory_bytes,
             });
@@ -2739,27 +2761,47 @@ impl WorkloadManager {
     ///
     /// Runtime usage is soft telemetry. Missing instances and unsupported backend sampling are
     /// logged at debug level and skipped so autoscale control input never blocks reconciliation.
-    pub(crate) async fn sample_local_service_runtime_replicas_usage(
+    pub(crate) async fn sample_local_service_replicas_usage(
         &self,
-        replicas: Vec<LocalServiceRuntimeReplica>,
+        replicas: Vec<LocalServiceReplica>,
     ) -> anyhow::Result<Vec<LocalServiceRuntimeUsageSample>> {
+        let values = self.load_workload_value_index().await?;
         let mut samples = Vec::with_capacity(replicas.len());
 
         for replica in replicas {
+            let Some(value) = values.get(&replica.task_id) else {
+                continue;
+            };
+            if value.node_id != self.local_node_id || value.state != WorkloadPhase::Running {
+                continue;
+            }
+            let spec = value_to_spec(value.id, value.clone());
+            let Some(runtime) = self
+                .resolve_live_or_named_runtime_for_task(&spec)
+                .await
+                .with_context(|| format!("failed to resolve runtime for task {}", value.id))?
+            else {
+                continue;
+            };
+
             match self
                 .runtime
                 .runtime_set
-                .sample_instance_usage(&replica.runtime)
+                .sample_instance_usage(&runtime)
                 .await
             {
-                Ok(usage) => samples.push(LocalServiceRuntimeUsageSample { replica, usage }),
+                Ok(usage) => samples.push(LocalServiceRuntimeUsageSample {
+                    replica,
+                    runtime,
+                    usage,
+                }),
                 Err(RuntimeError::NotFound(_)) => {}
                 Err(err) => {
                     debug!(
                         target: "task",
                         task_id = %replica.task_id,
-                        runtime_backend = %replica.runtime.backend_kind,
-                        runtime_handle = %replica.runtime.handle,
+                        runtime_backend = %runtime.backend_kind,
+                        runtime_handle = %runtime.handle,
                         "failed to sample runtime usage: {err}"
                     );
                 }
@@ -3742,13 +3784,21 @@ impl WorkloadManager {
 
     /// Reconciles the runtime inventory with the workload store so stale instances are adopted or removed.
     ///
+    /// Returns the same snapshot for running-task repair, excluding instances removed during adoption.
     /// This is the primary defense against daemon restarts that leave instances running without
     /// corresponding in-memory tracking. By comparing the local instance list against the latest
     /// task assignments, we either adopt the instance (if still owned locally) or stop it.
-    pub(super) async fn reconcile_local_runtime_inventory(&self) -> Result<(), anyhow::Error> {
+    pub(super) async fn reconcile_local_runtime_inventory(
+        &self,
+    ) -> Result<RuntimeInventory, anyhow::Error> {
         const UNOWNED_TASK_GRACE_SECS: i64 = 5;
 
-        let instances = self.runtime.runtime_set.list_instances(None).await?;
+        let instances = self
+            .runtime
+            .runtime_set
+            .list_instances(RuntimeListScope::Workloads)
+            .await?;
+        let mut inventory = RuntimeInventory::from_instances(&instances);
         let task_index = self.load_workload_value_index().await?;
 
         for instance in instances {
@@ -3760,6 +3810,7 @@ impl WorkloadManager {
             };
 
             let Some(value) = task_index.get(&task_id).cloned() else {
+                inventory.remove(&instance);
                 self.stop_unowned_instance(task_id, &instance, true, None)
                     .await;
                 continue;
@@ -3769,6 +3820,7 @@ impl WorkloadManager {
                 if workload_value_recent(&value, UNOWNED_TASK_GRACE_SECS) {
                     continue;
                 }
+                inventory.remove(&instance);
                 self.stop_unowned_instance(task_id, &instance, false, Some(&value))
                     .await;
                 continue;
@@ -3779,6 +3831,7 @@ impl WorkloadManager {
             if value.admission_group_id.is_some()
                 && !self.admission_group_allows_adoption(&spec).await?
             {
+                inventory.remove(&instance);
                 self.stop_unowned_instance(task_id, &instance, false, Some(&value))
                     .await;
                 continue;
@@ -3796,6 +3849,7 @@ impl WorkloadManager {
                     .publish_task_volume_mounts_for_task(task_id, &value.volumes)
                     .await
             {
+                inventory.remove(&instance);
                 self.mark_task_volume_unavailable(spec, err).await;
                 continue;
             }
@@ -3842,7 +3896,7 @@ impl WorkloadManager {
             }
         }
 
-        Ok(())
+        Ok(inventory)
     }
 
     /// Decide whether local attachments should be refreshed for the given task.
@@ -3897,8 +3951,7 @@ impl WorkloadManager {
         Ok(false)
     }
 
-    /// Tears down a locally running runtime instance without mutating replicated task state.
-    /// Tears down a local instance and optionally removes shared attachments for missing tasks.
+    /// Stops an unowned runtime and withdraws its local resources without changing replicated task state.
     async fn stop_unowned_instance(
         &self,
         task_id: Uuid,
@@ -4017,12 +4070,13 @@ impl WorkloadManager {
             );
         }
 
-        if let Err(err) = self.reconcile_local_runtime_inventory().await {
-            warn!(
-                target: "task",
-                "failed to reconcile local instance inventory: {err}"
-            );
-        }
+        let runtime_inventory = match self.reconcile_local_runtime_inventory().await {
+            Ok(inventory) => Some(inventory),
+            Err(err) => {
+                warn!(target: "task", "failed to reconcile local instance inventory: {err}");
+                None
+            }
+        };
 
         // Remove consumers left by a failed launch or lost final update before claiming task
         // reconcile guards below. Otherwise the task that needs the cleanup can starve its own
@@ -4033,17 +4087,6 @@ impl WorkloadManager {
                 "failed to reconcile stale replicated-volume publication: {error}"
             );
         }
-
-        let runtime_inventory = match self.list_runtime_inventory().await {
-            Ok(inventory) => Some(inventory),
-            Err(err) => {
-                warn!(
-                    target: "task",
-                    "failed to list runtime inventory for reconcile fallback: {err:#}"
-                );
-                None
-            }
-        };
 
         let task_index = self.load_workload_value_index().await?;
         let local_specs: Vec<WorkloadSpec> = task_index
@@ -4150,38 +4193,6 @@ impl WorkloadManager {
         }
 
         Ok(())
-    }
-
-    /// Lists runtime instances once so reconcile can avoid per-workload inspect calls.
-    async fn list_runtime_inventory(&self) -> Result<RuntimeInventory, anyhow::Error> {
-        let instances = self
-            .runtime
-            .runtime_set
-            .list_instances(None)
-            .await
-            .map_err(anyhow::Error::from)
-            .context("list runtime instances for reconcile")?;
-
-        let mut task_instances = HashMap::new();
-        let mut instance_ids = HashSet::new();
-
-        for instance in instances {
-            if !Self::instance_is_running(&instance.info) {
-                continue;
-            }
-            let instance_id = canonicalize_runtime_ref(&instance.runtime, &instance.info);
-            instance_ids.insert(instance_id.clone());
-
-            let Some(task_id) = Self::runtime_workload_id(&instance.info) else {
-                continue;
-            };
-            task_instances.insert(task_id, instance_id);
-        }
-
-        Ok(RuntimeInventory {
-            task_instances,
-            instance_ids,
-        })
     }
 
     /// Refreshes a running task's local runtime cache from the latest inventory snapshot.
@@ -5032,5 +5043,51 @@ fn http_host_literal(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ip) => ip.to_string(),
         IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    /// Builds a running owned instance so replacement and removal indexing are checked together.
+    fn instance(task_id: Uuid, handle: &str) -> RuntimeDiscoveredInstance {
+        RuntimeDiscoveredInstance {
+            runtime: RuntimeInstanceRef::new("mock", handle),
+            info: RuntimeInfo {
+                id: handle.to_string(),
+                labels: HashMap::from([("mantissa.workload_id".to_string(), task_id.to_string())]),
+                status: "running".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Removed rows must not be re-adopted, and removing an old row must preserve its replacement.
+    #[test]
+    fn shared_inventory_excludes_removed_instances_without_losing_replacements() {
+        let task_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let old = instance(task_id, "old");
+        let replacement = instance(task_id, "replacement");
+        let other = instance(other_id, "other");
+        let mut inventory =
+            RuntimeInventory::from_instances(&[old.clone(), replacement.clone(), other.clone()]);
+
+        inventory.remove(&old);
+        assert_eq!(
+            inventory.task_instances.get(&task_id),
+            Some(&replacement.runtime)
+        );
+        assert!(!inventory.instance_ids.contains(&old.runtime));
+
+        inventory.remove(&replacement);
+        assert!(!inventory.task_instances.contains_key(&task_id));
+        assert!(!inventory.instance_ids.contains(&replacement.runtime));
+        assert_eq!(
+            inventory.task_instances.get(&other_id),
+            Some(&other.runtime)
+        );
+        assert!(inventory.instance_ids.contains(&other.runtime));
     }
 }

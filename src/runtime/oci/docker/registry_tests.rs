@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::time::{interval, timeout};
 
-use super::{DockerRuntimeBackend, DockerRuntimeMode};
+use super::DockerRuntimeBackend;
 use crate::runtime::registry_auth::RegistryAuth;
 use crate::runtime::types::RuntimeBackend;
 
@@ -195,7 +195,6 @@ async fn image_pull_sends_registry_credentials_to_docker() {
         let backend = DockerRuntimeBackend {
             docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
                 .unwrap(),
-            mode: DockerRuntimeMode::Standard,
             nono_helper_host_path: None,
             docker_config_path: Some(path),
         };
@@ -280,7 +279,6 @@ async fn private_registry_pull_real_docker_uses_login_credentials() {
 
     let mut backend = DockerRuntimeBackend {
         docker: Docker::connect_with_defaults().expect("connect to fixture Docker Engine"),
-        mode: DockerRuntimeMode::Standard,
         nono_helper_host_path: None,
         docker_config_path: Some(directory.path().join("missing-config.json")),
     };

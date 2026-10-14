@@ -23,7 +23,7 @@ pub(crate) use mantissa::runtime::set::RuntimeSet;
 pub(crate) use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 pub(crate) use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
-    RuntimeInfo, RuntimeUsageSample,
+    RuntimeInfo, RuntimeListScope, RuntimeUsageSample,
 };
 pub(crate) use mantissa::scheduler::SlotReservationRequest;
 pub(crate) use mantissa::scheduler::SlotState;
@@ -1424,11 +1424,12 @@ impl RuntimeBackend for SlowCreateRuntimeBackend {
             .await
     }
 
+    /// Forwards inventory scope so service wrappers preserve workload and cleanup visibility.
     async fn list_instances(
         &self,
-        filters: Option<HashMap<String, Vec<String>>>,
+        scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
-        self.inner.list_instances(filters).await
+        self.inner.list_instances(scope).await
     }
 
     async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {
@@ -1533,11 +1534,12 @@ impl RuntimeBackend for ExitSignalRuntimeBackend {
             .await
     }
 
+    /// Forwards inventory scope so service wrappers preserve workload and cleanup visibility.
     async fn list_instances(
         &self,
-        filters: Option<HashMap<String, Vec<String>>>,
+        scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
-        self.inner.list_instances(filters).await
+        self.inner.list_instances(scope).await
     }
 
     async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {
@@ -1636,11 +1638,12 @@ impl RuntimeBackend for CreateFailureAfterBaselineRuntimeBackend {
             .await
     }
 
+    /// Forwards inventory scope so service wrappers preserve workload and cleanup visibility.
     async fn list_instances(
         &self,
-        filters: Option<HashMap<String, Vec<String>>>,
+        scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
-        self.inner.list_instances(filters).await
+        self.inner.list_instances(scope).await
     }
 
     async fn inspect_instance(&self, container_id: &str) -> Result<RuntimeInfo, RuntimeError> {

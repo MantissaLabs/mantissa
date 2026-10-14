@@ -12,7 +12,9 @@ use mantissa::registry::Registry;
 use mantissa::runtime::registry_auth::RegistryAuth;
 use mantissa::runtime::set::RuntimeSet;
 use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
-use mantissa::runtime::types::{RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo};
+use mantissa::runtime::types::{
+    RuntimeBackend, RuntimeCreateRequest, RuntimeError, RuntimeInfo, RuntimeListScope,
+};
 use mantissa::scheduler::Scheduler;
 use mantissa::scheduler::{SlotCapacity, SlotSpec};
 use mantissa::secrets::crypto::SecretKeyring;
@@ -53,7 +55,6 @@ use mantissa_protocol::secrets::secrets;
 use mantissa_protocol::server::cluster_session;
 use mantissa_store::uuid_key::UuidKey;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -170,9 +171,10 @@ impl RuntimeBackend for RecordingRuntimeBackend {
         Ok(())
     }
 
+    /// Leaves inventory empty so this fixture stays focused on secret materialization.
     async fn list_instances(
         &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
+        _scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
         Ok(Vec::new())
     }

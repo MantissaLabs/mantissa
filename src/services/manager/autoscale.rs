@@ -13,7 +13,7 @@ use crate::services::types::{
     ServiceEvent, ServicePreviousGeneration, ServiceSpecValue, ServiceStatus,
     TaskTemplateAutoscaleMetricKindValue, TaskTemplateAutoscalePolicyValue,
 };
-use crate::workload::manager::{LocalServiceRuntimeReplica, LocalServiceRuntimeUsageSample};
+use crate::workload::manager::{LocalServiceReplica, LocalServiceRuntimeUsageSample};
 
 /// Default time after which owner-side autoscale signals are discarded.
 const AUTOSCALE_SIGNAL_TTL_SECS: u64 = 180;
@@ -490,12 +490,12 @@ impl AutoscaleRuntimeSampleKey {
     /// Builds a low-cardinality local key for computing cumulative CPU deltas.
     fn from_sample(sample: &LocalServiceRuntimeUsageSample) -> Self {
         let runtime_id = if sample.usage.runtime_id.is_empty() {
-            sample.replica.runtime.handle.clone()
+            sample.runtime.handle.clone()
         } else {
             sample.usage.runtime_id.clone()
         };
         Self {
-            backend_kind: sample.replica.runtime.backend_kind.clone(),
+            backend_kind: sample.runtime.backend_kind.clone(),
             runtime_id,
         }
     }
@@ -1087,7 +1087,7 @@ fn build_autoscale_pending_spec(
 /// Returns the active autoscale policy for one local service replica from a service snapshot.
 fn autoscale_policy_for_replica(
     specs: &HashMap<Uuid, ActiveAutoscaleService>,
-    replica: &LocalServiceRuntimeReplica,
+    replica: &LocalServiceReplica,
 ) -> Option<AutoscaleSamplePolicy> {
     let spec = specs.get(&replica.service_id)?;
     if spec.service_name != replica.service_name {
@@ -1166,7 +1166,7 @@ impl ServiceController {
 
         let samples = self
             .workload_manager
-            .sample_local_service_runtime_replicas_usage(autoscale_replicas)
+            .sample_local_service_replicas_usage(autoscale_replicas)
             .await?;
         if samples.is_empty() {
             return Ok(());
@@ -2364,12 +2364,12 @@ mod tests {
         sampled_at_unix_ms: u64,
     ) -> LocalServiceRuntimeUsageSample {
         LocalServiceRuntimeUsageSample {
-            replica: crate::workload::manager::LocalServiceRuntimeReplica {
+            runtime: RuntimeInstanceRef::new("mock", "container-1"),
+            replica: crate::workload::manager::LocalServiceReplica {
                 service_id: Uuid::new_v4(),
                 service_name: "web".to_string(),
                 template_name: "api".to_string(),
                 task_id: Uuid::new_v4(),
-                runtime: RuntimeInstanceRef::new("mock", "container-1"),
                 cpu_requested_millis: 1_000,
                 memory_requested_bytes: 128,
             },

@@ -6,8 +6,8 @@ use futures::{SinkExt, StreamExt};
 use mantissa::runtime::testing::new_in_memory_runtime_backend;
 use mantissa::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
-    RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream,
-    RuntimeLogsOptions, RuntimeStateInfo,
+    RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeListScope, RuntimeLogFrame,
+    RuntimeLogStream, RuntimeLogsOptions, RuntimeStateInfo,
 };
 use mantissa::task::types::{TaskValue, TaskValueDraft};
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode, WorkloadPhase};
@@ -95,7 +95,7 @@ impl RuntimeBackend for StaticTaskStreamsRuntimeBackend {
     /// Lists no runtime instances because tests seed the replicated task store directly.
     async fn list_instances(
         &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
+        _scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
         Ok(Vec::new())
     }

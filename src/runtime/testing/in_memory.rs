@@ -9,8 +9,9 @@ use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use crate::runtime::registry_auth::RegistryAuth;
 use crate::runtime::types::{
     RuntimeAttachmentTarget, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest,
-    RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeLogFrame,
-    RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo, RuntimeSupportProfile, RuntimeUsageSample,
+    RuntimeError, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeListScope,
+    RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult, RuntimeStateInfo, RuntimeSupportProfile,
+    RuntimeUsageSample,
 };
 use crate::workload::model::ExecutionPlatform;
 
@@ -233,13 +234,15 @@ impl RuntimeBackend for InMemoryRuntimeBackend {
     }
 
     /// Lists the synthetic runtime inventory tracked by the in-memory backend.
-    async fn list_instances(
-        &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> RuntimeResult<Vec<RuntimeInfo>> {
+    async fn list_instances(&self, scope: RuntimeListScope) -> RuntimeResult<Vec<RuntimeInfo>> {
         let instances = self.instances.lock().await;
         let mut out = Vec::with_capacity(instances.len());
         for entry in instances.values() {
+            if scope == RuntimeListScope::Workloads
+                && !entry.labels.contains_key("mantissa.workload_id")
+            {
+                continue;
+            }
             out.push(RuntimeInfo {
                 id: entry.id.clone(),
                 name: entry.name.clone(),
@@ -383,4 +386,47 @@ fn current_unix_time_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Workload repair must keep stopped owned instances while full inventory retains foreign users.
+    #[tokio::test]
+    async fn inventory_scope_keeps_stopped_workloads_and_foreign_instances_separate() {
+        let backend = InMemoryRuntimeBackend::default();
+        let owned = backend
+            .create_instance(RuntimeCreateRequest {
+                name: "owned".to_string(),
+                labels: Some(HashMap::from([(
+                    "mantissa.workload_id".to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await
+            .expect("create owned instance");
+        let foreign = backend
+            .create_instance(RuntimeCreateRequest {
+                name: "foreign".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("create foreign instance");
+
+        let workloads = backend
+            .list_instances(RuntimeListScope::Workloads)
+            .await
+            .expect("workload inventory");
+        let all = backend
+            .list_instances(RuntimeListScope::All)
+            .await
+            .expect("full inventory");
+        assert_eq!(workloads.len(), 1);
+        assert_eq!(workloads[0].id, owned);
+        assert_eq!(workloads[0].state.running, Some(false));
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|instance| instance.id == foreign));
+    }
 }

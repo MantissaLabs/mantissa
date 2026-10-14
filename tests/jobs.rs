@@ -11,7 +11,7 @@ use mantissa::runtime::set::RuntimeSet;
 use mantissa::runtime::testing::IN_MEMORY_RUNTIME_BACKEND_KIND;
 use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeEvent,
-    RuntimeInfo,
+    RuntimeInfo, RuntimeListScope,
 };
 use mantissa::server::headless::{HeadlessConfig, HeadlessKeys, HeadlessNode, HeadlessTransport};
 use mantissa::task::types::{TaskStateFilter, TaskValue};
@@ -1473,11 +1473,12 @@ impl RuntimeBackend for ControllableExitRuntimeBackend {
             .await
     }
 
+    /// Overlays controlled exits on the requested inventory so job retry tests observe failures.
     async fn list_instances(
         &self,
-        filters: Option<HashMap<String, Vec<String>>>,
+        scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
-        let mut instances = self.inner.list_instances(filters).await?;
+        let mut instances = self.inner.list_instances(scope).await?;
         let exit_codes = self.exit_codes_by_workload.lock().await.clone();
         for instance in &mut instances {
             apply_controlled_exit_code(instance, &exit_codes);

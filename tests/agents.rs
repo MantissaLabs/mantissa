@@ -8,8 +8,8 @@ use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use mantissa::runtime::testing::InMemoryRuntimeBackend;
 use mantissa::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCreateRequest, RuntimeEvent, RuntimeExecOptions,
-    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult,
-    RuntimeSupportContract, RuntimeSupportProfile,
+    RuntimeExecResult, RuntimeInfo, RuntimeListScope, RuntimeLogFrame, RuntimeLogsOptions,
+    RuntimeResult, RuntimeSupportContract, RuntimeSupportProfile,
 };
 use mantissa::task::types::{TaskStateFilter, TaskValue};
 use mantissa::workload::model::{ExecutionPlatform, IsolationMode};
@@ -19,7 +19,6 @@ use mantissa_protocol::agents::{
     AgentRunStatus as ProtoAgentRunStatus, AgentSessionStatus as ProtoAgentSessionStatus, agents,
 };
 use mantissa_store::uuid_key::UuidKey;
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -750,11 +749,8 @@ impl RuntimeBackend for RecordingRuntimeBackend {
     }
 
     /// Lists in-memory runtime instances through the wrapped backend.
-    async fn list_instances(
-        &self,
-        filters: Option<HashMap<String, Vec<String>>>,
-    ) -> RuntimeResult<Vec<RuntimeInfo>> {
-        self.inner.list_instances(filters).await
+    async fn list_instances(&self, scope: RuntimeListScope) -> RuntimeResult<Vec<RuntimeInfo>> {
+        self.inner.list_instances(scope).await
     }
 
     /// Returns inspect data for one runtime instance through the wrapped backend.

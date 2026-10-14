@@ -7,7 +7,7 @@ use chrono::Utc;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use mantissa::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
-    RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeStateInfo,
+    RuntimeInfo, RuntimeListScope, RuntimeLogFrame, RuntimeLogStream, RuntimeStateInfo,
 };
 use mantissa::task::types::{TaskValue, TaskValueDraft};
 use mantissa::workload::model::WorkloadPhase;
@@ -76,9 +76,10 @@ impl RuntimeBackend for StaticAttachRuntimeBackend {
         Ok(())
     }
 
+    /// Leaves inventory empty so this fixture isolates attach from periodic runtime repair.
     async fn list_instances(
         &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
+        _scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
         Ok(Vec::new())
     }

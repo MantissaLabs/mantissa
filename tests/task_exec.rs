@@ -7,7 +7,8 @@ use chrono::Utc;
 use common::testkit::{RuntimeBackendOverrideGuard, TestNode};
 use mantissa::runtime::types::{
     RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError, RuntimeExecOptions,
-    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeStateInfo,
+    RuntimeExecResult, RuntimeInfo, RuntimeListScope, RuntimeLogFrame, RuntimeLogStream,
+    RuntimeStateInfo,
 };
 use mantissa::task::types::{TaskValue, TaskValueDraft};
 use mantissa::workload::model::WorkloadPhase;
@@ -75,9 +76,10 @@ impl RuntimeBackend for StaticExecRuntimeBackend {
         Ok(())
     }
 
+    /// Leaves inventory empty so this fixture isolates exec from periodic runtime repair.
     async fn list_instances(
         &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
+        _scope: RuntimeListScope,
     ) -> Result<Vec<RuntimeInfo>, RuntimeError> {
         Ok(Vec::new())
     }

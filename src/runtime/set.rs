@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +8,7 @@ use crate::runtime::registry_auth::RegistryAuth;
 use crate::runtime::types::{
     RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities, RuntimeCreateRequest, RuntimeError,
     RuntimeEvent, RuntimeExecOptions, RuntimeExecResult, RuntimeInfo, RuntimeInstanceRef,
-    RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult, RuntimeSupportContract,
+    RuntimeListScope, RuntimeLogFrame, RuntimeLogsOptions, RuntimeResult, RuntimeSupportContract,
     RuntimeSupportProfile, RuntimeUsageSample,
 };
 use crate::workload::model::{ExecutionPlatform, IsolationMode};
@@ -366,7 +365,10 @@ impl RuntimeSet {
             for entry in
                 self.matching_backends(execution_platform, isolation_mode, isolation_profile, &[])
             {
-                let listed = entry.backend.list_instances(None).await?;
+                let listed = entry
+                    .backend
+                    .list_instances(RuntimeListScope::Workloads)
+                    .await?;
                 if let Some(info) = listed
                     .into_iter()
                     .find(|info| info.name == name || info.id == name)
@@ -417,11 +419,11 @@ impl RuntimeSet {
     /// Lists runtime inventory across every registered backend.
     pub async fn list_instances(
         &self,
-        filters: Option<HashMap<String, Vec<String>>>,
+        scope: RuntimeListScope,
     ) -> RuntimeResult<Vec<RuntimeDiscoveredInstance>> {
         let mut instances = Vec::new();
         for entry in self.entries.iter() {
-            let listed = match entry.backend.list_instances(filters.clone()).await {
+            let listed = match entry.backend.list_instances(scope).await {
                 Ok(listed) => listed,
                 Err(error) => {
                     crate::observability::metrics::record_runtime_failure("list", &error);
@@ -651,7 +653,7 @@ mod tests {
 
         async fn list_instances(
             &self,
-            _filters: Option<HashMap<String, Vec<String>>>,
+            _scope: RuntimeListScope,
         ) -> RuntimeResult<Vec<RuntimeInfo>> {
             Ok(Vec::new())
         }

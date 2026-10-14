@@ -23,9 +23,9 @@ use crate::runtime::set::RuntimeSet;
 use crate::runtime::types::{
     ResourceLimits, RuntimeAttachOptions, RuntimeAttachmentTarget, RuntimeBackend,
     RuntimeCapabilities, RuntimeConfigInfo, RuntimeCreateRequest, RuntimeError, RuntimeExecOptions,
-    RuntimeExecResult, RuntimeInfo, RuntimeLogFrame, RuntimeLogStream, RuntimeLogsOptions,
-    RuntimeMount, RuntimeResult, RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode,
-    RuntimeStateInfo, RuntimeSupportContract, RuntimeSupportProfile,
+    RuntimeExecResult, RuntimeInfo, RuntimeListScope, RuntimeLogFrame, RuntimeLogStream,
+    RuntimeLogsOptions, RuntimeMount, RuntimeResult, RuntimeSandboxAccessMode,
+    RuntimeSandboxNetworkMode, RuntimeStateInfo, RuntimeSupportContract, RuntimeSupportProfile,
 };
 use crate::scheduler::digest::SchedulerDigestRegistry;
 use crate::scheduler::{
@@ -207,6 +207,7 @@ struct MockRuntimeBackend {
     inspect: Arc<AsyncMutex<HashMap<String, RuntimeInfo>>>,
     inspect_calls: Arc<AsyncMutex<Vec<String>>>,
     listed: Arc<AsyncMutex<Vec<RuntimeInfo>>>,
+    list_scopes: Arc<AsyncMutex<Vec<RuntimeListScope>>>,
     attach_calls: Arc<AsyncMutex<Vec<AttachCall>>>,
     attach_frames: Arc<AsyncMutex<HashMap<String, Vec<RuntimeLogFrame>>>>,
     attach_inputs: Arc<AsyncMutex<HashMap<String, Vec<Vec<u8>>>>>,
@@ -430,10 +431,9 @@ impl RuntimeBackend for MockRuntimeBackend {
         Ok(())
     }
 
-    async fn list_instances(
-        &self,
-        _filters: Option<HashMap<String, Vec<String>>>,
-    ) -> RuntimeResult<Vec<RuntimeInfo>> {
+    /// Records scopes and supplies controlled inventory for workload reconciliation tests.
+    async fn list_instances(&self, scope: RuntimeListScope) -> RuntimeResult<Vec<RuntimeInfo>> {
+        self.list_scopes.lock().await.push(scope);
         Ok(self.listed.lock().await.clone())
     }
 
@@ -4695,6 +4695,7 @@ async fn reconcile_local_tasks_uses_runtime_inventory_for_running_tasks() {
         ));
     }
     mock_cm.inspect_calls.lock().await.clear();
+    mock_cm.list_scopes.lock().await.clear();
 
     manager
         .reconcile_local_tasks()
@@ -4705,6 +4706,54 @@ async fn reconcile_local_tasks_uses_runtime_inventory_for_running_tasks() {
     assert!(
         inspect_calls.is_empty(),
         "running tasks present in runtime inventory should not trigger inspect"
+    );
+    assert_eq!(
+        *mock_cm.list_scopes.lock().await,
+        vec![RuntimeListScope::Workloads],
+        "adoption and running-task repair must share one workload listing"
+    );
+}
+
+/// Selecting autoscale policies must not inspect replicas that will not be sampled.
+#[tokio::test]
+async fn service_replica_metadata_defers_runtime_inspection_until_sampling() {
+    let (manager, _scheduler, runtime, _network_registry) = setup_manager().await;
+    let mut selected = test_task_spec(&manager, "selected");
+    let mut excluded = test_task_spec(&manager, "excluded");
+    for (spec, template) in [(&mut selected, "autoscaled"), (&mut excluded, "fixed")] {
+        spec.state = WorkloadPhase::Running;
+        spec.owner = Some(WorkloadOwner::ServiceReplica(WorkloadServiceMetadata::new(
+            "service", template, 1,
+        )));
+        manager
+            .persist_spec(spec)
+            .await
+            .expect("persist service replica");
+        let name = format!("mantissa-{}", spec.id);
+        runtime.inspect.lock().await.insert(
+            name.clone(),
+            running_runtime_info(&format!("runtime-{}", spec.id), &name, &spec.image),
+        );
+    }
+
+    let replicas = manager
+        .list_local_running_service_replicas()
+        .await
+        .expect("list cached replicas");
+    assert_eq!(replicas.len(), 2);
+    assert!(runtime.inspect_calls.lock().await.is_empty());
+
+    let eligible = replicas
+        .into_iter()
+        .filter(|replica| replica.template_name == "autoscaled")
+        .collect();
+    manager
+        .sample_local_service_replicas_usage(eligible)
+        .await
+        .expect("sample eligible replicas");
+    assert_eq!(
+        *runtime.inspect_calls.lock().await,
+        vec![format!("mantissa-{}", selected.id)]
     );
 }
 

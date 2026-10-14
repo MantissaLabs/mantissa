@@ -25,12 +25,14 @@ use log::{debug, info, trace, warn};
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender, UnboundedSender};
 
 use crate::runtime::registry_auth::RegistryAuth;
+use crate::runtime::types::RuntimeSupportContract;
 use crate::runtime::types::{
     RestartPolicyType, RuntimeAttachOptions, RuntimeBackend, RuntimeCapabilities,
     RuntimeCreateRequest, RuntimeError, RuntimeEvent, RuntimeExecOptions, RuntimeExecResult,
-    RuntimeInfo, RuntimeLogFrame, RuntimeLogsOptions, RuntimePortBinding, RuntimeResult,
-    RuntimeSupportProfile, RuntimeUsageSample,
+    RuntimeInfo, RuntimeListScope, RuntimeLogFrame, RuntimeLogsOptions, RuntimePortBinding,
+    RuntimeResult, RuntimeSupportProfile, RuntimeUsageSample,
 };
+use crate::workload::model::{ExecutionPlatform, IsolationMode};
 
 use super::conversions::{
     classify_runtime_error, runtime_info_from_inspect, runtime_info_from_list_entry,
@@ -38,7 +40,10 @@ use super::conversions::{
 };
 use super::images::PullProgressLogState;
 use super::interactive::AttachBridgeIo;
-use super::{DockerRuntimeBackend, WORKLOAD_ID_LABEL};
+use super::{
+    DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE, DockerRuntimeBackend,
+    WORKLOAD_ID_LABEL,
+};
 
 #[async_trait]
 impl RuntimeBackend for DockerRuntimeBackend {
@@ -48,7 +53,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
             name,
             image,
             execution_platform: _execution_platform,
-            isolation_mode: _isolation_mode,
+            isolation_mode,
             isolation_profile: _isolation_profile,
             sandbox_policy,
             labels,
@@ -63,6 +68,10 @@ impl RuntimeBackend for DockerRuntimeBackend {
             dns_servers,
             gpu_device_ids,
         } = request;
+        let sandbox_policy = match isolation_mode {
+            IsolationMode::Standard => None,
+            IsolationMode::Sandboxed => sandbox_policy,
+        };
         let prepared_launch = self
             .prepare_sandboxed_create(&image, command, env_vars, labels, volumes, sandbox_policy)
             .await?;
@@ -299,12 +308,15 @@ impl RuntimeBackend for DockerRuntimeBackend {
         .await
     }
 
-    /// Lists Docker containers through the generic runtime info shape.
-    async fn list_instances(
-        &self,
-        filters: Option<HashMap<String, Vec<String>>>,
-    ) -> RuntimeResult<Vec<RuntimeInfo>> {
-        tracing::trace!(target: "task::docker", ?filters, "listing containers");
+    /// Restricts workload repair to ownership-labelled containers while full scans protect mounts.
+    async fn list_instances(&self, scope: RuntimeListScope) -> RuntimeResult<Vec<RuntimeInfo>> {
+        let filters = match scope {
+            RuntimeListScope::All => None,
+            RuntimeListScope::Workloads => Some(HashMap::from([(
+                "label".to_string(),
+                vec![WORKLOAD_ID_LABEL.to_string()],
+            )])),
+        };
 
         let options = ListContainersOptions {
             all: true,
@@ -541,9 +553,33 @@ impl RuntimeBackend for DockerRuntimeBackend {
         }
     }
 
-    /// Advertises the exact Docker contract exposed by this backend registration.
+    /// Advertises both execution modes through one daemon without inventing profile combinations.
     fn advertised_support(&self) -> RuntimeSupportProfile {
-        self.mode.advertised_support(self.capabilities())
+        let mut contracts = vec![
+            RuntimeSupportContract::new(ExecutionPlatform::Oci, IsolationMode::Standard, None),
+            RuntimeSupportContract::new(
+                ExecutionPlatform::Oci,
+                IsolationMode::Standard,
+                Some(DOCKER_STANDARD_PROFILE),
+            ),
+        ];
+        if self.nono_helper_host_path.is_some() {
+            contracts.extend([
+                RuntimeSupportContract::new(ExecutionPlatform::Oci, IsolationMode::Sandboxed, None),
+                RuntimeSupportContract::new(
+                    ExecutionPlatform::Oci,
+                    IsolationMode::Sandboxed,
+                    Some(DOCKER_SANDBOXED_PROFILE),
+                ),
+                RuntimeSupportContract::new(
+                    ExecutionPlatform::Oci,
+                    IsolationMode::Sandboxed,
+                    Some(DOCKER_NONO_PROFILE),
+                ),
+            ]);
+        }
+
+        RuntimeSupportProfile::from_exact_contracts(contracts, self.capabilities().feature_flags())
     }
 
     /// Watches Docker container events and forwards task-relevant lifecycle

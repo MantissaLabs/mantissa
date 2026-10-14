@@ -595,22 +595,22 @@ pub enum WorkloadTrafficPublicationUpdate {
     Updated,
 }
 
-/// Local runtime replica metadata needed by service-level autoscale sampling.
+/// Cached service replica metadata used to select autoscale policies before runtime inspection.
 #[derive(Clone, Debug)]
-pub(crate) struct LocalServiceRuntimeReplica {
+pub(crate) struct LocalServiceReplica {
     pub service_id: Uuid,
     pub service_name: String,
     pub template_name: String,
     pub task_id: Uuid,
-    pub runtime: RuntimeInstanceRef,
     pub cpu_requested_millis: u64,
     pub memory_requested_bytes: u64,
 }
 
-/// Runtime usage sample paired with the service replica that produced it.
+/// Runtime usage paired with its service replica and backend-qualified identity for CPU deltas.
 #[derive(Clone, Debug)]
 pub(crate) struct LocalServiceRuntimeUsageSample {
-    pub replica: LocalServiceRuntimeReplica,
+    pub replica: LocalServiceReplica,
+    pub runtime: RuntimeInstanceRef,
     pub usage: RuntimeUsageSample,
 }
 

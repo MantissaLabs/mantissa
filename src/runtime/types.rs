@@ -53,6 +53,15 @@ pub type RuntimeResult<T> = Result<T, RuntimeError>;
 /// Stable handle used to address one runtime instance.
 pub type RuntimeHandle = String;
 
+/// Selects workload inventory for reconciliation or full inventory for mount-user safety checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeListScope {
+    /// Includes unmanaged instances whose mounts can prevent safe volume cleanup.
+    All,
+    /// Includes ownership-labelled Mantissa instances, including stopped workloads needing repair.
+    Workloads,
+}
+
 /// Stable backend-qualified reference used to route follow-up operations for one runtime instance.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RuntimeInstanceRef {
@@ -937,11 +946,8 @@ pub trait RuntimeBackend {
         remove_volumes: bool,
     ) -> RuntimeResult<()>;
 
-    /// Lists runtime instances, optionally filtered by backend-specific key/value selectors.
-    async fn list_instances(
-        &self,
-        filters: Option<HashMap<String, Vec<String>>>,
-    ) -> RuntimeResult<Vec<RuntimeInfo>>;
+    /// Lists instances in the requested scope, including stopped instances needed for cleanup.
+    async fn list_instances(&self, scope: RuntimeListScope) -> RuntimeResult<Vec<RuntimeInfo>>;
 
     /// Returns inspect-level metadata for one runtime instance.
     async fn inspect_instance(&self, runtime_id: &str) -> RuntimeResult<RuntimeInfo>;
