@@ -59,6 +59,229 @@ local_test!(
     }
 );
 
+local_test!(replicated_volume_rebuilds_missing_bootstrap_replica, {
+    verify_bootstrap_replica_repair(BootstrapReplicaFailure::Reservation).await;
+});
+
+local_test!(replicated_volume_rebuilds_incomplete_bootstrap_replica, {
+    verify_bootstrap_replica_repair(BootstrapReplicaFailure::FilePreparation).await;
+});
+
+/// Selects whether bootstrap fails before or after its local catalog reservation.
+#[derive(Clone, Copy)]
+enum BootstrapReplicaFailure {
+    Reservation,
+    FilePreparation,
+}
+
+/// Runs the real storage fixture and removes its private pool mount before
+/// shutting down nodes, including when the recovery assertions fail.
+async fn verify_bootstrap_replica_repair(failure: BootstrapReplicaFailure) {
+    if !replicated_volume_tests_enabled() {
+        return;
+    }
+    let root =
+        tempfile::tempdir_in("/var/tmp").expect("create missing-bootstrap-replica root on ext4");
+    let (cluster, states) = start_replicated_volume_test_cluster_with_node_count(
+        root.path(),
+        3,
+        ReplicatedVolumeTestDriverLimits::current(),
+        ReplicatedVolumeTestStorageLimits::current(),
+    )
+    .await
+    .expect("start missing-bootstrap-replica cluster");
+    let pool = states[2].node_root.join("replicas");
+
+    let result = run_missing_bootstrap_replica_flow(&cluster, &pool, failure).await;
+    // Restore the private pool even when an assertion in the flow fails, so
+    // temporary storage cannot remain mounted after the fixture shuts down.
+    let cleanup = match path_is_mounted(&pool) {
+        Ok(true) => unmount_bootstrap_pool_limit(&pool).await,
+        Ok(false) => Ok(()),
+        Err(error) => Err(error),
+    };
+    let shutdown = shutdown_replicated_volume_test_cluster(cluster).await;
+
+    cleanup.expect("remove missing-bootstrap-replica pool limit");
+    shutdown.expect("shut down missing-bootstrap-replica cluster");
+    result.expect("rebuild a voter whose bootstrap replica was never prepared");
+}
+
+/// Restores normal free space after a controlled failure in one private replica pool.
+async fn unmount_bootstrap_pool_limit(pool: &Path) -> anyhow::Result<()> {
+    let output = TokioCommand::new("umount").arg(pool).output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "unmount bootstrap pool limit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// Holds a bootstrap failure until data exclusion, then requires a complete
+/// rebuild without removing the failed node from Raft voting membership.
+async fn run_missing_bootstrap_replica_flow(
+    cluster: &[TestNode],
+    pool: &Path,
+    failure: BootstrapReplicaFailure,
+) -> anyhow::Result<()> {
+    let missing_node_id = cluster[2].id();
+    let volume_name = match failure {
+        BootstrapReplicaFailure::Reservation => "missing-bootstrap-replica",
+        BootstrapReplicaFailure::FilePreparation => "incomplete-bootstrap-replica",
+    };
+    let volume_id = create_replicated_volume_result(
+        &cluster[0].node.volumes_client,
+        volume_name,
+        REAL_REPLICATED_VOLUME_BYTES,
+    )
+    .await?;
+    let descriptor = SavedVolumeDescriptor::for_volume(volume_id, 0, REAL_REPLICATED_VOLUME_BYTES)?
+        .to_storage()?;
+    let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
+    // Admit desired intent on every node before faulting replica preparation.
+    // This keeps startup transport retries separate from the rebuild being tested.
+    let admitted = wait_until(
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        || async {
+            for node in &cluster[1..] {
+                if cluster[0]
+                    .node
+                    .inspect_replicated_volume_replica_for_test(node.id(), descriptor.clone())
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+    anyhow::ensure!(
+        admitted,
+        "bootstrap volume was not admitted on every replica node"
+    );
+
+    let blocks = pool
+        .join("replicas")
+        .join(format!("{volume_id}-1"))
+        .join("blocks");
+    match failure {
+        BootstrapReplicaFailure::Reservation => {
+            // The catalog is outside this mount. A small tmpfs makes reservation
+            // fail before a replica record exists, without exhausting host space.
+            let output = TokioCommand::new("mount")
+                .args(["-t", "tmpfs", "-o", "size=64m", "tmpfs"])
+                .arg(pool)
+                .output()
+                .await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "limit bootstrap pool space: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        BootstrapReplicaFailure::FilePreparation => {
+            // A file at the blocks-directory path lets reservation succeed but
+            // prevents file preparation and the following Raft group creation.
+            fs::create_dir_all(blocks.parent().context("replica blocks have no parent")?)?;
+            fs::write(&blocks, b"prevent bootstrap file preparation")?;
+        }
+    }
+    let client = cluster[0].node.task_client.clone();
+    let mut consumer = tokio::task::spawn_local(async move {
+        start_volume_task_via_public_api(&client, volume_id, volume_name, "/var/lib/data").await
+    });
+
+    let result = async {
+        // Wait for committed exclusion rather than initialization alone. Restoring
+        // space earlier could let an in-flight bootstrap attempt create the copy
+        // and bypass replacement, hiding the missing-voter defect.
+        let excluded = wait_until(
+            Duration::from_secs(90),
+            Duration::from_millis(50),
+            || async {
+                cluster[0]
+                    .node
+                    .replicated_volume_two_copy_state_is_applied_for_test(key, missing_node_id)
+                    .unwrap_or(false)
+            },
+        )
+        .await;
+        anyhow::ensure!(
+            excluded,
+            "failed bootstrap copy was not excluded from data: {}",
+            replicated_volume_start_diagnostics(cluster, volume_id)
+        );
+        match failure {
+            BootstrapReplicaFailure::Reservation => unmount_bootstrap_pool_limit(pool).await?,
+            BootstrapReplicaFailure::FilePreparation => fs::remove_file(&blocks)?,
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut poll = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            poll.tick().await;
+            let mut rebuilt_everywhere = true;
+            for node in cluster {
+                let Some(group) = node.node.volume_registry.get_group_status(volume_id)? else {
+                    rebuilt_everywhere = false;
+                    continue;
+                };
+                // An existing voter must rebuild in place. Removing it and
+                // rejoining as a learner would hide the broken voter branch.
+                anyhow::ensure!(
+                    group.voter_node_ids.len() == 3
+                        && cluster
+                            .iter()
+                            .all(|voter| group.voter_node_ids.contains(&voter.id())),
+                    "repair removed an existing voter instead of rebuilding in place: {}",
+                    replicated_volume_start_diagnostics(cluster, volume_id)
+                );
+                let state = node
+                    .node
+                    .volume_registry
+                    .get_node_state(volume_id, missing_node_id)?;
+                rebuilt_everywhere &= group.copy_node_ids.len() == 3
+                    && group.copy_node_ids.contains(&missing_node_id)
+                    && group.replacement_id.is_none()
+                    && state.is_some_and(|state| {
+                        matches!(
+                            state.state,
+                            VolumeNodeState::Ready | VolumeNodeState::Published
+                        ) && state.last_error.is_none()
+                    });
+            }
+
+            if rebuilt_everywhere {
+                break;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "missing bootstrap copy did not rebuild after space returned: {}",
+                replicated_volume_start_diagnostics(cluster, volume_id)
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(30), &mut consumer)
+            .await
+            .context("consumer did not start after rebuilding the missing copy")?
+            .context("join missing-bootstrap-replica consumer")??;
+        let (_, mount) =
+            wait_for_attached_volume(cluster, volume_id, Duration::from_secs(30)).await?;
+        write_synced_probe(
+            mount.join("after-bootstrap-repair.txt"),
+            b"all three replicas serve the rebuilt volume",
+        )
+        .await
+    }
+    .await;
+    consumer.abort();
+    result
+}
+
 local_test!(replicated_volume_failure_recovery_benchmark, {
     run_benchmark()
         .await

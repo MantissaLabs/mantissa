@@ -50,10 +50,18 @@ pub struct ReplicatedVolumeController {
     health_monitor: Arc<HealthMonitor>,
     gossip_tx: async_channel::Sender<Message>,
     runtime: Arc<ReplicatedVolumeRuntime>,
-    unavailable_since:
-        Arc<Mutex<HashMap<(mantissa_volume::catalog::ReplicaKey, VolumeNodeId), Instant>>>,
+    unavailable_since: Arc<Mutex<ReplicaFailureObservations>>,
     repair_failure_grace: Duration,
 }
+
+/// Keeps a new replacement attempt from inheriting the failure it was started to repair.
+struct ReplicaFailureObservation {
+    since: Instant,
+    replacement_id: Option<ReplacementId>,
+}
+
+type ReplicaFailureObservations =
+    HashMap<(mantissa_volume::catalog::ReplicaKey, VolumeNodeId), ReplicaFailureObservation>;
 
 /// One shared cluster observation used by every volume in a level pass.
 struct OperationalInputs {
@@ -327,6 +335,26 @@ impl ReplicatedVolumeController {
         let bootstrap_owned = local_origin
             .as_ref()
             .is_none_or(local_origin_allows_bootstrap);
+        // File preparation can succeed before saving the Raft group fails.
+        // Verify that ready file and finish group creation even if another
+        // voter initialized control state while this node was interrupted.
+        if bootstrap_owned
+            && local_selected
+            && control_state_initialized
+            && initial_local_status.exists
+            && initial_local_status.state == ReplicaState::Ready
+            && initial_local_status.health == ReplicaHealth::Healthy
+            && !initial_local_status.group_saved
+        {
+            self.runtime
+                .prepare_local_bootstrap_replica(
+                    descriptor.clone(),
+                    OperationId::new(plan.bootstrap_id)?,
+                    plan.replica_node_ids.into_iter().collect(),
+                )
+                .await?;
+        }
+
         if bootstrap_owned
             && (local_selected || plan.workload_node_id == self.runtime.node_id())
             && !control_state_initialized
@@ -346,6 +374,7 @@ impl ReplicatedVolumeController {
             self.publish_local_replica_observation(
                 spec,
                 &plan,
+                key,
                 &local_status,
                 initial_group_status.as_ref(),
             )
@@ -789,7 +818,12 @@ impl ReplicatedVolumeController {
         // Every copy tracks the continuous health observation before Raft is
         // woken. A leader change must not restart the safety delay and prevent
         // a stable failure from ever converging.
-        self.unavailable_after_grace(key, &observed_unavailable, Instant::now());
+        self.unavailable_after_grace(
+            key,
+            &observed_unavailable,
+            state.replacement(),
+            Instant::now(),
+        );
         let copy_requires_attention = !observed_unavailable.is_empty()
             || data.copies.iter().any(|node_id| {
                 operational
@@ -908,7 +942,12 @@ impl ReplicatedVolumeController {
             health,
             reported_replica_errors,
         )?;
-        let unavailable = self.unavailable_after_grace(key, &observed_unavailable, Instant::now());
+        let unavailable = self.unavailable_after_grace(
+            key,
+            &observed_unavailable,
+            state.replacement(),
+            Instant::now(),
+        );
         let unavailable_copies = data
             .copies
             .intersection(&unavailable)
@@ -1225,6 +1264,7 @@ impl ReplicatedVolumeController {
         &self,
         key: mantissa_volume::catalog::ReplicaKey,
         observed: &BTreeSet<VolumeNodeId>,
+        replacement: Option<ReplacementGrant>,
         now: Instant,
     ) -> BTreeSet<VolumeNodeId> {
         let mut first_seen = self.unavailable_since.lock();
@@ -1232,6 +1272,7 @@ impl ReplicatedVolumeController {
             &mut first_seen,
             key,
             observed,
+            replacement,
             now,
             self.repair_failure_grace,
         )
@@ -1310,6 +1351,7 @@ impl ReplicatedVolumeController {
         &self,
         spec: &VolumeSpecValue,
         plan: &ReplicatedVolumePlan,
+        key: mantissa_volume::catalog::ReplicaKey,
         local: &super::runtime::LocalReplicaStatus,
         group: Option<&ReplicatedVolumeGroupStatusValue>,
     ) -> Result<()> {
@@ -1329,6 +1371,16 @@ impl ReplicatedVolumeController {
         .with_group_id(group_id);
         let group_initialized =
             local.control_state_initialized || group.is_some_and(group_observation_is_initialized);
+        let local_is_copy = self.runtime.applied_state(key)?.map_or_else(
+            || group.is_some_and(|group| group.copy_node_ids.contains(&self.runtime.node_id())),
+            |state| {
+                state.data().is_some_and(|data| {
+                    data.copies
+                        .iter()
+                        .any(|copy| *copy.as_uuid() == self.runtime.node_id())
+                })
+            },
+        );
         let observation = self
             .registry
             .update_node_state(initial, |observation| {
@@ -1337,6 +1389,7 @@ impl ReplicatedVolumeController {
                     local.state,
                     local.health,
                     group_initialized,
+                    local_is_copy,
                     !observation.published_task_ids.is_empty(),
                 );
                 observation.group_id = Some(group_id);
@@ -1701,6 +1754,7 @@ fn local_replica_public_level(
     state: ReplicaState,
     health: ReplicaHealth,
     group_initialized: bool,
+    active_copy: bool,
     published: bool,
 ) -> (VolumeNodeState, Option<String>) {
     if !exists {
@@ -1719,6 +1773,16 @@ fn local_replica_public_level(
             Some("local replica file requires recovery".to_string()),
         );
     }
+    // A failed bootstrap can leave a reservation without a usable file. Once
+    // control state counts it as a copy, recovery must replace that data.
+    // An inactive replacement may still be preparing without being faulty.
+    if state == ReplicaState::Preparing && group_initialized && active_copy {
+        return (
+            VolumeNodeState::Error,
+            Some("committed control state has no prepared local replica data".to_string()),
+        );
+    }
+
     let state = match state {
         ReplicaState::Preparing => VolumeNodeState::Provisioning,
         ReplicaState::Ready if published => VolumeNodeState::Published,
@@ -2028,11 +2092,13 @@ fn operational_state_needs_raft(
     Ok(data.copies.len() != 3 || voters != &copy_nodes)
 }
 
-/// Updates transient failure observations and returns only grace-expired copies.
+/// Gives each replacement target a fresh failure grace period for its current
+/// grant while preserving the age of failures on active copies.
 fn confirm_unavailable(
-    first_seen: &mut HashMap<(mantissa_volume::catalog::ReplicaKey, VolumeNodeId), Instant>,
+    first_seen: &mut ReplicaFailureObservations,
     key: mantissa_volume::catalog::ReplicaKey,
     observed: &BTreeSet<VolumeNodeId>,
+    replacement: Option<ReplacementGrant>,
     now: Instant,
     grace: Duration,
 ) -> BTreeSet<VolumeNodeId> {
@@ -2041,15 +2107,29 @@ fn confirm_unavailable(
         .iter()
         .copied()
         .filter(|node_id| {
-            let since = first_seen.entry((key, *node_id)).or_insert(now);
-            now.saturating_duration_since(*since) >= grace
+            let replacement_id = replacement
+                .filter(|grant| grant.new_node_id == *node_id)
+                .map(|grant| grant.id);
+            let observation =
+                first_seen
+                    .entry((key, *node_id))
+                    .or_insert(ReplicaFailureObservation {
+                        since: now,
+                        replacement_id,
+                    });
+            if observation.replacement_id != replacement_id {
+                observation.since = now;
+                observation.replacement_id = replacement_id;
+            }
+
+            now.saturating_duration_since(observation.since) >= grace
         })
         .collect()
 }
 
 /// Drops transient failure timers once their volume generation is no longer desired.
 fn prune_unavailable_observations(
-    first_seen: &mut HashMap<(mantissa_volume::catalog::ReplicaKey, VolumeNodeId), Instant>,
+    first_seen: &mut ReplicaFailureObservations,
     desired: &HashSet<mantissa_volume::catalog::ReplicaKey>,
 ) {
     first_seen.retain(|(key, _), _| desired.contains(key));
@@ -2165,6 +2245,7 @@ mod tests {
                 ReplicaState::Preparing,
                 ReplicaHealth::Healthy,
                 true,
+                true,
                 false,
             )
             .0,
@@ -2175,6 +2256,7 @@ mod tests {
                 true,
                 ReplicaState::Ready,
                 ReplicaHealth::NeedsRecovery,
+                true,
                 true,
                 false,
             )
@@ -2188,8 +2270,51 @@ mod tests {
                 ReplicaHealth::Healthy,
                 true,
                 true,
+                true,
             ),
             (VolumeNodeState::Published, None)
+        );
+    }
+
+    /// Incomplete active copies need recovery; copies not yet counted in data
+    /// control state may still be preparing their files normally.
+    #[test]
+    fn preparing_copy_health_depends_on_committed_data_membership() {
+        assert_eq!(
+            local_replica_public_level(
+                true,
+                ReplicaState::Preparing,
+                ReplicaHealth::Healthy,
+                true,
+                true,
+                false,
+            ),
+            (
+                VolumeNodeState::Error,
+                Some("committed control state has no prepared local replica data".to_string()),
+            )
+        );
+        assert_eq!(
+            local_replica_public_level(
+                true,
+                ReplicaState::Preparing,
+                ReplicaHealth::Healthy,
+                true,
+                false,
+                false,
+            ),
+            (VolumeNodeState::Provisioning, None)
+        );
+        assert_eq!(
+            local_replica_public_level(
+                true,
+                ReplicaState::Preparing,
+                ReplicaHealth::Healthy,
+                false,
+                false,
+                false,
+            ),
+            (VolumeNodeState::Provisioning, None)
         );
     }
 
@@ -2325,12 +2450,15 @@ mod tests {
         let mut first_seen = HashMap::new();
         let observed = BTreeSet::from([node]);
 
-        assert!(confirm_unavailable(&mut first_seen, key, &observed, start, grace).is_empty());
+        assert!(
+            confirm_unavailable(&mut first_seen, key, &observed, None, start, grace).is_empty()
+        );
         assert!(
             confirm_unavailable(
                 &mut first_seen,
                 key,
                 &BTreeSet::new(),
+                None,
                 start + Duration::from_secs(10),
                 grace,
             )
@@ -2341,6 +2469,7 @@ mod tests {
                 &mut first_seen,
                 key,
                 &observed,
+                None,
                 start + Duration::from_secs(31),
                 grace,
             )
@@ -2352,9 +2481,76 @@ mod tests {
                 &mut first_seen,
                 key,
                 &observed,
+                None,
                 start + Duration::from_secs(61),
                 grace,
             )
+        );
+    }
+
+    /// A new repair gets one full grace period while failures of its source keep their age.
+    #[test]
+    fn replacement_grace_starts_with_each_committed_grant() {
+        let key = key(1);
+        let source = VolumeNodeId::new(Uuid::from_u128(2)).expect("source node ID");
+        let target = VolumeNodeId::new(Uuid::from_u128(3)).expect("target node ID");
+        let observed = BTreeSet::from([source, target]);
+        let start = Instant::now();
+        let grace = Duration::from_secs(30);
+        let mut first_seen = HashMap::new();
+
+        assert!(
+            confirm_unavailable(&mut first_seen, key, &observed, None, start, grace).is_empty()
+        );
+        assert_eq!(
+            confirm_unavailable(&mut first_seen, key, &observed, None, start + grace, grace),
+            observed
+        );
+
+        let replacement = ReplacementGrant {
+            id: ReplacementId::new(Uuid::from_u128(4)).expect("replacement ID"),
+            coordinator_node_id: source,
+            source_node_id: source,
+            old_node_id: None,
+            new_node_id: target,
+        };
+        assert_eq!(
+            confirm_unavailable(
+                &mut first_seen,
+                key,
+                &observed,
+                Some(replacement),
+                start + grace,
+                grace,
+            ),
+            BTreeSet::from([source])
+        );
+        assert_eq!(
+            confirm_unavailable(
+                &mut first_seen,
+                key,
+                &observed,
+                Some(replacement),
+                start + grace + grace,
+                grace,
+            ),
+            observed
+        );
+
+        let next_replacement = ReplacementGrant {
+            id: ReplacementId::new(Uuid::from_u128(5)).expect("next replacement ID"),
+            ..replacement
+        };
+        assert_eq!(
+            confirm_unavailable(
+                &mut first_seen,
+                key,
+                &observed,
+                Some(next_replacement),
+                start + grace + grace,
+                grace,
+            ),
+            BTreeSet::from([source])
         );
     }
 
@@ -2365,8 +2561,20 @@ mod tests {
         let stale_key = key(2);
         let node = VolumeNodeId::new(Uuid::from_u128(3)).expect("non-zero node ID");
         let mut first_seen = HashMap::from([
-            ((desired_key, node), Instant::now()),
-            ((stale_key, node), Instant::now()),
+            (
+                (desired_key, node),
+                ReplicaFailureObservation {
+                    since: Instant::now(),
+                    replacement_id: None,
+                },
+            ),
+            (
+                (stale_key, node),
+                ReplicaFailureObservation {
+                    since: Instant::now(),
+                    replacement_id: None,
+                },
+            ),
         ]);
 
         prune_unavailable_observations(&mut first_seen, &HashSet::from([desired_key]));

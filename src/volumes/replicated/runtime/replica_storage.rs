@@ -134,7 +134,14 @@ impl ReplicatedVolumeRuntime {
         }
         self.require_current_generation(key)?;
         let existing_replica = self.replicas.replica(key)?;
-        if existing_replica.is_none() && self.groups.catalog().group(&key)?.is_some() {
+        // Bootstrap saves its Raft group only after file preparation succeeds.
+        // An absent or unready copy with saved Raft state must therefore recover
+        // through replacement, including delayed bootstrap RPCs during a rebuild.
+        if existing_replica
+            .as_ref()
+            .is_none_or(|record| record.state() == ReplicaState::Preparing)
+            && self.groups.catalog().group(&key)?.is_some()
+        {
             anyhow::bail!(
                 "refusing to create an empty bootstrap replica while local Raft state survives"
             );
@@ -217,7 +224,7 @@ impl ReplicatedVolumeRuntime {
         self.local_status(key).await
     }
 
-    /// Initializes the exact bootstrap membership after all planned copies exist.
+    /// Starts the planned voters after the coordinator and one other copy are prepared.
     pub(crate) async fn initialize_bootstrap(
         &self,
         key: ReplicaKey,
@@ -245,7 +252,7 @@ impl ReplicatedVolumeRuntime {
         }
     }
 
-    /// Prepares one replacement file and activates its saved non-voting group endpoint.
+    /// Rebuilds an inactive replacement after its local Raft state authorizes file creation.
     pub(crate) async fn prepare_local_replacement_replica(
         &self,
         descriptor: mantissa_volume::VolumeDescriptor,
@@ -271,29 +278,37 @@ impl ReplicatedVolumeRuntime {
             anyhow::bail!("replicated-volume runtime is stopping");
         }
         self.require_current_generation(key)?;
-        if voters.contains(&self.node_id) {
-            // Degraded control state can rebuild a returned configured voter in
-            // place. A durably unhealthy file is reset only after local
-            // applied state proves this node is the exact inactive target.
-            // The ensuing full repair still overwrites the complete file
-            // before Raft may restore it to data control state.
-            let mut record = self
-                .replicas
-                .replica(key)?
-                .context("in-place replacement voter has no local replica")?;
+
+        let existing = self.replicas.replica(key)?;
+        if existing.as_ref().is_some_and(|record| {
+            record.state() == ReplicaState::Preparing
+                || (record.state() == ReplicaState::Ready
+                    && record.health() == ReplicaHealth::NeedsRecovery)
+        }) && self.groups.catalog().group(&key)?.is_none()
+        {
+            self.prepare_replacement_raft_group(descriptor, replacement_id, voters)
+                .await?;
+            return self.local_status(key).await;
+        }
+
+        if voters.contains(&self.node_id)
+            && let Some(mut record) = existing
+        {
             if !replacement_capacity_can_converge(record.descriptor(), &descriptor) {
                 anyhow::bail!("in-place replacement voter has a conflicting descriptor");
             }
             if self.groups.catalog().group(&key)?.is_none() {
                 anyhow::bail!("in-place replacement voter has no saved Raft group");
             }
-            if record.health() == ReplicaHealth::NeedsRecovery {
-                self.reset_unhealthy_replacement_file(&record, replacement_id)
+            if record.state() == ReplicaState::Preparing
+                || record.health() == ReplicaHealth::NeedsRecovery
+            {
+                self.prepare_inactive_replacement_file(&record, replacement_id)
                     .await?;
                 record = self
                     .replicas
                     .replica(key)?
-                    .context("reset in-place replacement replica disappeared")?;
+                    .context("prepared in-place replacement replica disappeared")?;
             }
             if record.state() != ReplicaState::Ready || record.health() != ReplicaHealth::Healthy {
                 anyhow::bail!("in-place replacement voter has no usable ready replica");
@@ -315,7 +330,7 @@ impl ReplicatedVolumeRuntime {
             self.reconcile_replica_io_gate(&record).await?;
             return self.local_status(key).await;
         }
-        if let Some(mut record) = self.replicas.replica(key)? {
+        if let Some(mut record) = existing {
             // A node that returns after quorum removed it still owns its old
             // bootstrap row. Wake its saved Raft endpoint first, but do not
             // erase the file until caught-up applied state names this exact
@@ -398,25 +413,56 @@ impl ReplicatedVolumeRuntime {
             self.reconcile_replica_io_gate(&record).await?;
             return self.local_status(key).await;
         }
+
+        self.prepare_replacement_raft_group(descriptor, replacement_id, voters)
+            .await?;
+        self.local_status(key).await
+    }
+
+    /// Starts Raft with an unready replica so missing voters can learn their
+    /// replacement grant before any empty data file becomes available.
+    async fn prepare_replacement_raft_group(
+        &self,
+        descriptor: mantissa_volume::VolumeDescriptor,
+        replacement_id: ReplacementId,
+        voters: BTreeSet<Uuid>,
+    ) -> Result<()> {
+        let key = ReplicaKey::from(&descriptor);
         let replicas = self.replicas.clone();
         let groups = self.groups.catalog().clone();
-        let settings = self.replica_file_settings;
         let max_saved_replicas = self.max_saved_replicas;
         let max_saved_groups = self.max_saved_groups;
-        let saved_voters = voters.clone();
-        let ready_file_is_open = self.replica_files.lock().contains_key(&key);
+        let saved_voters = voters;
+        // A returning voter can replay control state that still names it as a
+        // data copy. Keep the replica in Preparing until its applied replacement
+        // grant excludes it; an empty ready file could otherwise serve zeros.
         self.lifecycle_calls
             .run(
                 key,
                 "mantissa-volume-replacement-replica",
                 self.operation_timeout,
                 move || -> Result<()> {
-                    let record = replicas.reserve_replica_bounded(
-                        descriptor,
-                        LocalReplicaOrigin::replacement(replacement_id, saved_voters.clone())?,
-                        max_saved_replicas,
-                    )?;
-                    prepare_empty_replica_file(&replicas, &record, settings, ready_file_is_open)?;
+                    if let Some(record) = replicas.replica(key)? {
+                        if !(record.state() == ReplicaState::Preparing
+                            || (record.state() == ReplicaState::Ready
+                                && record.health() == ReplicaHealth::NeedsRecovery))
+                            || !replacement_capacity_can_converge(record.descriptor(), &descriptor)
+                        {
+                            anyhow::bail!(
+                                "interrupted replacement has a conflicting local replica"
+                            );
+                        }
+                        if record.state() == ReplicaState::Ready {
+                            replicas.set_replica_state(key, ReplicaState::Preparing)?;
+                        }
+                    } else {
+                        replicas.reserve_replica_bounded(
+                            descriptor,
+                            LocalReplicaOrigin::replacement(replacement_id, saved_voters.clone())?,
+                            max_saved_replicas,
+                        )?;
+                    }
+
                     let group = groups.open_or_create_group_bounded(
                         &key,
                         GroupActivation::Inactive,
@@ -463,11 +509,11 @@ impl ReplicatedVolumeRuntime {
             .replica(key)?
             .context("prepared replacement replica disappeared before admission")?;
         self.reconcile_replica_io_gate(&record).await?;
-        self.local_status(key).await
+        Ok(())
     }
 
-    /// Resets one unhealthy voter only while applied state names it as an inactive target.
-    pub(super) async fn reset_unhealthy_replacement_file(
+    /// Creates or resets voter data only under its exact applied inactive replacement grant.
+    async fn prepare_inactive_replacement_file(
         &self,
         record: &ReplicaRecord,
         replacement_id: ReplacementId,
@@ -477,7 +523,7 @@ impl ReplicatedVolumeRuntime {
             .groups
             .activate(&key)
             .await
-            .context("activate unhealthy in-place replacement voter")?;
+            .context("activate in-place replacement voter before preparing its file")?;
         let control_state = group.state();
         drop(group);
         validate_replacement_target_reset(&control_state, replacement_id, self.volume_node_id)?;
@@ -485,7 +531,7 @@ impl ReplicatedVolumeRuntime {
             record.state(),
             ReplicaState::Ready | ReplicaState::Preparing
         ) {
-            anyhow::bail!("unhealthy replacement replica is not locally rebuildable");
+            anyhow::bail!("replacement replica is not locally rebuildable");
         }
         if record.state() == ReplicaState::Ready {
             self.replicas
@@ -498,16 +544,16 @@ impl ReplicatedVolumeRuntime {
         let current = self
             .replicas
             .replica(key)?
-            .context("unhealthy replacement replica disappeared before reset")?;
+            .context("replacement replica disappeared before preparing its file")?;
         self.lifecycle_calls
             .run(
                 key,
-                "mantissa-volume-reset-unhealthy-replica",
+                "mantissa-volume-prepare-voter-replica",
                 self.operation_timeout,
                 move || prepare_empty_replica_file(&replicas, &current, settings, false),
             )
             .await
-            .context("reset unhealthy in-place replacement file")
+            .context("prepare inactive in-place replacement file")
     }
 
     /// Fails closed from terminal desired state without changing control state.
