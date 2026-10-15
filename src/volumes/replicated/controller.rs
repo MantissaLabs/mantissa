@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use mantissa_health::{HealthMonitor, Status as HealthStatus};
-use mantissa_volume::catalog::{LocalReplicaOrigin, ReplicaHealth, ReplicaState};
+use mantissa_volume::catalog::{LocalReplicaOrigin, ReplicaHealth, ReplicaKey, ReplicaState};
 use mantissa_volume::control_state::{
     BeginReplicaReplacement, BeginVolumeRecovery, CancelReplicaReplacement, ExpandVolume,
     ExpectedVolumeRevision, InitializeVolume, RecoveryGrant, ReplacementGrant,
-    SetVolumeDisposition, VolumeCommand, VolumeCommandResponse, VolumeDisposition,
+    SetVolumeDisposition, VolumeCommand, VolumeCommandResponse, VolumeControlState,
+    VolumeDisposition,
 };
 use mantissa_volume::storage_format::ReplicaSpace;
 use mantissa_volume::{
-    OperationId, RecoveryId, ReplacementId, VolumeCapacity, VolumeGeneration, VolumeId,
-    VolumeNodeId,
+    OperationId, RecoveryId, ReplacementId, VolumeCapacity, VolumeDescriptor, VolumeGeneration,
+    VolumeId, VolumeNodeId,
 };
 use parking_lot::Mutex;
 use tokio::time::interval;
@@ -24,7 +25,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::runtime::{
-    LeaderVolumeGroupState, ReplacementMembershipGoal, ReplicaCapacityStatus,
+    LeaderVolumeGroupState, LocalReplicaStatus, ReplacementMembershipGoal, ReplicaCapacityStatus,
     ReplicatedVolumeRuntime,
 };
 use super::split_validation::VolumeMembershipChangeBlocker;
@@ -233,17 +234,14 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Performs the next idempotent effects needed by one desired generation.
+    /// Reconciles one volume generation, checking removal before bootstrap or repair.
     async fn reconcile_volume(
         &self,
         spec: &VolumeSpecValue,
         operational: Option<&OperationalInputs>,
     ) -> Result<()> {
-        // Terminal intent is itself sufficient to revoke access and remove
-        // local resources. Depending on a plan or one last Raft application
-        // would strand a lagging member after the other voters removed their
-        // groups. The deterministic descriptor and local catalog are all the
-        // local cleanup path needs.
+        // Deletion must work after other voters have removed their Raft groups.
+        // The desired descriptor and local catalog are enough to remove local resources.
         if spec.is_delete_marker() {
             return self.reconcile_deleted_volume(spec).await;
         }
@@ -251,196 +249,239 @@ impl ReplicatedVolumeController {
         let capacity = spec
             .initial_capacity_bytes
             .context("replicated desired generation has no capacity")?;
-        let desired_descriptor =
-            SavedVolumeDescriptor::for_volume(spec.id, spec.volume_epoch, capacity)?
-                .to_storage()?;
-        let desired_key = mantissa_volume::catalog::ReplicaKey::from(&desired_descriptor);
-        self.runtime
-            .forget_superseded_replica_retirement(desired_key)?;
+        let descriptor = SavedVolumeDescriptor::for_volume(spec.id, spec.volume_epoch, capacity)?
+            .to_storage()?;
+        let key = ReplicaKey::from(&descriptor);
+        self.runtime.forget_superseded_replica_retirement(key)?;
 
-        let plan = match self.registry.get_plan(spec.id)? {
-            Some(plan) => plan,
-            None => return Ok(()),
+        let Some(plan) = self.registry.get_plan(spec.id)? else {
+            return Ok(());
         };
-        self.validate_bootstrap_plan(spec, &plan, &desired_descriptor)?;
+        self.validate_bootstrap_plan(spec, &plan, &descriptor)?;
 
-        let local_selected = plan.replica_node_ids.contains(&self.runtime.node_id());
-        let descriptor = plan.descriptor.to_storage()?;
-        let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
+        let Some(local_status) = self.finish_replica_removal(spec, key).await? else {
+            return Ok(());
+        };
+
+        let origin = self.runtime.local_replica_origin(key)?;
+        let group_status = self.registry.get_group_status(spec.id)?;
+        let applied_state = self.runtime.applied_state(key)?;
+        if self
+            .retire_excluded_replica(
+                spec,
+                &descriptor,
+                &local_status,
+                origin.as_ref(),
+                group_status.as_ref(),
+                applied_state.as_ref(),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
+        if !self
+            .reconcile_bootstrap(
+                &plan,
+                &descriptor,
+                &local_status,
+                origin.as_ref(),
+                group_status.as_ref(),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
+        self.reconcile_replica(spec, &plan, &descriptor, group_status.as_ref(), operational)
+            .await
+    }
+
+    /// Completes saved removal work before bootstrap can try to reuse local replica data.
+    /// Returns the current status only when no removal work prevents reconciliation.
+    async fn finish_replica_removal(
+        &self,
+        spec: &VolumeSpecValue,
+        key: ReplicaKey,
+    ) -> Result<Option<LocalReplicaStatus>> {
         if self.runtime.local_replica_retired(key)? {
             self.remove_local_replica_observation(spec).await?;
-            return Ok(());
-        }
-        let initial_local_status = self.runtime.local_status(key).await?;
-        if initial_local_status.exists
-            && matches!(
-                initial_local_status.state,
-                mantissa_volume::catalog::ReplicaState::Deleting
-                    | mantissa_volume::catalog::ReplicaState::Retiring
-            )
-        {
-            self.runtime
-                .reconcile_local_replica(key, desired_disposition(spec))
-                .await?;
-            return Ok(());
-        }
-        let local_origin = self.runtime.local_replica_origin(key)?;
-        let initial_group_status = self.registry.get_group_status(spec.id)?;
-        let initial_control_state = self.runtime.applied_state(key)?;
-        let initial_retirement_check = match initial_control_state.as_ref() {
-            Some(applied_state) => {
-                self.local_copy_may_be_removed(&initial_local_status, applied_state)
-                    || initial_group_status.as_ref().is_some_and(|status| {
-                        group_status_suggests_local_removal_check(status, self.runtime.node_id())
-                    })
-            }
-            None => local_origin.as_ref().map_or_else(
-                || {
-                    initial_group_status.as_ref().is_some_and(|status| {
-                        group_status_suggests_local_removal_check(status, self.runtime.node_id())
-                    })
-                },
-                |origin| {
-                    unapplied_replica_needs_removal_check(
-                        origin,
-                        initial_group_status.as_ref(),
-                        self.runtime.node_id(),
-                    )
-                },
-            ),
-        };
-        if initial_retirement_check
-            && let Some(observation) = self
-                .observe_quorum_state(
-                    spec,
-                    &descriptor,
-                    &initial_local_status,
-                    local_origin.as_ref(),
-                )
-                .await?
-            && control_state_excludes_local_copy(
-                &observation,
-                self.runtime.node_id(),
-                local_origin.as_ref(),
-            )?
-        {
-            self.runtime.retire_local_replica(key).await?;
-            self.remove_local_replica_observation(spec).await?;
-            return Ok(());
-        }
-        let control_state_initialized = initial_local_status.control_state_initialized
-            || initial_group_status
-                .as_ref()
-                .is_some_and(group_observation_is_initialized);
-        let bootstrap_owned = local_origin
-            .as_ref()
-            .is_none_or(local_origin_allows_bootstrap);
-        // File preparation can succeed before saving the Raft group fails.
-        // Verify that ready file and finish group creation even if another
-        // voter initialized control state while this node was interrupted.
-        if bootstrap_owned
-            && local_selected
-            && control_state_initialized
-            && initial_local_status.exists
-            && initial_local_status.state == ReplicaState::Ready
-            && initial_local_status.health == ReplicaHealth::Healthy
-            && !initial_local_status.group_saved
-        {
-            self.runtime
-                .prepare_local_bootstrap_replica(
-                    descriptor.clone(),
-                    OperationId::new(plan.bootstrap_id)?,
-                    plan.replica_node_ids.into_iter().collect(),
-                )
-                .await?;
+            return Ok(None);
         }
 
-        if bootstrap_owned
-            && (local_selected || plan.workload_node_id == self.runtime.node_id())
-            && !control_state_initialized
-            && !self
-                .reconcile_bootstrap_replicas(&plan, local_selected)
+        let local_status = self.runtime.local_status(key).await?;
+        if local_status.exists
+            && matches!(
+                local_status.state,
+                ReplicaState::Deleting | ReplicaState::Retiring
+            )
+        {
+            self.runtime
+                .reconcile_local_replica(key, desired_disposition(spec))
+                .await?;
+            return Ok(None);
+        }
+
+        Ok(Some(local_status))
+    }
+
+    /// Retires a former copy only after a quorum confirms that it is no longer needed.
+    /// Local and public observations can prompt this check but cannot authorize removal.
+    async fn retire_excluded_replica(
+        &self,
+        spec: &VolumeSpecValue,
+        descriptor: &VolumeDescriptor,
+        local_status: &LocalReplicaStatus,
+        origin: Option<&LocalReplicaOrigin>,
+        group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+        applied_state: Option<&VolumeControlState>,
+    ) -> Result<bool> {
+        let needs_removal_check = match applied_state {
+            Some(state) => {
+                self.local_copy_may_be_removed(local_status, state)
+                    || group_status.is_some_and(|status| {
+                        group_status_suggests_local_removal_check(status, self.runtime.node_id())
+                    })
+            }
+            None => {
+                unapplied_replica_needs_removal_check(origin, group_status, self.runtime.node_id())
+            }
+        };
+        if !needs_removal_check {
+            return Ok(false);
+        }
+
+        let Some(observation) = self
+            .observe_quorum_state(spec, descriptor, local_status, origin)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if !control_state_excludes_local_copy(&observation, self.runtime.node_id(), origin)? {
+            return Ok(false);
+        }
+
+        self.runtime
+            .retire_local_replica(ReplicaKey::from(descriptor))
+            .await?;
+        self.remove_local_replica_observation(spec).await?;
+        Ok(true)
+    }
+
+    /// Prepares planned copies before initialization and resumes interrupted group creation.
+    /// Returns false when bootstrap must wait for peer observations or prepared copies.
+    async fn reconcile_bootstrap(
+        &self,
+        plan: &ReplicatedVolumePlan,
+        descriptor: &VolumeDescriptor,
+        local_status: &LocalReplicaStatus,
+        origin: Option<&LocalReplicaOrigin>,
+        group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+    ) -> Result<bool> {
+        if origin.is_some_and(|origin| !local_origin_allows_bootstrap(origin)) {
+            return Ok(true);
+        }
+
+        let is_planned_replica = plan.replica_node_ids.contains(&self.runtime.node_id());
+        let initialized = local_status.control_state_initialized
+            || group_status.is_some_and(group_observation_is_initialized);
+        if initialized {
+            // File preparation can succeed before saving the Raft group fails.
+            // Verify the existing healthy file before finishing group creation.
+            if is_planned_replica
+                && local_status.exists
+                && local_status.state == ReplicaState::Ready
+                && local_status.health == ReplicaHealth::Healthy
+                && !local_status.group_saved
+            {
+                self.runtime
+                    .prepare_local_bootstrap_replica(
+                        descriptor.clone(),
+                        OperationId::new(plan.bootstrap_id)?,
+                        plan.replica_node_ids.into_iter().collect(),
+                    )
+                    .await?;
+            }
+            return Ok(true);
+        }
+
+        if is_planned_replica || plan.workload_node_id == self.runtime.node_id() {
+            return self
+                .reconcile_bootstrap_replicas(plan, is_planned_replica)
+                .await;
+        }
+        Ok(true)
+    }
+
+    /// Publishes local health before Raft decisions so failures can trigger repair.
+    /// Nodes outside both the bootstrap plan and the local catalog have no replica to update.
+    async fn reconcile_replica(
+        &self,
+        spec: &VolumeSpecValue,
+        plan: &ReplicatedVolumePlan,
+        descriptor: &VolumeDescriptor,
+        group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+        operational: Option<&OperationalInputs>,
+    ) -> Result<()> {
+        let key = ReplicaKey::from(descriptor);
+        let local_status = self.runtime.local_status(key).await?;
+        let is_planned_replica = plan.replica_node_ids.contains(&self.runtime.node_id());
+        if !is_planned_replica
+            && !local_status.exists
+            && !local_status.group_saved
+            && !local_status.control_state_initialized
+        {
+            return Ok(());
+        }
+
+        self.publish_local_replica_observation(spec, plan, key, &local_status, group_status)
+            .await?;
+        self.reconcile_control_state(spec, plan, descriptor, operational)
+            .await?;
+
+        self.reconcile_replica_resources(spec, descriptor).await
+    }
+
+    /// Updates capacity and local resources from applied Raft decisions.
+    /// Refreshes state after capacity work and checks removal before allowing local access.
+    async fn reconcile_replica_resources(
+        &self,
+        spec: &VolumeSpecValue,
+        descriptor: &VolumeDescriptor,
+    ) -> Result<()> {
+        let key = ReplicaKey::from(descriptor);
+        let Some(applied_state) = self.runtime.applied_state(key)? else {
+            // Followers cannot serve local resources until they have applied initialization.
+            return Ok(());
+        };
+        self.reconcile_capacity(spec, &applied_state).await?;
+
+        let Some(applied_state) = self.runtime.applied_state(key)? else {
+            return Ok(());
+        };
+        self.runtime.reconcile_maintenance(&applied_state)?;
+
+        let local_status = self.runtime.local_status(key).await?;
+        let origin = self.runtime.local_replica_origin(key)?;
+        let group_status = self.registry.get_group_status(spec.id)?;
+        if desired_disposition(spec) == VolumeDisposition::Live
+            && self
+                .retire_excluded_replica(
+                    spec,
+                    descriptor,
+                    &local_status,
+                    origin.as_ref(),
+                    group_status.as_ref(),
+                    Some(&applied_state),
+                )
                 .await?
         {
             return Ok(());
         }
-        let local_status = self.runtime.local_status(key).await?;
-        let local_replica_exists = local_status.exists;
-        if local_selected
-            || local_replica_exists
-            || local_status.group_saved
-            || local_status.control_state_initialized
-        {
-            self.publish_local_replica_observation(
-                spec,
-                &plan,
-                key,
-                &local_status,
-                initial_group_status.as_ref(),
-            )
-            .await?;
-            let applied = self.runtime.applied_state(key)?;
-            let reported_replica_errors =
-                self.reported_replica_errors(spec, key, applied.as_ref())?;
-            let control_state_needs_reconciliation = match applied.as_ref() {
-                Some(state) => self.control_state_needs_reconciliation(
-                    spec,
-                    key,
-                    state,
-                    operational,
-                    &reported_replica_errors,
-                )?,
-                None => true,
-            };
-            if control_state_needs_reconciliation {
-                self.reconcile_control_state(spec, &plan, operational, &reported_replica_errors)
-                    .await?;
-            }
-            let Some(local_state) = self.runtime.applied_state(key)? else {
-                // A follower may still be replaying initialization. No local
-                // resource may serve until durable applied state appears.
-                return Ok(());
-            };
-            self.reconcile_capacity(spec, &local_state).await?;
-            let Some(local_state) = self.runtime.applied_state(key)? else {
-                return Ok(());
-            };
-            self.runtime.reconcile_maintenance(&local_state)?;
-            let local_status = self.runtime.local_status(key).await?;
-            let current_local_origin = self.runtime.local_replica_origin(key)?;
-            let public_removal_hint = self
-                .registry
-                .get_group_status(spec.id)?
-                .as_ref()
-                .is_some_and(|status| {
-                    group_status_suggests_local_removal_check(status, self.runtime.node_id())
-                });
-            if desired_disposition(spec) == VolumeDisposition::Live
-                && (self.local_copy_may_be_removed(&local_status, &local_state)
-                    || public_removal_hint)
-                && let Some(observation) = self
-                    .observe_quorum_state(
-                        spec,
-                        &descriptor,
-                        &local_status,
-                        current_local_origin.as_ref(),
-                    )
-                    .await?
-                && control_state_excludes_local_copy(
-                    &observation,
-                    self.runtime.node_id(),
-                    current_local_origin.as_ref(),
-                )?
-            {
-                self.runtime.retire_local_replica(key).await?;
-                self.remove_local_replica_observation(spec).await?;
-                return Ok(());
-            }
-            self.runtime
-                .reconcile_local_replica(key, desired_disposition(spec))
-                .await?;
-        }
-        Ok(())
+
+        self.runtime
+            .reconcile_local_replica(key, desired_disposition(spec))
+            .await
     }
 
     /// Prepares local space and lets only the current leader commit a fully prepared target.
@@ -672,11 +713,11 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Returns true once this node may continue with control-state reconciliation.
+    /// Prepares the planned copies and lets the coordinator initialize Raft with a ready majority.
     async fn reconcile_bootstrap_replicas(
         &self,
         plan: &ReplicatedVolumePlan,
-        local_selected: bool,
+        is_planned_replica: bool,
     ) -> Result<bool> {
         let descriptor = plan.descriptor.to_storage()?;
         match self.check_volume_bootstrap(plan, &descriptor).await? {
@@ -726,7 +767,7 @@ impl ReplicatedVolumeController {
                     voters,
                 )
                 .await?;
-        } else if local_selected {
+        } else if is_planned_replica {
             self.runtime
                 .prepare_replica_on(self.runtime.node_id(), descriptor, bootstrap_id, voters)
                 .await?;
@@ -835,19 +876,34 @@ impl ReplicatedVolumeController {
         operational_state_needs_raft(state, bound, &voters, copy_requires_attention)
     }
 
-    /// Initializes control state exactly once and then converges desired disposition.
+    /// Wakes Raft only when initialization, desired changes, or replica failures need a decision.
     async fn reconcile_control_state(
         &self,
         spec: &VolumeSpecValue,
         plan: &ReplicatedVolumePlan,
+        descriptor: &VolumeDescriptor,
         operational: Option<&OperationalInputs>,
-        reported_replica_errors: &BTreeSet<VolumeNodeId>,
     ) -> Result<()> {
-        let descriptor = plan.descriptor.to_storage()?;
-        let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
+        let key = ReplicaKey::from(descriptor);
+        let applied_state = self.runtime.applied_state(key)?;
+        let reported_replica_errors =
+            self.reported_replica_errors(spec, key, applied_state.as_ref())?;
+        if let Some(state) = applied_state.as_ref()
+            && !self.control_state_needs_reconciliation(
+                spec,
+                key,
+                state,
+                operational,
+                &reported_replica_errors,
+            )?
+        {
+            return Ok(());
+        }
+
         let Some(state) = self.runtime.poll_local_quorum_state(key).await? else {
             return Ok(());
         };
+
         if state.descriptor().is_none() {
             self.membership_change_blocker
                 .require_membership_changes_allowed()?;
@@ -861,7 +917,7 @@ impl ReplicatedVolumeController {
                 .propose_as_leader_for_reconcile(
                     key,
                     VolumeCommand::Initialize(InitializeVolume {
-                        descriptor,
+                        descriptor: descriptor.clone(),
                         initial_copies,
                     }),
                 )
@@ -878,6 +934,7 @@ impl ReplicatedVolumeController {
             );
             return Ok(());
         }
+
         let wanted = desired_disposition(spec);
         if state.disposition() != wanted {
             require_command_applied(
@@ -896,6 +953,7 @@ impl ReplicatedVolumeController {
             )?;
             return Ok(());
         }
+
         if wanted == VolumeDisposition::Live
             && let Some(operational) = operational
         {
@@ -904,7 +962,7 @@ impl ReplicatedVolumeController {
                 key,
                 &state,
                 operational,
-                reported_replica_errors,
+                &reported_replica_errors,
             )
             .await?;
         }
@@ -1197,7 +1255,7 @@ impl ReplicatedVolumeController {
         } else if degraded_group_needs_new_member(&data.copies, &voters) {
             // Cancelling a failed target after it entered the voter set leaves
             // the two active copies as the complete safe membership. Rebuild
-            // directly onto a fresh learner; there is no stale third voter to
+            // directly onto a fresh learner. There is no stale third voter to
             // name as the old node in this state.
             let replacement = Self::select_replacement_node(
                 descriptor.volume_id().as_uuid(),
@@ -1861,13 +1919,14 @@ fn group_status_suggests_local_removal_check(
         || status.replacement_old_node_id == Some(local_node_id)
 }
 
-/// Finds an orphan candidate that has no local applied state to compare.
+/// Prompts a quorum check for replacement-owned data or public reports of exclusion.
+/// A replica without applied state cannot decide for itself whether removal is safe.
 fn unapplied_replica_needs_removal_check(
-    origin: &LocalReplicaOrigin,
+    origin: Option<&LocalReplicaOrigin>,
     status: Option<&ReplicatedVolumeGroupStatusValue>,
     local_node_id: Uuid,
 ) -> bool {
-    origin.replacement_id().is_some()
+    origin.is_some_and(|origin| origin.replacement_id().is_some())
         || status
             .is_some_and(|status| group_status_suggests_local_removal_check(status, local_node_id))
 }
@@ -2276,7 +2335,7 @@ mod tests {
         );
     }
 
-    /// Incomplete active copies need recovery; copies not yet counted in data
+    /// Incomplete active copies need recovery. Copies not yet counted in data
     /// control state may still be preparing their files normally.
     #[test]
     fn preparing_copy_health_depends_on_committed_data_membership() {
@@ -2855,25 +2914,32 @@ mod tests {
         );
         status.copy_node_ids = vec![Uuid::from_u128(1), Uuid::from_u128(2), local_node_id];
         status.voter_node_ids = status.copy_node_ids.clone();
+
         assert!(!group_status_suggests_local_removal_check(
             &status,
             local_node_id
         ));
         assert!(!unapplied_replica_needs_removal_check(
-            &bootstrap_origin(),
+            Some(&bootstrap_origin()),
             Some(&status),
             local_node_id,
         ));
         assert!(!unapplied_replica_needs_removal_check(
-            &bootstrap_origin(),
+            Some(&bootstrap_origin()),
             None,
             local_node_id,
         ));
         assert!(unapplied_replica_needs_removal_check(
-            &replacement_origin(20),
+            Some(&replacement_origin(20)),
             None,
             local_node_id,
         ));
+        assert!(!unapplied_replica_needs_removal_check(
+            None,
+            None,
+            local_node_id,
+        ));
+
         assert!(local_origin_allows_bootstrap(&bootstrap_origin()));
         assert!(!local_origin_allows_bootstrap(&replacement_origin(20)));
 
@@ -2888,7 +2954,12 @@ mod tests {
             local_node_id
         ));
         assert!(unapplied_replica_needs_removal_check(
-            &bootstrap_origin(),
+            Some(&bootstrap_origin()),
+            Some(&status),
+            local_node_id,
+        ));
+        assert!(unapplied_replica_needs_removal_check(
+            None,
             Some(&status),
             local_node_id,
         ));
