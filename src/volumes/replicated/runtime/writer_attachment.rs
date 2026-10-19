@@ -132,7 +132,8 @@ impl ReplicatedVolumeRuntime {
         ))
     }
 
-    /// Converges one writer grant, ublk device, mapped device, and filesystem mount.
+    /// Obtains exclusive writer permission from Raft and mounts the local replicated volume.
+    /// Finishes data recovery before starting the driver, block device, and filesystem mount.
     pub async fn mount_volume(
         &self,
         key: ReplicaKey,
@@ -170,67 +171,9 @@ impl ReplicatedVolumeRuntime {
             node_id: self.volume_node_id,
             session_id,
         };
-        if let Some(recovery) = state
-            .data()
-            .and_then(|data| data.recovery.as_ref())
-            .cloned()
-        {
-            if recovery.coordinator_node_id != self.volume_node_id
-                || recovery.source_node_id != self.volume_node_id
-            {
-                anyhow::bail!("volume recovery is coordinated by another active copy");
-            }
-            self.wait_for_recovery(&state, recovery.id).await?;
-            state = self.read_quorum_state(key).await?;
-            if state
-                .data()
-                .and_then(|data| data.recovery.as_ref())
-                .is_some()
-            {
-                anyhow::bail!("volume recovery grant changed while data was aligning");
-            }
-        }
-        if state.replacement().is_some() {
-            anyhow::bail!("volume replacement must converge before a writer is granted");
-        }
-        if state.data().and_then(|data| data.writer) != Some(writer) {
-            if let Some(current) = state.data().and_then(|data| data.writer) {
-                anyhow::bail!(
-                    "volume already has writer {} with another durable session",
-                    current.node_id
-                );
-            }
-            require_command_postcondition(
-                self.propose_volume_command(
-                    key,
-                    VolumeCommand::GrantWriter(GrantVolumeWriter {
-                        expected: ExpectedVolumeRevision {
-                            generation: key.generation(),
-                            revision: state.revision(),
-                        },
-                        writer,
-                    }),
-                )
-                .await?,
-            )?;
-            state = self.read_quorum_state(key).await?;
-        }
-        let data = state
-            .data()
-            .context("initialized volume has no data control state")?;
-        if data.writer != Some(writer) {
-            anyhow::bail!("writer grant changed while the local attachment was starting");
-        }
-        if attachment.granted_fence().is_none() {
-            self.replicas
-                .save_attachment_fence(key, session_id, data.fence)?;
-        } else if attachment.granted_fence() != Some(data.fence) {
-            anyhow::bail!("local writer fence handoff is still in progress");
-        }
         let attachment = self
-            .replicas
-            .attachment(key)?
-            .context("saved attachment disappeared after its writer grant")?;
+            .prepare_mount_writer(key, &mut state, &attachment, writer)
+            .await?;
         let ublk_device_path = match self
             .start_or_recover_ublk_device(&record, &attachment, &state)
             .await
@@ -264,6 +207,79 @@ impl ReplicatedVolumeRuntime {
             volume_filesystem(filesystem),
         )
         .await
+    }
+
+    /// Finishes recovery and obtains writer permission for the saved attachment session.
+    /// Confirms the Raft decision before saving its fence so device startup cannot use stale permission.
+    async fn prepare_mount_writer(
+        &self,
+        key: ReplicaKey,
+        state: &mut VolumeControlState,
+        attachment: &LocalAttachmentRecord,
+        writer: WriterGrant,
+    ) -> Result<LocalAttachmentRecord> {
+        if let Some(recovery) = state
+            .data()
+            .and_then(|data| data.recovery.as_ref())
+            .cloned()
+        {
+            if recovery.coordinator_node_id != self.volume_node_id
+                || recovery.source_node_id != self.volume_node_id
+            {
+                anyhow::bail!("volume recovery is coordinated by another active copy");
+            }
+            self.wait_for_recovery(state, recovery.id).await?;
+            *state = self.read_quorum_state(key).await?;
+            if state
+                .data()
+                .and_then(|data| data.recovery.as_ref())
+                .is_some()
+            {
+                anyhow::bail!("volume recovery grant changed while data was aligning");
+            }
+        }
+        if state.replacement().is_some() {
+            anyhow::bail!("volume replacement must converge before a writer is granted");
+        }
+
+        let session_id = attachment.session_id();
+        if state.data().and_then(|data| data.writer) != Some(writer) {
+            if let Some(current) = state.data().and_then(|data| data.writer) {
+                anyhow::bail!(
+                    "volume already has writer {} with another durable session",
+                    current.node_id
+                );
+            }
+            require_command_postcondition(
+                self.propose_volume_command(
+                    key,
+                    VolumeCommand::GrantWriter(GrantVolumeWriter {
+                        expected: ExpectedVolumeRevision {
+                            generation: key.generation(),
+                            revision: state.revision(),
+                        },
+                        writer,
+                    }),
+                )
+                .await?,
+            )?;
+            *state = self.read_quorum_state(key).await?;
+        }
+        let data = state
+            .data()
+            .context("initialized volume has no data control state")?;
+        if data.writer != Some(writer) {
+            anyhow::bail!("writer grant changed while the local attachment was starting");
+        }
+        if attachment.granted_fence().is_none() {
+            self.replicas
+                .save_attachment_fence(key, session_id, data.fence)?;
+        } else if attachment.granted_fence() != Some(data.fence) {
+            anyhow::bail!("local writer fence handoff is still in progress");
+        }
+        self.replicas
+            .attachment(key)?
+            .context("saved attachment disappeared after its writer grant")
     }
 
     /// Removes a fenced stale attachment before allocating or reusing one mount session.

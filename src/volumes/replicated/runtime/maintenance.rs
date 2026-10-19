@@ -482,7 +482,7 @@ impl ReplicatedVolumeRuntime {
                             target: "volumes",
                             ?key,
                             replacement_id = ?replacement.id,
-                            error = %error,
+                            error = %format_args!("{error:#}"),
                             "replica replacement failed transiently and will retry"
                         );
                         wait_for_maintenance_retry(cancel).await?;
@@ -492,7 +492,7 @@ impl ReplicatedVolumeRuntime {
                         target: "volumes",
                         ?key,
                         replacement_id = ?replacement.id,
-                        error = %error,
+                        error = %format_args!("{error:#}"),
                         "replica replacement target remained unusable; cancelling its grant"
                     );
                 }
@@ -510,7 +510,7 @@ impl ReplicatedVolumeRuntime {
                             target: "volumes",
                             ?key,
                             replacement_id = ?replacement.id,
-                            error = %error,
+                            error = %format_args!("{error:#}"),
                             "failed replacement rollback remains pending"
                         );
                         wait_for_maintenance_retry(cancel).await?;
@@ -767,12 +767,13 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Completes the stable copy and atomically adopts its active data set.
+    /// Finishes copying after writer I/O stops, then asks Raft to use the rebuilt replica.
+    /// Repeats the full copy unless this task completed the earlier copy while writes were running.
     async fn complete_replacement(
         &self,
         key: ReplicaKey,
         replacement: ReplacementGrant,
-        mut state: VolumeControlState,
+        state: VolumeControlState,
         copied_online_base: bool,
         expected_writer: Option<WriterGrant>,
         cancel: &mut watch::Receiver<bool>,
@@ -805,30 +806,15 @@ impl ReplicatedVolumeRuntime {
         if source_progress.stored_write_number() != source_progress.durable_write_number() {
             anyhow::bail!("replacement source contains changes that were not durably flushed");
         }
-        // Changed regions are sufficient only when this task completed the full
-        // online baseline. After a restart with an already fenced writer there
-        // is intentionally no saved phase, so repeat the full stable copy.
+        // Copying only changed regions is safe only after this task completed
+        // a full copy while the writer was running. That progress is not saved
+        // across restarts, so a restarted task must copy the whole volume again.
         if can_copy_only_changed_regions(
             copied_online_base,
             source_progress.changed_regions_complete(),
         ) {
-            for region in regions {
-                let offset = region
-                    .checked_mul(self.replica_file_settings.changed_region_bytes())
-                    .context("replacement changed-region offset overflow")?;
-                if offset >= descriptor.capacity().bytes() {
-                    anyhow::bail!("replacement changed region is outside the volume");
-                }
-                let length = self
-                    .replica_file_settings
-                    .changed_region_bytes()
-                    .min(descriptor.capacity().bytes() - offset);
-                let end = offset
-                    .checked_add(length)
-                    .context("changed maintenance range overflow")?;
-                self.copy_range(&source, &target, &identity, offset..end, true, cancel)
-                    .await?;
-            }
+            self.copy_changed_regions(&source, &target, &identity, regions, cancel)
+                .await?;
         } else {
             self.copy_full(&source, &target, &identity, true, cancel)
                 .await?;
@@ -856,6 +842,55 @@ impl ReplicatedVolumeRuntime {
         )
         .await?;
 
+        self.adopt_replacement(key, replacement, &state, expected_writer, cancel)
+            .await
+    }
+
+    /// Copies and verifies regions changed after this task's initial full-volume copy.
+    /// The caller must first stop writer I/O so the source stays unchanged during this final copy.
+    async fn copy_changed_regions(
+        &self,
+        source: &MaintenanceSource,
+        target: &ReplicaDataConnection,
+        identity: &ReplicaMaintenanceIdentity,
+        regions: BTreeSet<u64>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let descriptor = identity.descriptor();
+        for region in regions {
+            let offset = region
+                .checked_mul(self.replica_file_settings.changed_region_bytes())
+                .context("replacement changed-region offset overflow")?;
+            if offset >= descriptor.capacity().bytes() {
+                anyhow::bail!("replacement changed region is outside the volume");
+            }
+            let length = self
+                .replica_file_settings
+                .changed_region_bytes()
+                .min(descriptor.capacity().bytes() - offset);
+            let end = offset
+                .checked_add(length)
+                .context("changed maintenance range overflow")?;
+            self.copy_range(source, target, identity, offset..end, true, cancel)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Changes Raft membership to match the rebuilt data copies, then commits the new copy set.
+    /// Confirms that decision before updating the local writer's fence and replica connections.
+    async fn adopt_replacement(
+        &self,
+        key: ReplicaKey,
+        replacement: ReplacementGrant,
+        state: &VolumeControlState,
+        expected_writer: Option<WriterGrant>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let descriptor = state
+            .descriptor()
+            .context("replacement grant is not initialized")?;
+        let data = state.data().context("replacement grant has no data")?;
         let voters = cancellable(
             cancel,
             self.reconcile_replacement_membership(
@@ -877,7 +912,7 @@ impl ReplicatedVolumeRuntime {
         if voters != expected_voters {
             anyhow::bail!("replacement final voters differ from the rebuilt data-copy set");
         }
-        state = self
+        let state = self
             .read_replacement_grant_state(key, replacement.id)
             .await?;
         let response = self

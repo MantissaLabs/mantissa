@@ -1,11 +1,11 @@
 //! Replica and mounted-filesystem capacity inspection and expansion.
 
 use super::{
-    Context, DriverAttachment, LocalAttachmentRecord, LocalReplicaStatus, MappedVolumeLayout,
+    Arc, Context, DriverAttachment, LocalAttachmentRecord, LocalReplicaStatus, MappedVolumeLayout,
     ReplicaCapacityStatus, ReplicaFile, ReplicaHealth, ReplicaKey, ReplicaRecord, ReplicaState,
-    ReplicatedDriverSettings, ReplicatedVolumeRuntime, Result, SavedMountState, VolumeCapacity,
-    VolumeControlState, VolumeDescriptor, WriterFilesystemSpace, all_copies_serve_capacity, info,
-    space, validate_saved_writer,
+    ReplicatedDriver, ReplicatedDriverSettings, ReplicatedVolumeRuntime, Result, SavedMountState,
+    VolumeCapacity, VolumeControlState, VolumeDescriptor, WriterFilesystemSpace,
+    all_copies_serve_capacity, info, space, validate_saved_writer,
 };
 
 impl ReplicatedVolumeRuntime {
@@ -297,7 +297,8 @@ impl ReplicatedVolumeRuntime {
         all_copies_serve_capacity(data.copies.len(), &statuses, target)
     }
 
-    /// Switches one attached writer to the locally applied replicated capacity.
+    /// Expands the writer's block device and filesystem to the capacity already applied locally.
+    /// Saves the new attachment capacity before removing old devices so restart can identify them.
     pub(super) async fn reconcile_attached_volume_capacity(
         &self,
         record: &ReplicaRecord,
@@ -328,100 +329,8 @@ impl ReplicatedVolumeRuntime {
 
         let active_capacity_bytes = owner.lock().await.device_capacity_bytes();
         if active_capacity_bytes == current.capacity().bytes() {
-            let needs_target_path = owner.lock().await.path_capacity() < target.capacity();
-            let expansion_settings = ReplicatedDriverSettings::new(
-                self.ublk_owner_id,
-                self.driver_limits.ublk_settings(&target)?,
-                self.stop_io_timeout,
-            );
-            {
-                let mut driver = owner.lock().await;
-                driver.start_expansion_device(expansion_settings)?;
-                driver.finish_expansion_device_start().await?;
-            }
-            let (current_ublk_device_path, expansion_ublk_device_path, expansion_device) = {
-                let driver = owner.lock().await;
-                (
-                    driver.ublk_device_path()?.to_path_buf(),
-                    driver.expansion_ublk_device_path()?.to_path_buf(),
-                    driver.saved_expansion_device()?,
-                )
-            };
-            self.replicas.save_ublk_device(key, expansion_device)?;
-            let current_layout =
-                MappedVolumeLayout::new(self.volume_node_id, &current, current_ublk_device_path)?;
-            let expanded_layout =
-                MappedVolumeLayout::new(self.volume_node_id, &target, expansion_ublk_device_path)?;
-
-            let mapped_volumes = self.mapped_volumes.clone();
-            let current_to_suspend = current_layout.clone();
-            let expanded_layout_for_suspend = expanded_layout.clone();
-            self.lifecycle_calls
-                .run(
-                    key,
-                    "mantissa-volume-suspend-mapping",
-                    self.operation_timeout,
-                    move || {
-                        mapped_volumes
-                            .suspend_for_expansion(
-                                &current_to_suspend,
-                                &expanded_layout_for_suspend,
-                            )
-                            .map(drop)
-                    },
-                )
-                .await
-                .context("suspend mapped volume before capacity expansion")?;
-
-            let pause = {
-                let driver = owner.lock().await;
-                if driver.attachment() != attachment {
-                    anyhow::bail!("attached volume expansion found another driver attachment");
-                }
-                driver.io_pause()?
-            };
-            pause.drain_and_flush().await?;
-
-            // The old path must be fully drained before its replacement is
-            // opened. A busy path normally has writes between its stored and
-            // durable counters, so preparing first would make online
-            // expansion wait forever for an accidental idle instant.
-            let target_path = if needs_target_path {
-                Some(self.prepare_driver_path(record, attachment, state).await?)
-            } else {
-                None
-            };
-            if let Some(path) = target_path {
-                let mut driver = owner.lock().await;
-                if driver.path_capacity() < target.capacity() {
-                    if !driver.can_install_path() {
-                        anyhow::bail!("writer data path is not held for capacity expansion");
-                    }
-                    driver.install_path(path, target.clone(), attachment);
-                }
-            }
-            owner.lock().await.arm_expansion_device()?;
-
-            // Device-mapper resume may issue filesystem I/O before its ioctl
-            // returns. Let those requests reach the already-installed path;
-            // the suspended mapping still prevents them from arriving early.
-            owner.lock().await.resume_io()?;
-
-            let mapped_volumes = self.mapped_volumes.clone();
-            self.lifecycle_calls
-                .run(
-                    key,
-                    "mantissa-volume-expand-mapping",
-                    self.operation_timeout,
-                    move || {
-                        mapped_volumes
-                            .activate_expanded_layout(&current_layout, &expanded_layout)
-                            .map(drop)
-                    },
-                )
-                .await
-                .context("activate expanded mapped volume")?;
-            owner.lock().await.activate_expansion_device()?;
+            self.expand_attached_device(record, saved, state, &owner, attachment)
+                .await?;
         } else if active_capacity_bytes != target.capacity().bytes() {
             anyhow::bail!(
                 "tracked writer device capacity {active_capacity_bytes} does not match the saved \
@@ -438,6 +347,152 @@ impl ReplicatedVolumeRuntime {
             }
         }
 
+        self.remove_retired_attachment_devices(key, target.capacity(), &owner)
+            .await?;
+        self.reconcile_mounted_filesystem_capacity(key, &target)
+            .await?;
+        info!(
+            target: "mantissa::volumes::replicated",
+            volume_id = %key.volume_id().as_uuid(),
+            generation = key.generation().get(),
+            capacity_bytes = target.capacity().bytes(),
+            "expanded local replicated-volume attachment"
+        );
+        Ok(())
+    }
+
+    /// Starts and saves a larger ublk device before suspending the filesystem's mapping.
+    /// Saving both devices lets restart recovery determine whether expansion switched the mapping.
+    async fn prepare_expansion_mapping(
+        &self,
+        key: ReplicaKey,
+        current: &VolumeDescriptor,
+        target: &VolumeDescriptor,
+        owner: &Arc<tokio::sync::Mutex<ReplicatedDriver>>,
+    ) -> Result<(MappedVolumeLayout, MappedVolumeLayout)> {
+        let expansion_settings = ReplicatedDriverSettings::new(
+            self.ublk_owner_id,
+            self.driver_limits.ublk_settings(target)?,
+            self.stop_io_timeout,
+        );
+        {
+            let mut driver = owner.lock().await;
+            driver.start_expansion_device(expansion_settings)?;
+            driver.finish_expansion_device_start().await?;
+        }
+        let (current_ublk_device_path, expansion_ublk_device_path, expansion_device) = {
+            let driver = owner.lock().await;
+            (
+                driver.ublk_device_path()?.to_path_buf(),
+                driver.expansion_ublk_device_path()?.to_path_buf(),
+                driver.saved_expansion_device()?,
+            )
+        };
+        self.replicas.save_ublk_device(key, expansion_device)?;
+        let current_layout =
+            MappedVolumeLayout::new(self.volume_node_id, current, current_ublk_device_path)?;
+        let expanded_layout =
+            MappedVolumeLayout::new(self.volume_node_id, target, expansion_ublk_device_path)?;
+
+        let mapped_volumes = self.mapped_volumes.clone();
+        let current_to_suspend = current_layout.clone();
+        let expanded_layout_for_suspend = expanded_layout.clone();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-suspend-mapping",
+                self.operation_timeout,
+                move || {
+                    mapped_volumes
+                        .suspend_for_expansion(&current_to_suspend, &expanded_layout_for_suspend)
+                        .map(drop)
+                },
+            )
+            .await
+            .context("suspend mapped volume before capacity expansion")?;
+
+        Ok((current_layout, expanded_layout))
+    }
+
+    /// Pauses and flushes the writer, then switches device-mapper to the larger ublk device.
+    /// Installs replica connections for the new capacity before the mapping can deliver more I/O.
+    async fn expand_attached_device(
+        &self,
+        record: &ReplicaRecord,
+        saved: &LocalAttachmentRecord,
+        state: &VolumeControlState,
+        owner: &Arc<tokio::sync::Mutex<ReplicatedDriver>>,
+        attachment: DriverAttachment,
+    ) -> Result<()> {
+        let key = record.key();
+        let current = saved.descriptor();
+        let target = record.descriptor();
+        let needs_target_path = owner.lock().await.path_capacity() < target.capacity();
+        let (current_layout, expanded_layout) = self
+            .prepare_expansion_mapping(key, current, target, owner)
+            .await?;
+
+        let pause = {
+            let driver = owner.lock().await;
+            if driver.attachment() != attachment {
+                anyhow::bail!("attached volume expansion found another driver attachment");
+            }
+            driver.io_pause()?
+        };
+        pause.drain_and_flush().await?;
+
+        // Flush all pending writes before checking copies for the new
+        // connections. Otherwise normal workload writes can keep the stored
+        // and durable write numbers unequal, making preparation fail on
+        // every retry while the workload is busy.
+        let target_path = if needs_target_path {
+            Some(self.prepare_driver_path(record, attachment, state).await?)
+        } else {
+            None
+        };
+        if let Some(path) = target_path {
+            let mut driver = owner.lock().await;
+            if driver.path_capacity() < target.capacity() {
+                if !driver.can_install_path() {
+                    anyhow::bail!("writer data path is not held for capacity expansion");
+                }
+                driver.install_path(path, target.clone(), attachment);
+            }
+        }
+        owner.lock().await.arm_expansion_device()?;
+
+        // Resuming device-mapper may issue filesystem I/O before the resume
+        // call returns. Let the driver serve those requests now that its new
+        // replica connections are ready. The mapping is still suspended, so
+        // filesystem requests cannot arrive before the switch begins.
+        owner.lock().await.resume_io()?;
+
+        let mapped_volumes = self.mapped_volumes.clone();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-expand-mapping",
+                self.operation_timeout,
+                move || {
+                    mapped_volumes
+                        .activate_expanded_layout(&current_layout, &expanded_layout)
+                        .map(drop)
+                },
+            )
+            .await
+            .context("activate expanded mapped volume")?;
+        owner.lock().await.activate_expansion_device()?;
+        Ok(())
+    }
+
+    /// Stops obsolete writer connections and removes block devices smaller than the new capacity.
+    /// The caller must first save that capacity so restart can identify the obsolete devices.
+    async fn remove_retired_attachment_devices(
+        &self,
+        key: ReplicaKey,
+        target: VolumeCapacity,
+        owner: &Arc<tokio::sync::Mutex<ReplicatedDriver>>,
+    ) -> Result<()> {
         let old_devices = self
             .replicas
             .attachment(key)?
@@ -445,7 +500,7 @@ impl ReplicatedVolumeRuntime {
             .ublk_devices()
             .iter()
             .copied()
-            .filter(|device| device.capacity() < target.capacity())
+            .filter(|device| device.capacity() < target)
             .collect::<Vec<_>>();
         {
             let mut driver = owner.lock().await;
@@ -456,15 +511,6 @@ impl ReplicatedVolumeRuntime {
             self.remove_untracked_device(key, device).await?;
             self.replicas.clear_ublk_device(key, device)?;
         }
-        self.reconcile_mounted_filesystem_capacity(key, &target)
-            .await?;
-        info!(
-            target: "mantissa::volumes::replicated",
-            volume_id = %key.volume_id().as_uuid(),
-            generation = key.generation().get(),
-            capacity_bytes = target.capacity().bytes(),
-            "expanded local replicated-volume attachment"
-        );
         Ok(())
     }
 

@@ -255,7 +255,7 @@ impl VolumeRegistry {
     /// Checks the report's ID and rejects status for volumes marked as deleted.
     /// For replicated volumes, also checks the generation and Raft group against the
     /// saved spec and plan so an old report cannot describe a recreated volume.
-    /// Reports may arrive before the spec or plan; only known information is checked.
+    /// Reports may arrive before the spec or plan. Only known information is checked.
     fn validate_node_state(&self, value: &VolumeNodeStateValue) -> Result<()> {
         if value.id
             != compute_volume_node_state_id(value.volume_id, value.node_id, value.volume_epoch)

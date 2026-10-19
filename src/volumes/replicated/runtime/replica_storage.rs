@@ -4,9 +4,9 @@ use super::{
     AppliedVolumeStateRemovalError, Arc, BTreeSet, Context, EmptyNode, FenceAdmission,
     GroupActivation, LocalReplicaOrigin, LocalReplicaStatus, Membership, PathBuf, ReplacementId,
     ReplicaFile, ReplicaFileError, ReplicaHealth, ReplicaKey, ReplicaRecord, ReplicaState,
-    ReplicatedVolumeRuntime, Result, RuntimeError, StoredMembership, Uuid, VolumeDisposition, info,
-    prepare_empty_replica_file, read_connection_open, remove_replica_directory,
-    replacement_capacity_can_converge, replacement_voter_hint_is_valid,
+    ReplicatedVolumeRuntime, Result, RuntimeError, StoredMembership, Uuid, VolumeDescriptor,
+    VolumeDisposition, info, prepare_empty_replica_file, read_connection_open,
+    remove_replica_directory, replacement_capacity_can_converge, replacement_voter_hint_is_valid,
     validate_replacement_target_reset,
 };
 
@@ -252,7 +252,8 @@ impl ReplicatedVolumeRuntime {
         }
     }
 
-    /// Rebuilds an inactive replacement after its local Raft state authorizes file creation.
+    /// Prepares this node to receive replacement data without erasing an active copy.
+    /// Starts Raft first when needed so file creation waits for the applied replacement permission.
     pub(crate) async fn prepare_local_replacement_replica(
         &self,
         descriptor: mantissa_volume::VolumeDescriptor,
@@ -291,136 +292,169 @@ impl ReplicatedVolumeRuntime {
             return self.local_status(key).await;
         }
 
-        if voters.contains(&self.node_id)
-            && let Some(mut record) = existing
-        {
-            if !replacement_capacity_can_converge(record.descriptor(), &descriptor) {
-                anyhow::bail!("in-place replacement voter has a conflicting descriptor");
+        match existing {
+            Some(record) if voters.contains(&self.node_id) => {
+                self.prepare_replacement_voter(record, descriptor, replacement_id)
+                    .await
             }
-            if self.groups.catalog().group(&key)?.is_none() {
-                anyhow::bail!("in-place replacement voter has no saved Raft group");
+            Some(record) => {
+                self.prepare_excluded_replacement(record, descriptor, replacement_id, voters)
+                    .await
             }
-            if record.state() == ReplicaState::Preparing
-                || record.health() == ReplicaHealth::NeedsRecovery
-            {
-                self.prepare_inactive_replacement_file(&record, replacement_id)
+            None => {
+                self.prepare_replacement_raft_group(descriptor, replacement_id, voters)
                     .await?;
-                record = self
-                    .replicas
-                    .replica(key)?
-                    .context("prepared in-place replacement replica disappeared")?;
+                self.local_status(key).await
             }
-            if record.state() != ReplicaState::Ready || record.health() != ReplicaHealth::Healthy {
-                anyhow::bail!("in-place replacement voter has no usable ready replica");
-            }
-            if record.descriptor().capacity() < descriptor.capacity() {
-                self.apply_local_replica_capacity_locked(key, descriptor.capacity())
-                    .await?;
-                record = self
-                    .replicas
-                    .replica(key)?
-                    .context("expanded in-place replacement replica disappeared")?;
-            }
-            if record.descriptor() != &descriptor {
-                anyhow::bail!("in-place replacement voter did not reach current capacity");
-            }
-            if !self.data_connections.reopen(key) {
-                anyhow::bail!("old in-place replacement streams are still closing");
-            }
-            self.reconcile_replica_io_gate(&record).await?;
-            return self.local_status(key).await;
         }
-        if let Some(mut record) = existing {
-            // A node that returns after quorum removed it still owns its old
-            // bootstrap row. Wake its saved Raft endpoint first, but do not
-            // erase the file until caught-up applied state names this exact
-            // node and replacement grant while excluding it from data work.
-            if !replacement_capacity_can_converge(record.descriptor(), &descriptor) {
-                anyhow::bail!("excluded replacement target has a conflicting descriptor");
-            }
-            if self.groups.catalog().group(&key)?.is_none() {
-                anyhow::bail!("excluded replacement target has no saved Raft group");
-            }
-            self.close_replica_io(key).await?;
-            let group = self
-                .groups
-                .activate(&key)
-                .await
-                .context("activate excluded replacement Raft endpoint")?;
-            let applied = group.state();
-            drop(group);
-            if applied.descriptor() != Some(&descriptor)
-                || validate_replacement_target_reset(&applied, replacement_id, self.volume_node_id)
-                    .is_err()
-            {
-                return self.local_status(key).await;
-            }
+    }
 
-            self.close_replica_file(key)?;
-            let replacement_origin =
-                LocalReplicaOrigin::replacement(replacement_id, voters.clone())?;
-            if record.origin() != &replacement_origin
-                || record.state() == ReplicaState::Preparing
-                || record.health() == ReplicaHealth::NeedsRecovery
-            {
-                let replicas = self.replicas.clone();
-                let settings = self.replica_file_settings;
-                self.lifecycle_calls
-                    .run(
-                        key,
-                        "mantissa-volume-reuse-excluded-replica",
-                        self.operation_timeout,
-                        move || -> Result<()> {
-                            replicas.reserve_replica_capacity(key, descriptor.capacity())?;
-                            let record = replicas.begin_replica_replacement(
-                                key,
-                                descriptor,
-                                replacement_origin,
-                            )?;
-                            prepare_empty_replica_file(&replicas, &record, settings, false)
-                        },
-                    )
-                    .await
-                    .context("rebuild excluded replica as the current replacement")?;
-            } else {
-                if record.descriptor().capacity() < descriptor.capacity() {
-                    self.apply_local_replica_capacity_locked(key, descriptor.capacity())
-                        .await?;
-                    record = self
-                        .replicas
-                        .replica(key)?
-                        .context("expanded replacement replica disappeared")?;
-                }
-                let replicas = self.replicas.clone();
-                let settings = self.replica_file_settings;
-                self.lifecycle_calls
-                    .run(
-                        key,
-                        "mantissa-volume-verify-replacement-replica",
-                        self.operation_timeout,
-                        move || prepare_empty_replica_file(&replicas, &record, settings, false),
-                    )
-                    .await
-                    .context("verify existing replacement replica")?;
-            }
-            if !self.data_connections.reopen(key) {
-                anyhow::bail!("old excluded replacement streams are still closing");
-            }
-            let record = self
+    /// Prepares a replacement on a node that already belongs to the requested Raft membership.
+    /// Preserves healthy data, and rebuilds incomplete files only after applying Raft's permission.
+    async fn prepare_replacement_voter(
+        &self,
+        mut record: ReplicaRecord,
+        descriptor: VolumeDescriptor,
+        replacement_id: ReplacementId,
+    ) -> Result<LocalReplicaStatus> {
+        let key = record.key();
+        if !replacement_capacity_can_converge(record.descriptor(), &descriptor) {
+            anyhow::bail!("in-place replacement voter has a conflicting descriptor");
+        }
+        if self.groups.catalog().group(&key)?.is_none() {
+            anyhow::bail!("in-place replacement voter has no saved Raft group");
+        }
+        if record.state() == ReplicaState::Preparing
+            || record.health() == ReplicaHealth::NeedsRecovery
+        {
+            self.prepare_inactive_replacement_file(&record, replacement_id)
+                .await?;
+            record = self
                 .replicas
                 .replica(key)?
-                .context("rebuilt replacement replica disappeared before admission")?;
-            self.reconcile_replica_io_gate(&record).await?;
-            return self.local_status(key).await;
+                .context("prepared in-place replacement replica disappeared")?;
         }
-
-        self.prepare_replacement_raft_group(descriptor, replacement_id, voters)
-            .await?;
+        if record.state() != ReplicaState::Ready || record.health() != ReplicaHealth::Healthy {
+            anyhow::bail!("in-place replacement voter has no usable ready replica");
+        }
+        if record.descriptor().capacity() < descriptor.capacity() {
+            self.apply_local_replica_capacity_locked(key, descriptor.capacity())
+                .await?;
+            record = self
+                .replicas
+                .replica(key)?
+                .context("expanded in-place replacement replica disappeared")?;
+        }
+        if record.descriptor() != &descriptor {
+            anyhow::bail!("in-place replacement voter did not reach current capacity");
+        }
+        if !self.data_connections.reopen(key) {
+            anyhow::bail!("old in-place replacement streams are still closing");
+        }
+        self.reconcile_replica_io_gate(&record).await?;
         self.local_status(key).await
     }
 
-    /// Starts Raft with an unready replica so missing voters can learn their
-    /// replacement grant before any empty data file becomes available.
+    /// Prepares a returning node whose old replica is outside the requested Raft membership.
+    /// Waits for local Raft state to authorize this replacement before erasing the old file.
+    async fn prepare_excluded_replacement(
+        &self,
+        record: ReplicaRecord,
+        descriptor: VolumeDescriptor,
+        replacement_id: ReplacementId,
+        voters: BTreeSet<Uuid>,
+    ) -> Result<LocalReplicaStatus> {
+        let key = record.key();
+        // A returning node may still have its original replica record even
+        // though quorum removed it. Start its saved Raft group to learn the
+        // replacement decision. Erase its file only once applied state names
+        // this node and replacement ID and excludes it from active data copies.
+        if !replacement_capacity_can_converge(record.descriptor(), &descriptor) {
+            anyhow::bail!("excluded replacement target has a conflicting descriptor");
+        }
+        if self.groups.catalog().group(&key)?.is_none() {
+            anyhow::bail!("excluded replacement target has no saved Raft group");
+        }
+        self.close_replica_io(key).await?;
+        let group = self
+            .groups
+            .activate(&key)
+            .await
+            .context("activate excluded replacement Raft endpoint")?;
+        let applied = group.state();
+        drop(group);
+        if applied.descriptor() != Some(&descriptor)
+            || validate_replacement_target_reset(&applied, replacement_id, self.volume_node_id)
+                .is_err()
+        {
+            return self.local_status(key).await;
+        }
+
+        self.close_replica_file(key)?;
+        let origin = LocalReplicaOrigin::replacement(replacement_id, voters)?;
+        self.prepare_excluded_replacement_file(record, descriptor, origin)
+            .await?;
+        if !self.data_connections.reopen(key) {
+            anyhow::bail!("old excluded replacement streams are still closing");
+        }
+        let record = self
+            .replicas
+            .replica(key)?
+            .context("rebuilt replacement replica disappeared before admission")?;
+        self.reconcile_replica_io_gate(&record).await?;
+        self.local_status(key).await
+    }
+
+    /// Creates an empty file for the replacement, or verifies a file prepared by an earlier retry.
+    /// The caller must first check that applied Raft state names this replacement
+    /// and excludes this node from active data copies, preventing loss of live data.
+    async fn prepare_excluded_replacement_file(
+        &self,
+        mut record: ReplicaRecord,
+        descriptor: VolumeDescriptor,
+        origin: LocalReplicaOrigin,
+    ) -> Result<()> {
+        let key = record.key();
+        let rebuild = record.origin() != &origin
+            || record.state() == ReplicaState::Preparing
+            || record.health() == ReplicaHealth::NeedsRecovery;
+        if !rebuild && record.descriptor().capacity() < descriptor.capacity() {
+            self.apply_local_replica_capacity_locked(key, descriptor.capacity())
+                .await?;
+            record = self
+                .replicas
+                .replica(key)?
+                .context("expanded replacement replica disappeared")?;
+        }
+
+        let operation = if rebuild {
+            "mantissa-volume-reuse-excluded-replica"
+        } else {
+            "mantissa-volume-verify-replacement-replica"
+        };
+        let replicas = self.replicas.clone();
+        let settings = self.replica_file_settings;
+        self.lifecycle_calls
+            .run(
+                key,
+                operation,
+                self.operation_timeout,
+                move || -> Result<()> {
+                    let record = if rebuild {
+                        replicas.reserve_replica_capacity(key, descriptor.capacity())?;
+                        replicas.begin_replica_replacement(key, descriptor, origin)?
+                    } else {
+                        record
+                    };
+                    prepare_empty_replica_file(&replicas, &record, settings, false)
+                },
+            )
+            .await
+            .context("prepare excluded replacement replica")
+    }
+
+    /// Starts the replacement's Raft group while keeping its replica marked Preparing.
+    /// The node must learn that its old data copy was excluded before creating an empty file.
     async fn prepare_replacement_raft_group(
         &self,
         descriptor: mantissa_volume::VolumeDescriptor,
@@ -433,9 +467,10 @@ impl ReplicatedVolumeRuntime {
         let max_saved_replicas = self.max_saved_replicas;
         let max_saved_groups = self.max_saved_groups;
         let saved_voters = voters;
-        // A returning voter can replay control state that still names it as a
-        // data copy. Keep the replica in Preparing until its applied replacement
-        // grant excludes it; an empty ready file could otherwise serve zeros.
+        // Raft may replay older entries that still name this node as a data
+        // copy. Keep its replica marked Preparing until it applies the current
+        // replacement decision. Otherwise an empty file could serve zeros as
+        // if it contained the volume's data.
         self.lifecycle_calls
             .run(
                 key,
@@ -512,7 +547,8 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Creates or resets voter data only under its exact applied inactive replacement grant.
+    /// Creates or resets the replacement file only after local Raft state authorizes this node.
+    /// Requires a matching replacement ID and exclusion from active copies before erasing data.
     async fn prepare_inactive_replacement_file(
         &self,
         record: &ReplicaRecord,

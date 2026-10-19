@@ -1,4 +1,9 @@
-//! Level-based reconciliation for replicated-volume desired and observed facts.
+//! Turns volume requests and replica health into Raft decisions and local storage work.
+//!
+//! Raft records which nodes hold data and which attachment may read and write it.
+//! Recovery synchronizes surviving copies before writer access can resume.
+//! Replacement rebuilds a copy before adding it to normal reads and writes.
+//! Public status reports describe this work but never authorize storage access.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -35,14 +40,15 @@ use crate::registry::Registry;
 use crate::topology::peers::PeerValue;
 use crate::volumes::registry::VolumeRegistry;
 use crate::volumes::types::{
-    ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan, SavedVolumeDescriptor, VolumeDriver,
-    VolumeEvent, VolumeNodeState, VolumeNodeStateValue, VolumeSpecValue, VolumeStatus,
-    compute_replicated_volume_group_id, compute_replicated_volume_node_score,
+    ReplicatedVolumeCapacityRequest, ReplicatedVolumeGroupStatusValue, ReplicatedVolumePlan,
+    SavedVolumeDescriptor, VolumeDriver, VolumeEvent, VolumeNodeState, VolumeNodeStateValue,
+    VolumeSpecValue, VolumeStatus, compute_replicated_volume_group_id,
+    compute_replicated_volume_node_score,
 };
 
 const RECONCILE_TICK_SECS: u64 = 2;
 
-/// Reconciles immutable plans, local replicas, and bounded Raft control state from current facts.
+/// Creates and repairs replicated volumes by comparing requests with saved Raft and replica state.
 #[derive(Clone)]
 pub struct ReplicatedVolumeController {
     registry: VolumeRegistry,
@@ -55,7 +61,8 @@ pub struct ReplicatedVolumeController {
     repair_failure_grace: Duration,
 }
 
-/// Keeps a new replacement attempt from inheriting the failure it was started to repair.
+/// Tracks how long a replica has been unavailable and which replacement was being attempted.
+/// A new replacement gets its own grace period instead of inheriting an earlier failure's age.
 struct ReplicaFailureObservation {
     since: Instant,
     replacement_id: Option<ReplacementId>,
@@ -64,13 +71,66 @@ struct ReplicaFailureObservation {
 type ReplicaFailureObservations =
     HashMap<(mantissa_volume::catalog::ReplicaKey, VolumeNodeId), ReplicaFailureObservation>;
 
-/// One shared cluster observation used by every volume in a level pass.
+/// Node addresses and health read once for all volumes in a reconciliation pass.
 struct OperationalInputs {
     peers: HashMap<Uuid, PeerValue>,
     health: HashMap<Uuid, HealthStatus>,
 }
 
-/// Distinguishes a safe bootstrap decision from an ordinary incomplete observation pass.
+/// A pending status report and the check needed to avoid publishing older Raft state.
+struct GroupStatusUpdate {
+    observation: ReplicatedVolumeGroupStatusValue,
+    advances_progress: bool,
+}
+
+impl GroupStatusUpdate {
+    /// Compares this report with the latest saved report before publication.
+    /// A progress update needs newer Raft state. A leader refresh needs the same revision
+    /// and applied log index, so it cannot overwrite progress seen in the saved report.
+    fn can_replace(&self, saved: Option<&ReplicatedVolumeGroupStatusValue>) -> bool {
+        let observation = &self.observation;
+        if self.advances_progress {
+            group_status_is_behind_local_state(
+                saved,
+                observation.volume_epoch,
+                observation.group_id,
+                observation.control_revision,
+                observation.committed_index,
+            )
+        } else {
+            saved.is_some_and(|saved| {
+                group_status_has_local_progress(
+                    saved,
+                    observation.volume_epoch,
+                    observation.group_id,
+                    observation.control_revision,
+                    observation.committed_index,
+                )
+            })
+        }
+    }
+}
+
+/// One repair selected from a single Raft state and health observation.
+/// Selection does no I/O. Execution checks the observed revision before committing the decision.
+enum ReplicaRepair {
+    CancelReplacement {
+        replacement_id: ReplacementId,
+        surviving_voters: BTreeSet<Uuid>,
+    },
+    Recover {
+        source_node_id: VolumeNodeId,
+        copy_node_ids: BTreeSet<VolumeNodeId>,
+    },
+    RemoveExtraVoters(BTreeSet<Uuid>),
+    Replace {
+        old_node_id: Option<VolumeNodeId>,
+        new_node_id: VolumeNodeId,
+        source_node_id: VolumeNodeId,
+    },
+}
+
+/// Whether initial volume creation is complete, safe to start, or waiting for peer checks.
 enum VolumeBootstrapCheck {
     Initialized,
     SafeToInitialize,
@@ -78,7 +138,7 @@ enum VolumeBootstrapCheck {
 }
 
 impl ReplicatedVolumeController {
-    /// Builds the node-local reconciler around a recovered storage runtime.
+    /// Connects the storage runtime to volume requests, peer health, and status publication.
     pub(crate) fn new(
         registry: VolumeRegistry,
         cluster_registry: Registry,
@@ -100,7 +160,8 @@ impl ReplicatedVolumeController {
         }
     }
 
-    /// Repeats full level reconciliation so missed notifications cannot stall progress.
+    /// Rechecks current volume requests after notifications and on a timer.
+    /// The timer lets unfinished work retry even when a notification was missed.
     pub async fn run(&self) {
         let mut tick = interval(Duration::from_secs(RECONCILE_TICK_SECS));
         loop {
@@ -118,7 +179,7 @@ impl ReplicatedVolumeController {
         }
     }
 
-    /// Reconciles every current replicated-volume generation from durable facts.
+    /// Publishes status and advances creation, repair, or cleanup for each volume generation.
     pub async fn reconcile(&self) -> Result<()> {
         if self.runtime.is_stopping() {
             return Ok(());
@@ -198,7 +259,8 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Removes locally stored replicated generations made obsolete by a newer desired row.
+    /// Removes local replicas when a newer requested generation proves they are obsolete.
+    /// A missing request alone is insufficient because request delivery may be delayed.
     async fn reconcile_superseded_generations(&self, specs: &[VolumeSpecValue]) -> Result<()> {
         let current_epochs = specs
             .iter()
@@ -234,7 +296,8 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Reconciles one volume generation, checking removal before bootstrap or repair.
+    /// Advances creation, repair, or deletion for this volume generation.
+    /// Finishes prior removal work before initial creation can reuse local replica records.
     async fn reconcile_volume(
         &self,
         spec: &VolumeSpecValue,
@@ -325,8 +388,8 @@ impl ReplicatedVolumeController {
         Ok(Some(local_status))
     }
 
-    /// Retires a former copy only after a quorum confirms that it is no longer needed.
-    /// Local and public observations can prompt this check but cannot authorize removal.
+    /// Removes a former replica only after quorum confirms its exclusion from data and voting.
+    /// Local state and public reports may suggest checking, but cannot authorize erasing the file.
     async fn retire_excluded_replica(
         &self,
         spec: &VolumeSpecValue,
@@ -368,8 +431,9 @@ impl ReplicatedVolumeController {
         Ok(true)
     }
 
-    /// Prepares planned copies before initialization and resumes interrupted group creation.
-    /// Returns false when bootstrap must wait for peer observations or prepared copies.
+    /// Prepares initial replica files and resumes Raft group creation after an interrupted start.
+    /// Leaves replicas created for replacement to their own recovery path.
+    /// Returns false while initial creation must wait for peer checks or prepared copies.
     async fn reconcile_bootstrap(
         &self,
         plan: &ReplicatedVolumePlan,
@@ -413,8 +477,8 @@ impl ReplicatedVolumeController {
         Ok(true)
     }
 
-    /// Publishes local health before Raft decisions so failures can trigger repair.
-    /// Nodes outside both the bootstrap plan and the local catalog have no replica to update.
+    /// Reports this replica's health, checks for Raft decisions, then updates local storage.
+    /// Publishing health first lets missing or damaged files trigger repair decisions.
     async fn reconcile_replica(
         &self,
         spec: &VolumeSpecValue,
@@ -442,8 +506,8 @@ impl ReplicatedVolumeController {
         self.reconcile_replica_resources(spec, descriptor).await
     }
 
-    /// Updates capacity and local resources from applied Raft decisions.
-    /// Refreshes state after capacity work and checks removal before allowing local access.
+    /// Applies capacity changes and starts authorized copying work from local Raft state.
+    /// Rereads state after expansion and checks whether the copy was removed before enabling I/O.
     async fn reconcile_replica_resources(
         &self,
         spec: &VolumeSpecValue,
@@ -484,7 +548,8 @@ impl ReplicatedVolumeController {
             .await
     }
 
-    /// Prepares local space and lets only the current leader commit a fully prepared target.
+    /// Prepares local storage for expansion and lets the Raft leader approve the larger capacity.
+    /// Approval waits until every active copy has reserved and prepared enough space.
     async fn reconcile_capacity(
         &self,
         spec: &VolumeSpecValue,
@@ -544,20 +609,39 @@ impl ReplicatedVolumeController {
             .context("leader volume state has no data controls")?
             .copies
             .clone();
+        if !self
+            .copies_are_ready_for_expansion(key, &copies, target)
+            .await
+        {
+            return Ok(());
+        }
+        self.commit_capacity_expansion(spec, request.as_ref(), &leader_state, target)
+            .await
+    }
+
+    /// Checks that every active copy has reserved and prepared the requested capacity.
+    /// A missing, unhealthy, or undersized copy prevents Raft from approving expansion.
+    async fn copies_are_ready_for_expansion(
+        &self,
+        key: ReplicaKey,
+        copies: &BTreeSet<VolumeNodeId>,
+        target: VolumeCapacity,
+    ) -> bool {
         let checks = copies.iter().copied().map(|copy| {
             self.runtime
                 .inspect_replica_capacity_on(*copy.as_uuid(), key, target)
         });
         let checked = join_all(checks).await;
-        let mut statuses = Vec::with_capacity(checked.len());
+        // Every requested copy has a result, including failures. Requiring
+        // each result to succeed prevents committing with only a ready quorum.
         for (copy, status) in copies.iter().zip(checked) {
             let Ok(status) = status else {
-                return Ok(());
+                return false;
             };
             if !replica_is_prepared_for_capacity(&status, target) {
                 debug!(
                     target: "mantissa::volumes::replicated",
-                    volume_id = %spec.id,
+                    volume_id = %key.volume_id().as_uuid(),
                     generation = key.generation().get(),
                     copy_node_id = %copy.as_uuid(),
                     reserved_capacity_bytes = status.reserved_capacity_bytes,
@@ -566,22 +650,33 @@ impl ReplicatedVolumeController {
                     reason = %status.reason,
                     "replicated-volume expansion is waiting for one local copy"
                 );
-                return Ok(());
+                return false;
             }
-            statuses.push(status);
         }
-        if !all_copies_are_prepared(copies.len(), &statuses, target) {
-            return Ok(());
-        }
+        true
+    }
 
+    /// Rechecks that the expansion request is unchanged after inspecting remote copies.
+    /// Proposes the larger capacity with the observed Raft revision to reject stale decisions.
+    async fn commit_capacity_expansion(
+        &self,
+        spec: &VolumeSpecValue,
+        request: Option<&ReplicatedVolumeCapacityRequest>,
+        leader_state: &VolumeControlState,
+        target: VolumeCapacity,
+    ) -> Result<()> {
+        let leader_descriptor = leader_state
+            .descriptor()
+            .context("leader volume state has no descriptor")?;
+        let key = ReplicaKey::from(leader_descriptor);
         let latest_request = self.registry.get_capacity_request(spec.id)?;
-        if latest_request.as_ref().map(|value| {
+        if latest_request.map(|value| {
             (
                 value.revision,
                 value.request_id,
                 value.target_capacity_bytes,
             )
-        }) != request.as_ref().map(|value| {
+        }) != request.map(|value| {
             (
                 value.revision,
                 value.request_id,
@@ -615,7 +710,8 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Converges terminal local resources without requiring surviving Raft peers.
+    /// Cleans up a deleted volume using its saved request and local records.
+    /// Other voters may already have removed their groups, so deletion cannot require their quorum.
     async fn reconcile_deleted_volume(&self, spec: &VolumeSpecValue) -> Result<()> {
         let capacity = spec
             .initial_capacity_bytes
@@ -634,7 +730,8 @@ impl ReplicatedVolumeController {
         self.registry.remove_deleted_volume_records(spec.id).await
     }
 
-    /// Returns whether local applied facts justify a linearizable removal check.
+    /// Checks whether local Raft state suggests this replica may have been replaced or excluded.
+    /// A true result requires a fresh quorum check before any local data can be removed.
     fn local_copy_may_be_removed(
         &self,
         local: &super::runtime::LocalReplicaStatus,
@@ -652,7 +749,8 @@ impl ReplicatedVolumeController {
             })
     }
 
-    /// Tries current leader hints until one returns linearizable removal facts.
+    /// Asks known voters and reported leaders for quorum-confirmed state before removing a replica.
+    /// Trying several nodes allows the check to succeed when a saved leader address is stale.
     async fn observe_quorum_state(
         &self,
         spec: &VolumeSpecValue,
@@ -713,7 +811,8 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Prepares the planned copies and lets the coordinator initialize Raft with a ready majority.
+    /// Prepares the initial copies on their planned nodes and starts their Raft group.
+    /// The workload node coordinates creation after it and at least one other copy are ready.
     async fn reconcile_bootstrap_replicas(
         &self,
         plan: &ReplicatedVolumePlan,
@@ -775,7 +874,8 @@ impl ReplicatedVolumeController {
         Ok(true)
     }
 
-    /// Allows pristine file creation only after a read-only quorum saw no control state.
+    /// Inspects planned replicas before allowing initial file creation.
+    /// Any initialized replica stops initial creation. Fewer than two replies leave it pending.
     async fn check_volume_bootstrap(
         &self,
         plan: &ReplicatedVolumePlan,
@@ -817,7 +917,8 @@ impl ReplicatedVolumeController {
         Ok(VolumeBootstrapCheck::SafeToInitialize)
     }
 
-    /// Returns whether current local facts justify waking Raft for a decision.
+    /// Checks whether requested changes, replica failures, or unfinished repair require Raft.
+    /// A healthy volume with matching state stays idle instead of starting Raft on every pass.
     fn control_state_needs_reconciliation(
         &self,
         spec: &VolumeSpecValue,
@@ -856,9 +957,9 @@ impl ReplicatedVolumeController {
             &operational.health,
             reported_replica_errors,
         )?;
-        // Every copy tracks the continuous health observation before Raft is
-        // woken. A leader change must not restart the safety delay and prevent
-        // a stable failure from ever converging.
+        // Each node tracks how long copies have been unavailable before waking
+        // Raft. A new leader can then continue the grace period instead of
+        // repeatedly delaying repair by starting the timer again.
         self.unavailable_after_grace(
             key,
             &observed_unavailable,
@@ -957,47 +1058,28 @@ impl ReplicatedVolumeController {
         if wanted == VolumeDisposition::Live
             && let Some(operational) = operational
         {
-            self.reconcile_operational_state(
-                spec,
-                key,
-                &state,
-                operational,
-                &reported_replica_errors,
-            )
-            .await?;
+            self.reconcile_replica_repair(spec, key, &state, operational, &reported_replica_errors)
+                .await?;
         }
         Ok(())
     }
 
-    /// Selects only the safety transition that current health and membership require.
-    async fn reconcile_operational_state(
+    /// Observes membership and continuous failures, then applies at most one repair.
+    /// Selection uses one state snapshot so each decision retains the revision that authorized it.
+    async fn reconcile_replica_repair(
         &self,
         spec: &VolumeSpecValue,
-        key: mantissa_volume::catalog::ReplicaKey,
-        state: &mantissa_volume::control_state::VolumeControlState,
+        key: ReplicaKey,
+        state: &VolumeControlState,
         operational: &OperationalInputs,
         reported_replica_errors: &BTreeSet<VolumeNodeId>,
     ) -> Result<()> {
-        let data = state
-            .data()
-            .context("initialized volume has no data control state")?;
-        let descriptor = state
-            .descriptor()
-            .context("initialized volume has no descriptor")?;
-        let health = &operational.health;
-        let peers = &operational.peers;
         let voters = self.runtime.membership(key).await?;
-        let bound = spec
-            .bound_node_id
-            .map(VolumeNodeId::new)
-            .transpose()?
-            .filter(|node_id| data.copies.contains(node_id));
-        let missing_voter = missing_copy_voter(data, &voters)?;
         let observed_unavailable = observed_unavailable_volume_nodes(
             state,
             &voters,
-            peers,
-            health,
+            &operational.peers,
+            &operational.health,
             reported_replica_errors,
         )?;
         let unavailable = self.unavailable_after_grace(
@@ -1006,78 +1088,83 @@ impl ReplicatedVolumeController {
             state.replacement(),
             Instant::now(),
         );
+        let Some(repair) = Self::select_replica_repair(
+            spec,
+            state,
+            &voters,
+            &unavailable,
+            operational,
+            reported_replica_errors,
+        )?
+        else {
+            return Ok(());
+        };
+
+        self.apply_replica_repair(key, state, repair).await
+    }
+
+    /// Chooses repair in priority order without changing membership or starting copying work.
+    /// Writer recovery comes before rebuilding a third copy. An active recovery or replacement
+    /// prevents competing work until it completes or a failure requires it to be replaced.
+    fn select_replica_repair(
+        spec: &VolumeSpecValue,
+        state: &VolumeControlState,
+        voters: &BTreeSet<Uuid>,
+        unavailable: &BTreeSet<VolumeNodeId>,
+        operational: &OperationalInputs,
+        reported_replica_errors: &BTreeSet<VolumeNodeId>,
+    ) -> Result<Option<ReplicaRepair>> {
+        let data = state
+            .data()
+            .context("initialized volume has no data control state")?;
+        let bound = spec
+            .bound_node_id
+            .map(VolumeNodeId::new)
+            .transpose()?
+            .filter(|node_id| data.copies.contains(node_id));
+        let is_available = |node_id| {
+            replica_copy_is_available(
+                node_id,
+                &operational.peers,
+                &operational.health,
+                reported_replica_errors,
+            )
+        };
         let unavailable_copies = data
             .copies
-            .intersection(&unavailable)
+            .intersection(unavailable)
             .copied()
             .collect::<BTreeSet<_>>();
         let writer_needs_recovery = data.recovery.is_none()
             && data
                 .writer
                 .is_some_and(|writer| bound.is_some_and(|bound| bound != writer.node_id));
+
         if let Some(replacement) = state.replacement() {
-            if unavailable.contains(&replacement.new_node_id)
+            return if unavailable.contains(&replacement.new_node_id)
                 || !unavailable_copies.is_empty()
                 || writer_needs_recovery
             {
-                let rollback_voters =
-                    replacement_rollback_voters(&data.copies, &unavailable_copies)?;
-                self.runtime
-                    .reconcile_replacement_membership(
-                        descriptor.clone(),
-                        replacement.id,
-                        ReplacementMembershipGoal::Absent { rollback_voters },
-                    )
-                    .await?;
-                require_command_applied(
-                    self.runtime
-                        .propose_as_leader_for_reconcile(
-                            key,
-                            VolumeCommand::CancelReplacement(CancelReplicaReplacement {
-                                expected: ExpectedVolumeRevision {
-                                    generation: descriptor.generation(),
-                                    revision: state.revision(),
-                                },
-                                replacement_id: replacement.id,
-                            }),
-                        )
-                        .await?,
-                )?;
-            }
-            return Ok(());
-        }
-        if writer_needs_recovery {
-            let writer = data
-                .writer
-                .context("writer recovery has no current writer")?;
-            let coordinator = bound
-                .filter(|node_id| {
-                    replica_copy_is_available(*node_id, peers, health, reported_replica_errors)
-                })
-                .context("writer takeover has no available bound copy")?;
-            let recovery = RecoveryGrant {
-                id: RecoveryId::new(Uuid::new_v4())?,
-                coordinator_node_id: coordinator,
-                source_node_id: coordinator,
-                target_node_ids: data.copies.clone(),
+                Ok(Some(ReplicaRepair::CancelReplacement {
+                    replacement_id: replacement.id,
+                    surviving_voters: replacement_rollback_voters(
+                        &data.copies,
+                        &unavailable_copies,
+                    )?,
+                }))
+            } else {
+                Ok(None)
             };
-            require_command_applied(
-                self.runtime
-                    .propose_as_leader_for_reconcile(
-                        key,
-                        VolumeCommand::BeginRecovery(BeginVolumeRecovery {
-                            expected: ExpectedVolumeRevision {
-                                generation: descriptor.generation(),
-                                revision: state.revision(),
-                            },
-                            expected_writer: Some(writer),
-                            replaced_recovery_id: None,
-                            recovery,
-                        }),
-                    )
-                    .await?,
-            )?;
-            return Ok(());
+        }
+
+        if writer_needs_recovery {
+            let source_node_id = bound
+                .filter(|node_id| is_available(*node_id))
+                .context("writer takeover has no available bound copy")?;
+            return Ok(Some(ReplicaRepair::Recover {
+                source_node_id,
+                copy_node_ids: data.copies.clone(),
+            }));
         }
         if !unavailable_copies.is_empty() {
             let survivors = data
@@ -1094,181 +1181,122 @@ impl ReplicatedVolumeController {
             {
                 anyhow::bail!("recovery survivors are not all current Raft voters");
             }
-            let coordinator = select_recovery_coordinator(
+            let source_node_id = select_recovery_coordinator(
                 &survivors,
                 bound,
                 data.writer.map(|writer| writer.node_id),
-                |node_id| {
-                    replica_copy_is_available(node_id, peers, health, reported_replica_errors)
-                },
+                is_available,
             )
             .context("no available surviving copy can coordinate recovery")?;
-            let recovery = RecoveryGrant {
-                id: RecoveryId::new(Uuid::new_v4())?,
-                coordinator_node_id: coordinator,
-                source_node_id: coordinator,
-                target_node_ids: survivors,
-            };
-            require_command_applied(
-                self.runtime
-                    .propose_as_leader_for_reconcile(
-                        key,
-                        VolumeCommand::BeginRecovery(BeginVolumeRecovery {
-                            expected: ExpectedVolumeRevision {
-                                generation: descriptor.generation(),
-                                revision: state.revision(),
-                            },
-                            expected_writer: data.writer,
-                            replaced_recovery_id: data.recovery.as_ref().map(|grant| grant.id),
-                            recovery,
-                        }),
-                    )
-                    .await?,
-            )?;
-            return Ok(());
+            return Ok(Some(ReplicaRepair::Recover {
+                source_node_id,
+                copy_node_ids: survivors,
+            }));
         }
-        if let Some(current) = data.recovery.as_ref()
-            && let Some(bound) = bound
-            && (current.coordinator_node_id != bound || current.source_node_id != bound)
-        {
-            if !replica_copy_is_available(bound, peers, health, reported_replica_errors) {
-                anyhow::bail!("the bound recovery coordinator is not currently available");
-            }
-            let recovery = RecoveryGrant {
-                id: RecoveryId::new(Uuid::new_v4())?,
-                coordinator_node_id: bound,
-                source_node_id: bound,
-                target_node_ids: data.copies.clone(),
+        if let Some(recovery) = data.recovery.as_ref() {
+            // Mounting requires recovery to finish on the node selected for
+            // the workload, using its local replica as the source. Restart
+            // recovery there if the workload moved while copying was in progress.
+            return if let Some(bound) = bound
+                && (recovery.coordinator_node_id != bound || recovery.source_node_id != bound)
+            {
+                if !is_available(bound) {
+                    anyhow::bail!("the bound recovery coordinator is not currently available");
+                }
+                Ok(Some(ReplicaRepair::Recover {
+                    source_node_id: bound,
+                    copy_node_ids: data.copies.clone(),
+                }))
+            } else {
+                Ok(None)
             };
-            require_command_applied(
-                self.runtime
-                    .propose_as_leader_for_reconcile(
-                        key,
-                        VolumeCommand::BeginRecovery(BeginVolumeRecovery {
-                            expected: ExpectedVolumeRevision {
-                                generation: descriptor.generation(),
-                                revision: state.revision(),
-                            },
-                            expected_writer: None,
-                            replaced_recovery_id: Some(current.id),
-                            recovery,
-                        }),
-                    )
-                    .await?,
-            )?;
-            return Ok(());
-        }
-        if data.recovery.is_some() {
-            return Ok(());
         }
 
-        // Retain revokes a replacement immediately and deliberately does not
-        // wait for its OpenRaft membership call. After restore, membership may
-        // therefore contain the rebuilt voter while control state still names the
-        // former three-copy set. Recover from the copies that are also current
-        // voters before authorizing any new writer. If all three copies remain
-        // voters, only an extra joint voter needs to be removed.
-        let copy_voters = active_copy_voters(&data.copies, &voters)?;
-        let copy_node_ids = data
-            .copies
-            .iter()
-            .map(|node_id| *node_id.as_uuid())
-            .collect::<BTreeSet<_>>();
-        if voters != copy_node_ids && data.copies.len() == 3 {
+        // Retaining a volume can cancel replacement while its Raft membership
+        // change is unfinished. Restore must first align voters and data copies
+        // before writer access or another replacement can be authorized.
+        let copy_voters = active_copy_voters(&data.copies, voters)?;
+        let copy_node_ids = data.copies.iter().map(|copy| *copy.as_uuid()).collect();
+        if voters != &copy_node_ids && data.copies.len() == 3 {
             if copy_voters.len() == 3 {
-                self.runtime
-                    .remove_extra_raft_voters(key, state.revision(), copy_node_ids)
-                    .await?;
-                return Ok(());
+                return Ok(Some(ReplicaRepair::RemoveExtraVoters(copy_node_ids)));
             }
-            let coordinator = select_recovery_coordinator(
+            let source_node_id = select_recovery_coordinator(
                 &copy_voters,
                 bound,
                 data.writer.map(|writer| writer.node_id),
-                |node_id| {
-                    replica_copy_is_available(node_id, peers, health, reported_replica_errors)
-                },
+                is_available,
             )
             .context("no available data voter can reconcile interrupted membership")?;
-            let recovery = RecoveryGrant {
-                id: RecoveryId::new(Uuid::new_v4())?,
-                coordinator_node_id: coordinator,
-                source_node_id: coordinator,
-                target_node_ids: copy_voters,
-            };
-            require_command_applied(
-                self.runtime
-                    .propose_as_leader_for_reconcile(
-                        key,
-                        VolumeCommand::BeginRecovery(BeginVolumeRecovery {
-                            expected: ExpectedVolumeRevision {
-                                generation: descriptor.generation(),
-                                revision: state.revision(),
-                            },
-                            expected_writer: data.writer,
-                            replaced_recovery_id: None,
-                            recovery,
-                        }),
-                    )
-                    .await?,
-            )?;
-            return Ok(());
+            return Ok(Some(ReplicaRepair::Recover {
+                source_node_id,
+                copy_node_ids: copy_voters,
+            }));
         }
 
+        Self::select_replica_replacement(
+            state,
+            bound,
+            voters,
+            unavailable,
+            operational,
+            is_available,
+        )
+    }
+
+    /// Chooses replacement nodes after recovery and membership checks have completed.
+    /// Rebuilds a reachable voter in place, or selects a new node with enough storage.
+    fn select_replica_replacement(
+        state: &VolumeControlState,
+        bound: Option<VolumeNodeId>,
+        voters: &BTreeSet<Uuid>,
+        unavailable: &BTreeSet<VolumeNodeId>,
+        operational: &OperationalInputs,
+        is_available: impl Fn(VolumeNodeId) -> bool,
+    ) -> Result<Option<ReplicaRepair>> {
+        let descriptor = state
+            .descriptor()
+            .context("initialized volume has no descriptor")?;
+        let data = state
+            .data()
+            .context("initialized volume has no data control state")?;
         let draining = data.copies.iter().copied().find(|node_id| {
-            peers
+            operational
+                .peers
                 .get(node_id.as_uuid())
                 .is_some_and(|peer| peer.scheduling.drain_requested)
         });
-        let (old_node_id, new_node_id) = if let Some(draining) = draining {
-            let replacement = Self::select_replacement_node(
-                descriptor.volume_id().as_uuid(),
-                descriptor.capacity().bytes(),
-                state.revision(),
-                &voters,
-                &data.copies,
-                peers,
-                health,
-            )?;
-            (Some(draining), replacement)
+        let missing_voter = missing_copy_voter(data, voters)?;
+        let (old_node_id, rebuild_node_id) = if let Some(draining) = draining {
+            (Some(draining), None)
         } else if let Some(missing) = missing_voter {
-            if replica_node_is_available(missing, peers, health) {
-                // A reachable voter with an unusable or stale data file can
-                // rebuild in place. It is already outside data control state, so
-                // replacement can reset and repair its file without needing
-                // a fourth storage node or changing membership.
-                (None, missing)
+            if replica_node_is_available(missing, &operational.peers, &operational.health) {
+                // This voter survived recovery but its data was excluded.
+                // Rebuild its file instead of requiring another storage node.
+                (None, Some(missing))
             } else if unavailable.contains(&missing) {
-                let replacement = Self::select_replacement_node(
-                    descriptor.volume_id().as_uuid(),
-                    descriptor.capacity().bytes(),
-                    state.revision(),
-                    &voters,
-                    &data.copies,
-                    peers,
-                    health,
-                )?;
-                (Some(missing), replacement)
+                (Some(missing), None)
             } else {
-                return Ok(());
+                return Ok(None);
             }
-        } else if degraded_group_needs_new_member(&data.copies, &voters) {
-            // Cancelling a failed target after it entered the voter set leaves
-            // the two active copies as the complete safe membership. Rebuild
-            // directly onto a fresh learner. There is no stale third voter to
-            // name as the old node in this state.
-            let replacement = Self::select_replacement_node(
+        } else if degraded_group_needs_new_member(&data.copies, voters) {
+            // The failed voter is already gone. Add the third copy without
+            // removing another voter from the surviving pair.
+            (None, None)
+        } else {
+            return Ok(None);
+        };
+        let new_node_id = match rebuild_node_id {
+            Some(node_id) => node_id,
+            None => Self::select_replacement_node(
                 descriptor.volume_id().as_uuid(),
                 descriptor.capacity().bytes(),
                 state.revision(),
-                &voters,
+                voters,
                 &data.copies,
-                peers,
-                health,
-            )?;
-            (None, replacement)
-        } else {
-            return Ok(());
+                &operational.peers,
+                &operational.health,
+            )?,
         };
         if data
             .writer
@@ -1276,39 +1304,104 @@ impl ReplicatedVolumeController {
         {
             anyhow::bail!("a draining writer must move before its replica can be replaced");
         }
-        let coordinator = select_replacement_source(
+        let source_node_id = select_replacement_source(
             &data.copies,
             old_node_id,
             data.writer.map(|writer| writer.node_id),
             bound,
-            |node_id| replica_copy_is_available(node_id, peers, health, reported_replica_errors),
+            is_available,
         )
         .context("replacement has no active source copy")?;
-        let replacement = ReplacementGrant {
-            id: ReplacementId::new(Uuid::new_v4())?,
-            coordinator_node_id: coordinator,
+        Ok(Some(ReplicaRepair::Replace {
             old_node_id,
             new_node_id,
-            source_node_id: coordinator,
+            source_node_id,
+        }))
+    }
+
+    /// Applies the selected repair with the Raft revision, writer, and recovery it was based on.
+    /// Membership rollback completes before replacement cancellation. New recovery authorization
+    /// revokes writer access so copying cannot race with foreground writes.
+    async fn apply_replica_repair(
+        &self,
+        key: ReplicaKey,
+        state: &VolumeControlState,
+        repair: ReplicaRepair,
+    ) -> Result<()> {
+        let descriptor = state
+            .descriptor()
+            .context("initialized volume has no descriptor")?;
+        let data = state
+            .data()
+            .context("initialized volume has no data control state")?;
+        let expected = ExpectedVolumeRevision {
+            generation: descriptor.generation(),
+            revision: state.revision(),
+        };
+        let command = match repair {
+            ReplicaRepair::CancelReplacement {
+                replacement_id,
+                surviving_voters,
+            } => {
+                self.runtime
+                    .reconcile_replacement_membership(
+                        descriptor.clone(),
+                        replacement_id,
+                        ReplacementMembershipGoal::Absent {
+                            rollback_voters: surviving_voters,
+                        },
+                    )
+                    .await?;
+                VolumeCommand::CancelReplacement(CancelReplicaReplacement {
+                    expected,
+                    replacement_id,
+                })
+            }
+            ReplicaRepair::Recover {
+                source_node_id,
+                copy_node_ids,
+            } => VolumeCommand::BeginRecovery(BeginVolumeRecovery {
+                expected,
+                expected_writer: data.writer,
+                replaced_recovery_id: data.recovery.as_ref().map(|recovery| recovery.id),
+                recovery: RecoveryGrant {
+                    id: RecoveryId::new(Uuid::new_v4())?,
+                    coordinator_node_id: source_node_id,
+                    source_node_id,
+                    target_node_ids: copy_node_ids,
+                },
+            }),
+            ReplicaRepair::RemoveExtraVoters(voters) => {
+                return self
+                    .runtime
+                    .remove_extra_raft_voters(key, state.revision(), voters)
+                    .await
+                    .map(drop);
+            }
+            ReplicaRepair::Replace {
+                old_node_id,
+                new_node_id,
+                source_node_id,
+            } => VolumeCommand::BeginReplacement(BeginReplicaReplacement {
+                expected,
+                replacement: ReplacementGrant {
+                    id: ReplacementId::new(Uuid::new_v4())?,
+                    coordinator_node_id: source_node_id,
+                    old_node_id,
+                    new_node_id,
+                    source_node_id,
+                },
+            }),
         };
         require_command_applied(
             self.runtime
-                .propose_as_leader_for_reconcile(
-                    key,
-                    VolumeCommand::BeginReplacement(BeginReplicaReplacement {
-                        expected: ExpectedVolumeRevision {
-                            generation: descriptor.generation(),
-                            revision: state.revision(),
-                        },
-                        replacement,
-                    }),
-                )
+                .propose_as_leader_for_reconcile(key, command)
                 .await?,
         )?;
         Ok(())
     }
 
-    /// Loads the latest selected peer rows once for one operational decision.
+    /// Reads node addresses and storage advertisements once for the current reconciliation pass.
     fn storage_peers(&self) -> Result<HashMap<Uuid, PeerValue>> {
         Ok(self
             .cluster_registry
@@ -1317,7 +1410,8 @@ impl ReplicatedVolumeController {
             .collect())
     }
 
-    /// Confirms continuously unavailable copies only after the configured grace.
+    /// Returns failures that have remained continuously visible for the configured grace period.
+    /// Brief connection or health failures must not immediately change replica membership.
     fn unavailable_after_grace(
         &self,
         key: mantissa_volume::catalog::ReplicaKey,
@@ -1336,7 +1430,8 @@ impl ReplicatedVolumeController {
         )
     }
 
-    /// Chooses one rotating healthy capacity-qualified node outside membership.
+    /// Selects a healthy node with enough storage outside the current voters and data copies.
+    /// Ranks nodes by placement score and rotates candidates after repeated failed attempts.
     fn select_replacement_node(
         volume_id: &Uuid,
         capacity: u64,
@@ -1371,7 +1466,8 @@ impl ReplicatedVolumeController {
         .map_err(Into::into)
     }
 
-    /// Reads file failures for only the bounded current control state and membership candidates.
+    /// Reads reported replica errors only for this volume's voters, copies, and replacement target.
+    /// Avoids scanning unrelated nodes while deciding which copies are usable for repair.
     fn reported_replica_errors(
         &self,
         spec: &VolumeSpecValue,
@@ -1500,7 +1596,8 @@ impl ReplicatedVolumeController {
         Ok(())
     }
 
-    /// Repairs public group status from local committed state independently of lifecycle work.
+    /// Publishes the volume's Raft state for API responses and peer controllers.
+    /// Runs separately from device and copying work so their failures cannot hide Raft changes.
     async fn reconcile_group_status(&self, spec: &VolumeSpecValue) -> Result<()> {
         if spec.is_delete_marker() {
             return Ok(());
@@ -1508,115 +1605,142 @@ impl ReplicatedVolumeController {
         let Some(plan) = self.registry.get_plan(spec.id)? else {
             return Ok(());
         };
+
         let capacity = spec
             .initial_capacity_bytes
             .context("replicated desired generation has no capacity")?;
-        let desired_descriptor =
-            SavedVolumeDescriptor::for_volume(spec.id, spec.volume_epoch, capacity)?
-                .to_storage()?;
-        self.validate_bootstrap_plan(spec, &plan, &desired_descriptor)?;
-        let descriptor = plan.descriptor.to_storage()?;
-        let key = mantissa_volume::catalog::ReplicaKey::from(&descriptor);
+        let descriptor = SavedVolumeDescriptor::for_volume(spec.id, spec.volume_epoch, capacity)?
+            .to_storage()?;
+        self.validate_bootstrap_plan(spec, &plan, &descriptor)?;
+
+        let Some(update) = self
+            .observe_group_status(spec, &plan, ReplicaKey::from(&descriptor))
+            .await?
+        else {
+            return Ok(());
+        };
+        self.publish_group_status(spec, &plan, update).await
+    }
+
+    /// Builds a report when local Raft state is newer than the saved public status.
+    /// At the same revision and log index, an already-running leader may refresh its details.
+    /// Reading status must not start an idle Raft group just to obtain leader information.
+    async fn observe_group_status(
+        &self,
+        spec: &VolumeSpecValue,
+        plan: &ReplicatedVolumePlan,
+        key: ReplicaKey,
+    ) -> Result<Option<GroupStatusUpdate>> {
         let group_id = compute_replicated_volume_group_id(
             plan.descriptor.volume_id,
             plan.descriptor.generation,
         );
         let local = self.runtime.local_status(key).await?;
         let Some(local_control_state) = self.runtime.applied_state(key)? else {
-            return Ok(());
+            return Ok(None);
         };
         if local_control_state.descriptor().is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let Some(local_applied_log_index) = local.applied_log_index else {
-            return Ok(());
+            return Ok(None);
         };
         let public_status = self.registry.get_group_status(spec.id)?;
-        let public_status_is_behind = group_status_is_behind_local_state(
+        let advances_progress = group_status_is_behind_local_state(
             public_status.as_ref(),
             spec.volume_epoch,
             group_id,
             local_control_state.revision(),
             local_applied_log_index,
         );
-        let (control_state, committed_index, leader_node_id, voter_node_ids) =
-            if public_status_is_behind {
-                let leader_node_id = local
+        let observation = if advances_progress {
+            if local.voter_node_ids.is_empty() {
+                return Ok(None);
+            }
+            group_observation_from_local_state(
+                spec,
+                plan,
+                self.runtime.node_id(),
+                local_control_state,
+                local_applied_log_index,
+                local
                     .leader_node_id
-                    .filter(|leader| local.voter_node_ids.contains(leader));
-                (
-                    local_control_state,
-                    local_applied_log_index,
-                    leader_node_id,
-                    local.voter_node_ids,
-                )
-            } else {
-                if !public_status.as_ref().is_some_and(|status| {
-                    group_status_has_local_progress(
-                        status,
-                        spec.volume_epoch,
-                        group_id,
-                        local_control_state.revision(),
-                        local_applied_log_index,
-                    )
-                }) {
-                    return Ok(());
-                }
-                let Some(current) = self
-                    .runtime
-                    .poll_running_local_leader_observation(key)
-                    .await?
-                else {
-                    return Ok(());
-                };
-                let local = self.runtime.local_status(key).await?;
-                let Some(committed_index) = local.applied_log_index else {
-                    return Ok(());
-                };
-                (
-                    current.control_state,
-                    committed_index,
-                    local.leader_node_id,
-                    current.membership.voters,
-                )
-            };
-        if voter_node_ids.is_empty() {
-            return Ok(());
-        }
-        let observation = group_observation_from_local_state(
-            spec,
-            &plan,
-            self.runtime.node_id(),
-            control_state,
-            committed_index,
-            leader_node_id,
-            voter_node_ids,
-        );
-        let saved_group_status = self.registry.get_group_status(spec.id)?;
-        if public_status_is_behind
-            && !group_status_is_behind_local_state(
-                saved_group_status.as_ref(),
-                spec.volume_epoch,
-                group_id,
-                observation.control_revision,
-                observation.committed_index,
+                    .filter(|leader| local.voter_node_ids.contains(leader)),
+                local.voter_node_ids,
             )
-        {
-            return Ok(());
-        }
-        if !public_status_is_behind
-            && !saved_group_status.as_ref().is_some_and(|status| {
+        } else {
+            if !public_status.as_ref().is_some_and(|status| {
                 group_status_has_local_progress(
                     status,
                     spec.volume_epoch,
                     group_id,
-                    observation.control_revision,
-                    observation.committed_index,
+                    local_control_state.revision(),
+                    local_applied_log_index,
                 )
-            })
-        {
+            }) {
+                return Ok(None);
+            }
+            let Some(observation) = self.observe_running_leader_status(spec, plan, key).await?
+            else {
+                return Ok(None);
+            };
+            observation
+        };
+
+        Ok(Some(GroupStatusUpdate {
+            observation,
+            advances_progress,
+        }))
+    }
+
+    /// Builds a report from this node only if its Raft group is already running as leader.
+    /// Returns no report for an idle group rather than starting it for status publication.
+    async fn observe_running_leader_status(
+        &self,
+        spec: &VolumeSpecValue,
+        plan: &ReplicatedVolumePlan,
+        key: ReplicaKey,
+    ) -> Result<Option<ReplicatedVolumeGroupStatusValue>> {
+        let Some(current) = self
+            .runtime
+            .poll_running_local_leader_observation(key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let local = self.runtime.local_status(key).await?;
+        let Some(committed_index) = local.applied_log_index else {
+            return Ok(None);
+        };
+        if current.membership.voters.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(group_observation_from_local_state(
+            spec,
+            plan,
+            self.runtime.node_id(),
+            current.control_state,
+            committed_index,
+            local.leader_node_id,
+            current.membership.voters,
+        )))
+    }
+
+    /// Rereads saved status to check for newer Raft progress before publishing this report.
+    /// Saves changed reports locally before attempting gossip, which may be retried by sync.
+    async fn publish_group_status(
+        &self,
+        spec: &VolumeSpecValue,
+        plan: &ReplicatedVolumePlan,
+        update: GroupStatusUpdate,
+    ) -> Result<()> {
+        let saved_group_status = self.registry.get_group_status(spec.id)?;
+        if !update.can_replace(saved_group_status.as_ref()) {
             return Ok(());
         }
+
+        let observation = update.observation;
         if saved_group_status
             .as_ref()
             .is_some_and(|saved| same_group_observation(saved, &observation))
@@ -1627,31 +1751,11 @@ impl ReplicatedVolumeController {
         self.registry
             .upsert_group_status(observation.clone())
             .await?;
-        if let Some(leader_node_id) = observation.leader_node_id
-            && previous_leader_node_id != Some(leader_node_id)
-        {
-            match previous_leader_node_id {
-                Some(previous_leader_node_id) => info!(
-                    target: "mantissa::volumes::raft",
-                    volume_id = %spec.id,
-                    generation = plan.descriptor.generation,
-                    raft_group_id = %group_id,
-                    previous_leader_node_id = %previous_leader_node_id,
-                    leader_node_id = %leader_node_id,
-                    committed_log_index = observation.committed_index,
-                    "volume Raft leader changed"
-                ),
-                None => info!(
-                    target: "mantissa::volumes::raft",
-                    volume_id = %spec.id,
-                    generation = plan.descriptor.generation,
-                    raft_group_id = %group_id,
-                    leader_node_id = %leader_node_id,
-                    committed_log_index = observation.committed_index,
-                    "volume Raft leader elected"
-                ),
-            }
-        }
+        log_group_leader_change(
+            previous_leader_node_id,
+            &observation,
+            plan.descriptor.generation,
+        );
         if let Err(error) = try_enqueue_volume_gossip(
             &self.gossip_tx,
             VolumeEvent::GroupStatusUpsert(Box::new(observation)),
@@ -1679,7 +1783,41 @@ fn try_enqueue_volume_gossip(
         .map_err(|error| anyhow::anyhow!("enqueue replicated-volume gossip: {error}"))
 }
 
-/// Builds one advisory CRDT row from state already committed on this replica.
+/// Records leader elections and changes after saving the status that makes them visible to peers.
+fn log_group_leader_change(
+    previous_leader_node_id: Option<Uuid>,
+    observation: &ReplicatedVolumeGroupStatusValue,
+    generation: u64,
+) {
+    if let Some(leader_node_id) = observation.leader_node_id
+        && previous_leader_node_id != Some(leader_node_id)
+    {
+        match previous_leader_node_id {
+            Some(previous_leader_node_id) => info!(
+                target: "mantissa::volumes::raft",
+                volume_id = %observation.volume_id,
+                generation = generation,
+                raft_group_id = %observation.group_id,
+                previous_leader_node_id = %previous_leader_node_id,
+                leader_node_id = %leader_node_id,
+                committed_log_index = observation.committed_index,
+                "volume Raft leader changed"
+            ),
+            None => info!(
+                target: "mantissa::volumes::raft",
+                volume_id = %observation.volume_id,
+                generation = generation,
+                raft_group_id = %observation.group_id,
+                leader_node_id = %leader_node_id,
+                committed_log_index = observation.committed_index,
+                "volume Raft leader elected"
+            ),
+        }
+    }
+}
+
+/// Builds public status from Raft state already applied on this node.
+/// This report describes membership and writer access but never authorizes I/O itself.
 fn group_observation_from_local_state(
     spec: &VolumeSpecValue,
     plan: &ReplicatedVolumePlan,
@@ -1746,18 +1884,6 @@ fn replica_is_prepared_for_capacity(
     status.healthy
         && status.reserved_capacity_bytes >= target.bytes()
         && status.prepared_capacity_bytes >= target.bytes()
-}
-
-/// Requires one qualifying response for every active copy, not merely a Raft quorum.
-fn all_copies_are_prepared(
-    active_copy_count: usize,
-    statuses: &[ReplicaCapacityStatus],
-    target: VolumeCapacity,
-) -> bool {
-    statuses.len() == active_copy_count
-        && statuses
-            .iter()
-            .all(|status| replica_is_prepared_for_capacity(status, target))
 }
 
 /// Derives the exact nonterminal replicated generations admitted by one desired snapshot.
@@ -1931,7 +2057,8 @@ fn unapplied_replica_needs_removal_check(
             .is_some_and(|status| group_status_suggests_local_removal_check(status, local_node_id))
 }
 
-/// Keeps immutable genesis realization from taking over replacement-owned rows.
+/// Allows initial creation only for replicas recorded as part of the original plan.
+/// Replacement replicas must keep their separate authorization and recovery checks.
 fn local_origin_allows_bootstrap(origin: &LocalReplicaOrigin) -> bool {
     matches!(origin, LocalReplicaOrigin::Bootstrap(_))
 }
@@ -1950,7 +2077,8 @@ fn require_command_applied(response: VolumeCommandResponse) -> Result<u64> {
     }
 }
 
-/// Returns whether a current copy can remain in a safety-selected survivor set.
+/// Checks whether the node still advertises an active storage service and is not reported down.
+/// Used when selecting surviving copies for recovery or replacement.
 fn replica_node_is_available(
     node_id: VolumeNodeId,
     peers: &HashMap<Uuid, PeerValue>,
@@ -2026,7 +2154,8 @@ fn observed_unavailable_volume_nodes(
     Ok(unavailable)
 }
 
-/// Selects one available recovery source without requiring attachment demand.
+/// Chooses an available recovery source, preferring the workload node, then the current writer.
+/// Falls back to another survivor so volumes can recover even with no workload assigned.
 fn select_recovery_coordinator(
     survivors: &BTreeSet<VolumeNodeId>,
     bound: Option<VolumeNodeId>,
@@ -2044,7 +2173,8 @@ fn select_recovery_coordinator(
         })
 }
 
-/// Selects the current writer or the recovered bound copy as a replacement source.
+/// Chooses an available source for replacement, preferring the writer, then the workload node.
+/// Falls back to another active copy and always excludes the node being removed.
 fn select_replacement_source(
     copies: &BTreeSet<VolumeNodeId>,
     old_node_id: Option<VolumeNodeId>,
@@ -2065,7 +2195,8 @@ fn select_replacement_source(
         })
 }
 
-/// Detects a safe two-copy membership that needs a new third learner.
+/// Checks for two active data copies that are also the only Raft voters.
+/// This group needs a third copy added, with no existing voter left to remove.
 fn degraded_group_needs_new_member(
     copies: &BTreeSet<VolumeNodeId>,
     voters: &BTreeSet<Uuid>,
@@ -2075,7 +2206,8 @@ fn degraded_group_needs_new_member(
         && copies.iter().all(|copy| voters.contains(copy.as_uuid()))
 }
 
-/// Returns data copies represented by current voters and requires a safe quorum overlap.
+/// Selects active copies that still vote in Raft after an interrupted membership change.
+/// Requires at least two so recovery retains a majority of the original three data copies.
 fn active_copy_voters(
     copies: &BTreeSet<VolumeNodeId>,
     voters: &BTreeSet<Uuid>,
@@ -2230,8 +2362,13 @@ mod tests {
         DesiredVolumeDisposition, FilesystemOwnership, ReplicatedVolumeSpec, VolumeAccessMode,
         VolumeBindingMode, VolumeLifecycleIntent, VolumeReclaimPolicy, VolumeSpecDraft,
     };
-    use mantissa_volume::control_state::{AdoptReplicaReplacement, VolumeControlState};
-    use mantissa_volume::{VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId};
+    use mantissa_volume::control_state::{
+        AdoptReplicaReplacement, GrantVolumeWriter, RevokeVolumeRecovery, VolumeControlState,
+        WriterGrant,
+    };
+    use mantissa_volume::{
+        DriverSessionId, VolumeBlockSizes, VolumeDescriptor, VolumeGeneration, VolumeId,
+    };
 
     /// Builds one fixed replica key for transient observation tests.
     fn key(value: u128) -> mantissa_volume::catalog::ReplicaKey {
@@ -2241,9 +2378,10 @@ mod tests {
         )
     }
 
-    /// Raft expansion requires all active copies, not only a quorum, to be prepared.
+    /// Expansion requires reserved space, prepared file coverage, and a healthy replica.
+    /// The larger capacity need not be served until Raft approves it.
     #[test]
-    fn capacity_commit_requires_every_active_copy() {
+    fn capacity_preparation_requires_space_file_coverage_and_health() {
         let target = VolumeCapacity::new(128 << 20).expect("valid test capacity");
         let ready = ReplicaCapacityStatus {
             reserved_capacity_bytes: target.bytes(),
@@ -2252,31 +2390,19 @@ mod tests {
             healthy: true,
             reason: String::new(),
         };
-        assert!(!all_copies_are_prepared(
-            3,
-            &[ready.clone(), ready.clone()],
-            target
-        ));
-        assert!(all_copies_are_prepared(
-            3,
-            &[ready.clone(), ready.clone(), ready.clone()],
-            target
-        ));
+        assert!(replica_is_prepared_for_capacity(&ready, target));
+
+        let mut unreserved = ready.clone();
+        unreserved.reserved_capacity_bytes = 64 << 20;
+        assert!(!replica_is_prepared_for_capacity(&unreserved, target));
 
         let mut unprepared = ready.clone();
         unprepared.prepared_capacity_bytes = 64 << 20;
-        assert!(!all_copies_are_prepared(
-            3,
-            &[ready.clone(), ready.clone(), unprepared],
-            target
-        ));
-        let mut unhealthy = ready.clone();
+        assert!(!replica_is_prepared_for_capacity(&unprepared, target));
+
+        let mut unhealthy = ready;
         unhealthy.healthy = false;
-        assert!(!all_copies_are_prepared(
-            3,
-            &[ready.clone(), ready, unhealthy],
-            target
-        ));
+        assert!(!replica_is_prepared_for_capacity(&unhealthy, target));
     }
 
     /// Builds one initial local origin from immutable desired state.
@@ -2445,6 +2571,249 @@ mod tests {
                     .collect(),
             }))
             .state
+    }
+
+    /// Creates typed node IDs for the fixed membership used by repair decision tests.
+    fn volume_node(value: u128) -> VolumeNodeId {
+        VolumeNodeId::new(Uuid::from_u128(value)).expect("non-zero test node ID")
+    }
+
+    /// Supplies healthy storage nodes, including a fourth node that could receive a replacement.
+    /// Tests can then distinguish repairing existing copies from choosing a new placement.
+    fn repair_test_inputs() -> (VolumeSpecValue, OperationalInputs) {
+        let mut spec = VolumeSpecValue::new(VolumeSpecDraft {
+            name: "repair-decisions".to_string(),
+            driver: VolumeDriver::Replicated(ReplicatedVolumeSpec {
+                ownership: FilesystemOwnership::Daemon,
+                filesystem: crate::volumes::types::ReplicatedVolumeFilesystem::Ext4,
+            }),
+            access_mode: VolumeAccessMode::ReadWriteOnce,
+            binding_mode: VolumeBindingMode::WaitForFirstConsumer,
+            reclaim_policy: VolumeReclaimPolicy::Delete,
+            initial_capacity_bytes: Some(64 << 20),
+            labels: Vec::new(),
+            bound_node_id: Some(Uuid::from_u128(1)),
+            bound_node_name: Some("node-1".to_string()),
+        });
+        spec.id = Uuid::from_u128(10);
+
+        let peers = (1..=4)
+            .map(|id| {
+                let peer = PeerValue {
+                    address: "127.0.0.1:6578".to_string(),
+                    hostname: format!("node-{id}"),
+                    platform_os: "linux".to_string(),
+                    platform_arch: "x86_64".to_string(),
+                    noise_static_pub: [0; 32],
+                    signing_pub: [0; 32],
+                    identity_sig: Vec::new(),
+                    wireguard: None,
+                    scheduling: Default::default(),
+                    readiness: Default::default(),
+                    labels: Default::default(),
+                    runtime_support: Default::default(),
+                    replicated_volumes: super::super::ReplicatedVolumeSupport {
+                        address: "127.0.0.1:7578".to_string(),
+                        format_version: super::super::REPLICATED_VOLUME_FORMAT_VERSION,
+                        accepts_replicas: true,
+                        available_bytes: 1 << 30,
+                        updated_at_unix_ms: 1,
+                        publication_generation: 1,
+                    },
+                    root_schema: Default::default(),
+                    membership: Default::default(),
+                };
+                (Uuid::from_u128(id), peer)
+            })
+            .collect();
+        let health = (1..=4)
+            .map(|id| (Uuid::from_u128(id), HealthStatus::Alive))
+            .collect();
+
+        (spec, OperationalInputs { peers, health })
+    }
+
+    /// Applies a fixture command and fails immediately if its setup state was not accepted.
+    fn apply_control_command(
+        state: &VolumeControlState,
+        command: VolumeCommand,
+    ) -> VolumeControlState {
+        let plan = state.evaluate(&command);
+        assert!(matches!(
+            plan.response,
+            VolumeCommandResponse::Applied { .. }
+        ));
+        plan.state
+    }
+
+    /// Selects repair with no confirmed failures to isolate placement and membership decisions.
+    fn select_repair(
+        spec: &VolumeSpecValue,
+        state: &VolumeControlState,
+        operational: &OperationalInputs,
+        voters: &[u128],
+    ) -> Option<ReplicaRepair> {
+        ReplicatedVolumeController::select_replica_repair(
+            spec,
+            state,
+            &voters.iter().copied().map(Uuid::from_u128).collect(),
+            &BTreeSet::new(),
+            operational,
+            &BTreeSet::new(),
+        )
+        .expect("valid repair observations")
+    }
+
+    /// Starts recovery from node one using an explicitly selected set of surviving copies.
+    fn recovering_control_state(copies: &[u128]) -> VolumeControlState {
+        let state = initialized_control_state();
+        apply_control_command(
+            &state,
+            VolumeCommand::BeginRecovery(BeginVolumeRecovery {
+                expected: ExpectedVolumeRevision {
+                    generation: VolumeGeneration::new(1).expect("test generation"),
+                    revision: state.revision(),
+                },
+                expected_writer: None,
+                replaced_recovery_id: None,
+                recovery: RecoveryGrant {
+                    id: RecoveryId::new(Uuid::from_u128(20)).expect("test recovery ID"),
+                    coordinator_node_id: volume_node(1),
+                    source_node_id: volume_node(1),
+                    target_node_ids: copies.iter().copied().map(volume_node).collect(),
+                },
+            }),
+        )
+    }
+
+    /// A workload move must cancel an active replacement before revoking the current writer.
+    #[test]
+    fn repair_cancels_replacement_before_writer_takeover() {
+        let (mut spec, operational) = repair_test_inputs();
+        let state = initialized_control_state();
+        let state = apply_control_command(
+            &state,
+            VolumeCommand::GrantWriter(GrantVolumeWriter {
+                expected: ExpectedVolumeRevision {
+                    generation: VolumeGeneration::new(1).expect("test generation"),
+                    revision: state.revision(),
+                },
+                writer: WriterGrant {
+                    node_id: volume_node(1),
+                    session_id: DriverSessionId::new(Uuid::from_u128(21))
+                        .expect("test writer session"),
+                },
+            }),
+        );
+        let replacement_id = ReplacementId::new(Uuid::from_u128(22)).expect("test replacement ID");
+        let state = apply_control_command(
+            &state,
+            VolumeCommand::BeginReplacement(BeginReplicaReplacement {
+                expected: ExpectedVolumeRevision {
+                    generation: VolumeGeneration::new(1).expect("test generation"),
+                    revision: state.revision(),
+                },
+                replacement: ReplacementGrant {
+                    id: replacement_id,
+                    coordinator_node_id: volume_node(1),
+                    old_node_id: Some(volume_node(3)),
+                    new_node_id: volume_node(4),
+                    source_node_id: volume_node(1),
+                },
+            }),
+        );
+        assert!(select_repair(&spec, &state, &operational, &[1, 2, 3, 4]).is_none());
+
+        spec.bound_node_id = Some(Uuid::from_u128(2));
+        spec.bound_node_name = Some("node-2".to_string());
+        let repair = select_repair(&spec, &state, &operational, &[1, 2, 3, 4]);
+
+        assert!(matches!(repair, Some(ReplicaRepair::CancelReplacement {
+            replacement_id: selected,
+            surviving_voters,
+        }) if selected == replacement_id
+            && surviving_voters == [1, 2, 3].map(Uuid::from_u128).into_iter().collect()));
+    }
+
+    /// Recovery follows the workload's node and blocks replacement until copying has finished.
+    #[test]
+    fn repair_redirects_recovery_and_waits_for_completion() {
+        let (mut spec, mut operational) = repair_test_inputs();
+        let state = recovering_control_state(&[1, 2, 3]);
+        operational
+            .peers
+            .get_mut(&Uuid::from_u128(3))
+            .expect("third peer")
+            .scheduling
+            .drain_requested = true;
+
+        spec.bound_node_id = Some(Uuid::from_u128(2));
+        spec.bound_node_name = Some("node-2".to_string());
+        let repair = select_repair(&spec, &state, &operational, &[1, 2, 3]);
+
+        assert!(matches!(repair, Some(ReplicaRepair::Recover {
+            source_node_id,
+            copy_node_ids,
+        }) if source_node_id == volume_node(2)
+            && copy_node_ids == [1, 2, 3].map(volume_node).into_iter().collect()));
+
+        spec.bound_node_id = Some(Uuid::from_u128(1));
+        spec.bound_node_name = Some("node-1".to_string());
+        assert!(select_repair(&spec, &state, &operational, &[1, 2, 3]).is_none());
+    }
+
+    /// Interrupted membership changes require recovery of shared data voters or removal of extras.
+    #[test]
+    fn repair_aligns_data_copies_with_current_voters() {
+        let (spec, operational) = repair_test_inputs();
+        let state = initialized_control_state();
+        assert!(select_repair(&spec, &state, &operational, &[1, 2, 3]).is_none());
+
+        let repair = select_repair(&spec, &state, &operational, &[1, 2, 4]);
+
+        assert!(matches!(repair, Some(ReplicaRepair::Recover {
+            source_node_id,
+            copy_node_ids,
+        }) if source_node_id == volume_node(1)
+            && copy_node_ids == [1, 2].map(volume_node).into_iter().collect()));
+
+        let repair = select_repair(&spec, &state, &operational, &[1, 2, 3, 4]);
+
+        assert!(
+            matches!(repair, Some(ReplicaRepair::RemoveExtraVoters(voters))
+            if voters == [1, 2, 3].map(Uuid::from_u128).into_iter().collect())
+        );
+    }
+
+    /// A reachable voter whose data was excluded is rebuilt before choosing the fourth storage node.
+    #[test]
+    fn repair_rebuilds_reachable_excluded_voter() {
+        let (spec, operational) = repair_test_inputs();
+        let state = recovering_control_state(&[1, 2]);
+        let state = apply_control_command(
+            &state,
+            VolumeCommand::RevokeRecovery(RevokeVolumeRecovery {
+                expected: ExpectedVolumeRevision {
+                    generation: VolumeGeneration::new(1).expect("test generation"),
+                    revision: state.revision(),
+                },
+                recovery_id: state
+                    .data()
+                    .expect("recovery data")
+                    .recovery
+                    .as_ref()
+                    .expect("active recovery")
+                    .id,
+            }),
+        );
+
+        let repair = select_repair(&spec, &state, &operational, &[1, 2, 3]);
+
+        assert!(matches!(repair, Some(ReplicaRepair::Replace {
+            old_node_id: None,
+            new_node_id,
+            source_node_id,
+        }) if new_node_id == volume_node(3) && source_node_id == volume_node(1)));
     }
 
     /// Starts and adopts a replacement of node three by node four.
@@ -3054,6 +3423,44 @@ mod tests {
         assert!(same_group_observation(&previous, &current));
         current.committed_index += 1;
         assert!(!same_group_observation(&previous, &current));
+    }
+
+    /// Delayed local progress and leader refreshes must not replace reports from a later revision.
+    #[test]
+    fn group_status_update_rechecks_saved_progress() {
+        let mut observation = ReplicatedVolumeGroupStatusValue::new(
+            Uuid::from_u128(10),
+            0,
+            Uuid::from_u128(11),
+            Uuid::from_u128(1),
+            VolumeStatus::Ready,
+            12,
+        );
+        observation.control_revision = 3;
+        let update = GroupStatusUpdate {
+            observation: observation.clone(),
+            advances_progress: true,
+        };
+        let mut older = observation.clone();
+        older.control_revision = 2;
+        older.committed_index = 11;
+        let mut newer = observation.clone();
+        newer.control_revision = 4;
+        newer.committed_index = 13;
+
+        assert!(update.can_replace(None));
+        assert!(update.can_replace(Some(&older)));
+        assert!(!update.can_replace(Some(&observation)));
+        assert!(!update.can_replace(Some(&newer)));
+
+        let refresh = GroupStatusUpdate {
+            observation: observation.clone(),
+            advances_progress: false,
+        };
+        assert!(refresh.can_replace(Some(&observation)));
+        assert!(!refresh.can_replace(None));
+        assert!(!refresh.can_replace(Some(&older)));
+        assert!(!refresh.can_replace(Some(&newer)));
     }
 
     /// Public progress requires repair only until it reaches durable local progress.

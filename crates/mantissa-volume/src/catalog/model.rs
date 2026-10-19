@@ -856,10 +856,10 @@ pub enum PoolSpaceState {
     /// New replicas and recovery work may start.
     Ready,
 
-    /// New replicas stop; only work that fits the remaining space may start.
+    /// New replicas stop. Only work that fits the remaining space may start.
     NoNewReplicas,
 
-    /// No allocation may start; deletion remains allowed.
+    /// No allocation may start. Deletion remains allowed.
     DeleteOnly,
 }
 

@@ -114,31 +114,18 @@ impl VolumeController {
                 desired.capacity_bytes = spec.initial_capacity_bytes;
                 desired.used_bytes = Some(used_bytes);
 
-                let over_capacity = self
-                    .enforce_capacity_limits
-                    .then_some((used_bytes, spec.initial_capacity_bytes))
-                    .and_then(|(used_bytes, capacity)| {
-                        capacity.map(|capacity| (used_bytes, capacity))
-                    })
-                    .filter(|(used_bytes, capacity)| used_bytes > capacity);
-
-                if let Some((used_bytes, capacity)) = over_capacity {
-                    let message = capacity_exceeded_message(&spec.name, used_bytes, capacity);
-                    desired.state = VolumeNodeState::Error;
-                    desired.last_error = Some(message.clone());
-                    desired.updated_at = Utc::now().to_rfc3339();
-                    self.upsert_node_state_if_changed(&desired, &current)
-                        .await?;
-
-                    return Ok(());
-                }
-
-                desired.state = if desired.published_task_ids.is_empty() {
+                let capacity_error = spec
+                    .initial_capacity_bytes
+                    .filter(|capacity| self.enforce_capacity_limits && used_bytes > *capacity)
+                    .map(|capacity| capacity_exceeded_message(&spec.name, used_bytes, capacity));
+                desired.state = if capacity_error.is_some() {
+                    VolumeNodeState::Error
+                } else if desired.published_task_ids.is_empty() {
                     VolumeNodeState::Ready
                 } else {
                     VolumeNodeState::Published
                 };
-                desired.last_error = None;
+                desired.last_error = capacity_error;
                 desired.updated_at = Utc::now().to_rfc3339();
                 self.upsert_node_state_if_changed(&desired, &current)
                     .await?;

@@ -17,7 +17,7 @@ use capnp::struct_list;
 use mantissa_health::Status as NodeHealth;
 use mantissa_protocol::health::NodeStatus as ProtocolNodeHealth;
 use mantissa_protocol::volumes::{
-    VolumeDeleteDisposition as ProtocolVolumeDeleteDisposition, filesystem_ownership,
+    VolumeDeleteDisposition as ProtocolVolumeDeleteDisposition, VolumeState, filesystem_ownership,
     local_volume_spec, replicated_volume_capacity_request, replicated_volume_group_status,
     replicated_volume_plan, volume_driver_spec, volume_event, volume_filesystem_space,
     volume_inspect, volume_label, volume_node_status, volume_spec, volume_summary, volumes,
@@ -120,27 +120,151 @@ impl VolumesRpc {
         self.topology.ensure_no_active_cluster_operation(action)
     }
 
-    /// Chooses one stable metadata owner from the current active cluster membership.
+    /// Saves a volume's desired state before broadcasting it to other nodes.
+    async fn save_volume_spec(&self, spec: &VolumeSpecValue) -> Result<(), Error> {
+        self.registry
+            .upsert_spec(spec.clone())
+            .await
+            .map_err(to_capnp)?;
+        self.replicator
+            .broadcast(VolumeEvent::Upsert(Box::new(spec.clone())))
+            .await
+            .map_err(to_capnp)
+    }
+
+    /// Checks active task use and local data ownership before accepting a delete request.
+    /// Forbids erasing imported paths and requires the owning node to erase managed local data.
+    fn check_volume_delete_request(
+        &self,
+        spec: &VolumeSpecValue,
+        node_states: &[VolumeNodeStateValue],
+        delete_data: bool,
+        remove_data: bool,
+    ) -> Result<(), Error> {
+        if !spec.is_delete_marker()
+            && !spec.is_retained()
+            && let Some(blocker) = node_states
+                .iter()
+                .find(|state| !state.published_task_ids.is_empty())
+        {
+            return Err(Error::failed(format!(
+                "volume '{}' is still in use on node {} by tasks {:?}",
+                spec.name, blocker.node_name, blocker.published_task_ids
+            )));
+        }
+
+        if delete_data
+            && matches!(
+                spec.driver,
+                VolumeDriver::Local(LocalVolumeSpec::ImportedPath { .. })
+            )
+        {
+            return Err(Error::failed(format!(
+                "volume '{}' imports an existing host path; Mantissa will not delete that path",
+                spec.name
+            )));
+        }
+        if matches!(
+            &spec.driver,
+            VolumeDriver::Local(LocalVolumeSpec::Managed { .. })
+        ) && remove_data
+        {
+            let local_node_id = self.topology.self_id();
+            if let Some(owner_id) = spec.bound_node_id.filter(|id| *id != local_node_id) {
+                let owner_name = spec.bound_node_name.as_deref().unwrap_or("unknown");
+                return Err(Error::failed(format!(
+                    "destructive delete for managed local volume '{}' must be executed on owning node {} ({})",
+                    spec.name, owner_name, owner_id
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Saves whether replica controllers should delete the volume's data or retain it for restore.
+    /// A volume with no known plan or workload placement is deleted rather than retained.
+    async fn record_replicated_volume_deletion(
+        &self,
+        spec: &mut VolumeSpecValue,
+        remove_data: bool,
+    ) -> Result<ProtocolVolumeDeleteDisposition, Error> {
+        let unprovisioned = spec.bound_node_id.is_none()
+            && self.registry.get_plan(spec.id).map_err(to_capnp)?.is_none();
+        if unprovisioned || remove_data {
+            // Another node may already be creating replicas for the first
+            // workload even though its plan has not reached us. Record data
+            // removal so those replicas are cleaned up when deletion arrives.
+            spec.request_deleted(true).map_err(to_capnp)?;
+        } else {
+            spec.request_retained().map_err(to_capnp)?;
+        }
+        self.save_volume_spec(spec).await?;
+        Ok(if spec.is_deleted() {
+            ProtocolVolumeDeleteDisposition::Deleted
+        } else {
+            ProtocolVolumeDeleteDisposition::Retained
+        })
+    }
+
+    /// Saves deletion before removing managed local data and the volume's node status reports.
+    /// Returns a preserved path when data is retained or the volume imports an existing path.
+    async fn delete_local_volume(
+        &self,
+        spec: &mut VolumeSpecValue,
+        node_states: &[VolumeNodeStateValue],
+        remove_data: bool,
+    ) -> Result<Option<String>, Error> {
+        spec.request_deleted(remove_data).map_err(to_capnp)?;
+        self.save_volume_spec(spec).await?;
+
+        let mut preserved_path = None;
+        for state in node_states {
+            if let Some(path) = &state.local_path {
+                match &spec.driver {
+                    VolumeDriver::Local(LocalVolumeSpec::Managed { .. }) if remove_data => {
+                        match fs::remove_dir_all(path) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(err) => return Err(to_capnp(err)),
+                        }
+                    }
+                    _ => {
+                        preserved_path = Some(path.clone());
+                    }
+                }
+            }
+        }
+
+        for state in node_states {
+            self.registry
+                .remove_node_state(state.id)
+                .await
+                .map_err(to_capnp)?;
+            self.replicator
+                .broadcast(VolumeEvent::NodeRemove(state.id))
+                .await
+                .map_err(to_capnp)?;
+        }
+        Ok(preserved_path)
+    }
+
+    /// Chooses the node responsible for creating this volume's initial replica plan.
+    /// Ranks known nodes by the volume's placement score, using lower node IDs to break ties.
+    /// Nodes with the same membership view then choose the same coordinator.
     fn select_plan_coordinator(&self, volume_id: Uuid) -> Result<Uuid, Error> {
-        let mut candidates = self
-            .cluster_registry
+        self.cluster_registry
             .peer_values_snapshot()
             .map_err(to_capnp)?
             .into_iter()
             .map(|(node_id, _)| node_id)
-            .collect::<Vec<_>>();
-        let local_node_id = self.topology.self_id();
-        if !candidates.contains(&local_node_id) {
-            candidates.push(local_node_id);
-        }
-        candidates.sort_by(|left, right| {
-            compute_replicated_volume_node_score(volume_id, *right)
-                .cmp(&compute_replicated_volume_node_score(volume_id, *left))
-                .then(left.cmp(right))
-        });
-        candidates
-            .into_iter()
-            .next()
+            .chain(std::iter::once(self.topology.self_id()))
+            .max_by_key(|node_id| {
+                (
+                    compute_replicated_volume_node_score(volume_id, *node_id),
+                    std::cmp::Reverse(*node_id),
+                )
+            })
             .ok_or_else(|| Error::failed("volume plan coordinator set is empty".to_string()))
     }
 
@@ -1029,6 +1153,37 @@ struct PublicVolumeStatus {
     message: Option<String>,
 }
 
+/// Node failure counts and health warnings used to explain volume availability to users.
+#[derive(Default)]
+struct ReplicaNodeHealthSummary {
+    down_nodes: usize,
+    has_unknown_node: bool,
+    has_suspect_node: bool,
+    has_degraded_node: bool,
+}
+
+impl ReplicaNodeHealthSummary {
+    /// Counts down nodes and records warnings for the nodes selected to describe volume health.
+    /// Gives live-volume status and retained-volume restore messages the same health checks.
+    fn from_nodes(nodes: &[Uuid], node_health: &HashMap<Uuid, NodeHealth>) -> Self {
+        let mut summary = Self::default();
+        for node_id in nodes {
+            match node_health
+                .get(node_id)
+                .copied()
+                .unwrap_or(NodeHealth::Unknown)
+            {
+                NodeHealth::Down => summary.down_nodes += 1,
+                NodeHealth::Unknown => summary.has_unknown_node = true,
+                NodeHealth::Suspect => summary.has_suspect_node = true,
+                NodeHealth::Degraded => summary.has_degraded_node = true,
+                _ => {}
+            }
+        }
+        summary
+    }
+}
+
 /// Returns the requested replicated capacity without presenting it as applied.
 fn effective_desired_capacity(
     spec: &VolumeSpecValue,
@@ -1055,23 +1210,12 @@ fn retained_volume_message(
     node_health: &HashMap<Uuid, NodeHealth>,
     restoring: bool,
 ) -> String {
-    let nodes = current_replicated_health_nodes(plan, group_status);
+    let nodes = replica_health_nodes(plan, group_status);
     if nodes.is_empty() {
         return "retained volume has no bootstrap plan".to_string();
     }
-    let health = nodes
-        .iter()
-        .map(|node_id| {
-            node_health
-                .get(node_id)
-                .copied()
-                .unwrap_or(NodeHealth::Unknown)
-        })
-        .collect::<Vec<_>>();
-    let down = health
-        .iter()
-        .filter(|status| **status == NodeHealth::Down)
-        .count();
+    let health = ReplicaNodeHealthSummary::from_nodes(nodes, node_health);
+    let down = health.down_nodes;
     if down >= 2 {
         return if restoring {
             format!("restore is waiting for a Raft quorum; {down} of 3 replica nodes are down")
@@ -1079,14 +1223,14 @@ fn retained_volume_message(
             format!("{down} of 3 replica nodes are down; restore needs a Raft quorum")
         };
     }
-    if health.contains(&NodeHealth::Unknown) {
+    if health.has_unknown_node {
         return if restoring {
             "restore is in progress; replica health cannot yet be confirmed".to_string()
         } else {
             "replica health cannot be confirmed; restore availability is unknown".to_string()
         };
     }
-    if health.contains(&NodeHealth::Suspect) {
+    if health.has_suspect_node {
         return if restoring {
             "restore is in progress; one or more replica nodes are suspect".to_string()
         } else {
@@ -1108,21 +1252,21 @@ fn retained_volume_message(
     }
 }
 
-/// Returns committed storage nodes, falling back to bootstrap nodes before control state exists.
-fn current_replicated_health_nodes(
-    plan: Option<&ReplicatedVolumePlan>,
-    group_status: Option<&ReplicatedVolumeGroupStatusValue>,
-) -> Vec<Uuid> {
+/// Selects nodes for health reporting, preferring Raft voters because they determine quorum.
+/// Uses reported data copies or the initial plan when voter information is not yet available.
+fn replica_health_nodes<'a>(
+    plan: Option<&'a ReplicatedVolumePlan>,
+    group_status: Option<&'a ReplicatedVolumeGroupStatusValue>,
+) -> &'a [Uuid] {
     if let Some(group) = group_status {
         if !group.voter_node_ids.is_empty() {
-            return group.voter_node_ids.clone();
+            return &group.voter_node_ids;
         }
         if !group.copy_node_ids.is_empty() {
-            return group.copy_node_ids.clone();
+            return &group.copy_node_ids;
         }
     }
-    plan.map(|plan| plan.replica_node_ids.to_vec())
-        .unwrap_or_default()
+    plan.map_or(&[], |plan| &plan.replica_node_ids)
 }
 
 /// Calculates the state shown to users from saved storage state and current node health.
@@ -1133,46 +1277,8 @@ fn public_volume_status(
     group_status: Option<&ReplicatedVolumeGroupStatusValue>,
     node_health: &HashMap<Uuid, NodeHealth>,
 ) -> PublicVolumeStatus {
-    use crate::volumes::types::VolumeStatus;
-    use mantissa_protocol::volumes::VolumeState;
-
-    if spec.lifecycle.disposition == DesiredVolumeDisposition::Deleted {
-        return PublicVolumeStatus {
-            state: VolumeState::Deleted,
-            message: None,
-        };
-    }
-    if spec.lifecycle.disposition == DesiredVolumeDisposition::Retained
-        && group_status.is_none_or(|group| group.status != VolumeStatus::Retained)
-    {
-        return PublicVolumeStatus {
-            state: VolumeState::Retaining,
-            message: Some("volume data is being retained".to_string()),
-        };
-    }
-    if spec.lifecycle.disposition == DesiredVolumeDisposition::Live
-        && group_status.is_some_and(|group| group.status == VolumeStatus::Retained)
-    {
-        return PublicVolumeStatus {
-            state: VolumeState::Restoring,
-            message: Some(retained_volume_message(
-                plan,
-                group_status,
-                node_health,
-                true,
-            )),
-        };
-    }
-    if spec.lifecycle.disposition == DesiredVolumeDisposition::Retained {
-        return PublicVolumeStatus {
-            state: VolumeState::Retained,
-            message: Some(retained_volume_message(
-                plan,
-                group_status,
-                node_health,
-                false,
-            )),
-        };
+    if let Some(status) = volume_lifecycle_status(spec, plan, group_status, node_health) {
+        return status;
     }
     if group_status.is_some_and(|value| value.status == VolumeStatus::Failed) {
         return PublicVolumeStatus {
@@ -1182,62 +1288,10 @@ fn public_volume_status(
     }
     let control_state_ready = group_status
         .is_some_and(|value| matches!(value.status, VolumeStatus::Ready | VolumeStatus::InUse));
-    if control_state_ready {
-        let health = current_replicated_health_nodes(plan, group_status)
-            .into_iter()
-            .map(|node_id| {
-                node_health
-                    .get(&node_id)
-                    .copied()
-                    .unwrap_or(NodeHealth::Unknown)
-            })
-            .collect::<Vec<_>>();
-        let down = health
-            .iter()
-            .filter(|status| **status == NodeHealth::Down)
-            .count();
-        if down >= 2 {
-            return PublicVolumeStatus {
-                state: VolumeState::Unavailable,
-                message: Some(format!(
-                    "{down} of 3 replica nodes are down; Raft quorum is unavailable"
-                )),
-            };
-        }
-        if down == 1 {
-            return PublicVolumeStatus {
-                state: VolumeState::Degraded,
-                message: Some("1 of 3 replica nodes is down".to_string()),
-            };
-        }
-        if health.contains(&NodeHealth::Suspect) {
-            return PublicVolumeStatus {
-                state: VolumeState::Degraded,
-                message: Some("one or more replica nodes are suspect".to_string()),
-            };
-        }
-        if health.contains(&NodeHealth::Degraded) {
-            return PublicVolumeStatus {
-                state: VolumeState::Degraded,
-                message: Some("one or more replica nodes report degraded health".to_string()),
-            };
-        }
-    }
-    if control_state_ready && group_status.is_some_and(|value| value.degraded) {
-        return PublicVolumeStatus {
-            state: VolumeState::Degraded,
-            message: Some("replicated volume control state is rebuilding or degraded".to_string()),
-        };
-    }
     if control_state_ready
-        && node_states
-            .iter()
-            .any(|state| state.state == VolumeNodeState::Error)
+        && let Some(status) = replica_health_status(node_states, plan, group_status, node_health)
     {
-        return PublicVolumeStatus {
-            state: VolumeState::Degraded,
-            message: Some("one or more replica copies report an error".to_string()),
-        };
+        return status;
     }
     if node_states
         .iter()
@@ -1273,6 +1327,97 @@ fn public_volume_status(
         state,
         message: None,
     }
+}
+
+/// Gives deletion, retention, and restore priority over health and mount status in API responses.
+/// Compares the request with reported Raft state to identify work still in progress.
+fn volume_lifecycle_status(
+    spec: &VolumeSpecValue,
+    plan: Option<&ReplicatedVolumePlan>,
+    group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+    node_health: &HashMap<Uuid, NodeHealth>,
+) -> Option<PublicVolumeStatus> {
+    let retained = group_status.is_some_and(|group| group.status == VolumeStatus::Retained);
+    let (state, message) = match spec.lifecycle.disposition {
+        DesiredVolumeDisposition::Deleted => (VolumeState::Deleted, None),
+        DesiredVolumeDisposition::Retained if !retained => (
+            VolumeState::Retaining,
+            Some("volume data is being retained".to_string()),
+        ),
+        DesiredVolumeDisposition::Live if retained => (
+            VolumeState::Restoring,
+            Some(retained_volume_message(
+                plan,
+                group_status,
+                node_health,
+                true,
+            )),
+        ),
+        DesiredVolumeDisposition::Retained => (
+            VolumeState::Retained,
+            Some(retained_volume_message(
+                plan,
+                group_status,
+                node_health,
+                false,
+            )),
+        ),
+        DesiredVolumeDisposition::Live => return None,
+    };
+    Some(PublicVolumeStatus { state, message })
+}
+
+/// Selects the most urgent replica health problem for API responses.
+/// Quorum loss takes priority over node warnings, unfinished repair, and copy errors.
+fn replica_health_status(
+    node_states: &[VolumeNodeStateValue],
+    plan: Option<&ReplicatedVolumePlan>,
+    group_status: Option<&ReplicatedVolumeGroupStatusValue>,
+    node_health: &HashMap<Uuid, NodeHealth>,
+) -> Option<PublicVolumeStatus> {
+    let health =
+        ReplicaNodeHealthSummary::from_nodes(replica_health_nodes(plan, group_status), node_health);
+    let down_nodes = health.down_nodes;
+    let (state, message) = if down_nodes >= 2 {
+        (
+            VolumeState::Unavailable,
+            format!("{down_nodes} of 3 replica nodes are down; Raft quorum is unavailable"),
+        )
+    } else if down_nodes == 1 {
+        (
+            VolumeState::Degraded,
+            "1 of 3 replica nodes is down".to_string(),
+        )
+    } else if health.has_suspect_node {
+        (
+            VolumeState::Degraded,
+            "one or more replica nodes are suspect".to_string(),
+        )
+    } else if health.has_degraded_node {
+        (
+            VolumeState::Degraded,
+            "one or more replica nodes report degraded health".to_string(),
+        )
+    } else if group_status.is_some_and(|group| group.degraded) {
+        (
+            VolumeState::Degraded,
+            "replicated volume control state is rebuilding or degraded".to_string(),
+        )
+    } else if node_states
+        .iter()
+        .any(|state| state.state == VolumeNodeState::Error)
+    {
+        (
+            VolumeState::Degraded,
+            "one or more replica copies report an error".to_string(),
+        )
+    } else {
+        return None;
+    };
+    Some(PublicVolumeStatus {
+        state,
+        message: Some(message),
+    })
 }
 
 /// Serializes one inspect payload with the canonical spec and all known node-state rows.
@@ -1577,14 +1722,7 @@ impl volumes::Server for VolumesRpc {
         if spec.driver.is_replicated() {
             spec.plan_coordinator_node_id = Some(self.select_plan_coordinator(spec.id)?);
         }
-        self.registry
-            .upsert_spec(spec.clone())
-            .await
-            .map_err(to_capnp)?;
-        self.replicator
-            .broadcast(VolumeEvent::Upsert(Box::new(spec.clone())))
-            .await
-            .map_err(to_capnp)?;
+        self.save_volume_spec(&spec).await?;
 
         if let Some(node_id) = resolved_node_id {
             let state = VolumeNodeStateValue::new(
@@ -1664,14 +1802,7 @@ impl volumes::Server for VolumesRpc {
         if let Some(previous) = deleted_generation.as_ref() {
             spec.recreate_after(previous).map_err(to_capnp)?;
         }
-        self.registry
-            .upsert_spec(spec.clone())
-            .await
-            .map_err(to_capnp)?;
-        self.replicator
-            .broadcast(VolumeEvent::Upsert(Box::new(spec.clone())))
-            .await
-            .map_err(to_capnp)?;
+        self.save_volume_spec(&spec).await?;
 
         let state = VolumeNodeStateValue::new(
             spec.id,
@@ -1715,127 +1846,35 @@ impl volumes::Server for VolumesRpc {
             .registry
             .list_node_states_for_volume(spec.id)
             .map_err(to_capnp)?;
-        if !spec.is_delete_marker()
-            && !spec.is_retained()
-            && let Some(blocker) = node_states
-                .iter()
-                .find(|state| !state.published_task_ids.is_empty())
-        {
-            return Err(Error::failed(format!(
-                "volume '{}' is still in use on node {} by tasks {:?}",
-                spec.name, blocker.node_name, blocker.published_task_ids
-            )));
-        }
-
         // The flag is a one-time override. It must not change the volume's
         // stored reclaim policy because request fields are immutable.
         let remove_data = delete_data
             || spec.reclaim_policy == VolumeReclaimPolicy::Delete
             || spec.data_deletion_was_requested();
 
-        if delete_data
-            && matches!(
-                spec.driver,
-                VolumeDriver::Local(LocalVolumeSpec::ImportedPath { .. })
-            )
-        {
-            return Err(Error::failed(format!(
-                "volume '{}' imports an existing host path; Mantissa will not delete that path",
-                spec.name
-            )));
-        }
-        if matches!(
-            &spec.driver,
-            VolumeDriver::Local(LocalVolumeSpec::Managed { .. })
-        ) && remove_data
-        {
-            let local_node_id = self.topology.self_id();
-            if let Some(owner_id) = spec.bound_node_id.filter(|id| *id != local_node_id) {
-                let owner_name = spec.bound_node_name.as_deref().unwrap_or("unknown");
-                return Err(Error::failed(format!(
-                    "destructive delete for managed local volume '{}' must be executed on owning node {} ({})",
-                    spec.name, owner_name, owner_id
-                )));
-            }
-        }
+        self.check_volume_delete_request(&spec, &node_states, delete_data, remove_data)?;
 
-        if spec.driver.is_replicated() {
-            let unprovisioned = spec.bound_node_id.is_none()
-                && self.registry.get_plan(spec.id).map_err(to_capnp)?.is_none();
-            if unprovisioned {
-                // A concurrent first binding may already be creating owned
-                // replica files on another node. Terminal deletion must
-                // authorize those files to converge away even if this view
-                // has not observed the plan yet.
-                spec.request_deleted(true).map_err(to_capnp)?;
-            } else if remove_data {
-                spec.request_deleted(true).map_err(to_capnp)?;
-            } else {
-                spec.request_retained().map_err(to_capnp)?;
-            }
-            self.registry
-                .upsert_spec(spec.clone())
-                .await
-                .map_err(to_capnp)?;
-            self.replicator
-                .broadcast(VolumeEvent::Upsert(Box::new(spec.clone())))
-                .await
-                .map_err(to_capnp)?;
-            let mut result = results.get().init_result();
-            result.set_preserved_path("");
-            result.set_disposition(if spec.is_deleted() {
+        let (disposition, preserved_path) = if spec.driver.is_replicated() {
+            (
+                self.record_replicated_volume_deletion(&mut spec, remove_data)
+                    .await?,
+                None,
+            )
+        } else {
+            let preserved_path = self
+                .delete_local_volume(&mut spec, &node_states, remove_data)
+                .await?;
+            let disposition = if remove_data {
                 ProtocolVolumeDeleteDisposition::Deleted
             } else {
                 ProtocolVolumeDeleteDisposition::Retained
-            });
-            return Ok(());
-        }
+            };
+            (disposition, preserved_path)
+        };
 
-        spec.request_deleted(remove_data).map_err(to_capnp)?;
-        self.registry
-            .upsert_spec(spec.clone())
-            .await
-            .map_err(to_capnp)?;
-        self.replicator
-            .broadcast(VolumeEvent::Upsert(Box::new(spec.clone())))
-            .await
-            .map_err(to_capnp)?;
-
-        let mut preserved_path = None;
-        for state in &node_states {
-            if let Some(path) = &state.local_path {
-                match &spec.driver {
-                    VolumeDriver::Local(LocalVolumeSpec::Managed { .. }) if remove_data => {
-                        match fs::remove_dir_all(path) {
-                            Ok(()) => {}
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(err) => return Err(to_capnp(err)),
-                        }
-                    }
-                    _ => {
-                        preserved_path = Some(path.clone());
-                    }
-                }
-            }
-        }
-
-        for state in &node_states {
-            self.registry
-                .remove_node_state(state.id)
-                .await
-                .map_err(to_capnp)?;
-            self.replicator
-                .broadcast(VolumeEvent::NodeRemove(state.id))
-                .await
-                .map_err(to_capnp)?;
-        }
         let mut result = results.get().init_result();
         result.set_preserved_path(preserved_path.as_deref().unwrap_or(""));
-        result.set_disposition(if remove_data {
-            ProtocolVolumeDeleteDisposition::Deleted
-        } else {
-            ProtocolVolumeDeleteDisposition::Retained
-        });
+        result.set_disposition(disposition);
         Ok(())
     }
 
@@ -1888,14 +1927,7 @@ impl volumes::Server for VolumesRpc {
         }
         if spec.is_retained() {
             spec.request_live().map_err(to_capnp)?;
-            self.registry
-                .upsert_spec(spec.clone())
-                .await
-                .map_err(to_capnp)?;
-            self.replicator
-                .broadcast(VolumeEvent::Upsert(Box::new(spec.clone())))
-                .await
-                .map_err(to_capnp)?;
+            self.save_volume_spec(&spec).await?;
         }
         write_volume_spec(results.get().init_volume(), &spec);
         Ok(())

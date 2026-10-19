@@ -1,18 +1,25 @@
-//! ublk, device-mapper, filesystem mount, and local resource cleanup.
+//! Connects replicated data to local block devices and filesystem mounts.
+//!
+//! The ublk device forwards kernel I/O to the replicated driver. Device-mapper gives
+//! the filesystem a stable device path while the underlying ublk device changes.
+//! Cleanup removes the mount and mapping before stopping the device that serves them.
 
 use super::{
     Arc, Context, DriverAttachment, FixedReplicaCopy, FixedReplicaPath, LocalAttachmentRecord,
     MappedVolumeLayout, PathBuf, PreparedDriverCopy, ReplicaDataConnectionOpen,
-    ReplicaDataConnectionPurpose, ReplicaDataProgress, ReplicaKey, ReplicaRecord, ReplicatedDriver,
-    ReplicatedDriverSettings, ReplicatedVolumeRuntime, Result, SavedFilesystemFormat,
-    SavedMountState, SavedUblkDevice, SavedVolumeMount, TrackedDriver, UblkDeviceState, UblkSystem,
-    VolumeControlState, VolumeDescriptor, VolumeFilesystem, WriterGrant, data, debug,
-    deterministic_filesystem_id, info, is_exact_filesystem, record_driver_copy_progress,
-    same_mount, validate_saved_writer, writer_fence_install_generation,
+    ReplicaDataConnectionPurpose, ReplicaDataProgress, ReplicaFile, ReplicaKey, ReplicaRecord,
+    ReplicatedDriver, ReplicatedDriverSettings, ReplicatedVolumeRuntime, Result,
+    SavedFilesystemFormat, SavedMountState, SavedUblkDevice, SavedVolumeMount, TrackedDriver,
+    UblkDeviceState, UblkSystem, VolumeControlState, VolumeDescriptor, VolumeFilesystem,
+    VolumeNodeId, WriterGrant, data, debug, deterministic_filesystem_id, info, is_exact_filesystem,
+    record_driver_copy_progress, same_mount, validate_saved_writer,
+    writer_fence_install_generation,
 };
 
 impl ReplicatedVolumeRuntime {
-    /// Opens every current copy, drains older fences, and starts one data path.
+    /// Builds the writer's replica connections after checking that their data progress agrees.
+    /// Checks every copy before installing a new fence, which rejects requests from older writers.
+    /// Copies that disagree require recovery before normal I/O can start.
     pub(super) async fn prepare_driver_path(
         &self,
         record: &ReplicaRecord,
@@ -37,65 +44,16 @@ impl ReplicatedVolumeRuntime {
         let mut progress_matches = true;
         let mut greatest_changed_generation = 0_u64;
         for copy in data_state.copies.iter().copied() {
-            if copy == self.volume_node_id {
-                debug!(
-                    target: "volumes",
-                    ?copy,
-                    fence = attachment.fence.get(),
-                    "inspecting local replicated-volume writer copy"
-                );
-                let file = self.replica_file(record.key())?;
-                let progress = ReplicaDataProgress::from_file(file.progress());
-                prepared.push((copy, PreparedDriverCopy::Local(file)));
-                record_driver_copy_progress(
-                    copy,
-                    progress,
-                    data_fence,
-                    &mut common_progress,
-                    &mut progress_matches,
-                    &mut greatest_changed_generation,
-                )?;
-            } else {
-                debug!(
-                    target: "volumes",
-                    ?copy,
-                    fence = attachment.fence.get(),
-                    "opening remote replicated-volume writer path"
-                );
-                let open = ReplicaDataConnectionOpen::new(
-                    record.descriptor().clone(),
-                    attachment.fence,
-                    attachment.session_id,
-                    ReplicaDataConnectionPurpose::Data,
-                );
-                let connection = tokio::time::timeout(
-                    self.operation_timeout,
-                    data::connect(
-                        &self.transport,
-                        copy,
-                        &open,
-                        self.replica_data_limits,
-                        self.fixed_path_settings.max_in_flight_writes(),
-                    ),
-                )
-                .await
-                .with_context(|| format!("connect to writer replica {copy} timed out"))??;
-                let progress = tokio::time::timeout(
-                    self.operation_timeout,
-                    connection.progress(record.descriptor().clone(), data_fence),
-                )
-                .await
-                .with_context(|| format!("inspect writer replica {copy} timed out"))??;
-                record_driver_copy_progress(
-                    copy,
-                    progress,
-                    data_fence,
-                    &mut common_progress,
-                    &mut progress_matches,
-                    &mut greatest_changed_generation,
-                )?;
-                prepared.push((copy, PreparedDriverCopy::Remote(connection)));
-            }
+            let (prepared_copy, progress) = self.open_writer_copy(record, copy, attachment).await?;
+            record_driver_copy_progress(
+                copy,
+                progress,
+                data_fence,
+                &mut common_progress,
+                &mut progress_matches,
+                &mut greatest_changed_generation,
+            )?;
+            prepared.push((copy, prepared_copy));
         }
         let current_progress = common_progress.context("writer grant has no data copies")?;
         let install_generation = writer_fence_install_generation(
@@ -106,66 +64,17 @@ impl ReplicatedVolumeRuntime {
         )?;
 
         let mut copies = Vec::with_capacity(prepared.len());
-        for (copy, prepared) in prepared {
-            match prepared {
-                PreparedDriverCopy::Local(file) => {
-                    if let Some(changed_generation) = install_generation {
-                        let gate = self
-                            .gates
-                            .read()
-                            .get(&record.key())
-                            .cloned()
-                            .context("local data gate is unavailable")?;
-                        let install = tokio::time::timeout(
-                            self.operation_timeout,
-                            gate.prepare_fence_install(attachment.fence),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!("local writer fence {} did not drain", attachment.fence)
-                        })??;
-                        let maintenance =
-                            self.replica_file_workers.maintenance(Arc::clone(&file))?;
-                        tokio::time::timeout(
-                            self.operation_timeout,
-                            maintenance.install_fence(data_fence, changed_generation, install),
-                        )
-                        .await
-                        .context("local fence installation timed out")??;
-                    }
-                    copies.push(FixedReplicaCopy::local(file));
-                }
-                PreparedDriverCopy::Remote(connection) => {
-                    if let Some(changed_generation) = install_generation {
-                        tokio::time::timeout(
-                            self.operation_timeout,
-                            connection.install_fence(
-                                record.descriptor().clone(),
-                                data_fence,
-                                changed_generation,
-                            ),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!("install writer fence on replica {copy} timed out")
-                        })?
-                        .with_context(|| format!("install writer fence on replica {copy}"))?;
-                    }
-                    copies.push(
-                        tokio::time::timeout(
-                            self.operation_timeout,
-                            FixedReplicaCopy::remote(
-                                record.descriptor().clone(),
-                                data_fence,
-                                connection,
-                            ),
-                        )
-                        .await
-                        .with_context(|| format!("check writer replica {copy} timed out"))?
-                        .with_context(|| format!("check writer replica {copy}"))?,
-                    );
-                }
-            }
+        for (copy, prepared_copy) in prepared {
+            copies.push(
+                self.activate_writer_copy(
+                    record,
+                    copy,
+                    prepared_copy,
+                    attachment,
+                    install_generation,
+                )
+                .await?,
+            );
             debug!(
                 target: "volumes",
                 ?copy,
@@ -181,6 +90,161 @@ impl ReplicatedVolumeRuntime {
             copies,
         )
         .context("start fixed-file replicated data path")
+    }
+
+    /// Opens a local file or remote data connection and reads its write and flush progress.
+    /// Leaves fence installation to the caller after it has compared progress across all copies.
+    async fn open_writer_copy(
+        &self,
+        record: &ReplicaRecord,
+        copy: VolumeNodeId,
+        attachment: DriverAttachment,
+    ) -> Result<(PreparedDriverCopy, ReplicaDataProgress)> {
+        if copy == self.volume_node_id {
+            debug!(
+                target: "volumes",
+                ?copy,
+                fence = attachment.fence.get(),
+                "inspecting local replicated-volume writer copy"
+            );
+            let file = self.replica_file(record.key())?;
+            let progress = ReplicaDataProgress::from_file(file.progress());
+            Ok((PreparedDriverCopy::Local(file), progress))
+        } else {
+            debug!(
+                target: "volumes",
+                ?copy,
+                fence = attachment.fence.get(),
+                "opening remote replicated-volume writer path"
+            );
+            let open = ReplicaDataConnectionOpen::new(
+                record.descriptor().clone(),
+                attachment.fence,
+                attachment.session_id,
+                ReplicaDataConnectionPurpose::Data,
+            );
+            let connection = tokio::time::timeout(
+                self.operation_timeout,
+                data::connect(
+                    &self.transport,
+                    copy,
+                    &open,
+                    self.replica_data_limits,
+                    self.fixed_path_settings.max_in_flight_writes(),
+                ),
+            )
+            .await
+            .with_context(|| format!("connect to writer replica {copy} timed out"))??;
+            let progress = tokio::time::timeout(
+                self.operation_timeout,
+                connection.progress(record.descriptor().clone(), attachment.fence),
+            )
+            .await
+            .with_context(|| format!("inspect writer replica {copy} timed out"))??;
+            Ok((PreparedDriverCopy::Remote(connection), progress))
+        }
+    }
+
+    /// Installs the new fence when needed and prepares this copy for the writer's data connections.
+    /// The caller must first check all copies so changing one fence cannot hide a data mismatch.
+    async fn activate_writer_copy(
+        &self,
+        record: &ReplicaRecord,
+        copy: VolumeNodeId,
+        prepared: PreparedDriverCopy,
+        attachment: DriverAttachment,
+        install_generation: Option<u64>,
+    ) -> Result<FixedReplicaCopy> {
+        match prepared {
+            PreparedDriverCopy::Local(file) => {
+                if let Some(changed_generation) = install_generation {
+                    self.install_local_writer_fence(
+                        record.key(),
+                        &file,
+                        attachment,
+                        changed_generation,
+                    )
+                    .await?;
+                }
+                Ok(FixedReplicaCopy::local(file))
+            }
+            PreparedDriverCopy::Remote(connection) => {
+                if let Some(changed_generation) = install_generation {
+                    tokio::time::timeout(
+                        self.operation_timeout,
+                        connection.install_fence(
+                            record.descriptor().clone(),
+                            attachment.fence,
+                            changed_generation,
+                        ),
+                    )
+                    .await
+                    .with_context(|| format!("install writer fence on replica {copy} timed out"))?
+                    .with_context(|| format!("install writer fence on replica {copy}"))?;
+                }
+                Ok(tokio::time::timeout(
+                    self.operation_timeout,
+                    FixedReplicaCopy::remote(
+                        record.descriptor().clone(),
+                        attachment.fence,
+                        connection,
+                    ),
+                )
+                .await
+                .with_context(|| format!("check writer replica {copy} timed out"))?
+                .with_context(|| format!("check writer replica {copy}"))?)
+            }
+        }
+    }
+
+    /// Drains older local requests before saving the writer's new fence in the replica file.
+    /// This prevents an old request from changing data after the new writer takes over.
+    async fn install_local_writer_fence(
+        &self,
+        key: ReplicaKey,
+        file: &Arc<ReplicaFile>,
+        attachment: DriverAttachment,
+        changed_generation: u64,
+    ) -> Result<()> {
+        let gate = self
+            .gates
+            .read()
+            .get(&key)
+            .cloned()
+            .context("local data gate is unavailable")?;
+        let install = tokio::time::timeout(
+            self.operation_timeout,
+            gate.prepare_fence_install(attachment.fence),
+        )
+        .await
+        .with_context(|| format!("local writer fence {} did not drain", attachment.fence))??;
+        let maintenance = self.replica_file_workers.maintenance(Arc::clone(file))?;
+        tokio::time::timeout(
+            self.operation_timeout,
+            maintenance.install_fence(attachment.fence, changed_generation, install),
+        )
+        .await
+        .context("local fence installation timed out")??;
+        Ok(())
+    }
+
+    /// Resumes a device-mapper volume only if it matches the expected device and capacity.
+    /// Tracks the blocking operation so cleanup waits for it even if the caller is cancelled.
+    pub(super) async fn resume_saved_mapping(
+        &self,
+        key: ReplicaKey,
+        layout: MappedVolumeLayout,
+    ) -> Result<()> {
+        let mapped_volumes = self.mapped_volumes.clone();
+        self.lifecycle_calls
+            .run(
+                key,
+                "mantissa-volume-resume-saved-mapping",
+                self.operation_timeout,
+                move || mapped_volumes.resume_exact(&layout).map(drop),
+            )
+            .await
+            .context("resume exact saved mapped volume")
     }
 
     /// Starts or recovers the private ublk device for one writer attachment.

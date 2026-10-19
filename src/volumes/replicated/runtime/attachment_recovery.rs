@@ -1,18 +1,30 @@
 //! Reconciliation and restart recovery for saved writer attachments.
+//!
+//! An attachment records a local writer session, its block devices, and its filesystem mount.
+//! Its saved fence is the Raft-assigned number used to reject requests from older writers.
+//! Restart recovery checks that Raft still permits this session to write before restoring I/O.
 
 use super::{
     ATTACHMENT_RECONCILE_ATTEMPT_TIMEOUT, Arc, AttachmentDetachProgress, BTreeMap, BTreeSet,
     Context, DriverAttachment, ExpectedVolumeRevision, FenceEpoch, FixedReplicaCopy,
     LocalAttachmentRecord, MappedVolumeLayout, PathBuf, ReplicaDataConnectionOpen,
     ReplicaDataConnectionPurpose, ReplicaKey, ReplicaRecord, ReplicatedDriver,
-    ReplicatedDriverSettings, ReplicatedVolumeRuntime, Result, SavedMountState, SavedVolumeMount,
-    UblkDeviceId, UblkDeviceInfo, UblkDeviceState, UblkSystem, Uuid, VolumeCommand,
-    VolumeControlState, VolumeDescriptor, WriterGrant, WriterReplicaRecoveryRequired, data, debug,
-    require_command_postcondition, saved_writer_fence, validate_saved_writer, warn,
+    ReplicatedDriverSettings, ReplicatedVolumeRuntime, Result, SavedMountState, SavedUblkDevice,
+    SavedVolumeMount, UblkDeviceId, UblkDeviceInfo, UblkDeviceState, UblkSystem, Uuid,
+    VolumeCommand, VolumeControlState, VolumeDescriptor, WriterGrant,
+    WriterReplicaRecoveryRequired, data, debug, require_command_postcondition, saved_writer_fence,
+    validate_saved_writer, warn,
 };
 
+/// The saved block device selected for restart and whether device-mapper already points to it.
+struct SavedDeviceSelection {
+    device: SavedUblkDevice,
+    mapping_exists: bool,
+}
+
 impl ReplicatedVolumeRuntime {
-    /// Reconciles every durable attachment from current control state and local resources.
+    /// Retries saved attachments against current Raft state and local devices.
+    /// Collects failures after visiting all attachments so one failure cannot block the rest.
     pub(crate) async fn reconcile_local_attachments(&self) -> Result<()> {
         let _lifecycle = self.driver_lifecycle.read().await;
         if self.is_stopping() {
@@ -41,7 +53,8 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Reconciles one saved attachment without coupling its failure to later entries.
+    /// Resumes or cleans up a saved attachment according to its current Raft writer permission.
+    /// Serializes work for this volume to prevent mount, expansion, and cleanup from overlapping.
     pub(super) async fn reconcile_local_attachment(
         &self,
         saved: LocalAttachmentRecord,
@@ -79,224 +92,246 @@ impl ReplicatedVolumeRuntime {
             })
             .and_then(|writer| state.data().map(|data| (writer, data.fence)));
         if let Some((_writer, fence)) = exact_writer {
-            if saved.granted_fence().is_none() {
-                self.replicas
-                    .save_attachment_fence(key, saved.session_id(), fence)?;
-                return Ok(());
-            }
-            if saved.granted_fence() != Some(fence) {
-                if saved.granted_fence().is_some_and(|saved| saved < fence) {
-                    let record = self
-                        .replicas
-                        .replica(key)?
-                        .context("saved attachment has no local replica")?;
-                    self.advance_local_driver_fence(&record, &saved, &state, fence)
-                        .await?;
-                    return Ok(());
-                }
-                // A mounted filesystem may still be owned by a workload.
-                // Applied state already fences this older path; the
-                // workload manager must stop its consumer before calling
-                // unmount and advancing physical cleanup.
-                if saved
-                    .volume_mount()
-                    .is_none_or(|mount| mount.state() != SavedMountState::Mounted)
-                {
-                    self.cleanup_attachment(key).await?;
-                }
-                return Ok(());
-            }
-            let record = self
-                .replicas
-                .replica(key)?
-                .context("saved attachment has no local replica")?;
-            if saved.descriptor().capacity() < record.descriptor().capacity() {
-                if !self
-                    .all_active_copies_serve_capacity(&state, record.descriptor().capacity())
-                    .await
-                {
-                    return Ok(());
-                }
-                self.reconcile_attached_volume_capacity(&record, &saved, &state)
-                    .await?;
-                return Ok(());
-            }
-            if saved.descriptor().capacity() > record.descriptor().capacity() {
-                anyhow::bail!("saved mapped capacity exceeds the applied replica capacity");
-            }
-            let serving = if let Some(driver) = self.tracked_driver(key) {
-                let mut driver = driver.lock().await;
-                let attachment = DriverAttachment {
-                    node_id: self.volume_node_id,
-                    generation: key.generation(),
-                    fence,
-                    session_id: saved.session_id(),
-                };
-                if driver.attachment() == attachment
-                    && driver.is_io_paused()
-                    && state.replacement().is_none()
-                {
-                    driver.resume_io()?;
-                }
-                if driver.attachment() == attachment && driver.is_available() {
-                    driver.stop_retiring_path().await?;
-                    driver.stop_retiring_device().await?;
-                    let active_device = driver.saved_device()?;
-                    let ublk_device_path = driver.ublk_device_path()?.to_path_buf();
-                    drop(driver);
-                    if saved.volume_mount().is_some() {
-                        let layout = MappedVolumeLayout::new(
-                            self.volume_node_id,
-                            saved.descriptor(),
-                            ublk_device_path,
-                        )?;
-                        let mapped_volumes = self.mapped_volumes.clone();
-                        self.lifecycle_calls
-                            .run(
-                                key,
-                                "mantissa-volume-resume-saved-mapping",
-                                self.operation_timeout,
-                                move || mapped_volumes.resume_exact(&layout).map(drop),
-                            )
-                            .await
-                            .context("resume exact saved mapped volume")?;
-                    }
-                    for stale in saved
-                        .ublk_devices()
-                        .iter()
-                        .copied()
-                        .filter(|device| device.id() != active_device.id())
-                    {
-                        self.remove_untracked_device(key, stale).await?;
-                        self.replicas.clear_ublk_device(key, stale)?;
-                    }
-                    true
-                } else {
-                    false
-                }
-            } else {
-                saved.ublk_devices().is_empty()
-            };
-            if serving {
-                if let Some(volume_mount) = saved.volume_mount()
-                    && volume_mount.state() != SavedMountState::Mounted
-                {
-                    let record = self
-                        .replicas
-                        .replica(key)?
-                        .context("saved attachment has no local replica")?;
-                    let ublk_device_path = {
-                        let driver = self
-                            .tracked_driver(key)
-                            .context("serving attachment lost its tracked ublk device")?;
-                        driver.lock().await.ublk_device_path()?.to_path_buf()
-                    };
-                    let mapped_path = self
-                        .create_or_verify_mapped_device(saved.descriptor(), ublk_device_path)
-                        .await?;
-                    self.recover_saved_mount(
-                        &record,
-                        &saved,
-                        &state,
-                        volume_mount,
-                        saved.descriptor(),
-                        mapped_path,
-                    )
-                    .await?;
-                }
-                self.reconcile_mounted_filesystem_capacity(key, record.descriptor())
-                    .await?;
-                return Ok(());
-            }
-            if saved.volume_mount().is_none() {
-                debug!(
-                    target: "volumes",
-                    ?key,
-                    session_id = ?saved.session_id(),
-                    "failed unpublished driver will be fenced and cleaned"
-                );
-                return match self.attempt_attachment_detach(key).await? {
-                    AttachmentDetachProgress::Complete => Ok(()),
-                    AttachmentDetachProgress::FencePending(error) => {
-                        Err(error.context("failed unpublished writer fence remains pending"))
-                    }
-                };
-            }
-            debug!(
-                target: "volumes",
-                ?key,
-                session_id = ?saved.session_id(),
-                "failed local driver requires control-state recovery"
-            );
-            let current_state = match tokio::time::timeout(
-                ATTACHMENT_RECONCILE_ATTEMPT_TIMEOUT,
-                self.read_quorum_state(key),
-            )
-            .await
-            {
-                Ok(Ok(state)) => state,
-                Err(_) => {
-                    debug!(
-                        target: "volumes",
-                        ?key,
-                        "failed writer grant confirmation timed out"
-                    );
-                    return Ok(());
-                }
-                Ok(Err(error)) => {
-                    warn!(
-                        target: "volumes",
-                        ?key,
-                        error = %error,
-                        "failed writer waits for current quorum state"
-                    );
-                    return Ok(());
-                }
-            };
-            let Some(current_writer) =
-                current_state
-                    .data()
-                    .and_then(|data| data.writer)
-                    .filter(|current| {
-                        current.node_id == self.volume_node_id
-                            && current.session_id == saved.session_id()
-                    })
-            else {
-                return Ok(());
-            };
-            self.begin_recovery_for_failed_writer(key, &current_state, current_writer)
-                .await?;
-            // Do not tear a mounted block device out from under its
-            // consumer. The workload manager observes `is_mounted=false`,
-            // stops the container, and then calls `unmount_volume`, which
-            // owns the safe mount-before-device cleanup order.
-            if saved
-                .volume_mount()
-                .is_some_and(|mount| mount.state() == SavedMountState::Mounted)
-            {
-                return Ok(());
-            }
-        } else if state.replacement().is_none()
+            return self
+                .reconcile_writer_attachment(&saved, &state, fence)
+                .await;
+        }
+        if state.replacement().is_none()
             && let Some(driver) = self.tracked_driver(key)
         {
             let driver = driver.lock().await;
             if driver.is_io_paused() {
-                // Once no replacement owns the pause, release held I/O
-                // through the dynamically fenced old path. Its bounded
-                // failure lets the workload stop and local cleanup run.
+                // Replacement may have paused requests before writer access
+                // was revoked. Release them once replacement ends so the
+                // stale-writer checks can reject them and let the workload stop.
                 driver.resume_io()?;
             }
         }
+        self.cleanup_unmounted_attachment(&saved).await
+    }
+
+    /// Updates the writer fence, capacity, and devices for an attachment still authorized by Raft.
+    /// Mounted filesystems stay in place until the workload manager has stopped their users.
+    async fn reconcile_writer_attachment(
+        &self,
+        saved: &LocalAttachmentRecord,
+        state: &VolumeControlState,
+        fence: FenceEpoch,
+    ) -> Result<()> {
+        let key = saved.key();
+        if saved.granted_fence().is_none() {
+            self.replicas
+                .save_attachment_fence(key, saved.session_id(), fence)?;
+            return Ok(());
+        }
+        if saved.granted_fence() != Some(fence) {
+            if saved.granted_fence().is_some_and(|saved| saved < fence) {
+                let record = self
+                    .replicas
+                    .replica(key)?
+                    .context("saved attachment has no local replica")?;
+                self.advance_local_driver_fence(&record, saved, state, fence)
+                    .await?;
+                return Ok(());
+            }
+            // The workload manager must stop the consumer and unmount its
+            // filesystem before this mismatched attachment can be removed.
+            if saved
+                .volume_mount()
+                .is_none_or(|mount| mount.state() != SavedMountState::Mounted)
+            {
+                self.cleanup_attachment(key).await?;
+            }
+            return Ok(());
+        }
+
+        let record = self
+            .replicas
+            .replica(key)?
+            .context("saved attachment has no local replica")?;
+        if saved.descriptor().capacity() < record.descriptor().capacity() {
+            if !self
+                .all_active_copies_serve_capacity(state, record.descriptor().capacity())
+                .await
+            {
+                return Ok(());
+            }
+            self.reconcile_attached_volume_capacity(&record, saved, state)
+                .await?;
+            return Ok(());
+        }
+        if saved.descriptor().capacity() > record.descriptor().capacity() {
+            anyhow::bail!("saved mapped capacity exceeds the applied replica capacity");
+        }
+        if !self
+            .reconcile_attachment_driver(saved, state, fence)
+            .await?
+        {
+            return self.recover_failed_attachment(saved).await;
+        }
+
+        if let Some(volume_mount) = saved.volume_mount()
+            && volume_mount.state() != SavedMountState::Mounted
+        {
+            let record = self
+                .replicas
+                .replica(key)?
+                .context("saved attachment has no local replica")?;
+            let ublk_device_path = {
+                let driver = self
+                    .tracked_driver(key)
+                    .context("serving attachment lost its tracked ublk device")?;
+                driver.lock().await.ublk_device_path()?.to_path_buf()
+            };
+            let mapped_path = self
+                .create_or_verify_mapped_device(saved.descriptor(), ublk_device_path)
+                .await?;
+            self.recover_saved_mount(
+                &record,
+                saved,
+                state,
+                volume_mount,
+                saved.descriptor(),
+                mapped_path,
+            )
+            .await?;
+        }
+        self.reconcile_mounted_filesystem_capacity(key, record.descriptor())
+            .await?;
+        Ok(())
+    }
+
+    /// Resumes an authorized driver and its mapping, then removes obsolete devices.
+    /// Returns false when saved or tracked devices require recovery. With neither a driver
+    /// nor saved devices, returns true so normal mount creation can still proceed.
+    async fn reconcile_attachment_driver(
+        &self,
+        saved: &LocalAttachmentRecord,
+        state: &VolumeControlState,
+        fence: FenceEpoch,
+    ) -> Result<bool> {
+        let key = saved.key();
+        let Some(driver) = self.tracked_driver(key) else {
+            return Ok(saved.ublk_devices().is_empty());
+        };
+        let mut driver = driver.lock().await;
+        let attachment = DriverAttachment {
+            node_id: self.volume_node_id,
+            generation: key.generation(),
+            fence,
+            session_id: saved.session_id(),
+        };
+        if driver.attachment() == attachment
+            && driver.is_io_paused()
+            && state.replacement().is_none()
+        {
+            driver.resume_io()?;
+        }
+        if driver.attachment() != attachment || !driver.is_available() {
+            return Ok(false);
+        }
+
+        driver.stop_retiring_path().await?;
+        driver.stop_retiring_device().await?;
+        let active_device = driver.saved_device()?;
+        let ublk_device_path = driver.ublk_device_path()?.to_path_buf();
+        drop(driver);
+        if saved.volume_mount().is_some() {
+            let layout =
+                MappedVolumeLayout::new(self.volume_node_id, saved.descriptor(), ublk_device_path)?;
+            self.resume_saved_mapping(key, layout).await?;
+        }
+        for stale in saved
+            .ublk_devices()
+            .iter()
+            .copied()
+            .filter(|device| device.id() != active_device.id())
+        {
+            self.remove_untracked_device(key, stale).await?;
+            self.replicas.clear_ublk_device(key, stale)?;
+        }
+        Ok(true)
+    }
+
+    /// Cleans up a failed driver with no saved mount, or requests data recovery for a mounted one.
+    /// Recovery requires quorum confirmation that this attachment still owns writer access.
+    async fn recover_failed_attachment(&self, saved: &LocalAttachmentRecord) -> Result<()> {
+        let key = saved.key();
+        if saved.volume_mount().is_none() {
+            debug!(
+                target: "volumes",
+                ?key,
+                session_id = ?saved.session_id(),
+                "failed unpublished driver will be fenced and cleaned"
+            );
+            return match self.attempt_attachment_detach(key).await? {
+                AttachmentDetachProgress::Complete => Ok(()),
+                AttachmentDetachProgress::FencePending(error) => {
+                    Err(error.context("failed unpublished writer fence remains pending"))
+                }
+            };
+        }
+        debug!(
+            target: "volumes",
+            ?key,
+            session_id = ?saved.session_id(),
+            "failed local driver requires control-state recovery"
+        );
+        let current_state = match tokio::time::timeout(
+            ATTACHMENT_RECONCILE_ATTEMPT_TIMEOUT,
+            self.read_quorum_state(key),
+        )
+        .await
+        {
+            Ok(Ok(state)) => state,
+            Err(_) => {
+                debug!(
+                    target: "volumes",
+                    ?key,
+                    "failed writer grant confirmation timed out"
+                );
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                warn!(
+                    target: "volumes",
+                    ?key,
+                    error = %error,
+                    "failed writer waits for current quorum state"
+                );
+                return Ok(());
+            }
+        };
+        let Some(current_writer) =
+            current_state
+                .data()
+                .and_then(|data| data.writer)
+                .filter(|current| {
+                    current.node_id == self.volume_node_id
+                        && current.session_id == saved.session_id()
+                })
+        else {
+            return Ok(());
+        };
+        self.begin_recovery_for_failed_writer(key, &current_state, current_writer)
+            .await?;
+        self.cleanup_unmounted_attachment(saved).await
+    }
+
+    /// Removes attachment resources only when the saved filesystem is no longer marked mounted.
+    /// The workload manager must stop the consuming task and unmount before cleanup can proceed.
+    async fn cleanup_unmounted_attachment(&self, saved: &LocalAttachmentRecord) -> Result<()> {
         if saved
             .volume_mount()
             .is_none_or(|mount| mount.state() != SavedMountState::Mounted)
         {
-            self.cleanup_attachment(key).await?;
+            self.cleanup_attachment(saved.key()).await?;
         }
         Ok(())
     }
 
-    /// Converges one adopted fence without replacing its device or mount.
+    /// Installs the newer writer fence after Raft adds a rebuilt copy to the data set.
+    /// Updates the paused driver's replica connections without replacing the mounted device.
     pub(super) async fn advance_local_driver_fence(
         &self,
         record: &ReplicaRecord,
@@ -366,7 +401,8 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Finishes an adopted local writer handoff without making it a Raft phase.
+    /// Resumes the local writer after Raft approves the replacement's new data-copy set.
+    /// Serializes the fence and connection update with other attachment work for this volume.
     pub(super) async fn converge_adopted_local_writer(
         &self,
         key: ReplicaKey,
@@ -410,7 +446,8 @@ impl ReplicatedVolumeRuntime {
         }
     }
 
-    /// Fences one failed local writer by authorizing replay from its local copy.
+    /// Asks Raft to revoke the failed local writer and recover data from its local replica.
+    /// Requires the same writer session and at least two reachable copies before starting recovery.
     pub(super) async fn begin_recovery_for_failed_writer(
         &self,
         key: ReplicaKey,
@@ -460,7 +497,8 @@ impl ReplicatedVolumeRuntime {
         require_command_postcondition(response)
     }
 
-    /// Selects the local writer and every copy reachable through current control state.
+    /// Probes the current writer's data connections to select copies for recovery.
+    /// Includes the local source and requires at least one reachable remote copy.
     pub(super) async fn reachable_recovery_targets(
         &self,
         key: ReplicaKey,
@@ -524,7 +562,8 @@ impl ReplicatedVolumeRuntime {
         Ok(targets)
     }
 
-    /// Recovers only sessions confirmed by a live quorum and leaves others inert.
+    /// Restores saved writer devices and mounts at startup after checking a live Raft quorum.
+    /// Attachments without current writer permission must not resume I/O.
     pub(super) async fn recover_saved_attachments(&self) -> Result<()> {
         let attachments = self
             .replicas
@@ -611,7 +650,9 @@ impl ReplicatedVolumeRuntime {
         Ok(())
     }
 
-    /// Recovers one saved attachment while leaving unrelated startup work independent.
+    /// Restores a saved attachment after confirming its writer session and fence with Raft.
+    /// Recovers its block device before the mapping and mount that depend on it.
+    /// Keeps saved records throughout so an interrupted restart can retry unfinished work.
     pub(super) async fn recover_saved_attachment(
         &self,
         mut saved: LocalAttachmentRecord,
@@ -621,104 +662,17 @@ impl ReplicatedVolumeRuntime {
         let Some(record) = self.replicas.replica(key)? else {
             anyhow::bail!("saved attachment has no local replica");
         };
-        if !self.generation_is_desired(key) {
-            self.quarantine_deleted_local(key).await;
-            return self.cleanup_attachment(key).await;
-        }
-        if saved.is_detaching() {
-            if let AttachmentDetachProgress::FencePending(error) =
-                self.attempt_attachment_detach(key).await?
-            {
-                debug!(
-                    target: "volumes",
-                    ?key,
-                    error = %error,
-                    "saved local detach waits for quorum writer fencing"
-                );
-            }
-            return Ok(());
-        }
-        let state = match self.read_quorum_state(key).await {
-            Ok(state) => state,
-            Err(error) => {
-                warn!(
-                    target: "volumes",
-                    ?key,
-                    error = %error,
-                    "saved attachment remains inert until quorum state is known"
-                );
-                return Ok(());
-            }
-        };
-        let Some(fence) = saved.granted_fence() else {
+        let Some((state, committed_fence)) = self.confirm_saved_writer(&mut saved).await? else {
             return Ok(());
         };
-        let committed_fence =
-            match saved_writer_fence(&state, self.volume_node_id, saved.session_id()) {
-                Ok(committed_fence) if committed_fence >= fence => committed_fence,
-                _ => return self.cleanup_attachment(key).await,
-            };
-        if committed_fence > fence {
-            self.replicas.advance_attachment_fence(
-                key,
-                saved.session_id(),
-                fence,
-                committed_fence,
-            )?;
-            saved = self
-                .replicas
-                .attachment(key)?
-                .context("advanced saved attachment disappeared")?;
-        }
-        if validate_saved_writer(
-            &state,
-            self.volume_node_id,
-            saved.session_id(),
-            committed_fence,
-        )
-        .is_err()
-        {
-            return self.cleanup_attachment(key).await;
-        }
         if saved.ublk_devices().is_empty() {
             return Ok(());
         }
-        let mut candidates = Vec::new();
-        for device in saved.ublk_devices().iter().copied() {
-            let Some(info) = states.get(&device.id()) else {
-                continue;
-            };
-            let descriptor = saved.descriptor().with_capacity(device.capacity())?;
-            let layout =
-                MappedVolumeLayout::new(self.volume_node_id, &descriptor, info.block_path())?;
-            candidates.push((device, info.clone(), descriptor, layout));
-        }
-        let layouts = candidates
-            .iter()
-            .map(|(_, _, _, layout)| layout.clone())
-            .collect::<Vec<_>>();
-        let mapped_volumes = self.mapped_volumes.clone();
-        let selected = tokio::task::spawn_blocking(move || mapped_volumes.active_layout(&layouts))
-            .await
-            .context("join saved mapped-volume inspection")??;
-        let mapping_exists = selected.is_some();
-        let saved_device = if let Some(index) = selected {
-            candidates
-                .get(index)
-                .map(|(device, _, _, _)| *device)
-                .context("mapped-volume selection exceeded saved candidates")?
-        } else {
-            let active = saved
-                .ublk_devices()
-                .iter()
-                .copied()
-                .filter(|device| device.capacity() == saved.descriptor().capacity())
-                .collect::<Vec<_>>();
-            if active.len() != 1 {
-                anyhow::bail!("saved attachment does not identify one active-capacity device");
-            }
-            active[0]
-        };
+
+        let SavedDeviceSelection {
+            device: saved_device,
+            mapping_exists,
+        } = self.select_saved_attachment_device(&saved, states).await?;
         let attachment_descriptor = saved.descriptor().with_capacity(saved_device.capacity())?;
         if attachment_descriptor.capacity() < saved.descriptor().capacity()
             || attachment_descriptor.capacity() > record.descriptor().capacity()
@@ -733,16 +687,190 @@ impl ReplicatedVolumeRuntime {
                 .attachment(key)?
                 .context("advanced mapped attachment disappeared")?;
         }
+
+        let driver = self
+            .restore_saved_driver(
+                &record,
+                &mut saved,
+                &state,
+                saved_device,
+                committed_fence,
+                states,
+            )
+            .await?;
+        self.reconcile_recovered_devices(
+            &record,
+            &mut saved,
+            &attachment_descriptor,
+            &driver,
+            states,
+        )
+        .await?;
+        let mapped_path = self
+            .restore_attachment_mapping(&record, &attachment_descriptor, &driver, mapping_exists)
+            .await?;
+        if let Some(volume_mount) = saved.volume_mount().cloned() {
+            self.recover_saved_mount(
+                &record,
+                &saved,
+                &state,
+                &volume_mount,
+                &attachment_descriptor,
+                mapped_path,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Confirms the saved attachment's writer session and fence with a live Raft quorum.
+    /// Deleted, detaching, or revoked attachments are cleaned up instead of restarting their devices.
+    /// A valid session's saved fence may advance, but never move backwards.
+    async fn confirm_saved_writer(
+        &self,
+        saved: &mut LocalAttachmentRecord,
+    ) -> Result<Option<(VolumeControlState, FenceEpoch)>> {
+        let key = saved.key();
+        if !self.generation_is_desired(key) {
+            self.quarantine_deleted_local(key).await;
+            self.cleanup_attachment(key).await?;
+            return Ok(None);
+        }
+        if saved.is_detaching() {
+            if let AttachmentDetachProgress::FencePending(error) =
+                self.attempt_attachment_detach(key).await?
+            {
+                debug!(
+                    target: "volumes",
+                    ?key,
+                    error = %error,
+                    "saved local detach waits for quorum writer fencing"
+                );
+            }
+            return Ok(None);
+        }
+        let state = match self.read_quorum_state(key).await {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(
+                    target: "volumes",
+                    ?key,
+                    error = %error,
+                    "saved attachment remains inert until quorum state is known"
+                );
+                return Ok(None);
+            }
+        };
+
+        let Some(fence) = saved.granted_fence() else {
+            return Ok(None);
+        };
+        let committed_fence =
+            match saved_writer_fence(&state, self.volume_node_id, saved.session_id()) {
+                Ok(committed_fence) if committed_fence >= fence => committed_fence,
+                _ => {
+                    self.cleanup_attachment(key).await?;
+                    return Ok(None);
+                }
+            };
+        if committed_fence > fence {
+            self.replicas.advance_attachment_fence(
+                key,
+                saved.session_id(),
+                fence,
+                committed_fence,
+            )?;
+            *saved = self
+                .replicas
+                .attachment(key)?
+                .context("advanced saved attachment disappeared")?;
+        }
+        if validate_saved_writer(
+            &state,
+            self.volume_node_id,
+            saved.session_id(),
+            committed_fence,
+        )
+        .is_err()
+        {
+            self.cleanup_attachment(key).await?;
+            return Ok(None);
+        }
+        Ok(Some((state, committed_fence)))
+    }
+
+    /// Uses the device already backing the filesystem's mapping when choosing what to recover.
+    /// If no mapping exists, the saved attachment capacity must identify exactly one device.
+    async fn select_saved_attachment_device(
+        &self,
+        saved: &LocalAttachmentRecord,
+        states: &BTreeMap<UblkDeviceId, UblkDeviceInfo>,
+    ) -> Result<SavedDeviceSelection> {
+        let mut candidates = Vec::new();
+        for device in saved.ublk_devices().iter().copied() {
+            let Some(info) = states.get(&device.id()) else {
+                continue;
+            };
+            let descriptor = saved.descriptor().with_capacity(device.capacity())?;
+            let layout =
+                MappedVolumeLayout::new(self.volume_node_id, &descriptor, info.block_path())?;
+            candidates.push((device, layout));
+        }
+        let layouts = candidates
+            .iter()
+            .map(|(_, layout)| layout.clone())
+            .collect::<Vec<_>>();
+        let mapped_volumes = self.mapped_volumes.clone();
+        let selected = tokio::task::spawn_blocking(move || mapped_volumes.active_layout(&layouts))
+            .await
+            .context("join saved mapped-volume inspection")??;
+        let mapping_exists = selected.is_some();
+        let saved_device = if let Some(index) = selected {
+            candidates
+                .get(index)
+                .map(|(device, _)| *device)
+                .context("mapped-volume selection exceeded saved candidates")?
+        } else {
+            let active = saved
+                .ublk_devices()
+                .iter()
+                .copied()
+                .filter(|device| device.capacity() == saved.descriptor().capacity())
+                .collect::<Vec<_>>();
+            if active.len() != 1 {
+                anyhow::bail!("saved attachment does not identify one active-capacity device");
+            }
+            active[0]
+        };
+        Ok(SavedDeviceSelection {
+            device: saved_device,
+            mapping_exists,
+        })
+    }
+
+    /// Rebuilds the authorized writer's replica connections and takes over its saved ublk device.
+    /// Creates and records a new device when the saved device is absent or stopped.
+    async fn restore_saved_driver(
+        &self,
+        record: &ReplicaRecord,
+        saved: &mut LocalAttachmentRecord,
+        state: &VolumeControlState,
+        saved_device: SavedUblkDevice,
+        committed_fence: FenceEpoch,
+        states: &BTreeMap<UblkDeviceId, UblkDeviceInfo>,
+    ) -> Result<Arc<tokio::sync::Mutex<ReplicatedDriver>>> {
+        let key = record.key();
+        let attachment_descriptor = saved.descriptor().with_capacity(saved_device.capacity())?;
         let path = self
             .prepare_driver_path(
-                &record,
+                record,
                 DriverAttachment {
                     node_id: self.volume_node_id,
                     generation: key.generation(),
                     fence: committed_fence,
                     session_id: saved.session_id(),
                 },
-                &state,
+                state,
             )
             .await?;
         let ublk = saved_device.settings(&attachment_descriptor)?;
@@ -790,6 +918,8 @@ impl ReplicatedVolumeRuntime {
                 settings,
             )
         };
+        // Register before kernel startup so cleanup still owns the device if
+        // starting it fails or this caller is cancelled while waiting.
         let driver = self.register_starting_driver(key, driver).await?;
         let start = {
             let mut driver = driver.lock().await;
@@ -809,11 +939,25 @@ impl ReplicatedVolumeRuntime {
             let replacement = driver.lock().await.saved_device()?;
             self.replicas
                 .replace_ublk_device(key, saved_device, replacement)?;
-            saved = self
+            *saved = self
                 .replicas
                 .attachment(key)?
                 .context("recovered attachment disappeared")?;
         }
+        Ok(driver)
+    }
+
+    /// Recovers a larger saved device when restart interrupted capacity expansion.
+    /// Once the active device has the applied capacity, removes the obsolete saved devices.
+    async fn reconcile_recovered_devices(
+        &self,
+        record: &ReplicaRecord,
+        saved: &mut LocalAttachmentRecord,
+        attachment_descriptor: &VolumeDescriptor,
+        driver: &Arc<tokio::sync::Mutex<ReplicatedDriver>>,
+        states: &BTreeMap<UblkDeviceId, UblkDeviceInfo>,
+    ) -> Result<()> {
+        let key = record.key();
         let active_device = driver.lock().await.saved_device()?;
         if attachment_descriptor.capacity() < record.descriptor().capacity() {
             let expanded = saved
@@ -841,7 +985,7 @@ impl ReplicatedVolumeRuntime {
                     Some(_) | None => {
                         self.remove_untracked_device(key, expanded).await?;
                         self.replicas.clear_ublk_device(key, expanded)?;
-                        saved = self
+                        *saved = self
                             .replicas
                             .attachment(key)?
                             .context("saved attachment disappeared during device cleanup")?;
@@ -859,54 +1003,45 @@ impl ReplicatedVolumeRuntime {
                 self.remove_untracked_device(key, stale).await?;
                 self.replicas.clear_ublk_device(key, stale)?;
             }
-            saved = self
+            *saved = self
                 .replicas
                 .attachment(key)?
                 .context("saved attachment disappeared during old-device cleanup")?;
         }
+        Ok(())
+    }
+
+    /// Restores the device-mapper path that the saved filesystem mount uses.
+    /// During interrupted expansion, leaves an existing smaller mapping for expansion to finish.
+    async fn restore_attachment_mapping(
+        &self,
+        record: &ReplicaRecord,
+        attachment_descriptor: &VolumeDescriptor,
+        driver: &Arc<tokio::sync::Mutex<ReplicatedDriver>>,
+        mapping_exists: bool,
+    ) -> Result<PathBuf> {
+        let key = record.key();
         let ublk_device_path = driver.lock().await.ublk_device_path()?.to_path_buf();
-        let active_layout = MappedVolumeLayout::new(
-            self.volume_node_id,
-            &attachment_descriptor,
-            ublk_device_path,
-        )?;
+        let active_layout =
+            MappedVolumeLayout::new(self.volume_node_id, attachment_descriptor, ublk_device_path)?;
         let mapped_path = if mapping_exists {
             if attachment_descriptor.capacity() == record.descriptor().capacity() {
-                let mapped_volumes = self.mapped_volumes.clone();
-                let layout = active_layout.clone();
-                self.lifecycle_calls
-                    .run(
-                        key,
-                        "mantissa-volume-resume-saved-mapping",
-                        self.operation_timeout,
-                        move || mapped_volumes.resume_exact(&layout).map(drop),
-                    )
-                    .await
-                    .context("resume exact saved mapped volume")?;
+                self.resume_saved_mapping(key, active_layout.clone())
+                    .await?;
             }
             active_layout.expected_path().to_path_buf()
         } else {
             self.create_or_verify_mapped_device(
-                &attachment_descriptor,
+                attachment_descriptor,
                 active_layout.underlying_device_path().to_path_buf(),
             )
             .await?
         };
-        if let Some(volume_mount) = saved.volume_mount().cloned() {
-            self.recover_saved_mount(
-                &record,
-                &saved,
-                &state,
-                &volume_mount,
-                &attachment_descriptor,
-                mapped_path,
-            )
-            .await?;
-        }
-        Ok(())
+        Ok(mapped_path)
     }
 
-    /// Restores one exact saved mount after its driver and writer grant are current.
+    /// Restores the saved filesystem mount only after validating its writer session and fence.
+    /// Reapplies saved ownership and capacity, or continues unmounting if detach already began.
     pub(super) async fn recover_saved_mount(
         &self,
         record: &ReplicaRecord,

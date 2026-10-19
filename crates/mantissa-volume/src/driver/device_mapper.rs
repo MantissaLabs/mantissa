@@ -443,7 +443,7 @@ fn select_saved_linear_layout(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(any(test, target_os = "linux"))]
 enum ExpansionAction {
-    /// The expanded table is already active; resume it if it is suspended.
+    /// The expanded table is already active. Resume it if it is suspended.
     Finish,
     /// The old table is active and the expanded table must be loaded.
     LoadExpandedTable,

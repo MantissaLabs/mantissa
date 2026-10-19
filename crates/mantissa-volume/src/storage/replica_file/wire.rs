@@ -241,7 +241,7 @@ pub enum ReplicaDataAction {
         identity: ReplicaMaintenanceIdentity,
         /// Block-aligned logical byte offset.
         offset: u64,
-        /// Greatest allocated bytes returned; a sparse range may be longer.
+        /// Greatest allocated bytes returned. A sparse range may be longer.
         maximum_bytes: usize,
         /// True when the bytes must not change during the read.
         must_be_stable: bool,
@@ -537,7 +537,7 @@ impl ReplicaDataResponse {
 /// Remote outcome carried by one data response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaDataResult {
-    /// The named write reached the copy; progress reports the contiguous prefix.
+    /// The named write reached the copy. Progress reports the contiguous prefix.
     Stored(ReplicaDataProgress),
 
     /// The named flush and covered writes are durable on the copy.
