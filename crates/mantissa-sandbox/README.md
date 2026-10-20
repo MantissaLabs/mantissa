@@ -6,6 +6,8 @@ This crate builds the `mantissa-sandbox-init` helper. The helper reads a
 serialized Mantissa runtime sandbox policy from the environment, applies it via
 the current sandbox backend, and then `exec`s the target workload command.
 
+Building this crate requires Rust 1.95 or newer, as required by Nono 0.80.0.
+
 ## Binary
 
 ```sh

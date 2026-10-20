@@ -95,21 +95,27 @@ where
     Ok(command)
 }
 
-/// Applies one structured runtime sandbox policy through the current backend implementation.
+/// Applies filesystem and network restrictions before starting the workload.
+///
+/// On Linux, Nono uses seccomp if the kernel cannot filter TCP through Landlock.
+/// The helper rejects any fallback that would need a separate network proxy.
 fn apply_runtime_sandbox_policy(policy: &RuntimeSandboxPolicy) -> Result<(), SandboxInitError> {
     let capabilities = build_capability_set(policy)?;
 
     #[cfg(target_os = "linux")]
-    match Sandbox::apply(&capabilities)? {
+    match Sandbox::apply_auto(&capabilities)? {
         SeccompNetFallback::None | SeccompNetFallback::BlockAll => Ok(()),
         SeccompNetFallback::ProxyOnly { .. } => Err(SandboxInitError::UnsupportedProxyFallback),
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        Sandbox::apply(&capabilities)?;
+        Sandbox::apply_auto(&capabilities)?;
         Ok(())
     }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err(nono::NonoError::UnsupportedPlatform(std::env::consts::OS.to_string()).into())
 }
 
 /// Builds one runtime backend capability set from one structured sandbox policy.

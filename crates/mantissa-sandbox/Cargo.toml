@@ -2,6 +2,7 @@
 name = "mantissa-sandbox"
 version = "0.5.0"
 edition = "2024"
+rust-version = "1.95"
 publish = false
 license.workspace = true
 repository.workspace = true
@@ -11,8 +12,8 @@ workspace = true
 
 [dependencies]
 mantissa = { path = "../.." }
-nono = "0.29.1"
-keyring = { version = "3.6.3", default-features = false, features = ["vendored"] }
+# The helper applies policies without accessing the system keyring.
+nono = { version = "0.80.0", default-features = false }
 thiserror = "2.0.12"
 
 [target.'cfg(unix)'.dependencies]
