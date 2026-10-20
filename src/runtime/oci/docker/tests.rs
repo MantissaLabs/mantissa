@@ -23,7 +23,6 @@ use super::sandbox::{parse_sandboxed_container_metadata, resolve_effective_sandb
 use super::{
     DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE,
     MANTISSA_SANDBOX_ENABLED_LABEL, MANTISSA_SANDBOX_POLICY_ENV_VAR,
-    NonoSandboxBackendAvailability,
 };
 
 #[test]
@@ -130,7 +129,7 @@ fn docker_backend_with_helper_advertises_both_execution_modes() {
     ));
 }
 
-/// Workload filtering must happen in Docker; full scans must still expose foreign mount users.
+/// Keeps checks out of workload inventory while full scans retain every mount user.
 #[tokio::test]
 async fn docker_inventory_scope_preserves_full_scans_and_filters_workloads() {
     use axum::{
@@ -144,8 +143,16 @@ async fn docker_inventory_scope_preserves_full_scans_and_filters_workloads() {
         State(tx): State<mpsc::UnboundedSender<HashMap<String, String>>>,
         Query(query): Query<HashMap<String, String>>,
     ) -> Json<Vec<serde_json::Value>> {
+        let full_inventory = !query.contains_key("filters");
         tx.send(query).expect("record list query");
-        Json(Vec::new())
+        let mut containers = vec![
+            serde_json::json!({"Id": "workload", "Labels": {"mantissa.workload_id": "owned"}}),
+            serde_json::json!({"Id": "check", "Labels": {"mantissa.workload_id": "inherited", "mantissa.sandbox.check": "true"}}),
+        ];
+        if full_inventory {
+            containers.push(serde_json::json!({"Id": "foreign"}));
+        }
+        Json(containers)
     }
 
     let (tx, mut queries) = mpsc::unbounded_channel();
@@ -166,14 +173,17 @@ async fn docker_inventory_scope_preserves_full_scans_and_filters_workloads() {
         docker_config_path: None,
     };
 
-    backend
+    let all = backend
         .list_instances(RuntimeListScope::All)
         .await
         .expect("full inventory");
-    backend
+    let owned = backend
         .list_instances(RuntimeListScope::Workloads)
         .await
         .expect("workload inventory");
+    assert_eq!(all.len(), 3);
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].id, "workload");
     let full = queries.recv().await.expect("full query");
     let workloads = queries.recv().await.expect("workload query");
     assert_eq!(full.get("all").map(String::as_str), Some("true"));
@@ -184,6 +194,74 @@ async fn docker_inventory_scope_preserves_full_scans_and_filters_workloads() {
         serde_json::json!({"label": ["mantissa.workload_id"]})
     );
 
+    server.abort();
+    let _ = server.await;
+}
+
+/// Check containers must not report completion for ownership labels inherited from their image.
+#[tokio::test]
+async fn sandbox_check_events_do_not_change_workload_state() {
+    use axum::{Router, routing::get};
+
+    let owner = Uuid::new_v4();
+    let events = [true, false]
+        .map(|check| {
+            serde_json::json!({
+                "Type": "container",
+                "Action": "die",
+                "Actor": {
+                    "ID": "container",
+                    "Attributes": {
+                        "mantissa.workload_id": owner.to_string(),
+                        "mantissa.sandbox.check": check.to_string(),
+                        "exitCode": "0"
+                    }
+                }
+            })
+            .to_string()
+        })
+        .join("\n");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Docker event listener");
+    let endpoint = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let app = Router::new().route(
+        "/events",
+        get(move || {
+            let events = events.clone();
+            async move { events }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("Docker events");
+    });
+    let backend = DockerRuntimeBackend {
+        docker: Docker::connect_with_http(&endpoint, 120, bollard::API_DEFAULT_VERSION)
+            .expect("Docker client"),
+        nono_helper_host_path: None,
+        docker_config_path: None,
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    backend
+        .watch_runtime_events(tx)
+        .await
+        .expect("event stream");
+
+    assert!(
+        matches!(rx.try_recv(), Ok(crate::runtime::types::RuntimeEvent::TaskExited { task_id, exit_code: 0 }) if task_id == owner)
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(crate::runtime::types::RuntimeEvent::InstanceStateChanged)
+    ));
+    assert!(
+        rx.try_recv().is_err(),
+        "checks must not emit workload events"
+    );
     server.abort();
     let _ = server.await;
 }
@@ -274,6 +352,18 @@ async fn docker_create_selects_sandboxing_from_each_request() {
             "/images/{image}/json",
             get(|| async { Json(serde_json::json!({"Config": {"WorkingDir": "/workspace"}})) }),
         )
+        .route(
+            "/containers/{id}/start",
+            post(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
+        .route(
+            "/containers/{id}/wait",
+            post(|| async { Json(serde_json::json!({"StatusCode": 0})) }),
+        )
+        .route(
+            "/containers/{id}",
+            axum::routing::delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+        )
         .with_state(tx);
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve Docker");
@@ -299,7 +389,15 @@ async fn docker_create_selects_sandboxing_from_each_request() {
             .expect("create instance");
     }
     let standard = bodies.recv().await.expect("standard create");
+    let check = bodies.recv().await.expect("sandbox check");
     let sandboxed = bodies.recv().await.expect("sandboxed create");
+
+    assert_eq!(check["Cmd"], serde_json::json!(["--check", "/bin/tool"]));
+    assert_eq!(check["HostConfig"]["NetworkMode"], "none");
+    assert_eq!(check["Labels"]["mantissa.sandbox.check"], "true");
+    assert_eq!(sandboxed["Labels"]["mantissa.sandbox.check"], "false");
+    assert_eq!(check["Env"], sandboxed["Env"]);
+
     assert!(standard["Entrypoint"].is_null());
     assert!(standard["Labels"]["mantissa.sandbox.enabled"].is_null());
     assert_eq!(
@@ -307,6 +405,14 @@ async fn docker_create_selects_sandboxing_from_each_request() {
         serde_json::json!(["/mantissa-sandbox-init"])
     );
     assert_eq!(sandboxed["Labels"]["mantissa.sandbox.enabled"], "true");
+    let encoded = sandboxed["Env"][0].as_str().expect("policy environment");
+    let policy = RuntimeSandboxPolicy::decode_env_value(
+        encoded
+            .strip_prefix("MANTISSA_SANDBOX_POLICY=")
+            .expect("policy prefix"),
+    )
+    .expect("stored policy");
+    assert_eq!(policy, RuntimeSandboxPolicy::default());
     assert_eq!(
         sandboxed["HostConfig"]["Binds"],
         serde_json::json!(["/host/mantissa-sandbox-init:/mantissa-sandbox-init:ro"])
@@ -314,39 +420,6 @@ async fn docker_create_selects_sandboxing_from_each_request() {
 
     server.abort();
     let _ = server.await;
-}
-
-#[test]
-fn nono_sandbox_availability_rejects_unsupported_hosts() {
-    let availability = NonoSandboxBackendAvailability::from_parts(
-        false,
-        Some("/tmp/mantissa-sandbox-init".into()),
-    );
-
-    assert!(matches!(
-        availability,
-        NonoSandboxBackendAvailability::UnsupportedHost
-    ));
-    assert_eq!(
-        availability.unavailable_reason().as_deref(),
-        Some("sandboxed Docker backend requires a Linux or macOS host")
-    );
-}
-
-#[test]
-fn nono_sandbox_availability_requires_helper_path() {
-    let availability = NonoSandboxBackendAvailability::from_parts(true, None);
-
-    assert!(matches!(
-        availability,
-        NonoSandboxBackendAvailability::MissingHelper
-    ));
-    assert!(
-        availability
-            .unavailable_reason()
-            .expect("missing helper should explain itself")
-            .contains("mantissa-sandbox-init")
-    );
 }
 
 #[test]

@@ -1017,11 +1017,16 @@ local_test!(
     }
 );
 
+/// Checks that joining receives the cluster master key before the next background
+/// sync, even with the passphrase encryption cost configured for production nodes.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "uses production Argon2 cost and prints a join latency baseline"]
 async fn production_kdf_join_latency_baseline() {
     mantissa::logger::init_for_tests();
-    common::testkit::run_local(async {
+
+    // Keep the large node startup state on the heap to avoid overflowing the
+    // test thread's stack, matching the shared local_test! macro.
+    common::testkit::run_local(Box::pin(async {
         let _guard = RuntimeBackendOverrideGuard::install_default();
         let cfg = ClusterConfig {
             sync_tick_ms: Some(30_000),
@@ -1044,7 +1049,7 @@ async fn production_kdf_join_latency_baseline() {
             elapsed < Duration::from_secs(15),
             "production KDF join should not wait for background sync: {elapsed:?}"
         );
-    })
+    }))
     .await;
 }
 

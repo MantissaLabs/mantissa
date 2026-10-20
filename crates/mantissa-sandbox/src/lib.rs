@@ -1,16 +1,20 @@
 use std::env;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use mantissa::runtime::oci::docker::{MANTISSA_SANDBOX_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS};
+use mantissa::runtime::oci::docker::{
+    MANTISSA_SANDBOX_CHECK_ARGUMENT, MANTISSA_SANDBOX_POLICY_ENV_VAR,
+};
 use mantissa::runtime::types::{
     RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode, RuntimeSandboxPathKind,
     RuntimeSandboxPathRule, RuntimeSandboxPolicy, RuntimeSandboxPolicyCodecError,
 };
 #[cfg(target_os = "linux")]
-use nono::sandbox::SeccompNetFallback;
+use nono::sandbox::{SeccompNetFallback, SeccompOpts};
 use nono::{AccessMode, CapabilitySet, Sandbox};
 use thiserror::Error;
+
+mod bootstrap;
 
 /// Errors returned while the sandbox helper translates one Mantissa policy into active isolation.
 #[derive(Debug, Error)]
@@ -27,6 +31,9 @@ pub enum SandboxInitError {
     #[error("sandboxed command must contain at least one argument")]
     MissingCommand,
 
+    #[error("sandbox command was not found or is not executable: {0}")]
+    CommandNotExecutable(String),
+
     #[error("sandbox working directory must resolve to a directory: {0}")]
     WorkingDirectoryNotDirectory(String),
 
@@ -42,26 +49,41 @@ pub enum SandboxInitError {
     #[cfg(target_os = "linux")]
     #[error("proxy-only network fallback is not supported by the mantissa sandbox helper")]
     UnsupportedProxyFallback,
+
+    #[cfg(target_os = "linux")]
+    #[error(
+        "sandbox requires Landlock ABI V3 or newer to protect read-only files from truncation, detected {0}"
+    )]
+    UnsupportedLandlockVersion(&'static str),
 }
 
-/// Runs the generic Mantissa sandbox helper entry flow for one target command.
+/// Restricts the workload before exec, or checks the same restrictions without running it.
 ///
-/// Today this translates Mantissa's runtime sandbox contract into `nono`, but
-/// the process boundary and transport are intentionally generic so the helper
-/// crate can grow other sandbox-entry paths later.
+/// Docker uses `--check` with the workload command to verify its image and policy
+/// in a disposable container before creating the actual workload container.
 pub fn run_sandbox_init<I>(args: I) -> Result<(), SandboxInitError>
 where
     I: IntoIterator<Item = OsString>,
 {
     let policy = load_runtime_sandbox_policy_from_env()?;
+    let mut args = args.into_iter().peekable();
+    let check_only = args
+        .next_if(|arg| arg == MANTISSA_SANDBOX_CHECK_ARGUMENT)
+        .is_some();
     let command = resolve_target_command_from_args(args)?;
 
     if let Some(working_directory) = policy.working_directory.as_ref() {
         env::set_current_dir(working_directory)?;
     }
 
-    apply_runtime_sandbox_policy(&policy)?;
-    exec_target_command(&command)
+    let executable = resolve_executable(&command[0])?;
+    apply_runtime_sandbox_policy(&policy, &executable)?;
+
+    if check_only {
+        Ok(())
+    } else {
+        exec_target_command(&executable, &command)
+    }
 }
 
 /// Loads one serialized runtime sandbox policy from the helper environment.
@@ -97,15 +119,29 @@ where
 
 /// Applies filesystem and network restrictions before starting the workload.
 ///
-/// On Linux, Nono uses seccomp if the kernel cannot filter TCP through Landlock.
-/// The helper rejects any fallback that would need a separate network proxy.
-fn apply_runtime_sandbox_policy(policy: &RuntimeSandboxPolicy) -> Result<(), SandboxInitError> {
-    let capabilities = build_capability_set(policy)?;
+/// Linux needs the static seccomp filter even when Landlock can restrict TCP,
+/// because Landlock does not block UDP. Proxy-dependent fallbacks are rejected.
+fn apply_runtime_sandbox_policy(
+    policy: &RuntimeSandboxPolicy,
+    executable: &Path,
+) -> Result<(), SandboxInitError> {
+    let capabilities = build_capability_set(policy, executable)?;
 
     #[cfg(target_os = "linux")]
-    match Sandbox::apply_auto(&capabilities)? {
-        SeccompNetFallback::None | SeccompNetFallback::BlockAll => Ok(()),
-        SeccompNetFallback::ProxyOnly { .. } => Err(SandboxInitError::UnsupportedProxyFallback),
+    {
+        let abi = Sandbox::detect_abi()?;
+        // Read-only permissions must prevent truncation as well as ordinary writes.
+        if !abi.has_truncate() {
+            return Err(SandboxInitError::UnsupportedLandlockVersion(
+                abi.version_string(),
+            ));
+        }
+
+        match Sandbox::apply_seccomp_with_abi(&capabilities, &abi, SeccompOpts::network_baseline())?
+        {
+            SeccompNetFallback::None | SeccompNetFallback::BlockAll => Ok(()),
+            SeccompNetFallback::ProxyOnly { .. } => Err(SandboxInitError::UnsupportedProxyFallback),
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -118,9 +154,12 @@ fn apply_runtime_sandbox_policy(policy: &RuntimeSandboxPolicy) -> Result<(), San
     Err(nono::NonoError::UnsupportedPlatform(std::env::consts::OS.to_string()).into())
 }
 
-/// Builds one runtime backend capability set from one structured sandbox policy.
-fn build_capability_set(policy: &RuntimeSandboxPolicy) -> Result<CapabilitySet, SandboxInitError> {
-    let mut capabilities = CapabilitySet::new();
+/// Adds declared permissions to the runtime files needed to launch the selected executable.
+fn build_capability_set(
+    policy: &RuntimeSandboxPolicy,
+    executable: &Path,
+) -> Result<CapabilitySet, SandboxInitError> {
+    let mut capabilities = bootstrap::allow_runtime_files(CapabilitySet::new(), executable)?;
     for rule in &policy.filesystem {
         capabilities = add_path_rule(capabilities, rule)?;
     }
@@ -139,10 +178,6 @@ fn add_path_rule(
     capabilities: CapabilitySet,
     rule: &RuntimeSandboxPathRule,
 ) -> Result<CapabilitySet, SandboxInitError> {
-    if !rule.path.exists() && is_optional_bootstrap_rule(rule) {
-        return Ok(capabilities);
-    }
-
     let access = access_mode(rule.access);
     match rule.kind {
         RuntimeSandboxPathKind::Directory => capabilities
@@ -154,15 +189,43 @@ fn add_path_rule(
     }
 }
 
-/// Returns whether one filesystem rule is an optional bootstrap directory that may be absent.
-fn is_optional_bootstrap_rule(rule: &RuntimeSandboxPathRule) -> bool {
-    rule.kind == RuntimeSandboxPathKind::Directory
-        && rule.access == RuntimeSandboxAccessMode::Read
-        && NONO_EXEC_READONLY_DIRS
-            .iter()
-            .any(|candidate| rule.path == Path::new(candidate))
-}
+/// Resolves PATH before restricting access so exec uses the same file that received permission.
+fn resolve_executable(command: &std::ffi::OsStr) -> Result<PathBuf, SandboxInitError> {
+    let path = Path::new(command);
+    let candidates = if path.components().count() > 1 || path.is_absolute() {
+        vec![path.to_path_buf()]
+    } else {
+        env::split_paths(&env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into()))
+            .map(|directory| directory.join(path))
+            .collect()
+    };
 
+    for candidate in candidates {
+        let Ok(metadata) = candidate.metadata() else {
+            continue;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+
+        if metadata.is_file() {
+            return Ok(if candidate.is_absolute() {
+                candidate
+            } else {
+                env::current_dir()?.join(candidate)
+            });
+        }
+    }
+
+    Err(SandboxInitError::CommandNotExecutable(
+        command.to_string_lossy().into_owned(),
+    ))
+}
 /// Maps one Mantissa sandbox access mode into the current helper backend model.
 fn access_mode(mode: RuntimeSandboxAccessMode) -> AccessMode {
     match mode {
@@ -198,19 +261,21 @@ fn validate_working_directory(
 }
 
 /// Replaces the helper process with the real workload command after sandboxing.
-fn exec_target_command(command: &[OsString]) -> Result<(), SandboxInitError> {
+fn exec_target_command(executable: &Path, command: &[OsString]) -> Result<(), SandboxInitError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
 
-        let mut process = std::process::Command::new(&command[0]);
+        let mut process = std::process::Command::new(executable);
+        // Preserve names used by programs such as BusyBox to select their behavior.
+        process.arg0(&command[0]);
         process.args(&command[1..]);
         Err(SandboxInitError::Io(process.exec()))
     }
 
     #[cfg(not(unix))]
     {
-        let status = std::process::Command::new(&command[0])
+        let status = std::process::Command::new(executable)
             .args(&command[1..])
             .status()?;
         if status.success() {
@@ -251,7 +316,8 @@ mod tests {
             network: RuntimeSandboxNetworkMode::Blocked,
         };
 
-        build_capability_set(&policy).expect("working directory should be covered");
+        build_capability_set(&policy, &env::current_exe().expect("test executable"))
+            .expect("working directory should be covered");
     }
 
     #[test]
@@ -271,23 +337,12 @@ mod tests {
             network: RuntimeSandboxNetworkMode::Blocked,
         };
 
-        let error = build_capability_set(&policy).expect_err("helper should reject denied workdir");
+        let error = build_capability_set(&policy, &env::current_exe().expect("test executable"))
+            .expect_err("helper should reject denied workdir");
         assert!(matches!(
             error,
             SandboxInitError::WorkingDirectoryNotAllowed(path)
             if path == denied.display().to_string()
         ));
-    }
-
-    #[test]
-    fn optional_bootstrap_rule_matches_readonly_dir_entries() {
-        let rule = RuntimeSandboxPathRule::directory("/lib64", RuntimeSandboxAccessMode::Read);
-        assert!(is_optional_bootstrap_rule(&rule));
-    }
-
-    #[test]
-    fn optional_bootstrap_rule_rejects_non_bootstrap_paths() {
-        let rule = RuntimeSandboxPathRule::directory("/workspace", RuntimeSandboxAccessMode::Read);
-        assert!(!is_optional_bootstrap_rule(&rule));
     }
 }

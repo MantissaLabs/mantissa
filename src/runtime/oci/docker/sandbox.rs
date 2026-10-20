@@ -12,15 +12,12 @@ use std::path::{Path, PathBuf};
 
 use bollard::query_parameters::InspectContainerOptions;
 
-use crate::runtime::types::{
-    RuntimeError, RuntimeResult, RuntimeSandboxAccessMode, RuntimeSandboxPathRule,
-    RuntimeSandboxPolicy,
-};
+use crate::runtime::types::{RuntimeError, RuntimeResult, RuntimeSandboxPolicy};
 
 use super::{
     DockerRuntimeBackend, MANTISSA_SANDBOX_ENABLED_LABEL, MANTISSA_SANDBOX_HELPER_BINARY_NAME,
     MANTISSA_SANDBOX_HELPER_CONTAINER_PATH, MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR,
-    MANTISSA_SANDBOX_POLICY_ENV_VAR, NONO_EXEC_READONLY_DIRS,
+    MANTISSA_SANDBOX_POLICY_ENV_VAR,
 };
 
 /// Fully prepared Docker create settings after optional `nono` helper injection.
@@ -46,13 +43,6 @@ pub(super) struct PreparedSandboxedExec {
 pub(super) struct SandboxedContainerMetadata {
     pub(super) encoded_policy: String,
     pub(super) working_dir: Option<String>,
-}
-
-/// Effective image command plus Docker working-directory metadata needed for helper launches.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ResolvedSandboxLaunchTarget {
-    command: Vec<String>,
-    working_dir: Option<String>,
 }
 
 impl DockerRuntimeBackend {
@@ -101,20 +91,16 @@ impl DockerRuntimeBackend {
         };
 
         let helper_path = self.ensure_nono_helper_host_path()?;
-        let launch_target = self
-            .resolve_effective_sandbox_launch_target(image, command.as_deref())
+        let command = self
+            .resolve_effective_sandbox_command(image, command.as_deref())
             .await?;
-        let encoded_policy = augment_sandbox_policy_for_launch(
-            policy,
-            &launch_target.command,
-            launch_target.working_dir.as_deref(),
-        )
-        .encode_env_value()
-        .map_err(|err| RuntimeError::OperationFailed(err.to_string()))?;
+        let encoded_policy = policy
+            .encode_env_value()
+            .map_err(|err| RuntimeError::OperationFailed(err.to_string()))?;
 
         Ok(PreparedSandboxedCreate {
             entrypoint: Some(vec![MANTISSA_SANDBOX_HELPER_CONTAINER_PATH.to_string()]),
-            command: Some(launch_target.command),
+            command: Some(command),
             env_vars: Some(merge_env_var(
                 env_vars.unwrap_or_default(),
                 MANTISSA_SANDBOX_POLICY_ENV_VAR,
@@ -129,7 +115,7 @@ impl DockerRuntimeBackend {
                 volumes.unwrap_or_default(),
                 helper_path,
                 MANTISSA_SANDBOX_HELPER_CONTAINER_PATH,
-            )),
+            )?),
         })
     }
 
@@ -175,12 +161,12 @@ impl DockerRuntimeBackend {
         })
     }
 
-    /// Resolves the effective process command and image workdir Docker would have launched directly.
-    async fn resolve_effective_sandbox_launch_target(
+    /// Preserves Docker's entrypoint and command rules when inserting the sandbox helper.
+    async fn resolve_effective_sandbox_command(
         &self,
         image: &str,
         requested_command: Option<&[String]>,
-    ) -> RuntimeResult<ResolvedSandboxLaunchTarget> {
+    ) -> RuntimeResult<Vec<String>> {
         let inspect = self
             .docker
             .inspect_image(image)
@@ -188,15 +174,12 @@ impl DockerRuntimeBackend {
             .map_err(|err| RuntimeError::backend(None, err.to_string()))?;
         let config = inspect.config.unwrap_or_default();
 
-        Ok(ResolvedSandboxLaunchTarget {
-            command: resolve_effective_sandbox_command_parts(
-                image,
-                config.entrypoint.as_deref(),
-                config.cmd.as_deref(),
-                requested_command,
-            )?,
-            working_dir: normalize_optional_text(config.working_dir.as_deref()),
-        })
+        resolve_effective_sandbox_command_parts(
+            image,
+            config.entrypoint.as_deref(),
+            config.cmd.as_deref(),
+            requested_command,
+        )
     }
 
     /// Inspects one container and extracts the persisted helper metadata needed for later exec calls.
@@ -227,36 +210,6 @@ impl DockerRuntimeBackend {
         let canonical = path.canonicalize().ok()?;
         canonical.is_file().then_some(canonical)
     }
-}
-
-/// Adds Docker/image bootstrap allowances to one policy before it is handed to the helper.
-fn augment_sandbox_policy_for_launch(
-    mut policy: RuntimeSandboxPolicy,
-    target_command: &[String],
-    image_working_dir: Option<&str>,
-) -> RuntimeSandboxPolicy {
-    for path in NONO_EXEC_READONLY_DIRS {
-        add_or_widen_sandbox_rule(
-            &mut policy,
-            RuntimeSandboxPathRule::directory(*path, RuntimeSandboxAccessMode::Read),
-        );
-    }
-
-    if let Some(working_dir) = normalize_optional_text(image_working_dir) {
-        add_or_widen_sandbox_rule(
-            &mut policy,
-            RuntimeSandboxPathRule::directory(working_dir, RuntimeSandboxAccessMode::Read),
-        );
-    }
-
-    if let Some(parent) = absolute_command_parent_directory(target_command.first()) {
-        add_or_widen_sandbox_rule(
-            &mut policy,
-            RuntimeSandboxPathRule::directory(parent, RuntimeSandboxAccessMode::Read),
-        );
-    }
-
-    policy
 }
 
 /// Resolves the final target command the helper must `exec` once Docker has started it.
@@ -319,59 +272,10 @@ fn collect_non_empty_command_parts(parts: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
-/// Returns the parent directory of one absolute command path so the sandbox can read it.
-fn absolute_command_parent_directory(command: Option<&String>) -> Option<PathBuf> {
-    let command = command?.trim();
-    if command.is_empty() {
-        return None;
-    }
-
-    let path = Path::new(command);
-    path.is_absolute()
-        .then(|| path.parent().map(Path::to_path_buf))
-        .flatten()
-}
-
-/// Adds one filesystem rule to the policy, widening exact duplicates when needed.
-fn add_or_widen_sandbox_rule(policy: &mut RuntimeSandboxPolicy, candidate: RuntimeSandboxPathRule) {
-    if let Some(existing) = policy
-        .filesystem
-        .iter_mut()
-        .find(|rule| rule.kind == candidate.kind && rule.path == candidate.path)
-    {
-        existing.access = widen_sandbox_access(existing.access, candidate.access);
-        return;
-    }
-
-    policy.filesystem.push(candidate);
-}
-
-/// Returns the broadest access mode required by two exact filesystem rules.
-fn widen_sandbox_access(
-    current: RuntimeSandboxAccessMode,
-    candidate: RuntimeSandboxAccessMode,
-) -> RuntimeSandboxAccessMode {
-    use RuntimeSandboxAccessMode::{Read, ReadWrite, Write};
-
-    match (current, candidate) {
-        (ReadWrite, _) | (_, ReadWrite) => ReadWrite,
-        (Read, Write) | (Write, Read) => ReadWrite,
-        (Write, Write) => Write,
-        _ => Read,
-    }
-}
-
 /// Adds or replaces one environment variable in Docker's `NAME=value` list representation.
 fn merge_env_var(mut env_vars: Vec<String>, name: &str, value: String) -> Vec<String> {
     let prefix = format!("{name}=");
-    if let Some(entry) = env_vars
-        .iter_mut()
-        .find(|entry| entry.starts_with(&prefix) || entry.as_str() == name)
-    {
-        *entry = format!("{prefix}{value}");
-        return env_vars;
-    }
-
+    env_vars.retain(|entry| !entry.starts_with(&prefix) && entry != name);
     env_vars.push(format!("{prefix}{value}"));
     env_vars
 }
@@ -386,21 +290,23 @@ fn merge_label(
     labels
 }
 
-/// Adds the helper bind mount when the container does not already expose that target path.
+/// Reserves the helper path so a workload mount cannot replace the sandbox launcher.
 fn merge_bind_mount(
     mut mounts: Vec<String>,
     host_path: &Path,
     container_path: &str,
-) -> Vec<String> {
+) -> RuntimeResult<Vec<String>> {
     if mounts
         .iter()
         .any(|mount| bind_mount_targets_path(mount, container_path))
     {
-        return mounts;
+        return Err(RuntimeError::OperationFailed(format!(
+            "sandbox helper mount path {container_path} is reserved"
+        )));
     }
 
     mounts.push(format!("{}:{container_path}:ro", host_path.display()));
-    mounts
+    Ok(mounts)
 }
 
 /// Returns whether one Docker bind mount string already targets the provided container path.
@@ -425,69 +331,33 @@ fn normalize_optional_text(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::types::{
-        RuntimeSandboxAccessMode, RuntimeSandboxNetworkMode, RuntimeSandboxPathKind,
-    };
 
+    /// A declared mount must not replace the helper that enforces the policy.
     #[test]
-    fn launch_policy_augmentation_adds_bootstrap_read_paths() {
-        let policy = augment_sandbox_policy_for_launch(
-            RuntimeSandboxPolicy {
-                working_directory: Some(PathBuf::from("/workspace")),
-                filesystem: vec![RuntimeSandboxPathRule::directory(
-                    "/workspace",
-                    RuntimeSandboxAccessMode::ReadWrite,
-                )],
-                network: RuntimeSandboxNetworkMode::Blocked,
-            },
-            &["/app/bin/agent".to_string(), "--once".to_string()],
-            Some("/app"),
-        );
+    fn sandbox_rejects_replacing_helper_mount() {
+        let error = merge_bind_mount(
+            vec!["/tmp/replacement:/mantissa-sandbox-init:rw".to_string()],
+            Path::new("/trusted/helper"),
+            MANTISSA_SANDBOX_HELPER_CONTAINER_PATH,
+        )
+        .expect_err("helper path must be reserved");
 
-        assert!(policy.filesystem.iter().any(|rule| {
-            rule.path == Path::new("/bin")
-                && rule.kind == RuntimeSandboxPathKind::Directory
-                && rule.access == RuntimeSandboxAccessMode::Read
-        }));
-        assert!(policy.filesystem.iter().any(|rule| {
-            rule.path == Path::new("/app")
-                && rule.kind == RuntimeSandboxPathKind::Directory
-                && rule.access == RuntimeSandboxAccessMode::Read
-        }));
-        assert!(policy.filesystem.iter().any(|rule| {
-            rule.path == Path::new("/app/bin")
-                && rule.kind == RuntimeSandboxPathKind::Directory
-                && rule.access == RuntimeSandboxAccessMode::Read
-        }));
-        assert!(policy.filesystem.iter().any(|rule| {
-            rule.path == Path::new("/workspace")
-                && rule.kind == RuntimeSandboxPathKind::Directory
-                && rule.access == RuntimeSandboxAccessMode::ReadWrite
-        }));
+        assert!(error.to_string().contains("reserved"));
     }
 
+    /// Duplicate environment entries must not override the policy recorded by Mantissa.
     #[test]
-    fn launch_policy_augmentation_ignores_relative_commands() {
-        let policy = augment_sandbox_policy_for_launch(
-            RuntimeSandboxPolicy {
-                working_directory: None,
-                filesystem: Vec::new(),
-                network: RuntimeSandboxNetworkMode::AllowAll,
-            },
-            &["sh".to_string(), "-lc".to_string(), "echo ok".to_string()],
-            None,
+    fn sandbox_policy_replaces_all_environment_duplicates() {
+        let env = merge_env_var(
+            vec![
+                "MANTISSA_SANDBOX_POLICY=old".to_string(),
+                "KEEP=value".to_string(),
+                "MANTISSA_SANDBOX_POLICY=other".to_string(),
+            ],
+            MANTISSA_SANDBOX_POLICY_ENV_VAR,
+            "current".to_string(),
         );
 
-        assert!(
-            !policy
-                .filesystem
-                .iter()
-                .any(|rule| rule.path == Path::new("sh") || rule.path == Path::new("."))
-        );
-        assert!(policy.filesystem.iter().any(|rule| {
-            rule.path == Path::new("/usr")
-                && rule.kind == RuntimeSandboxPathKind::Directory
-                && rule.access == RuntimeSandboxAccessMode::Read
-        }));
+        assert_eq!(env, vec!["KEEP=value", "MANTISSA_SANDBOX_POLICY=current"]);
     }
 }

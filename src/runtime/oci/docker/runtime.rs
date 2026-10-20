@@ -42,12 +42,12 @@ use super::images::PullProgressLogState;
 use super::interactive::AttachBridgeIo;
 use super::{
     DOCKER_NONO_PROFILE, DOCKER_SANDBOXED_PROFILE, DOCKER_STANDARD_PROFILE, DockerRuntimeBackend,
-    WORKLOAD_ID_LABEL,
+    SANDBOX_CHECK_LABEL, WORKLOAD_ID_LABEL,
 };
 
 #[async_trait]
 impl RuntimeBackend for DockerRuntimeBackend {
-    /// Creates one Docker container from the generic runtime create request.
+    /// Checks sandboxed launches before creating the workload with its requested Docker settings.
     async fn create_instance(&self, request: RuntimeCreateRequest) -> RuntimeResult<String> {
         let RuntimeCreateRequest {
             name,
@@ -70,7 +70,11 @@ impl RuntimeBackend for DockerRuntimeBackend {
         } = request;
         let sandbox_policy = match isolation_mode {
             IsolationMode::Standard => None,
-            IsolationMode::Sandboxed => sandbox_policy,
+            IsolationMode::Sandboxed => Some(sandbox_policy.ok_or_else(|| {
+                RuntimeError::OperationFailed(
+                    "sandboxed Docker workloads require an explicit sandbox policy".to_string(),
+                )
+            })?),
         };
         let prepared_launch = self
             .prepare_sandboxed_create(&image, command, env_vars, labels, volumes, sandbox_policy)
@@ -144,10 +148,13 @@ impl RuntimeBackend for DockerRuntimeBackend {
             host_config.port_bindings = Some(port_bindings);
         }
 
-        // Create container config
+        // Override image labels so only disposable checks carry the check marker.
+        let mut labels = prepared_launch.labels.unwrap_or_default();
+        labels.insert(SANDBOX_CHECK_LABEL.to_string(), "false".to_string());
+
         let config = ContainerCreateBody {
             image: Some(image.clone()),
-            labels: prepared_launch.labels,
+            labels: Some(labels),
             tty: Some(tty),
             open_stdin: Some(open_stdin),
             env: prepared_launch.env_vars,
@@ -157,6 +164,10 @@ impl RuntimeBackend for DockerRuntimeBackend {
             host_config: Some(host_config),
             ..Default::default()
         };
+
+        if isolation_mode == IsolationMode::Sandboxed {
+            self.check_sandbox(&config).await?;
+        }
 
         // Set container name options
         let options = Some(CreateContainerOptions {
@@ -308,7 +319,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         .await
     }
 
-    /// Restricts workload repair to ownership-labelled containers while full scans protect mounts.
+    /// Excludes checks from workload repair while full scans retain every volume mount user.
     async fn list_instances(&self, scope: RuntimeListScope) -> RuntimeResult<Vec<RuntimeInfo>> {
         let filters = match scope {
             RuntimeListScope::All => None,
@@ -332,6 +343,12 @@ impl RuntimeBackend for DockerRuntimeBackend {
 
         let result = containers
             .into_iter()
+            .filter(|container| {
+                scope == RuntimeListScope::All
+                    || !container.labels.as_ref().is_some_and(|labels| {
+                        labels.get(SANDBOX_CHECK_LABEL).map(String::as_str) == Some("true")
+                    })
+            })
             .map(runtime_info_from_list_entry)
             .collect();
 
@@ -582,8 +599,7 @@ impl RuntimeBackend for DockerRuntimeBackend {
         RuntimeSupportProfile::from_exact_contracts(contracts, self.capabilities().feature_flags())
     }
 
-    /// Watches Docker container events and forwards task-relevant lifecycle
-    /// edges.
+    /// Reports workload exits and lifecycle changes so their owners can reconcile them.
     async fn watch_runtime_events(
         &self,
         events_tx: UnboundedSender<RuntimeEvent>,
@@ -617,6 +633,12 @@ impl RuntimeBackend for DockerRuntimeBackend {
                 .actor
                 .as_ref()
                 .and_then(|actor| actor.attributes.as_ref());
+            if attributes.is_some_and(|attrs| {
+                attrs.get(SANDBOX_CHECK_LABEL).map(String::as_str) == Some("true")
+            }) {
+                continue;
+            }
+
             let workload_id = attributes
                 .and_then(|attrs| attrs.get(WORKLOAD_ID_LABEL))
                 .and_then(|value| uuid::Uuid::parse_str(value).ok());

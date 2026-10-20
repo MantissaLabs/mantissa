@@ -3422,11 +3422,11 @@ dependencies = [
 name = "mantissa-sandbox"
 version = "0.5.0"
 dependencies = [
- "libc",
  "mantissa",
  "nono",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

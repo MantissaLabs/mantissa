@@ -22,6 +22,7 @@ mod interactive;
 mod registry_tests;
 mod runtime;
 mod sandbox;
+mod sandbox_check;
 #[cfg(test)]
 mod tests;
 
@@ -34,7 +35,7 @@ pub(super) const DOCKER_STANDARD_PROFILE: &str = "default";
 /// Default operator-facing profile name for sandboxed OCI Docker workloads.
 pub(super) const DOCKER_SANDBOXED_PROFILE: &str = "oci-default";
 
-/// Explicit operator-facing profile alias for the future `nono`-backed sandbox contract.
+/// Explicit profile name for Docker workloads restricted by the Nono helper.
 pub(super) const DOCKER_NONO_PROFILE: &str = "nono-default";
 
 /// Binary name used when Mantissa injects the sandbox init helper into containers.
@@ -52,68 +53,11 @@ pub(super) const MANTISSA_SANDBOX_HELPER_CONTAINER_PATH: &str = "/mantissa-sandb
 /// Label that marks one container as running through the `nono` helper boundary.
 pub(super) const MANTISSA_SANDBOX_ENABLED_LABEL: &str = "mantissa.sandbox.enabled";
 
-/// Optional read-only roots commonly needed so sandboxed OCI images can start.
-///
-/// Some image layouts omit specific entries such as `/lib64`. The helper treats
-/// these as optional bootstrap allowances and skips only the missing ones.
-pub const NONO_EXEC_READONLY_DIRS: &[&str] = &[
-    "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc",
-];
+/// Helper argument used to validate a policy without executing the workload.
+pub const MANTISSA_SANDBOX_CHECK_ARGUMENT: &str = "--check";
 
-/// Host-side availability decision for the `nono`-backed Docker sandbox contract.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum NonoSandboxBackendAvailability {
-    /// The host can register the sandboxed Docker backend with the provided helper path.
-    Available(PathBuf),
-    /// The current host platform cannot run the `nono` sandbox contract.
-    UnsupportedHost,
-    /// The sandbox helper binary could not be resolved on an otherwise supported host.
-    MissingHelper,
-}
-
-impl NonoSandboxBackendAvailability {
-    /// Detects whether the current host can advertise the `nono` Docker sandbox contract.
-    fn detect() -> Self {
-        Self::from_parts(
-            DockerRuntimeBackend::host_supports_nono_sandbox(),
-            DockerRuntimeBackend::resolve_nono_helper_host_path(),
-        )
-    }
-
-    /// Collapses host capability and helper discovery into one registration decision.
-    fn from_parts(host_supported: bool, helper_host_path: Option<PathBuf>) -> Self {
-        if !host_supported {
-            return Self::UnsupportedHost;
-        }
-
-        match helper_host_path {
-            Some(path) => Self::Available(path),
-            None => Self::MissingHelper,
-        }
-    }
-
-    /// Returns the helper path when the sandboxed Docker backend can be registered.
-    fn helper_host_path(&self) -> Option<&PathBuf> {
-        match self {
-            Self::Available(path) => Some(path),
-            Self::UnsupportedHost | Self::MissingHelper => None,
-        }
-    }
-
-    /// Returns one operator-facing reason why the sandboxed Docker backend is unavailable.
-    fn unavailable_reason(&self) -> Option<String> {
-        match self {
-            Self::Available(_) => None,
-            Self::UnsupportedHost => {
-                Some("sandboxed Docker backend requires a Linux or macOS host".to_string())
-            }
-            Self::MissingHelper => Some(format!(
-                "sandboxed Docker backend requires helper binary {}; set {} or place it next to the mantissa executable",
-                MANTISSA_SANDBOX_HELPER_BINARY_NAME, MANTISSA_SANDBOX_HELPER_HOST_ENV_VAR
-            )),
-        }
-    }
-}
+/// Marks disposable checks so inherited image labels cannot make them look like workloads.
+pub(super) const SANDBOX_CHECK_LABEL: &str = "mantissa.sandbox.check";
 
 /// Docker runtime backend implementation.
 #[derive(Clone)]
@@ -124,14 +68,16 @@ pub struct DockerRuntimeBackend {
 }
 
 impl DockerRuntimeBackend {
-    /// Connects one Docker daemon and enables sandbox contracts when its helper is available.
+    /// Connects to Docker and checks helper compatibility before offering sandboxed execution.
     pub async fn new() -> RuntimeResult<Self> {
         let (docker, endpoint) = Self::connect_verified().await?;
-        let availability = NonoSandboxBackendAvailability::detect();
-        let nono_helper_host_path = availability.helper_host_path().cloned();
-        if let Some(reason) = availability.unavailable_reason() {
-            info!(target: "task", "Docker sandbox support is unavailable: {reason}");
-        }
+        let nono_helper_host_path = match Self::find_sandbox_helper(&docker).await {
+            Ok(path) => Some(path),
+            Err(reason) => {
+                info!(target: "task", "Docker sandbox support is unavailable: {reason}");
+                None
+            }
+        };
 
         info!(target: "task", "Connected to Docker endpoint {endpoint}");
         if let Some(path) = &nono_helper_host_path {
@@ -143,11 +89,6 @@ impl DockerRuntimeBackend {
             nono_helper_host_path,
             docker_config_path: credentials::docker_config_path(),
         })
-    }
-
-    /// Returns whether the current host can run the Docker sandbox helper.
-    fn host_supports_nono_sandbox() -> bool {
-        cfg!(any(target_os = "linux", target_os = "macos"))
     }
 
     /// Connects to Docker and verifies the daemon is reachable before the backend is registered.

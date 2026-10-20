@@ -463,6 +463,30 @@ repository root with a plain `cargo build`, the workspace default members now
 emit both binaries into the shared `target/<profile>/` directory so the helper
 is colocated with the daemon automatically.
 
+The helper must be built for Linux and the Docker daemon's CPU architecture,
+even when Mantissa runs on macOS. Before each sandboxed launch, Mantissa starts
+the helper in a temporary container with the workload's image, mounts, and
+policy. It checks that the helper can start and apply the restrictions without
+running the workload command. A failed check or a timeout prevents the launch.
+Mantissa removes the temporary container afterward.
+
+Default permissions allow reads from standard program and library directories,
+certificates, time zone data, and selected system files. Other application data,
+workspaces, and secrets need explicit policy rules. For example, running
+`/app/agent` allows that executable to be read. Reading `/app/config.json` requires
+a rule for that file or its directory. The image's working directory gets no extra
+permissions. See the
+[helper's filesystem defaults](../crates/mantissa-sandbox/README.md#policy-handling)
+for details.
+
+On Linux, blocking network access denies TCP and UDP through Landlock and seccomp.
+The kernel must support Landlock ABI V3 or newer so workloads cannot empty
+read-only files.
+
+Agent runs supply the required sandbox policy automatically. Other callers of
+the Docker backend must provide one. Recreate existing containers to use the
+updated helper and default permissions.
+
 ## Networking Is Runtime-Neutral
 
 The networking layer no longer assumes that every schedulable execution is "an
