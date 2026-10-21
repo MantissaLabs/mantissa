@@ -116,11 +116,17 @@ impl Fixture {
             }
         }
 
-        for path in ["etc/mantissa-test-secret", "usr/share/mantissa-test-secret"] {
+        for (path, contents) in [
+            ("etc/ssl/openssl.cnf", "test OpenSSL configuration"),
+            ("etc/mantissa-test-secret", "private"),
+            ("etc/ssl/mantissa-test-secret", "private"),
+            ("usr/share/mantissa-test-secret", "private"),
+        ] {
             let destination = self.root.join(path);
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            std::fs::write(destination, "private").unwrap();
+            std::fs::write(destination, contents).unwrap();
         }
+
         std::fs::remove_file(self.root.join("workspace/link")).unwrap();
         std::os::unix::fs::symlink("/private/secret", self.root.join("workspace/link")).unwrap();
         std::fs::write(

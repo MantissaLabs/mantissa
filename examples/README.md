@@ -216,7 +216,7 @@ agents, see `docs/deployment-deadlines.md`.
 ## Run a sandboxed Codex agent session
 
 ```sh
-docker build -t mantissa/codex-sandbox:0.142.4 \
+docker build -t mantissa/codex-sandbox:0.163.0 \
   examples/images/codex-sandbox
 mantissa secrets create openai-api-key --value "$OPENAI_API_KEY"
 mantissa agents run --file examples/codex_agent_nono.ron
@@ -232,7 +232,7 @@ This manifest shows the first real agent-shaped `nono` example:
 - deployment deadlines for queued and bootstrapping agent runs
 
 The example image lives at `examples/images/codex-sandbox/Dockerfile`. It uses
-the official `node:22-bookworm-slim` base, installs a pinned
+the official `node:<version>-trixie-slim` base, installs a pinned
 `@openai/codex` version, switches to the non-root `node` user, preconfigures
 Codex's writable state under `/var/tmp`, defaults the example to the cheaper
 `gpt-5.4-nano` model, reads `CODEX_API_KEY` from the mounted secret file when

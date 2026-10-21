@@ -62,8 +62,20 @@ fn main() {
         ErrorKind::PermissionDenied
     );
     if root == Path::new("/") {
+        assert_eq!(
+            fs::read_to_string("/etc/ssl/openssl.cnf").unwrap(),
+            "test OpenSSL configuration"
+        );
+        assert_eq!(
+            fs::write("/etc/ssl/openssl.cnf", "changed")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+
         for path in [
             "/etc/mantissa-test-secret",
+            "/etc/ssl/mantissa-test-secret",
             "/usr/share/mantissa-test-secret",
         ] {
             assert_eq!(

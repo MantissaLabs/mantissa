@@ -26,7 +26,7 @@ const READ_DIRECTORIES: &[&str] = &[
     "/usr/share/zoneinfo",
 ];
 
-/// These individual files provide loading, name resolution, time, and random data.
+/// These files provide library configuration, name resolution, time, and random data.
 const READ_FILES: &[&str] = &[
     "/etc/ld.so.cache",
     "/etc/hosts",
@@ -37,6 +37,8 @@ const READ_FILES: &[&str] = &[
     "/etc/passwd",
     "/etc/group",
     "/etc/localtime",
+    // OpenSSL clients such as Node read this configuration during startup.
+    "/etc/ssl/openssl.cnf",
     "/dev/urandom",
     "/dev/random",
     "/dev/zero",

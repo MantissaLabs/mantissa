@@ -151,7 +151,7 @@ secret value into Docker env metadata at all.
 A complete end-to-end flow for that example looks like this:
 
 ```bash
-docker build -t mantissa/codex-sandbox:0.142.4 \
+docker build -t mantissa/codex-sandbox:0.163.0 \
   examples/images/codex-sandbox
 mantissa secrets create openai-api-key --value "$OPENAI_API_KEY"
 mantissa agents run --file examples/codex_agent_nono.ron
