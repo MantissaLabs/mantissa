@@ -235,7 +235,7 @@ The example image lives at `examples/images/codex-sandbox/Dockerfile`. It uses
 the official `node:<version>-trixie-slim` base, installs a pinned
 `@openai/codex` version, switches to the non-root `node` user, preconfigures
 Codex's writable state under `/var/tmp`, defaults the example to the cheaper
-`gpt-5.4-nano` model, reads `CODEX_API_KEY` from the mounted secret file when
+`gpt-6-luna` model, reads `CODEX_API_KEY` from the mounted secret file when
 present, and launches `codex exec` from an image entrypoint when Mantissa
 provides `MANTISSA_AGENT_INPUT`. The manifest also sets
 `path_env_name: Some("CODEX_API_KEY_PATH")`, which is the preferred pattern
@@ -256,3 +256,38 @@ mantissa agents wait <SESSION_ID>
 If `nono-default` is rejected at submission time, the node did not advertise
 the sandboxed Docker contract at startup. See `docs/workloads-and-runtimes.md`
 for the helper discovery requirements behind that profile.
+
+### Replicated workspace
+
+`codex_agent_nono_replicated_volume.ron` runs the same Codex agent with a
+replicated ext4 volume named `codex-replicated-workspace`. It stores three
+copies on different nodes and keeps the files between runs. The separate
+volume name lets this example run alongside the local-workspace example.
+
+This example requires three nodes with replicated storage available and enough
+space for a 1 GiB volume on each node. Eligible workload nodes also need the
+Codex image and the sandbox helper. Use the same image and API key setup above:
+
+```sh
+mantissa agents run --file examples/codex_agent_nono_replicated_volume.ron
+mantissa agents wait <SESSION_ID>
+mantissa volumes inspect codex-replicated-workspace
+```
+
+The first input writes `hello.txt` and runs `sync` so the write reaches storage.
+The volume has one writer at a time. After that node is lost, a later run can
+use a surviving replica once the storage controller has recovered a writable
+volume and fenced the previous writer.
+
+Agent runs do not automatically restart on another node after node loss.
+Replication preserves workspace files, but does not resume a running Codex
+process. To check workspace recovery in a test cluster, let the first run
+finish, stop its workspace node, then queue another input on the session:
+
+```sh
+mantissa agents input <SESSION_ID> \
+  "Read hello.txt, create recovered.txt confirming that the greeting was preserved, run sync, then print both files."
+mantissa agents wait <SESSION_ID>
+mantissa agents inspect <SESSION_ID>
+mantissa volumes inspect codex-replicated-workspace
+```

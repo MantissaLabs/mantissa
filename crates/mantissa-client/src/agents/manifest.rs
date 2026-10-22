@@ -997,12 +997,17 @@ mod tests {
         );
     }
 
-    /// Keeps the repository agent example aligned with the manifest contract.
+    /// Checks that the local and replicated workspace examples remain valid agent manifests.
     #[test]
     fn repository_agent_examples_parse() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-        let path = root.join("codex_agent_nono.ron");
-        load_manifest_from_path(&path)
-            .unwrap_or_else(|error| panic!("failed to parse {}: {error:#}", path.display()));
+        for name in [
+            "codex_agent_nono.ron",
+            "codex_agent_nono_replicated_volume.ron",
+        ] {
+            let path = root.join(name);
+            load_manifest_from_path(&path)
+                .unwrap_or_else(|error| panic!("failed to parse {}: {error:#}", path.display()));
+        }
     }
 }
