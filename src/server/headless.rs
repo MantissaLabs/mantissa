@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use futures::future::LocalBoxFuture;
 use std::{io, net::TcpListener, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 use uuid::Uuid;
 
@@ -114,6 +115,7 @@ pub enum HeadlessTransport {
     Tcp { addr: String },
 }
 
+/// Owns a real test node whose constructors keep startup and the completed node on the heap.
 pub struct HeadlessNode {
     pub id: Uuid,
 
@@ -181,198 +183,201 @@ struct State {
 }
 
 impl HeadlessNode {
-    /// Core constructor used by all variants. It builds a **real** node using the same
-    /// Bootstrap flow as production, and wires transport depending on `transport`.
-    pub async fn new_with(
+    /// Starts a real node through shared heap-allocated startup, regardless of the test fixture.
+    pub fn new_with(
         db: Arc<redb::Database>,
         self_id: Uuid,
         keys: HeadlessKeys,
         cfg: HeadlessConfig,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_optional_replicated_volume_listener(db, self_id, keys, cfg, None).await
+    ) -> LocalBoxFuture<'static, Result<Box<Self>, Box<dyn std::error::Error>>> {
+        Self::new_with_optional_replicated_volume_listener(db, self_id, keys, cfg, None)
     }
 
     /// Builds a real node while preserving a test-reserved storage socket.
-    pub async fn new_with_replicated_volume_listener(
+    pub fn new_with_replicated_volume_listener(
         db: Arc<redb::Database>,
         self_id: Uuid,
         keys: HeadlessKeys,
         cfg: HeadlessConfig,
         listener: TcpListener,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> LocalBoxFuture<'static, Result<Box<Self>, Box<dyn std::error::Error>>> {
         Self::new_with_optional_replicated_volume_listener(db, self_id, keys, cfg, Some(listener))
-            .await
     }
 
-    /// Runs shared headless bootstrap with an optional pre-bound storage socket.
-    async fn new_with_optional_replicated_volume_listener(
+    /// Keeps large bootstrap state and its result out of every constructor caller's stack.
+    fn new_with_optional_replicated_volume_listener(
         db: Arc<redb::Database>,
         self_id: Uuid,
         keys: HeadlessKeys,
         cfg: HeadlessConfig,
         replicated_volume_listener: Option<TcpListener>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let HeadlessKeys { noise, signing } = keys;
-        let HeadlessConfig {
-            listen_addr,
-            transport,
-            root_schema_override,
-            sync_tick,
-            sync_fanout,
-            global_metadata_sync_tick,
-            global_metadata_sync_fanout,
-            gossip_tick,
-            gossip_fanout,
-            network_reconcile_tick,
-            network_attachment_refresh_tick,
-            gossip_channel_capacity,
-            task_runtime,
-            runtime_set,
-            local_volume_root,
-            master_key_kdf_params,
-            store_gc_config,
-            service_timing,
-            runtime_health,
-            replicated_volumes,
-        } = cfg;
-        // Local Node + client
-        let mut node_obj = node::Node::new();
-        node_obj.collect_system_info();
-        node_obj.id = self_id;
-        let node_client = capnp_rpc::new_client(node_obj.clone());
+    ) -> LocalBoxFuture<'static, Result<Box<Self>, Box<dyn std::error::Error>>> {
+        Box::pin(async move {
+            let HeadlessKeys { noise, signing } = keys;
+            let HeadlessConfig {
+                listen_addr,
+                transport,
+                root_schema_override,
+                sync_tick,
+                sync_fanout,
+                global_metadata_sync_tick,
+                global_metadata_sync_fanout,
+                gossip_tick,
+                gossip_fanout,
+                network_reconcile_tick,
+                network_attachment_refresh_tick,
+                gossip_channel_capacity,
+                task_runtime,
+                runtime_set,
+                local_volume_root,
+                master_key_kdf_params,
+                store_gc_config,
+                service_timing,
+                runtime_health,
+                replicated_volumes,
+            } = cfg;
 
-        // Build runtime exactly like production
-        let ctx = BootstrapContext::from_parts(
-            listen_addr,
-            self_id,
-            noise.clone(),
-            signing.clone(),
-            db.clone(),
-            node_obj,
-            node_client,
-        );
-        let defaults = BootstrapOptions::default();
-        let options = BootstrapOptions {
-            task_runtime,
-            runtime_set,
-            root_schema_override,
-            local_volume_root,
-            gossip_channel_capacity: gossip_channel_capacity
-                .unwrap_or(defaults.gossip_channel_capacity),
-            gossip_fanout: gossip_fanout.unwrap_or(defaults.gossip_fanout),
-            sync_tick,
-            sync_fanout,
-            workload_repair_fanout: None,
-            global_metadata_sync_tick,
-            global_metadata_sync_fanout,
-            gossip_tick,
-            network_reconcile_tick,
-            network_attachment_refresh_tick,
-            advertise_override: matches!(&transport, HeadlessTransport::Inproc)
-                .then(|| format!("inproc://{self_id}")),
-            master_key_passphrase: Some(SecretPassphrase::new(
-                b"mantissa-headless-master-key-passphrase".to_vec(),
-            )?),
-            rest_token_enabled: defaults.rest_token_enabled,
-            // Headless nodes still exercise the real master-key envelope and transfer
-            // code paths, but avoid production Argon2 cost in broad integration tests.
-            master_key_kdf_params: master_key_kdf_params.unwrap_or_else(PassphraseKdfParams::test),
-            store_gc_config,
-            service_timing: service_timing.unwrap_or(defaults.service_timing),
-            runtime_health: runtime_health.unwrap_or(defaults.runtime_health),
-            replicated_volumes: replicated_volumes
-                .map_or(ReplicatedVolumeStartup::Disabled, |config| {
-                    ReplicatedVolumeStartup::Configured(Box::new(config))
-                }),
-        };
+            // Give bootstrap the same node identity and system information as the daemon.
+            let mut node_obj = node::Node::new();
+            node_obj.collect_system_info();
+            node_obj.id = self_id;
+            let node_client = capnp_rpc::new_client(node_obj.clone());
 
-        let BootedRuntime {
-            stores,
-            components: comps,
-            server,
-            runtime_tasks,
-        } = boot_with_replicated_volume_listener(ctx, options, replicated_volume_listener).await?;
+            // Use the daemon's bootstrap so tests exercise the real stores and controllers.
+            let ctx = BootstrapContext::from_parts(
+                listen_addr,
+                self_id,
+                noise.clone(),
+                signing.clone(),
+                db.clone(),
+                node_obj,
+                node_client,
+            );
+            let defaults = BootstrapOptions::default();
+            let options = BootstrapOptions {
+                task_runtime,
+                runtime_set,
+                root_schema_override,
+                local_volume_root,
+                gossip_channel_capacity: gossip_channel_capacity
+                    .unwrap_or(defaults.gossip_channel_capacity),
+                gossip_fanout: gossip_fanout.unwrap_or(defaults.gossip_fanout),
+                sync_tick,
+                sync_fanout,
+                workload_repair_fanout: None,
+                global_metadata_sync_tick,
+                global_metadata_sync_fanout,
+                gossip_tick,
+                network_reconcile_tick,
+                network_attachment_refresh_tick,
+                advertise_override: matches!(&transport, HeadlessTransport::Inproc)
+                    .then(|| format!("inproc://{self_id}")),
+                master_key_passphrase: Some(SecretPassphrase::new(
+                    b"mantissa-headless-master-key-passphrase".to_vec(),
+                )?),
+                rest_token_enabled: defaults.rest_token_enabled,
+                // Headless nodes still exercise the real master-key envelope and transfer
+                // code paths, but avoid production Argon2 cost in broad integration tests.
+                master_key_kdf_params: master_key_kdf_params
+                    .unwrap_or_else(PassphraseKdfParams::test),
+                store_gc_config,
+                service_timing: service_timing.unwrap_or(defaults.service_timing),
+                runtime_health: runtime_health.unwrap_or(defaults.runtime_health),
+                replicated_volumes: replicated_volumes
+                    .map_or(ReplicatedVolumeStartup::Disabled, |config| {
+                        ReplicatedVolumeStartup::Configured(Box::new(config))
+                    }),
+            };
 
-        // Cap’n Proto Server capability
-        let server_client: mantissa_protocol::server::server::Client =
-            capnp_rpc::new_client(server.clone());
+            let BootedRuntime {
+                stores,
+                components: comps,
+                server,
+                runtime_tasks,
+            } = boot_with_replicated_volume_listener(ctx, options, replicated_volume_listener)
+                .await?;
 
-        // Keep a clone to use start/stop server on.
-        let stored_server = server.clone();
-        let replicated_volume_runtime = comps.replicated_volumes.clone();
+            // Cap’n Proto Server capability
+            let server_client: mantissa_protocol::server::server::Client =
+                capnp_rpc::new_client(server.clone());
 
-        // Transport wiring + readiness: compute the effective transport we report back
-        let (handles, effective_transport) = match transport {
-            HeadlessTransport::Inproc => {
-                // Register in-process so get_client_secure_join/get_client_secure_peer resolves here
-                mantissa_net::inproc::register(self_id.to_string(), server_client.clone());
+            // Retain the server so restart tests can stop and reopen its transport.
+            let stored_server = server.clone();
+            let replicated_volume_runtime = comps.replicated_volumes.clone();
 
-                (None, HeadlessTransport::Inproc)
-            }
-            HeadlessTransport::Tcp { .. } => {
-                // Start TCP listener non-blocking (Noise + Cap’n Proto)
-                let mut h = server.start_nonblocking(false).await?;
+            // Publish the server only after its selected transport is ready for test clients.
+            let (handles, effective_transport) = match transport {
+                HeadlessTransport::Inproc => {
+                    // Register in-process so get_client_secure_join/get_client_secure_peer resolves here
+                    mantissa_net::inproc::register(self_id.to_string(), server_client.clone());
 
-                // Wait until the listener is actually bound and ready.
-                h.wait_ready().await;
+                    (None, HeadlessTransport::Inproc)
+                }
+                HeadlessTransport::Tcp { .. } => {
+                    // Start the Noise and Cap’n Proto listener before reporting its bound address.
+                    let mut h = server.start_nonblocking(false).await?;
 
-                // Use the actual bound socket addr in our transport (handles ephemeral ports)
-                let bound = h.addr();
-                server.refresh_bound_addr(bound).await?;
+                    // Wait until the listener is actually bound and ready.
+                    h.wait_ready().await;
 
-                (
-                    Some(h),
-                    HeadlessTransport::Tcp {
-                        addr: bound.to_string(),
-                    },
-                )
-            }
-        };
+                    // Tests using an ephemeral port need the actual address chosen by the listener.
+                    let bound = h.addr();
+                    server.refresh_bound_addr(bound).await?;
 
-        Ok(Self {
-            id: self_id,
-            topology_client: comps.topology_client.clone(),
-            server_client,
-            sync_client: comps.sync_client.clone(),
-            task_client: comps.task_client.clone(),
-            jobs_client: comps.jobs_client.clone(),
-            agents_client: comps.agents_client.clone(),
-            services_client: comps.services_client.clone(),
-            secrets_client: comps.secrets_client.clone(),
-            networks_client: comps.networks_client.clone(),
-            ingress_client: comps.ingress_client.clone(),
-            volumes_client: comps.volumes_client.clone(),
-            job_controller: comps.job_controller.clone(),
-            agent_controller: comps.agent_controller.clone(),
-            service_controller: comps.service_controller.clone(),
-            workload_manager: comps.workload_manager.clone(),
-            network_registry: comps.network_registry.clone(),
-            ingress_pool_registry: comps.ingress_pool_registry.clone(),
-            volume_registry: comps.volume_registry.clone(),
-            network_controller: comps.network_controller.clone(),
-            registry: comps.registry.clone(),
-            scheduler: comps.scheduler.clone(),
-            topology_runtime: comps.topology.clone(),
-            peers: stores.peers.clone(),
-            workloads: stores.workloads.clone(),
-            jobs: stores.jobs.clone(),
-            agents: stores.agents.clone(),
-            services: stores.services.clone(),
-            ingress_pools: stores.ingress_pools.clone(),
-            scheduler_digests: stores.scheduler_digests.clone(),
-            local_sessions: stores.local_sessions.clone(),
-            local_creds: stores.local_creds.clone(),
-            secret_master_store: stores.secret_master_store.clone(),
-            secret_master_keys: stores.secret_master_keys.clone(),
-            _db: db,
-            _noise_keys: noise,
-            _signing: signing,
-            transport: effective_transport,
-            handles,
-            runtime_tasks: Some(runtime_tasks),
-            replicated_volumes: replicated_volume_runtime,
-            server: stored_server,
-            _tmp_dir: None,
+                    (
+                        Some(h),
+                        HeadlessTransport::Tcp {
+                            addr: bound.to_string(),
+                        },
+                    )
+                }
+            };
+
+            Ok(Box::new(Self {
+                id: self_id,
+                topology_client: comps.topology_client.clone(),
+                server_client,
+                sync_client: comps.sync_client.clone(),
+                task_client: comps.task_client.clone(),
+                jobs_client: comps.jobs_client.clone(),
+                agents_client: comps.agents_client.clone(),
+                services_client: comps.services_client.clone(),
+                secrets_client: comps.secrets_client.clone(),
+                networks_client: comps.networks_client.clone(),
+                ingress_client: comps.ingress_client.clone(),
+                volumes_client: comps.volumes_client.clone(),
+                job_controller: comps.job_controller.clone(),
+                agent_controller: comps.agent_controller.clone(),
+                service_controller: comps.service_controller.clone(),
+                workload_manager: comps.workload_manager.clone(),
+                network_registry: comps.network_registry.clone(),
+                ingress_pool_registry: comps.ingress_pool_registry.clone(),
+                volume_registry: comps.volume_registry.clone(),
+                network_controller: comps.network_controller.clone(),
+                registry: comps.registry.clone(),
+                scheduler: comps.scheduler.clone(),
+                topology_runtime: comps.topology.clone(),
+                peers: stores.peers.clone(),
+                workloads: stores.workloads.clone(),
+                jobs: stores.jobs.clone(),
+                agents: stores.agents.clone(),
+                services: stores.services.clone(),
+                ingress_pools: stores.ingress_pools.clone(),
+                scheduler_digests: stores.scheduler_digests.clone(),
+                local_sessions: stores.local_sessions.clone(),
+                local_creds: stores.local_creds.clone(),
+                secret_master_store: stores.secret_master_store.clone(),
+                secret_master_keys: stores.secret_master_keys.clone(),
+                _db: db,
+                _noise_keys: noise,
+                _signing: signing,
+                transport: effective_transport,
+                handles,
+                runtime_tasks: Some(runtime_tasks),
+                replicated_volumes: replicated_volume_runtime,
+                server: stored_server,
+                _tmp_dir: None,
+            }))
         })
     }
 
@@ -390,7 +395,7 @@ impl HeadlessNode {
         noise_keys: Arc<NoiseKeys>,
         signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         Self::new_with(
             db,
             self_id,
@@ -407,7 +412,7 @@ impl HeadlessNode {
         noise_keys: Arc<NoiseKeys>,
         signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         Self::new_with(
             db,
             self_id,
@@ -427,7 +432,7 @@ impl HeadlessNode {
         noise_keys: Arc<NoiseKeys>,
         signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         let addr = "127.0.0.1:0".to_string();
         Self::new_with(
             db,
@@ -449,7 +454,7 @@ impl HeadlessNode {
         signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
         tick: Duration,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         Self::new_with(
             db,
             self_id,
@@ -462,13 +467,14 @@ impl HeadlessNode {
         .await
     }
 
+    /// Restarts caller-owned node state on an ephemeral TCP port with the selected sync interval.
     pub async fn new_tcp_ephemeral_with_tick_from_parts(
         db: Arc<redb::Database>,
         noise_keys: Arc<NoiseKeys>,
         signing_key: ed25519_dalek::SigningKey,
         self_id: Uuid,
         tick: Duration,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Box<Self>, Box<dyn std::error::Error>> {
         let addr = "127.0.0.1:0".to_string();
         Self::new_with(
             db,
@@ -485,7 +491,7 @@ impl HeadlessNode {
     }
 
     /// Quick-start a self-contained node with an explicit headless runtime config.
-    pub async fn new_with_config(cfg: HeadlessConfig) -> io::Result<Self> {
+    pub async fn new_with_config(cfg: HeadlessConfig) -> io::Result<Box<Self>> {
         let state = self_contained_state()?;
         let local_volume_root = cfg
             .local_volume_root
@@ -508,16 +514,17 @@ impl HeadlessNode {
 
     /// Quick-start **in-process** node using a temp DB and deterministic test keys.
     /// Great for simple tests. For full control, prefer the *_from_parts variants.
-    pub async fn new_inproc() -> io::Result<Self> {
+    pub async fn new_inproc() -> io::Result<Box<Self>> {
         Self::new_inproc_custom(None, None, None).await
     }
 
-    pub async fn new_inproc_with_gossip_fanout(fanout: usize) -> io::Result<Self> {
+    /// Starts an in-process node with the gossip fanout selected by its test.
+    pub async fn new_inproc_with_gossip_fanout(fanout: usize) -> io::Result<Box<Self>> {
         Self::new_inproc_custom(None, None, Some(fanout)).await
     }
 
     /// Quick-start **TCP** node bound at an ephemeral 127.0.0.1 port.
-    pub async fn new_tcp_ephemeral() -> io::Result<Self> {
+    pub async fn new_tcp_ephemeral() -> io::Result<Box<Self>> {
         let state = self_contained_state()?;
         let mut node = Self::new_tcp_ephemeral_from_parts(
             state.db,
@@ -532,12 +539,12 @@ impl HeadlessNode {
     }
 
     /// Quick-start **in-process** node with a custom sync tick.
-    pub async fn new_inproc_with_tick(tick: Duration) -> io::Result<Self> {
+    pub async fn new_inproc_with_tick(tick: Duration) -> io::Result<Box<Self>> {
         Self::new_inproc_custom(Some(tick), None, None).await
     }
 
     /// Quick-start **TCP** node with a custom sync tick on an ephemeral port.
-    pub async fn new_tcp_ephemeral_with_tick(tick: Duration) -> io::Result<Self> {
+    pub async fn new_tcp_ephemeral_with_tick(tick: Duration) -> io::Result<Box<Self>> {
         let state = self_contained_state()?;
         let mut node = Self::new_tcp_ephemeral_with_tick_from_parts(
             state.db,
@@ -553,7 +560,7 @@ impl HeadlessNode {
     }
 
     /// Quick-start **TCP** node bound at `addr` (e.g., "127.0.0.1:6578").
-    pub async fn new_tcp_at(addr: impl Into<String>) -> io::Result<Self> {
+    pub async fn new_tcp_at(addr: impl Into<String>) -> io::Result<Box<Self>> {
         let state = self_contained_state()?;
         let mut node = Self::new_tcp_at_from_parts(
             addr.into(),
@@ -568,11 +575,12 @@ impl HeadlessNode {
         Ok(node)
     }
 
+    /// Starts an in-process node with the test's sync interval, gossip interval, and fanout.
     pub async fn new_inproc_custom(
         sync_tick: Option<Duration>,
         gossip_tick: Option<Duration>,
         fanout: Option<usize>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Box<Self>> {
         Self::new_inproc_custom_with_task_runtime(sync_tick, gossip_tick, fanout, None, None).await
     }
 
@@ -583,7 +591,7 @@ impl HeadlessNode {
         fanout: Option<usize>,
         gossip_channel_capacity: Option<usize>,
         task_runtime: Option<WorkloadRuntimeConfig>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Box<Self>> {
         let state = self_contained_state()?;
         let mut node = Self::new_with(
             state.db,
@@ -897,13 +905,13 @@ impl HeadlessNode {
             .map(|_| ())
     }
 
-    /// Shut down the full headless runtime before dropping the node.
+    /// Shuts down the full runtime while keeping the owned node on the heap.
     ///
     /// Restart tests use this instead of plain `stop()` when they need to
     /// model a real daemon exit. The method stops peer loops, drops cached peer
     /// sessions, stops the exported transport, tears down local networking, and
     /// then aborts the long-running runtime actors started during boot.
-    pub async fn shutdown(mut self) -> io::Result<()> {
+    pub async fn shutdown(mut self: Box<Self>) -> io::Result<()> {
         self.stop().await?;
         let replicated_shutdown_deadline = if let Some(storage) = self.replicated_volumes.as_ref() {
             let deadline = tokio::time::Instant::now() + storage.shutdown_attempt_timeout();
@@ -939,6 +947,7 @@ impl HeadlessNode {
         } else {
             None
         };
+
         self.topology_runtime.stop_cluster_background_tasks();
         self.registry.clear().await;
         self.server.release_replicated_volumes();
@@ -946,6 +955,7 @@ impl HeadlessNode {
         if let Some(runtime_tasks) = self.runtime_tasks.take() {
             runtime_tasks.abort_and_wait().await;
         }
+
         let storage_result = match self.replicated_volumes.take() {
             Some(storage) => {
                 let deadline = replicated_shutdown_deadline.ok_or_else(|| {

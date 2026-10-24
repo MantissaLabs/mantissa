@@ -330,7 +330,7 @@ fn successful_reconcile_preserves_non_pending_spec_status() {
 }
 
 /// Starts a real controller with background actors stopped so tests control each spec write.
-async fn stopped_network_node() -> HeadlessNode {
+async fn stopped_network_node() -> Box<HeadlessNode> {
     let mut node = HeadlessNode::new_with_config(HeadlessConfig {
         runtime_set: Some(RuntimeSet::singleton(
             IN_MEMORY_RUNTIME_BACKEND_KIND,

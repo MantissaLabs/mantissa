@@ -1300,7 +1300,7 @@ pub(crate) async fn create_restartable_service_node(
     keys: HeadlessKeys,
     runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
     local_volume_root: PathBuf,
-) -> HeadlessNode {
+) -> Box<HeadlessNode> {
     HeadlessNode::new_with(
         db,
         self_id,

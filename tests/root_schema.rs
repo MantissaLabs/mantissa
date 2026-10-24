@@ -75,14 +75,12 @@ async fn new_node_with_root_schema(
     supported_version: u32,
 ) -> TestNode {
     TestNode {
-        node: Box::new(
-            HeadlessNode::new_with_config(headless_config_with_root_schema(
-                minimum_supported_version,
-                supported_version,
-            ))
-            .await
-            .expect("headless node with root schema"),
-        ),
+        node: HeadlessNode::new_with_config(headless_config_with_root_schema(
+            minimum_supported_version,
+            supported_version,
+        ))
+        .await
+        .expect("headless node with root schema"),
     }
 }
 
@@ -94,7 +92,7 @@ async fn create_restartable_node_with_root_schema(
     local_volume_root: PathBuf,
     minimum_supported_version: u32,
     supported_version: u32,
-) -> HeadlessNode {
+) -> Box<HeadlessNode> {
     HeadlessNode::new_with(
         db,
         self_id,
@@ -644,17 +642,15 @@ local_test!(
         let local_volume_root = state_dir.path().join("volumes");
 
         let peer = TestNode {
-            node: Box::new(
-                create_restartable_node_with_root_schema(
-                    db.clone(),
-                    self_id,
-                    keys.clone(),
-                    local_volume_root.clone(),
-                    1,
-                    2,
-                )
-                .await,
-            ),
+            node: create_restartable_node_with_root_schema(
+                db.clone(),
+                self_id,
+                keys.clone(),
+                local_volume_root.clone(),
+                1,
+                2,
+            )
+            .await,
         };
 
         peer.join(&anchor).await.expect("join restartable peer");
@@ -664,23 +660,21 @@ local_test!(
         assert_eq!(stored_peer_root_schema(&anchor, self_id), (1, 2));
 
         // Stop pending join writes before the restarted node reuses the same database.
-        (*peer.node)
+        peer.node
             .shutdown()
             .await
             .expect("shut down restartable peer");
 
         let restarted = TestNode {
-            node: Box::new(
-                create_restartable_node_with_root_schema(
-                    db,
-                    self_id,
-                    keys,
-                    local_volume_root,
-                    1,
-                    1,
-                )
-                .await,
-            ),
+            node: create_restartable_node_with_root_schema(
+                db,
+                self_id,
+                keys,
+                local_volume_root,
+                1,
+                1,
+            )
+            .await,
         };
 
         assert_eq!(stored_peer_root_schema(&restarted, self_id), (1, 1));

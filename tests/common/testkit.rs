@@ -428,11 +428,10 @@ impl TestNode {
         ))
         .await
         .expect("headless inproc node");
-        Self {
-            node: Box::new(node),
-        }
+        Self { node }
     }
 
+    /// Starts an in-process node with the gossip fanout selected by its test.
     pub async fn new_with_fanout(fanout: usize) -> Self {
         let node = HeadlessNode::new_with_config(Self::apply_test_runtime_backend(
             Self::inproc_config(InprocConfigOverrides {
@@ -442,9 +441,7 @@ impl TestNode {
         ))
         .await
         .expect("headless inproc node (custom fanout)");
-        Self {
-            node: Box::new(node),
-        }
+        Self { node }
     }
 
     /// Start a node that listens on a random TCP port (Noise + Cap'n Proto over TCP).
@@ -452,6 +449,7 @@ impl TestNode {
         Self::try_new_tcp().await.expect("headless tcp node")
     }
 
+    /// Starts a TCP test node while returning listener failures to callers that must inspect them.
     pub async fn try_new_tcp() -> Result<Self, Box<dyn std::error::Error>> {
         let addr = "127.0.0.1:0".to_string();
         let node =
@@ -461,9 +459,7 @@ impl TestNode {
                 ..HeadlessConfig::default()
             }))
             .await?;
-        Ok(Self {
-            node: Box::new(node),
-        })
+        Ok(Self { node })
     }
 
     /// Start a node with in-process transport and a custom periodic sync tick.
@@ -476,9 +472,7 @@ impl TestNode {
         ))
         .await
         .expect("headless inproc node (with tick)");
-        Self {
-            node: Box::new(node),
-        }
+        Self { node }
     }
 
     /// Start a TCP node with a custom periodic sync tick.
@@ -488,6 +482,7 @@ impl TestNode {
             .expect("headless tcp node (with tick)")
     }
 
+    /// Starts a TCP test node with the selected sync interval and reports listener failures.
     pub async fn try_new_tcp_with_tick_ms(ms: u64) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = "127.0.0.1:0".to_string();
         let node =
@@ -499,9 +494,7 @@ impl TestNode {
                 ..HeadlessConfig::default()
             }))
             .await?;
-        Ok(Self {
-            node: Box::new(node),
-        })
+        Ok(Self { node })
     }
 
     /// Ask this node to join the cluster whose **anchor** is `anchor`.
@@ -1128,7 +1121,8 @@ impl ClusterConfig {
     }
 }
 
-async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
+/// Builds a node with the cluster's selected transport and runtime settings.
+async fn build_inproc_node_with_config(cfg: ClusterConfig) -> TestNode {
     let (sync_tick, sync_fanout, gossip_fanout) = cfg.as_options();
     let gossip_tick = cfg.gossip_tick_ms.map(std::time::Duration::from_millis);
     let gossip_channel_capacity = cfg.gossip_channel_capacity;
@@ -1147,38 +1141,33 @@ async fn build_inproc_node_with_config(cfg: ClusterConfig) -> HeadlessNode {
         store_gc_config: cfg.store_gc_config,
         ..headless_cfg
     };
-    HeadlessNode::new_with_config(TestNode::apply_test_runtime_backend(headless_cfg))
+
+    let node = HeadlessNode::new_with_config(TestNode::apply_test_runtime_backend(headless_cfg))
         .await
-        .expect("headless inproc node (custom)")
+        .expect("headless inproc node (custom)");
+
+    TestNode { node }
 }
 
 impl TestNode {
     /// Starts one in-process node with the provided cluster test configuration.
     pub async fn new_inproc_with_config(cfg: ClusterConfig) -> Self {
-        let node = build_inproc_node_with_config(cfg).await;
-        Self {
-            node: Box::new(node),
-        }
+        build_inproc_node_with_config(cfg).await
     }
 
+    /// Builds and joins nodes with the transport and runtime settings selected by the fixture.
     pub async fn new_cluster_inproc_with_config(
         n: usize,
         cfg: ClusterConfig,
     ) -> Result<Vec<TestNode>, capnp::Error> {
         assert!(n >= 1, "cluster size must be >= 1");
 
-        let anchor_node = build_inproc_node_with_config(cfg.clone()).await;
-        let anchor = TestNode {
-            node: Box::new(anchor_node),
-        };
+        let anchor = build_inproc_node_with_config(cfg.clone()).await;
         let mut cluster = Vec::with_capacity(n);
         cluster.push(anchor);
 
         for _ in 1..n {
-            let node = build_inproc_node_with_config(cfg.clone()).await;
-            let test_node = TestNode {
-                node: Box::new(node),
-            };
+            let test_node = build_inproc_node_with_config(cfg.clone()).await;
             test_node.join(&cluster[0]).await?;
             cluster.push(test_node);
         }

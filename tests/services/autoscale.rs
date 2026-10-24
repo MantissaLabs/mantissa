@@ -559,7 +559,7 @@ local_test!(services_autoscale_owner_failover_scales_on_new_owner, {
     }
 
     let failed_owner = cluster.remove(2);
-    let failed_owner = *failed_owner.node;
+    let failed_owner = failed_owner.node;
     failed_owner
         .shutdown()
         .await

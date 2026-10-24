@@ -316,7 +316,7 @@ pub fn privileged_headless_config() -> HeadlessConfig {
 }
 
 /// Start one real headless node with fast control-plane ticks for privileged dataplane tests.
-pub async fn create_privileged_node() -> HeadlessNode {
+pub async fn create_privileged_node() -> Box<HeadlessNode> {
     HeadlessNode::new_with_config(privileged_headless_config())
         .await
         .expect("start privileged networking node")

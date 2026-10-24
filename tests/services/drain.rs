@@ -276,7 +276,7 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
     let baseline_ids: BTreeSet<Uuid> = baseline_spec.assigned_replica_ids().into_iter().collect();
 
     let failed_node = cluster.remove(2);
-    let failed_node = *failed_node.node;
+    let failed_node = failed_node.node;
     failed_node
         .shutdown()
         .await

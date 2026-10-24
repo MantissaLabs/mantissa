@@ -365,9 +365,7 @@ impl ReplicatedVolumeTestNodeState {
             }
             anyhow::Error::msg(message)
         })?;
-        Ok(TestNode {
-            node: Box::new(node),
-        })
+        Ok(TestNode { node })
     }
 }
 
@@ -888,7 +886,7 @@ pub(crate) async fn start_replicated_volume_test_cluster_with_node_count(
         if let Some(anchor) = cluster.first()
             && let Err(error) = node.join(anchor).await
         {
-            let _ = (*node.node).shutdown().await;
+            let _ = node.node.shutdown().await;
             let _ = shutdown_replicated_volume_test_cluster(cluster).await;
             return Err(anyhow::Error::from(error))
                 .with_context(|| format!("join storage node {index}"));
@@ -1038,7 +1036,7 @@ pub(crate) async fn shutdown_replicated_volume_test_cluster(
     let mut first_error = None;
     while let Some(node) = cluster.pop() {
         let node_id = node.id();
-        let result = tokio::time::timeout(NODE_SHUTDOWN_TIMEOUT, (*node.node).shutdown()).await;
+        let result = tokio::time::timeout(NODE_SHUTDOWN_TIMEOUT, node.node.shutdown()).await;
         let result = match result {
             Ok(result) => result.map_err(anyhow::Error::from),
             Err(_) => Err(anyhow::anyhow!(
@@ -1069,7 +1067,7 @@ pub(crate) async fn shutdown_replicated_volume_test_node(
         .position(|node| node.id() == node_id)
         .context("test cluster does not contain the requested node")?;
     let node = cluster.remove(index);
-    tokio::time::timeout(timeout, (*node.node).shutdown())
+    tokio::time::timeout(timeout, node.node.shutdown())
         .await
         .context("replicated-volume test node shutdown timed out")?
         .context("shut down replicated-volume test node")?;
@@ -4341,7 +4339,7 @@ pub(crate) async fn start_standalone_volume_task(
 pub(crate) async fn create_recording_node(
     manager: Arc<RecordingRuntimeBackend>,
     local_volume_root: PathBuf,
-) -> HeadlessNode {
+) -> Box<HeadlessNode> {
     HeadlessNode::new_with_config(HeadlessConfig {
         runtime_set: Some(RuntimeSet::singleton(
             IN_MEMORY_RUNTIME_BACKEND_KIND,
@@ -4365,7 +4363,7 @@ pub(crate) async fn create_recording_node_with_parts(
     keys: HeadlessKeys,
     manager: Arc<RecordingRuntimeBackend>,
     local_volume_root: PathBuf,
-) -> HeadlessNode {
+) -> Box<HeadlessNode> {
     HeadlessNode::new_with(
         db,
         self_id,

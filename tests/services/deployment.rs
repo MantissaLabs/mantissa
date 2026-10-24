@@ -673,9 +673,7 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         "restart should resume the deploying generation from persisted task ids"
     );
 
-    let restarted = TestNode {
-        node: Box::new(restarted),
-    };
+    let restarted = TestNode { node: restarted };
     assert!(
         wait_for_service_task_count_all(
             std::slice::from_ref(&restarted),
@@ -728,7 +726,7 @@ local_test!(
         }
 
         let failed_owner = cluster.remove(2);
-        let failed_owner = *failed_owner.node;
+        let failed_owner = failed_owner.node;
         failed_owner
             .shutdown()
             .await

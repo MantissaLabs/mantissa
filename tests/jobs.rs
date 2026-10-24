@@ -640,7 +640,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
 
     cluster[owner_index].leave().await.expect("owner leave");
     let departed_owner = cluster.remove(owner_index);
-    let departed_owner_node = *departed_owner.node;
+    let departed_owner_node = departed_owner.node;
     departed_owner_node
         .shutdown()
         .await
@@ -1275,7 +1275,7 @@ async fn create_restartable_job_node(
     keys: HeadlessKeys,
     runtime_backend: Arc<dyn RuntimeBackend + Send + Sync>,
     local_volume_root: PathBuf,
-) -> HeadlessNode {
+) -> Box<HeadlessNode> {
     HeadlessNode::new_with(
         db,
         self_id,

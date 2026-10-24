@@ -758,7 +758,7 @@ local_test!(
         );
 
         let coordinator = cluster.remove(0);
-        let coordinator = *coordinator.node;
+        let coordinator = coordinator.node;
         coordinator
             .shutdown()
             .await
