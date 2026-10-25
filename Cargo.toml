@@ -77,7 +77,7 @@ thiserror = "2.0.12"
 async-trait = "0.1.88"
 async-channel = "2.5.0"
 futures = "0.3.31"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
 arc-swap = "1.6"
 parking_lot = { workspace = true }
@@ -162,13 +162,13 @@ log = "0.4"
 # Test harness support
 anyhow = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "net", "time"] }
 
 # REST, TLS, and task WebSocket integration tests
 axum = "0.8"
 mantissa-rest = { path = "crates/mantissa-rest" }
 rcgen = { version = "0.14", features = ["pem"] }
-rustls = "0.23"
+rustls = "0.23.46"
 tokio-tungstenite = "0.27"
 tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }

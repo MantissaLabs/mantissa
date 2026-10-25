@@ -14,7 +14,7 @@ capnp = { workspace = true }
 redb = "4.1.0"
 merkle-search-tree = "0.8.0"
 crdts = "7.3.2"
-tokio = { version = "1", features = ["sync"], default-features = false }
+tokio = { version = "1.54.1", features = ["sync"], default-features = false }
 tracing = "0.1"
 uuid = { version = "1", features = ["serde"] }
 base64 = "0.22.1"
@@ -25,6 +25,6 @@ thiserror = "1"
 capnpc = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1.54.1", features = ["rt", "macros"] }
 tempfile = "3"
 uuid = { version = "1", features = ["v4", "v7", "fast-rng", "serde"] }
