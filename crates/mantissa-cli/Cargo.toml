@@ -31,7 +31,7 @@ tabwriter = "1"
 textwrap = { version = "0.16.2", default-features = false, features = ["unicode-width"] }
 tokio = { version = "1.54.1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-zeroize = "1.8.1"
+zeroize = "1.9.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
