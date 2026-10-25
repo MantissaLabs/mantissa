@@ -43,7 +43,7 @@ parking_lot = "0.12"
 
 # Consensus stays typed in memory. Serde remains disabled because Mantissa
 # encodes structured Raft wire and durable records with Cap'n Proto.
-openraft = { version = "=0.9.24", default-features = false, features = [
+openraft = { version = "=0.9.25", default-features = false, features = [
     "generic-snapshot-data",
     "storage-v2",
 ] }
@@ -132,7 +132,7 @@ libc = "0.2"
 
 # Storage, replication, and deterministic hashing
 # redb is used as our storage engine for the cluster state.
-redb = "4.1.0"
+redb = "4.4.0"
 
 # crdt based structures useful for state replication and conflict resolution.
 merkle-search-tree = "0.8.0"

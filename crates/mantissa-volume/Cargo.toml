@@ -22,7 +22,7 @@ mantissa-raft = { path = "../mantissa-raft" }
 nix = { version = "0.29", default-features = false, features = ["fs", "mount"] }
 openraft = { workspace = true }
 parking_lot = { workspace = true }
-redb = "4.1.0"
+redb = "4.4.0"
 smol = "2"
 thiserror = "2"
 tokio = { version = "1.54.1", features = ["io-util", "process", "rt", "sync", "time"] }
