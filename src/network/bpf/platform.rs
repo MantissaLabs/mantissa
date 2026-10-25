@@ -9,11 +9,11 @@ mod linux {
     use aya::maps::MapData;
     use aya::pin::PinError;
     use aya::programs::tc::{
-        NlOptions, SchedClassifierLinkId, TcAttachOptions, TcAttachType, qdisc_add_clsact,
+        NlOptions, SchedClassifierLinkId, TcAttachOptions, TcAttachType, TcError, qdisc_add_clsact,
         qdisc_detach_program,
     };
     use aya::programs::xdp::XdpLinkId;
-    use aya::programs::{SchedClassifier, Xdp, XdpFlags};
+    use aya::programs::{SchedClassifier, Xdp, XdpMode};
     use aya::{Ebpf, EbpfLoader};
     use libc::if_nametoindex;
     use nix::mount::{MsFlags, mount};
@@ -1056,8 +1056,8 @@ mod linux {
         }
     }
 
-    /// Detach stale `tc` filters so repeated daemon restarts do not stack multiple classifiers on
-    /// the same hook (which can produce surprising behavior and wastes CPU cycles).
+    /// Removes stale TC filters so daemon restarts cannot run duplicate classifiers on one hook.
+    /// Accepts missing filters when another cleanup pass removes them first.
     fn detach_tc_filters(
         interface: &str,
         attach_type: TcAttachType,
@@ -1078,7 +1078,8 @@ mod linux {
         for name in candidates {
             match qdisc_detach_program(interface, attach_type, &name) {
                 Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(TcError::IoError(err)) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(TcError::NetlinkError(err)) if err.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(err) => return Err(err.into()),
             }
         }
@@ -1206,7 +1207,7 @@ mod linux {
             config::bpf_overlay_flow_capacity(),
         )?;
         for map_name in lb_flow_map_names(family) {
-            loader.set_max_entries(map_name, flow_capacity);
+            loader.map_max_entries(map_name, flow_capacity);
         }
         Ok(())
     }
@@ -1729,7 +1730,7 @@ mod linux {
             lb_family: Option<OverlayIpFamily>,
         ) -> Result<ProgramHandle> {
             let mut loader = EbpfLoader::new();
-            loader.map_pin_path(map_pin_path);
+            loader.default_map_pin_directory(map_pin_path);
             configure_overlay_flow_map_capacities(&mut loader, lb_family)
                 .context("configure overlay bpf map capacities")?;
             let mut bpf = load_bpf_object(&mut loader, object)
@@ -1749,11 +1750,9 @@ mod linux {
                         .with_context(|| format!("program '{}' is not XDP", program_name))?;
                     xdp.load()
                         .with_context(|| format!("load xdp program '{}'", program_name))?;
-                    let link_id =
-                        xdp.attach(interface, XdpFlags::default())
-                            .with_context(|| {
-                                format!("attach xdp program '{}' to {}", program_name, interface)
-                            })?;
+                    let link_id = xdp.attach(interface, XdpMode::Default).with_context(|| {
+                        format!("attach xdp program '{}' to {}", program_name, interface)
+                    })?;
                     Ok(Box::new(XdpHandle {
                         bpf,
                         program_name,
@@ -1766,7 +1765,10 @@ mod linux {
                 } => {
                     match qdisc_add_clsact(interface) {
                         Ok(()) => {}
-                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(TcError::IoError(err))
+                            if err.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(TcError::NetlinkError(err))
+                            if err.raw_os_error() == Some(libc::EEXIST) => {}
                         Err(err) => {
                             return Err(anyhow!(
                                 "ensure clsact qdisc on interface {}: {err}",

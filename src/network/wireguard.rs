@@ -310,10 +310,10 @@ fn load_wireguard_peer_plan(
 #[cfg(target_os = "linux")]
 fn build_kernel_wireguard_peers(
     peer_plan: &WireGuardPeerPlan,
-) -> Result<Vec<defguard_wireguard_rs::host::Peer>> {
+) -> Result<Vec<defguard_wireguard_rs::peer::Peer>> {
     let mut peers = Vec::with_capacity(peer_plan.peer_configs.len());
     for peer_config in &peer_plan.peer_configs {
-        let mut peer = defguard_wireguard_rs::host::Peer::new(
+        let mut peer = defguard_wireguard_rs::peer::Peer::new(
             defguard_wireguard_rs::key::Key::new(peer_config.public_key),
         );
         peer.set_allowed_ips(vec![defguard_wireguard_rs::net::IpAddrMask::host(
@@ -346,6 +346,7 @@ async fn apply_wireguard_interface_config(
         port: local.listen_port,
         peers: peers.clone(),
         mtu: Some(MANTISSA_WIREGUARD_MTU),
+        fwmark: None,
     };
     let ifname_for_blocking = local.ifname.clone();
 

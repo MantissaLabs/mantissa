@@ -17,7 +17,7 @@ use aya::Pod;
 use aya::maps::{Map, MapData, PerCpuArray};
 use aya::programs::ProgramError;
 use aya::programs::tc::{
-    NlOptions, SchedClassifier, TcAttachOptions, TcAttachType, qdisc_add_clsact,
+    NlOptions, SchedClassifier, TcAttachOptions, TcAttachType, TcError, qdisc_add_clsact,
     qdisc_detach_program,
 };
 use aya::{Ebpf, EbpfLoader};
@@ -2024,10 +2024,10 @@ fn configure_nodeport_loader_capacities(
         IPV6_MAPS.vip_map,
         IPV6_MAPS.return_map,
     ] {
-        loader.set_max_entries(map_name, vip_capacity);
+        loader.map_max_entries(map_name, vip_capacity);
     }
     for map_name in [IPV4_MAPS.host_map, IPV6_MAPS.host_map] {
-        loader.set_max_entries(map_name, host_capacity);
+        loader.map_max_entries(map_name, host_capacity);
     }
     for map_name in [
         IPV4_MAPS.forward_map,
@@ -2035,7 +2035,7 @@ fn configure_nodeport_loader_capacities(
         IPV6_MAPS.forward_map,
         IPV6_MAPS.reverse_map,
     ] {
-        loader.set_max_entries(map_name, flow_capacity);
+        loader.map_max_entries(map_name, flow_capacity);
     }
 
     Ok(())
@@ -2049,7 +2049,7 @@ fn load_program(name: &str, capacities: NodePortMapCapacities) -> Result<Ebpf> {
         .with_context(|| format!("resolve nodeport artifact {name}"))?;
     let map_pin_path = map_pin_dir()?;
     let mut loader = EbpfLoader::new();
-    loader.map_pin_path(&map_pin_path);
+    loader.default_map_pin_directory(&map_pin_path);
     configure_nodeport_loader_capacities(&mut loader, capacities)
         .context("configure nodeport bpf map capacities")?;
     let bpf = load_bpf_object(&mut loader, &object)
@@ -2069,7 +2069,8 @@ fn load_bpf_object(loader: &mut EbpfLoader<'_>, object: &BpfObject) -> Result<Eb
 fn ensure_clsact(iface: &str) -> Result<()> {
     match qdisc_add_clsact(iface) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(TcError::IoError(err)) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(TcError::NetlinkError(err)) if err.raw_os_error() == Some(libc::EEXIST) => Ok(()),
         Err(err) => Err(anyhow!("ensure clsact qdisc on {iface}: {err}")),
     }
 }
@@ -2127,7 +2128,7 @@ fn attach_tc(
     Ok(())
 }
 
-/// Detach a tc program from the provided interface, tolerating missing attachments.
+/// Removes TC programs without failing if another cleanup pass already removed them.
 fn detach_tc(iface: &str, attach_type: TcAttachType, program_name: &str) -> Result<()> {
     let mut candidates = vec![program_name.to_string()];
     let truncated: String = program_name.chars().take(15).collect();
@@ -2138,7 +2139,8 @@ fn detach_tc(iface: &str, attach_type: TcAttachType, program_name: &str) -> Resu
     for name in candidates {
         match qdisc_detach_program(iface, attach_type, &name) {
             Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(TcError::IoError(err)) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(TcError::NetlinkError(err)) if err.raw_os_error() == Some(libc::ENOENT) => {}
             Err(err) => return Err(err.into()),
         }
     }

@@ -2,7 +2,7 @@
 
 use super::convergence::wait_until;
 use anyhow::{Context, Result};
-use aya::programs::tc::{TcAttachType, qdisc_detach_program};
+use aya::programs::tc::{TcAttachType, TcError, qdisc_detach_program};
 use futures::TryStreamExt;
 use mantissa::config::{
     Config, ConfigSource, global_config, global_config_source, set_global_config_with_source,
@@ -114,12 +114,13 @@ fn privileged_nodeport_bpf_pin_dir() -> PathBuf {
     PathBuf::from("/sys/fs/bpf/mantissa/nodeport")
 }
 
-/// Detach one tc program name (and its truncated kernel-visible alias) from one interface hook.
+/// Removes test TC filters under full and kernel-truncated names during network cleanup.
+/// Accepts missing filters when the node has already torn down its attachments.
 fn detach_tc_program_by_name(
     iface: &str,
     attach_type: TcAttachType,
     program_name: &str,
-) -> io::Result<()> {
+) -> Result<(), TcError> {
     let mut candidates = vec![program_name.to_string()];
     let truncated: String = program_name.chars().take(15).collect();
     if truncated != program_name {
@@ -129,7 +130,8 @@ fn detach_tc_program_by_name(
     for candidate in candidates {
         match qdisc_detach_program(iface, attach_type, &candidate) {
             Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(TcError::IoError(err)) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(TcError::NetlinkError(err)) if err.raw_os_error() == Some(libc::ENOENT) => {}
             Err(err) => return Err(err),
         }
     }
