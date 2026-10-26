@@ -7,9 +7,10 @@ repo_root="$(cd -- "$script_dir/.." && pwd)"
 out_dir="$repo_root/target/dist/mantissa"
 release_dir="$repo_root/target/$target/release"
 
-rustup target add "$target"
+rustup target add --toolchain stable "$target"
 
-cargo build \
+cargo +stable build \
+  --locked \
   --release \
   --target "$target" \
   --package mantissa-cli \

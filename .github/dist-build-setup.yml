@@ -18,6 +18,12 @@
       pkg-config \
       zstd
 
+- name: Install Rust stable for release binaries
+  shell: bash
+  run: |
+    rustup toolchain install stable --profile minimal
+    rustc +stable --version
+
 - name: Install Rust nightly for eBPF
   shell: bash
   run: |
