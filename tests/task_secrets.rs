@@ -1617,6 +1617,27 @@ async fn check_remote_registry_auth_readiness(
         release: RefCell::new(Some(release_rx)),
     });
     let owner = &cluster[0];
+
+    // Membership and scheduler digests replicate independently. Gang admission needs
+    // the target's digest to plan placement before it can check secret readiness.
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || async {
+                owner
+                    .node
+                    .scheduler
+                    .observed_scheduler_digests()
+                    .expect("read owner scheduler digests")
+                    .iter()
+                    .any(|observed| observed.digest.node_id == target.id())
+            }
+        )
+        .await,
+        "owner must observe the target scheduler digest before testing secret readiness"
+    );
+
     let inner = owner
         .node
         .registry
@@ -1652,7 +1673,7 @@ async fn check_remote_registry_auth_readiness(
     request.target_node = Some(target.id());
     let reference = request.registry_auth.clone();
     let manager = owner.node.workload_manager.clone();
-    let launch = spawn_local(async move {
+    let mut launch = spawn_local(async move {
         match admission_mode {
             WorkloadAdmissionMode::Gang => {
                 manager
@@ -1665,10 +1686,16 @@ async fn check_remote_registry_auth_readiness(
         }
     });
 
-    let observed = tokio::time::timeout(Duration::from_secs(5), first_check_rx)
-        .await
-        .expect("remote admission must query registry secret readiness")
-        .expect("receive first readiness request");
+    let observed = tokio::select! {
+        observed = tokio::time::timeout(Duration::from_secs(5), first_check_rx) => {
+            observed
+                .expect("remote admission must query registry secret readiness")
+                .expect("receive first readiness request")
+        }
+        result = &mut launch => {
+            panic!("remote admission finished before checking registry secret readiness: {result:#?}");
+        }
+    };
 
     assert_eq!(
         observed,
