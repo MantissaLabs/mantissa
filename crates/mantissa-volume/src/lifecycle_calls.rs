@@ -653,6 +653,10 @@ mod tests {
             pending.wait(Duration::from_secs(1)).await?,
             WaitResult::Finished
         ));
+
+        // A completed result can arrive before the worker removes its tracker entry.
+        // Wait for that removal before asserting that the tracker is empty.
+        tracker.stop(Duration::from_secs(1)).await?;
         assert_eq!(tracker.len(), 0);
         Ok(())
     }
