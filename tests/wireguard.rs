@@ -3,6 +3,9 @@
 #[macro_use]
 mod common;
 
+#[path = "wireguard/routing.rs"]
+mod routing;
+
 use common::convergence::wait_until;
 use common::privileged_networking::{
     PrivilegedTestGuard, command_stdout, create_privileged_network, create_privileged_node,

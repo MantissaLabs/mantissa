@@ -327,10 +327,10 @@ fn build_kernel_wireguard_peers(
     Ok(peers)
 }
 
-/// Apply the desired WireGuard interface and peer routing state to the kernel.
+/// Applies WireGuard keys, peer endpoints, interface addresses, and VXLAN firewall access.
 ///
-/// This is the expensive part of reconciliation, so callers should only invoke it after the
-/// configuration hash says a refresh is necessary.
+/// Tunnel routes are reconciled separately on every pass. This expensive device setup
+/// runs only when configuration changes or a periodic refresh is due.
 #[cfg(target_os = "linux")]
 async fn apply_wireguard_interface_config(
     local: &LocalWireGuardConfig,
@@ -344,7 +344,7 @@ async fn apply_wireguard_interface_config(
             local.tunnel_ip,
         )],
         port: local.listen_port,
-        peers: peers.clone(),
+        peers,
         mtu: Some(MANTISSA_WIREGUARD_MTU),
         fwmark: None,
     };
@@ -361,9 +361,6 @@ async fn apply_wireguard_interface_config(
         wgapi
             .configure_interface(&interface_config)
             .context("configure wireguard interface")?;
-        wgapi
-            .configure_peer_routing(&peers)
-            .context("configure wireguard peer routing")?;
         ensure_vxlan_firewall_accept(&interface_config.name)?;
         Ok(())
     })
@@ -470,25 +467,20 @@ fn persist_wireguard_underlay_preference_if_ready(
     }
 }
 
-/// Prune stale tunnel routes that no longer belong to the local node or its scoped peers.
+/// Reconcile the tunnel routes for this node and the peers currently sharing its networks.
 ///
-/// Route cleanup is best-effort because stale peer routes should not block overlay reconciliation.
+/// Physical endpoint routing belongs to the host, including any existing VPN policy.
+/// Only Mantissa's tunnel addresses should select the WireGuard interface.
 #[cfg(target_os = "linux")]
-async fn prune_wireguard_tunnel_routes(
+async fn reconcile_wireguard_tunnel_routes(
     local: &LocalWireGuardConfig,
     peer_plan: &WireGuardPeerPlan,
-) {
+) -> Result<()> {
     let mut desired_tunnel_routes = HashSet::with_capacity(peer_plan.peer_configs.len() + 1);
     desired_tunnel_routes.insert(local.tunnel_v6);
     desired_tunnel_routes.extend(peer_plan.peer_configs.iter().map(|peer| peer.allowed_ip));
 
-    if let Err(err) = prune_stale_wireguard_routes(&local.ifname, &desired_tunnel_routes).await {
-        tracing::warn!(
-            target: "network",
-            ifname = local.ifname,
-            "failed to prune stale wireguard tunnel routes: {err:#}"
-        );
-    }
+    reconcile_wireguard_routes(&local.ifname, &desired_tunnel_routes).await
 }
 
 /// Inputs used to derive one controller-facing WireGuard underlay snapshot.
@@ -564,6 +556,11 @@ pub async fn ensure_wireguard_underlay(
     let peer_plan = load_wireguard_peer_plan(registry, self_id, desired_peer_ids)?;
     let (config_hash, last_configured_at) =
         reconcile_wireguard_kernel_state(&local, &peer_plan, previous.as_ref(), now).await?;
+
+    // The library's combined routing helper also rewrites physical endpoint routes.
+    // Install only our tunnel routes, and require them before publishing readiness.
+    reconcile_wireguard_tunnel_routes(&local, &peer_plan).await?;
+
     let published = match publish_local_wireguard_state(registry, &local).await {
         Ok(()) => true,
         Err(err) if wireguard_required => return Err(err),
@@ -591,8 +588,6 @@ pub async fn ensure_wireguard_underlay(
         &peer_plan,
         scoped_ready_for_encryption,
     );
-    prune_wireguard_tunnel_routes(&local, &peer_plan).await;
-
     Ok(build_wireguard_underlay_state(
         WireGuardUnderlayStateInput {
             ifname: local.ifname,
@@ -736,22 +731,23 @@ fn ensure_vxlan_firewall_accept(ifname: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove stale `/128` tunnel routes from the WireGuard interface.
+/// Add missing tunnel routes and remove retired tunnel addresses from the WireGuard interface.
 ///
-/// Kernel route helpers can leave old peer routes behind after cluster membership churn. Keeping
-/// those stale routes can blackhole VXLAN traffic whenever stale forwarding entries still point at
-/// retired tunnel addresses, so we prune every route outside the current self + peer set.
+/// Limit changes to Mantissa's `/128` addresses in the main table. Endpoint routes,
+/// default gateways, policy rules, and unrelated routes remain owned by the host.
 #[cfg(target_os = "linux")]
-async fn prune_stale_wireguard_routes(
+async fn reconcile_wireguard_routes(
     ifname: &str,
     desired_routes: &HashSet<Ipv6Addr>,
 ) -> Result<()> {
     use futures::TryStreamExt;
-    use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteHeader};
+    use rtnetlink::packet_route::route::{
+        RouteAddress, RouteAttribute, RouteHeader, RouteProtocol,
+    };
     use rtnetlink::{RouteMessageBuilder, new_connection};
 
     let (connection, handle, _) =
-        new_connection().context("open rtnetlink connection for wireguard route pruning")?;
+        new_connection().context("open rtnetlink connection for wireguard routes")?;
     tokio::spawn(connection);
 
     // Rtnetlink link lookups are dump streams. Keep the first match but drain the
@@ -768,14 +764,16 @@ async fn prune_stale_wireguard_routes(
             ifindex = Some(link.header.index);
         }
     }
-    let ifindex = ifindex
-        .ok_or_else(|| anyhow::anyhow!("link {ifname} missing while pruning wireguard routes"))?;
+    let ifindex = ifindex.ok_or_else(|| {
+        anyhow::anyhow!("link {ifname} missing while reconciling wireguard routes")
+    })?;
 
     let mut routes = handle
         .route()
         .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
         .execute();
 
+    let mut existing_routes = HashSet::new();
     let mut stale_routes = Vec::new();
     while let Some(route) = routes
         .try_next()
@@ -808,16 +806,39 @@ async fn prune_stale_wireguard_routes(
         let Some(route_ip) = route_ip else {
             continue;
         };
-        if !is_mantissa_tunnel_ipv6(route_ip) || desired_routes.contains(&route_ip) {
+        if !is_mantissa_tunnel_ipv6(route_ip) {
             continue;
         }
-        stale_routes.push(route_ip);
+
+        if desired_routes.contains(&route_ip) {
+            existing_routes.insert(route_ip);
+        } else {
+            stale_routes.push(route_ip);
+        }
+    }
+
+    for route_ip in desired_routes.difference(&existing_routes) {
+        let add = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(*route_ip, 128)
+            .output_interface(ifindex)
+            .protocol(RouteProtocol::Boot)
+            .build();
+        handle
+            .route()
+            .add(add)
+            .replace()
+            .execute()
+            .await
+            .with_context(|| format!("add wireguard tunnel route {route_ip}/128 on {ifname}"))?;
     }
 
     for route_ip in stale_routes {
+        // Kernel-created and controller-created routes can use different protocols.
+        // Match our tunnel address and interface regardless of their protocol.
         let delete = RouteMessageBuilder::<Ipv6Addr>::new()
             .destination_prefix(route_ip, 128)
             .output_interface(ifindex)
+            .protocol(RouteProtocol::Unspec)
             .build();
 
         if let Err(err) = handle.route().del(delete).execute().await {
