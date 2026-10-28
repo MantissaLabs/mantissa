@@ -3127,7 +3127,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3212,7 +3212,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-client"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3262,14 +3262,14 @@ dependencies = [
 
 [[package]]
 name = "mantissa-ebpf"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aya-ebpf",
 ]
 
 [[package]]
 name = "mantissa-health"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "parking_lot",
  "tracing",
@@ -3278,7 +3278,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-net"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "capnp",
@@ -3306,7 +3306,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "capnp",
  "capnpc",
@@ -3314,7 +3314,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-raft"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-rest"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -3364,7 +3364,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-sandbox"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "mantissa",
  "nono",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-store"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "capnp",
@@ -3394,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-ui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -3404,7 +3404,7 @@ dependencies = [
 
 [[package]]
 name = "mantissa-volume"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "arc-swap",
  "async-channel",
