@@ -20,12 +20,13 @@ local_test!(restart_restores_volume_node_state, {
     )
     .await;
 
-    let volume_id = create_managed_volume(&node.volumes_client, "restart-restore").await;
+    let volume_id = create_managed_volume(&node.clients.cluster.volumes, "restart-restore").await;
     let task = start_standalone_volume_task(&node, volume_id, "restart-restore", "/srv/data").await;
     wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
 
     let local_path = node
-        .volume_registry
+        .registries
+        .volumes
         .get_node_state(volume_id, node.id)
         .expect("load node state before restart")
         .expect("node state before restart")
@@ -70,7 +71,8 @@ local_test!(restart_restores_volume_node_state, {
             Duration::from_millis(25),
             || async {
                 match restarted
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_node_state(volume_id, restarted.id)
                 {
                     Ok(Some(state)) => {

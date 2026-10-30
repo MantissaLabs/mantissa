@@ -41,19 +41,22 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
     let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
     let node = TestNode::new().await;
 
-    let job_id = submit_job(&node.node.jobs_client, "demo-job", 0, 0)
+    let job_id = submit_job(&node.node.clients.cluster.jobs, "demo-job", 0, 0)
         .await
         .expect("submit job");
-    let inspected = inspect_job(&node.node.jobs_client, job_id)
+    let inspected = inspect_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("inspect submitted job");
     assert_eq!(inspected.snapshot.id, job_id);
 
-    let active_workload_id =
-        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
-            .await
-            .expect("job should launch one workload");
-    let inspected = inspect_job(&node.node.jobs_client, job_id)
+    let active_workload_id = wait_for_active_workload(
+        &node.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("job should launch one workload");
+    let inspected = inspect_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("inspect running job");
     assert!(
@@ -70,7 +73,7 @@ local_test!(jobs_submit_and_reach_succeeded_after_task_exit, {
 
     assert!(
         wait_for_job_status(
-            &node.node.jobs_client,
+            &node.node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Succeeded,
             Duration::from_secs(10)
@@ -85,14 +88,17 @@ local_test!(jobs_retry_after_failed_task, {
     let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
     let node = TestNode::new().await;
 
-    let job_id = submit_job(&node.node.jobs_client, "retry-job", 1, 0)
+    let job_id = submit_job(&node.node.clients.cluster.jobs, "retry-job", 1, 0)
         .await
         .expect("submit retrying job");
 
-    let first_workload_id =
-        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
-            .await
-            .expect("job should launch first workload");
+    let first_workload_id = wait_for_active_workload(
+        &node.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("job should launch first workload");
 
     backend
         .signal_workload_exit(first_workload_id, 1)
@@ -101,7 +107,7 @@ local_test!(jobs_retry_after_failed_task, {
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.jobs_client.clone();
+            let client = node.node.clients.cluster.jobs.clone();
             async move {
                 let jobs = list_jobs(&client).await.expect("list jobs");
                 jobs.iter().any(|job| {
@@ -120,7 +126,8 @@ local_test!(jobs_retry_after_failed_task, {
 
     let tasks = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list tasks");
@@ -135,21 +142,25 @@ local_test!(jobs_gang_admission_records_grouped_attempt, {
     let node = TestNode::new().await;
 
     let job_id = submit_job_with_admission(
-        &node.node.jobs_client,
+        &node.node.clients.cluster.jobs,
         "gang-job",
         WorkloadAdmissionMode::Gang,
     )
     .await
     .expect("submit gang-admitted job");
 
-    let workload_id =
-        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
-            .await
-            .expect("gang job should launch one workload");
+    let workload_id = wait_for_active_workload(
+        &node.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("gang job should launch one workload");
 
     let workload = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(workload_id)
         .await
         .expect("inspect gang job workload");
@@ -169,7 +180,7 @@ local_test!(jobs_gang_capacity_failure_leaves_no_attempt_workloads, {
     let node = TestNode::new().await;
 
     let job_id = submit_job_with_admission_resources(
-        &node.node.jobs_client,
+        &node.node.clients.cluster.jobs,
         "gang-job-overcommit",
         WorkloadAdmissionMode::Gang,
         OVERCOMMITTED_CPU_MILLIS,
@@ -180,7 +191,7 @@ local_test!(jobs_gang_capacity_failure_leaves_no_attempt_workloads, {
 
     assert!(
         wait_for_job_status(
-            &node.node.jobs_client,
+            &node.node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Failed,
             Duration::from_secs(10),
@@ -189,7 +200,7 @@ local_test!(jobs_gang_capacity_failure_leaves_no_attempt_workloads, {
         "overcommitted gang job should fail the launch attempt"
     );
 
-    let inspected = inspect_job(&node.node.jobs_client, job_id)
+    let inspected = inspect_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("inspect failed gang job");
     assert_eq!(inspected.snapshot.attempts_started, 1);
@@ -213,7 +224,8 @@ local_test!(jobs_gang_capacity_failure_leaves_no_attempt_workloads, {
 
     let workloads = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list workloads after failed gang job");
@@ -230,16 +242,19 @@ local_test!(jobs_cancel_running_job_reaches_cancelled, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
-    let job_id = submit_job(&node.node.jobs_client, "cancel-job", 0, 0)
+    let job_id = submit_job(&node.node.clients.cluster.jobs, "cancel-job", 0, 0)
         .await
         .expect("submit cancellable job");
 
-    let active_workload_id =
-        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
-            .await
-            .expect("job should launch one workload before cancellation");
+    let active_workload_id = wait_for_active_workload(
+        &node.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("job should launch one workload before cancellation");
 
-    let snapshot = cancel_job(&node.node.jobs_client, job_id)
+    let snapshot = cancel_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("cancel job");
     assert_eq!(snapshot.id, job_id);
@@ -254,7 +269,7 @@ local_test!(jobs_cancel_running_job_reaches_cancelled, {
 
     assert!(
         wait_for_job_status(
-            &node.node.jobs_client,
+            &node.node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Cancelled,
             Duration::from_secs(10)
@@ -269,11 +284,11 @@ local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
     let _guard = RuntimeBackendOverrideGuard::install(backend.clone());
     let node = TestNode::new().await;
 
-    let job_id = submit_job(&node.node.jobs_client, "delete-job", 0, 0)
+    let job_id = submit_job(&node.node.clients.cluster.jobs, "delete-job", 0, 0)
         .await
         .expect("submit deletable job");
 
-    let delete_error = delete_job(&node.node.jobs_client, job_id)
+    let delete_error = delete_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect_err("non-terminal delete should fail");
     assert!(
@@ -281,10 +296,13 @@ local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
         "delete error should explain that the job must be terminal first"
     );
 
-    let active_workload_id =
-        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
-            .await
-            .expect("job should launch one workload");
+    let active_workload_id = wait_for_active_workload(
+        &node.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("job should launch one workload");
 
     backend
         .signal_workload_exit(active_workload_id, 0)
@@ -293,7 +311,7 @@ local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
 
     assert!(
         wait_for_job_status(
-            &node.node.jobs_client,
+            &node.node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Succeeded,
             Duration::from_secs(10)
@@ -302,7 +320,7 @@ local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
         "job should converge to succeeded before delete"
     );
 
-    let removed = delete_job(&node.node.jobs_client, job_id)
+    let removed = delete_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("delete terminal job");
     assert_eq!(removed.id, job_id);
@@ -310,7 +328,7 @@ local_test!(jobs_delete_requires_terminal_state_and_removes_job, {
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.jobs_client.clone();
+            let client = node.node.clients.cluster.jobs.clone();
             async move {
                 let jobs = list_jobs(&client).await.expect("list jobs");
                 jobs.into_iter().all(|job| job.id != job_id)
@@ -326,7 +344,7 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
     let node = TestNode::new().await;
 
     let job_id = submit_job_with_runtime(
-        &node.node.jobs_client,
+        &node.node.clients.cluster.jobs,
         "sandboxed-job",
         0,
         0,
@@ -337,7 +355,7 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
     .await
     .expect("submit sandboxed job");
 
-    let inspected = inspect_job(&node.node.jobs_client, job_id)
+    let inspected = inspect_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("inspect submitted sandboxed job");
     assert_eq!(inspected.snapshot.execution_platform, "oci");
@@ -347,13 +365,17 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
         Some("oci-default")
     );
 
-    let active_workload_id =
-        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
-            .await
-            .expect("job should launch one sandboxed workload");
+    let active_workload_id = wait_for_active_workload(
+        &node.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("job should launch one sandboxed workload");
     let workload = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(active_workload_id)
         .await
         .expect("inspect sandboxed job workload");
@@ -361,7 +383,7 @@ local_test!(jobs_runtime_selection_reaches_workload_attempts, {
     assert_eq!(workload.isolation_mode, IsolationMode::Sandboxed);
     assert_eq!(workload.isolation_profile.as_deref(), Some("oci-default"));
 
-    let inspected = inspect_job(&node.node.jobs_client, job_id)
+    let inspected = inspect_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("inspect launched sandboxed job");
     assert!(
@@ -381,7 +403,7 @@ local_test!(jobs_progress_deadline_fails_attempt_waiting_for_network, {
 
     let missing_network_id = Uuid::new_v4();
     let job_id = submit_job_with_deployment_policy(
-        &node.node.jobs_client,
+        &node.node.clients.cluster.jobs,
         "network-deadline-job",
         0,
         0,
@@ -397,7 +419,7 @@ local_test!(jobs_progress_deadline_fails_attempt_waiting_for_network, {
 
     assert!(
         wait_for_job_status(
-            &node.node.jobs_client,
+            &node.node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Failed,
             Duration::from_secs(10)
@@ -405,7 +427,7 @@ local_test!(jobs_progress_deadline_fails_attempt_waiting_for_network, {
         .await,
         "job should fail once the deployment progress deadline expires"
     );
-    let detail = inspect_job(&node.node.jobs_client, job_id)
+    let detail = inspect_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("inspect failed job")
         .snapshot
@@ -422,7 +444,7 @@ local_test!(jobs_healthy_deadline_fails_bootstrapping_attempt, {
     let node = TestNode::new().await;
 
     let job_id = submit_job_with_deployment_policy(
-        &node.node.jobs_client,
+        &node.node.clients.cluster.jobs,
         "healthy-deadline-job",
         0,
         0,
@@ -435,10 +457,13 @@ local_test!(jobs_healthy_deadline_fails_bootstrapping_attempt, {
     )
     .await
     .expect("submit job with short healthy deadline");
-    let workload_id =
-        wait_for_active_workload(&node.node.jobs_client, job_id, Duration::from_secs(5))
-            .await
-            .expect("job should launch one workload");
+    let workload_id = wait_for_active_workload(
+        &node.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("job should launch one workload");
 
     mark_workload_phase_with_created_at(
         &node,
@@ -450,7 +475,7 @@ local_test!(jobs_healthy_deadline_fails_bootstrapping_attempt, {
 
     assert!(
         wait_for_job_status(
-            &node.node.jobs_client,
+            &node.node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Failed,
             Duration::from_secs(10)
@@ -458,7 +483,7 @@ local_test!(jobs_healthy_deadline_fails_bootstrapping_attempt, {
         .await,
         "job should fail once the launched workload exceeds its healthy deadline"
     );
-    let detail = inspect_job(&node.node.jobs_client, job_id)
+    let detail = inspect_job(&node.node.clients.cluster.jobs, job_id)
         .await
         .expect("inspect failed job")
         .snapshot
@@ -489,12 +514,12 @@ local_test!(jobs_retry_backoff_survives_controller_restart, {
     )
     .await;
 
-    let job_id = submit_job(&node.jobs_client, "restartable-job", 1, 3)
+    let job_id = submit_job(&node.clients.cluster.jobs, "restartable-job", 1, 3)
         .await
         .expect("submit restartable job");
 
     let first_workload_id =
-        wait_for_active_workload(&node.jobs_client, job_id, Duration::from_secs(5))
+        wait_for_active_workload(&node.clients.cluster.jobs, job_id, Duration::from_secs(5))
             .await
             .expect("job should launch first workload before restart");
     runtime
@@ -504,7 +529,7 @@ local_test!(jobs_retry_backoff_survives_controller_restart, {
 
     assert!(
         wait_for_job_status(
-            &node.jobs_client,
+            &node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Retrying,
             Duration::from_secs(10)
@@ -526,7 +551,7 @@ local_test!(jobs_retry_backoff_survives_controller_restart, {
 
     assert!(
         !wait_until(Duration::from_secs(1), Duration::from_millis(100), || {
-            let client = restarted.jobs_client.clone();
+            let client = restarted.clients.cluster.jobs.clone();
             async move {
                 let jobs = list_jobs(&client).await.expect("list jobs after restart");
                 jobs.iter().any(|job| {
@@ -543,7 +568,7 @@ local_test!(jobs_retry_backoff_survives_controller_restart, {
     );
 
     let second_workload_id = wait_for_active_workload_transition(
-        &restarted.jobs_client,
+        &restarted.clients.cluster.jobs,
         job_id,
         Some(first_workload_id),
         Duration::from_secs(10),
@@ -558,7 +583,7 @@ local_test!(jobs_retry_backoff_survives_controller_restart, {
 
     assert!(
         wait_for_job_status(
-            &restarted.jobs_client,
+            &restarted.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Succeeded,
             Duration::from_secs(10)
@@ -601,7 +626,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
         .map(|(node, backend)| (node.id(), backend.clone()))
         .collect::<HashMap<_, _>>();
 
-    let job_id = submit_job(&cluster[0].node.jobs_client, "failover-job", 1, 2)
+    let job_id = submit_job(&cluster[0].node.clients.cluster.jobs, "failover-job", 1, 2)
         .await
         .expect("submit failover job");
     let owner_id = select_job_owner_for_test(job_id, &cluster_ids(&cluster)).expect("job owner");
@@ -611,13 +636,17 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
         .expect("owner index");
     let owner = &cluster[owner_index];
 
-    let first_workload_id =
-        wait_for_active_workload(&owner.node.jobs_client, job_id, Duration::from_secs(10))
-            .await
-            .expect("job should launch first workload");
+    let first_workload_id = wait_for_active_workload(
+        &owner.node.clients.cluster.jobs,
+        job_id,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("job should launch first workload");
     let first_attempt = owner
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(first_workload_id)
         .await
         .expect("inspect first workload");
@@ -629,7 +658,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
 
     assert!(
         wait_for_job_status(
-            &owner.node.jobs_client,
+            &owner.node.clients.cluster.jobs,
             job_id,
             ProtoJobStatus::Retrying,
             Duration::from_secs(10)
@@ -660,7 +689,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
         .expect("post-failover owner node");
 
     let second_workload_id = wait_for_active_workload_transition(
-        &remaining_owner.node.jobs_client,
+        &remaining_owner.node.clients.cluster.jobs,
         job_id,
         Some(first_workload_id),
         Duration::from_secs(12),
@@ -670,7 +699,8 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
 
     let second_attempt = remaining_owner
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(second_workload_id)
         .await
         .expect("inspect second workload");
@@ -685,7 +715,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
         .expect("emit successful retry exit after failover");
 
     if !wait_for_job_status(
-        &remaining_owner.node.jobs_client,
+        &remaining_owner.node.clients.cluster.jobs,
         job_id,
         ProtoJobStatus::Succeeded,
         Duration::from_secs(20),
@@ -702,7 +732,7 @@ local_test!(jobs_retrying_owner_failover_launches_next_attempt, {
     for node in &cluster {
         assert!(
             wait_for_job_status(
-                &node.node.jobs_client,
+                &node.node.clients.cluster.jobs,
                 job_id,
                 ProtoJobStatus::Succeeded,
                 Duration::from_secs(10)
@@ -1034,7 +1064,8 @@ async fn mark_workload_phase_with_created_at(
     let mut task = loop {
         match node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .inspect_workload(workload_id)
             .await
         {
@@ -1050,6 +1081,7 @@ async fn mark_workload_phase_with_created_at(
     task.created_at = created_at.to_rfc3339();
     task.updated_at = Utc::now().to_rfc3339();
     node.node
+        .stores
         .workloads
         .upsert(
             &UuidKey::from(workload_id),
@@ -1114,7 +1146,7 @@ async fn describe_remaining_job_state(
 ) -> String {
     let mut entries = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let job = match inspect_job(&node.node.jobs_client, job_id).await {
+        let job = match inspect_job(&node.node.clients.cluster.jobs, job_id).await {
             Ok(detail) => {
                 let attempts = detail
                     .attempts
@@ -1140,7 +1172,8 @@ async fn describe_remaining_job_state(
         };
         let workload = match node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .inspect_workload(workload_id)
             .await
         {

@@ -95,14 +95,15 @@ local_test!(services_placement_constraints_honor_node_labels, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit constrained deployment");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -121,7 +122,8 @@ local_test!(services_placement_constraints_honor_node_labels, {
         "service placement should converge consistently across the cluster"
     );
 
-    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let tasks =
+        list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
     assert_eq!(
         tasks.len(),
         1,
@@ -160,14 +162,15 @@ local_test!(services_placement_constraints_honor_node_id, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit node-id constrained deployment");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -186,7 +189,8 @@ local_test!(services_placement_constraints_honor_node_id, {
         "node.id placement should converge consistently across the cluster"
     );
 
-    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let tasks =
+        list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
     assert_eq!(
         tasks.len(),
         1,
@@ -233,14 +237,15 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
             .await
             .expect("submit platform-constrained deployment");
 
         assert!(
             wait_for_service_status(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -285,10 +290,10 @@ local_test!(
             "local planner should observe a remote digest before testing heterogeneous platform placement"
         );
 
-        let node0_arch = node_platform_value(&cluster[0].node.registry, cluster[0].id())
+        let node0_arch = node_platform_value(&cluster[0].node.registries.peers, cluster[0].id())
             .expect("node 0 platform should exist before override")
             .1;
-        let node1_arch = node_platform_value(&cluster[1].node.registry, cluster[1].id())
+        let node1_arch = node_platform_value(&cluster[1].node.registries.peers, cluster[1].id())
             .expect("node 1 platform should exist before override")
             .1;
         set_node_platform(&cluster, cluster[0].id(), "linux", &node0_arch).await;
@@ -326,7 +331,8 @@ local_test!(
 
         let specs = cluster[0]
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .start_workloads_batch(vec![request])
             .await
             .expect("start heterogeneous platform workload");
@@ -342,7 +348,8 @@ local_test!(
         if !reached_running {
             let tasks = cluster[0]
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .list_workloads(&TaskStateFilter::all())
                 .await
                 .expect("list workloads after heterogeneous placement failure");
@@ -352,7 +359,8 @@ local_test!(
         }
 
         let tasks =
-            list_active_workloads_by_ids(&cluster[0].node.workload_manager, &workload_ids).await;
+            list_active_workloads_by_ids(&cluster[0].node.controllers.workloads, &workload_ids)
+                .await;
         assert_eq!(
             tasks.len(),
             1,
@@ -392,14 +400,15 @@ local_test!(services_placement_constraints_reject_unknown_platform, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit blocked platform deployment");
 
     assert!(
         wait_for_service_status_detail(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             "exclude every eligible node"
         )
@@ -476,14 +485,15 @@ local_test!(services_placement_constraints_recover_after_label_change, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit initially blocked deployment");
 
     assert!(
         wait_for_service_status_detail(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             "exclude every eligible node"
         )
@@ -516,7 +526,7 @@ local_test!(services_placement_constraints_recover_after_label_change, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -535,7 +545,8 @@ local_test!(services_placement_constraints_recover_after_label_change, {
         "recovered placement should converge consistently across the cluster"
     );
 
-    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let tasks =
+        list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
     assert_eq!(
         tasks.len(),
         1,
@@ -580,14 +591,15 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
             .await
             .expect("submit spread deployment");
 
         assert!(
             wait_for_service_status(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -607,7 +619,7 @@ local_test!(
         );
 
         let tasks =
-            list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+            list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
         let counts = workload_counts_by_node(&tasks);
 
         assert_eq!(
@@ -653,14 +665,15 @@ local_test!(services_static_host_port_replicas_spread_across_nodes, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit static-host-port deployment");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -679,7 +692,8 @@ local_test!(services_static_host_port_replicas_spread_across_nodes, {
         "static host-port placement should converge consistently across the cluster"
     );
 
-    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let tasks =
+        list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
     let placements = workload_counts_by_node(&tasks);
     assert_eq!(
         placements.len(),
@@ -712,20 +726,22 @@ local_test!(services_static_host_port_exhaustion_blocks_extra_replica, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit overcommitted static-host-port deployment");
 
     let saw_exhaustion_detail = wait_for_service_status_detail(
-        &cluster[0].node.service_controller,
+        &cluster[0].node.controllers.services,
         service_id,
         "host ports unavailable",
     )
     .await;
     let service_snapshot = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("service registry should be readable");
@@ -760,14 +776,15 @@ local_test!(services_placement_service_affinity_overrides_spread, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit service-affinity deployment");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -786,7 +803,8 @@ local_test!(services_placement_service_affinity_overrides_spread, {
         "service-affinity deployment should converge consistently across the cluster"
     );
 
-    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let tasks =
+        list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
     let unique_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
 
     assert_eq!(
@@ -825,14 +843,15 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
             .await
             .expect("submit service-anti-affinity deployment");
 
         assert!(
             wait_for_service_status(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -852,7 +871,7 @@ local_test!(
         );
 
         let tasks =
-            list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+            list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
         let unique_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
 
         assert_eq!(
@@ -890,7 +909,8 @@ local_test!(services_placement_task_affinity_packs_matching_template, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -902,7 +922,7 @@ local_test!(services_placement_task_affinity_packs_matching_template, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -921,7 +941,8 @@ local_test!(services_placement_task_affinity_packs_matching_template, {
         "task-affinity deployment should converge consistently across the cluster"
     );
 
-    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let tasks =
+        list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
     let api_nodes: HashSet<Uuid> = tasks
         .iter()
         .filter(|task| {
@@ -976,7 +997,8 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 service_name,
@@ -988,7 +1010,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -1008,7 +1030,7 @@ local_test!(
         );
 
         let tasks =
-            list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+            list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
         let api_nodes: HashSet<Uuid> = tasks
             .iter()
             .filter(|task| {
@@ -1068,14 +1090,15 @@ local_test!(services_placement_binpack_reuses_matching_node, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
         .await
         .expect("submit binpack deployment");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -1094,7 +1117,8 @@ local_test!(services_placement_binpack_reuses_matching_node, {
         "binpack placement should converge consistently across the cluster"
     );
 
-    let tasks = list_active_service_tasks(&cluster[0].node.workload_manager, service_name).await;
+    let tasks =
+        list_active_service_tasks(&cluster[0].node.controllers.workloads, service_name).await;
     let counts = workload_counts_by_node(&tasks);
     let west_nodes = [cluster[0].id(), cluster[1].id()];
     let west_placements: Vec<usize> = west_nodes
@@ -1143,7 +1167,8 @@ local_test!(
 
         let specs = cluster[0]
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .start_workloads_batch(vec![
                 demo_binpack_workload_request("binpack-batch-a"),
                 demo_binpack_workload_request("binpack-batch-b"),
@@ -1170,7 +1195,8 @@ local_test!(
         );
 
         let tasks =
-            list_active_workloads_by_ids(&cluster[0].node.workload_manager, &workload_ids).await;
+            list_active_workloads_by_ids(&cluster[0].node.controllers.workloads, &workload_ids)
+                .await;
         let unique_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
 
         assert_eq!(
@@ -1214,7 +1240,8 @@ local_test!(
         let workload_name = "down-remote-untargeted";
         let err = cluster[0]
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .start_workloads_batch(vec![demo_binpack_workload_request(workload_name)])
             .await
             .expect_err("untargeted placement should not use a down remote digest");
@@ -1226,7 +1253,7 @@ local_test!(
             "down remote digest should be ignored instead of attempted; err={err:#}"
         );
         assert!(
-            list_active_workloads_by_name(&cluster[0].node.workload_manager, workload_name)
+            list_active_workloads_by_name(&cluster[0].node.controllers.workloads, workload_name)
                 .await
                 .is_empty(),
             "failed placement must not materialize a workload on the down peer"
@@ -1261,7 +1288,8 @@ local_test!(workloads_placement_rejects_targeted_down_node, {
 
     let err = cluster[0]
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .start_workloads_batch(vec![request])
         .await
         .expect_err("targeted placement should reject a down peer before remote prepare");
@@ -1274,7 +1302,7 @@ local_test!(workloads_placement_rejects_targeted_down_node, {
         "targeted down peer should surface an unavailable-target error; err={err:#}"
     );
     assert!(
-        list_active_workloads_by_name(&cluster[0].node.workload_manager, workload_name)
+        list_active_workloads_by_name(&cluster[0].node.controllers.workloads, workload_name)
             .await
             .is_empty(),
         "targeted down placement must not materialize a workload on the down peer"
@@ -1300,7 +1328,8 @@ local_test!(
 
         let specs = cluster[0]
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .start_workloads_batch(vec![
                 demo_owned_preference_workload_request(
                     "owned-batch-a",
@@ -1338,7 +1367,8 @@ local_test!(
         );
 
         let tasks =
-            list_active_workloads_by_ids(&cluster[0].node.workload_manager, &workload_ids).await;
+            list_active_workloads_by_ids(&cluster[0].node.controllers.workloads, &workload_ids)
+                .await;
         let unique_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
 
         assert_eq!(
@@ -1374,7 +1404,7 @@ local_test!(
         set_cluster_zone_labels(&cluster, &["west", "east"]).await;
 
         let volume_id = create_immediate_managed_volume_on_node(
-            &cluster[0].node.volumes_client,
+            &cluster[0].node.clients.cluster.volumes,
             "placement-pinned-volume",
             cluster[1].id(),
         )
@@ -1408,7 +1438,8 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
             .await
             .expect("submit volume-pinned deployment");
@@ -1420,7 +1451,8 @@ local_test!(
         );
         let spec = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load blocked service")
@@ -1654,12 +1686,14 @@ async fn set_node_platform(
     for node in cluster {
         let mut value = node
             .node
-            .registry
+            .registries
+            .peers
             .peer_value_unscoped(node_id)
             .expect("peer row should exist before platform override");
         value.platform_os = platform_os.to_string();
         value.platform_arch = platform_arch.to_string();
         node.node
+            .stores
             .peers
             .upsert(&UuidKey::from(node_id), value)
             .await
@@ -1738,7 +1772,7 @@ fn node_platform_visible_on_all(
     expected_arch: &str,
 ) -> bool {
     cluster.iter().all(|node| {
-        node_platform_value(&node.node.registry, node_id)
+        node_platform_value(&node.node.registries.peers, node_id)
             == Some((expected_os.to_string(), expected_arch.to_string()))
     })
 }
@@ -1771,7 +1805,7 @@ fn node_label_visible_on_all(
     expected: &str,
 ) -> bool {
     cluster.iter().all(|node| {
-        node_label_value(&node.node.registry, node_id, key).as_deref() == Some(expected)
+        node_label_value(&node.node.registries.peers, node_id, key).as_deref() == Some(expected)
     })
 }
 
@@ -1791,7 +1825,14 @@ async fn wait_for_pairwise_sessions(cluster: &[TestNode]) {
             Duration::from_millis(50),
             || async {
                 for node in cluster {
-                    if node.node.registry.connect_known_peers(true).await.is_err() {
+                    if node
+                        .node
+                        .registries
+                        .peers
+                        .connect_known_peers(true)
+                        .await
+                        .is_err()
+                    {
                         return false;
                     }
                 }
@@ -1811,6 +1852,7 @@ async fn wait_for_remote_scheduler_digest(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         node.node
+            .controllers
             .scheduler
             .observed_scheduler_digests()
             .map(|digests| {
@@ -1825,7 +1867,7 @@ async fn wait_for_remote_scheduler_digest(
 
 /// Marks one peer down in the observer's local health view for scheduler placement checks.
 fn mark_peer_down_for_scheduler(observer: &TestNode, peer_id: Uuid) {
-    let health_monitor = observer.node.registry.health_monitor();
+    let health_monitor = observer.node.registries.peers.health_monitor();
     health_monitor.handle_down_event(peer_id, u64::MAX / 2);
     assert_eq!(
         health_monitor.status(peer_id),
@@ -1838,6 +1880,7 @@ fn mark_peer_down_for_scheduler(observer: &TestNode, peer_id: Uuid) {
 async fn reserve_all_local_scheduler_slots(node: &TestNode) {
     let snapshot = node
         .node
+        .controllers
         .scheduler
         .snapshot()
         .await
@@ -1857,6 +1900,7 @@ async fn reserve_all_local_scheduler_slots(node: &TestNode) {
         })
         .collect::<Vec<_>>();
     node.node
+        .controllers
         .scheduler
         .reserve_slots(snapshot.version, reservations)
         .await
@@ -1907,7 +1951,7 @@ async fn wait_for_volume_binding_all(
     wait_until(timeout, Duration::from_millis(100), || async {
         cluster.iter().all(|node| {
             matches!(
-                node.node.volume_registry.get_spec(volume_id),
+                node.node.registries.volumes.get_spec(volume_id),
                 Ok(Some(spec)) if spec.bound_node_id == Some(expected_node)
             )
         })
@@ -1995,7 +2039,7 @@ async fn wait_for_service_running_tasks_stable_all(
 
         for node in cluster {
             let mut tasks =
-                list_active_service_tasks(&node.node.workload_manager, service_name).await;
+                list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
             tasks.sort_by_key(|task| task.id);
             if tasks.len() != expected
                 || tasks
@@ -2056,7 +2100,7 @@ async fn wait_for_workloads_running_stable_all(
 
         for node in cluster {
             let mut tasks =
-                list_active_workloads_by_ids(&node.node.workload_manager, workload_ids).await;
+                list_active_workloads_by_ids(&node.node.controllers.workloads, workload_ids).await;
             tasks.sort_by_key(|task| task.id);
             if tasks.len() != workload_ids.len()
                 || tasks
@@ -2106,7 +2150,7 @@ async fn all_nodes_have_service_task_count(
     expected: usize,
 ) -> bool {
     for node in cluster {
-        let count = list_active_service_tasks(&node.node.workload_manager, service_name)
+        let count = list_active_service_tasks(&node.node.controllers.workloads, service_name)
             .await
             .len();
         if count != expected {

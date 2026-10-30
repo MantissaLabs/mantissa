@@ -18,12 +18,16 @@ local_test!(services_gossip_propagates_across_peers, {
 
     let manifest_id = Uuid::new_v4();
     let secret_name = "demo-service-secret";
-    create_secret(&anchor.node.secrets_client, secret_name, b"super-secret")
-        .await
-        .expect("create secret for service");
+    create_secret(
+        &anchor.node.clients.cluster.secrets,
+        secret_name,
+        b"super-secret",
+    )
+    .await
+    .expect("create secret for service");
     assert!(
         wait_for_secret(
-            &anchor.node.secrets_client,
+            &anchor.node.clients.cluster.secrets,
             secret_name,
             Duration::from_secs(10)
         )
@@ -32,7 +36,7 @@ local_test!(services_gossip_propagates_across_peers, {
     );
     assert!(
         wait_for_secret(
-            &peer.node.secrets_client,
+            &peer.node.clients.cluster.secrets,
             secret_name,
             Duration::from_secs(10)
         )
@@ -47,7 +51,8 @@ local_test!(services_gossip_propagates_across_peers, {
 
     let service_id = anchor
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             manifest_id,
             MANIFEST_NAME,
@@ -86,7 +91,7 @@ local_test!(services_gossip_propagates_across_peers, {
 
     assert!(
         wait_for_service_status(
-            &anchor.node.service_controller,
+            &anchor.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -95,32 +100,32 @@ local_test!(services_gossip_propagates_across_peers, {
     );
 
     assert!(
-        wait_for_service_state(&anchor.node.service_controller, service_id, true).await,
+        wait_for_service_state(&anchor.node.controllers.services, service_id, true).await,
         "anchor should observe newly registered service"
     );
     assert!(
-        wait_for_service_state(&peer.node.service_controller, service_id, true).await,
+        wait_for_service_state(&peer.node.controllers.services, service_id, true).await,
         "peer should receive service via gossip"
     );
 
-    let peer_ids = list_service_ids(&peer.node.services_client).await;
+    let peer_ids = list_service_ids(&peer.node.clients.cluster.services).await;
     assert!(
         peer_ids.contains(&service_id),
         "peer Services.list should report gossiped service"
     );
 
-    remove_service_via_rpc(&anchor.node.services_client, service_id).await;
+    remove_service_via_rpc(&anchor.node.clients.cluster.services, service_id).await;
 
     assert!(
-        wait_for_service_state(&anchor.node.service_controller, service_id, false).await,
+        wait_for_service_state(&anchor.node.controllers.services, service_id, false).await,
         "anchor should remove service after delete"
     );
     assert!(
-        wait_for_service_state(&peer.node.service_controller, service_id, false).await,
+        wait_for_service_state(&peer.node.controllers.services, service_id, false).await,
         "peer should drop service after gossip remove"
     );
 
-    let peer_ids = list_service_ids(&peer.node.services_client).await;
+    let peer_ids = list_service_ids(&peer.node.clients.cluster.services).await;
     assert!(
         peer_ids.is_empty(),
         "peer service listing should be empty after removal"
@@ -135,12 +140,16 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
     let service_name = "ack-demo";
     let manifest_name = "manifest-ack";
     let secret_name = "ack-demo-secret";
-    create_secret(&node.node.secrets_client, secret_name, b"ack-secret")
-        .await
-        .expect("create ack secret");
+    create_secret(
+        &node.node.clients.cluster.secrets,
+        secret_name,
+        b"ack-secret",
+    )
+    .await
+    .expect("create ack secret");
     assert!(
         wait_for_secret(
-            &node.node.secrets_client,
+            &node.node.clients.cluster.secrets,
             secret_name,
             Duration::from_secs(2)
         )
@@ -183,14 +192,16 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(manifest_id, manifest_name, service_name, tasks)
         .await
         .expect("submit service deployment");
 
     let initial = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read service from registry")
@@ -203,7 +214,7 @@ local_test!(services_submit_deployment_waits_for_task_ack, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -220,7 +231,8 @@ local_test!(services_deployment_healthy_deadline_fails_slow_bootstrap, {
     let service_name = "deadline-slow-bootstrap";
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -241,7 +253,7 @@ local_test!(services_deployment_healthy_deadline_fails_slow_bootstrap, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Failed
         )
@@ -250,7 +262,7 @@ local_test!(services_deployment_healthy_deadline_fails_slow_bootstrap, {
     );
     assert!(
         wait_for_service_status_detail_any(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             &["healthy deadline"]
         )
@@ -269,7 +281,8 @@ local_test!(
         let service_name = "deadline-slow-bootstrap-ok";
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -290,7 +303,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -299,7 +312,8 @@ local_test!(
         );
         let spec = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load service")
@@ -321,7 +335,8 @@ local_test!(services_network_delete_rejects_attached_network, {
     let service_name = "delete-attached-network-service";
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -335,7 +350,7 @@ local_test!(services_network_delete_rejects_attached_network, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -347,9 +362,10 @@ local_test!(services_network_delete_rejects_attached_network, {
         "network should expose one attachment before delete is attempted"
     );
 
-    let attached_delete_error = delete_network_via_rpc(&node.node.networks_client, network_id)
-        .await
-        .expect_err("attached network delete should be rejected");
+    let attached_delete_error =
+        delete_network_via_rpc(&node.node.clients.cluster.networks, network_id)
+            .await
+            .expect_err("attached network delete should be rejected");
     assert!(
         attached_delete_error
             .to_string()
@@ -359,7 +375,8 @@ local_test!(services_network_delete_rejects_attached_network, {
 
     let spec = node
         .node
-        .network_registry
+        .registries
+        .networks
         .get_spec(network_id)
         .expect("load network after rejected delete")
         .expect("network should still exist after rejected delete");
@@ -368,9 +385,9 @@ local_test!(services_network_delete_rejects_attached_network, {
         "failed delete must not tombstone an attached network"
     );
 
-    remove_service_via_rpc(&node.node.services_client, service_id).await;
+    remove_service_via_rpc(&node.node.clients.cluster.services, service_id).await;
     assert!(
-        wait_for_service_state(&node.node.service_controller, service_id, false).await,
+        wait_for_service_state(&node.node.controllers.services, service_id, false).await,
         "service should be removed before retrying network deletion"
     );
     assert!(
@@ -378,7 +395,7 @@ local_test!(services_network_delete_rejects_attached_network, {
         "network attachments should be removed after the service stops"
     );
 
-    delete_network_via_rpc(&node.node.networks_client, network_id)
+    delete_network_via_rpc(&node.node.clients.cluster.networks, network_id)
         .await
         .expect("detached network delete should succeed");
     assert!(
@@ -393,12 +410,16 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     let manifest_id = Uuid::new_v4();
     let secret_name = "capacity-secret";
-    create_secret(&node.node.secrets_client, secret_name, b"overcommit-secret")
-        .await
-        .expect("create capacity secret");
+    create_secret(
+        &node.node.clients.cluster.secrets,
+        secret_name,
+        b"overcommit-secret",
+    )
+    .await
+    .expect("create capacity secret");
     assert!(
         wait_for_secret(
-            &node.node.secrets_client,
+            &node.node.clients.cluster.secrets,
             secret_name,
             Duration::from_secs(2)
         )
@@ -412,7 +433,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             manifest_id,
             "capacity-starved",
@@ -453,7 +475,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Failed
         )
@@ -463,7 +485,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     let failed_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load failed service spec")
@@ -476,7 +499,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     let listed = node
         .node
-        .service_controller
+        .controllers
+        .services
         .list_services()
         .expect("list services after failure");
     assert!(
@@ -488,7 +512,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     let recovered_manifest_id = Uuid::new_v4();
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             recovered_manifest_id,
             "capacity-starved",
@@ -516,7 +541,7 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -526,7 +551,8 @@ local_test!(services_deployment_exhausts_retries_and_fails, {
 
     let recovered = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load recovered service")
@@ -564,7 +590,8 @@ local_test!(services_deploying_generation_resumes_after_restart, {
     .await;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "restartable-deploy",
@@ -615,7 +642,8 @@ local_test!(services_deploying_generation_resumes_after_restart, {
             Duration::from_millis(100),
             || async {
                 let Some(spec) = node
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .expect("load deploying spec")
@@ -630,7 +658,8 @@ local_test!(services_deploying_generation_resumes_after_restart, {
         "deployment should persist the first dependency stage before restart"
     );
     let persisted_backend_task_id = node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("reload persisted deploying spec")
@@ -654,7 +683,8 @@ local_test!(services_deploying_generation_resumes_after_restart, {
             Duration::from_millis(100),
             || async {
                 let Some(spec) = restarted
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .expect("load restarted service spec")
@@ -734,7 +764,8 @@ local_test!(
 
         let service_id_from_submission = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "owner-failover-deploy",
@@ -763,7 +794,8 @@ local_test!(
 
         let initial = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read initial failover deployment")
@@ -803,7 +835,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &live_owner.node.service_controller,
+                &live_owner.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -853,7 +885,8 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "missing-runtime",
@@ -887,7 +920,7 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
         Duration::from_secs(20),
         Duration::from_millis(100),
         || async {
-            if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id) {
+            if let Ok(Some(spec)) = node.node.controllers.services.registry().get(service_id) {
                 return spec.status() == ServiceStatus::Failed;
             }
             false
@@ -897,14 +930,21 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
     if !failed {
         let current = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read service after failed wait")
             .expect("service should still be present");
         let mut task_details = Vec::new();
         for task_id in current.assigned_replica_ids() {
-            let detail = match node.node.workload_manager.inspect_workload(task_id).await {
+            let detail = match node
+                .node
+                .controllers
+                .workloads
+                .inspect_workload(task_id)
+                .await
+            {
                 Ok(task) => format!("{}:{:?}:phase{}", task.id, task.state, task.phase_version),
                 Err(err) => format!("{task_id}:inspect-error:{err}"),
             };
@@ -923,7 +963,8 @@ local_test!(services_deployment_runtime_exit_signal_reaches_failed, {
 
     let failed_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load failed service")
@@ -967,14 +1008,15 @@ local_test!(services_deployment_replicates_across_cluster, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(manifest_id, &manifest.name, &manifest.name, task_templates)
         .await
         .expect("submit deployment via controller");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -985,7 +1027,7 @@ local_test!(services_deployment_replicates_across_cluster, {
     for node in &cluster {
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -1007,7 +1049,7 @@ local_test!(services_deployment_replicates_across_cluster, {
 
     for node in &cluster {
         if !wait_for_task_count(
-            &node.node.workload_manager,
+            &node.node.controllers.workloads,
             expected_count,
             Duration::from_secs(30),
         )
@@ -1016,7 +1058,8 @@ local_test!(services_deployment_replicates_across_cluster, {
             let filter = TaskStateFilter::all();
             let specs = node
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .list_workloads(&filter)
                 .await
                 .expect("list tasks after task-count timeout");
@@ -1031,7 +1074,8 @@ local_test!(services_deployment_replicates_across_cluster, {
         let filter = TaskStateFilter::all();
         let specs = node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .list_workloads(&filter)
             .await
             .expect("list tasks");
@@ -1045,7 +1089,8 @@ local_test!(services_deployment_replicates_across_cluster, {
 
         let services = node
             .node
-            .service_controller
+            .controllers
+            .services
             .list_services()
             .expect("list services");
         let service = services
@@ -1133,7 +1178,8 @@ async fn wait_for_network_attachment_count(
         Duration::from_millis(50),
         || async {
             node.node
-                .network_registry
+                .registries
+                .networks
                 .attachment_count(network_id)
                 .expect("count network attachments")
                 == expected
@@ -1149,7 +1195,7 @@ async fn wait_for_network_deleted(node: &TestNode, network_id: Uuid) -> bool {
         Duration::from_millis(50),
         || async {
             matches!(
-                node.node.network_registry.get_spec(network_id),
+                node.node.registries.networks.get_spec(network_id),
                 Ok(Some(spec)) if spec.is_deleted()
             )
         },

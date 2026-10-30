@@ -58,14 +58,14 @@ local_test!(replicated_volume_postgresql_benchmark, {
     .expect("start real replicated-volume benchmark cluster");
     let result = async {
         let volume_id = create_replicated_volume_with_ownership_result(
-            &cluster[0].node.volumes_client,
+            &cluster[0].node.clients.cluster.volumes,
             "postgres-benchmark",
             REAL_REPLICATED_VOLUME_BYTES,
             FilesystemOwnership::User { uid: 70, gid: 70 },
         )
         .await?;
         start_volume_task_via_public_api(
-            &cluster[0].node.task_client,
+            &cluster[0].node.clients.cluster.task,
             volume_id,
             "postgres-benchmark",
             "/var/lib/postgresql/data",

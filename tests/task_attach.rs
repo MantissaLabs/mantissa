@@ -290,12 +290,14 @@ local_test!(task_attach_relay_over_tcp_sessions, {
     let owner_value = replicated_task_value(task_id, owner.id(), "owner-node");
     owner
         .node
+        .stores
         .workloads
         .upsert(&UuidKey::from(task_id), owner_value.clone().into())
         .await
         .expect("store task on owner");
     requester
         .node
+        .stores
         .workloads
         .upsert(&UuidKey::from(task_id), owner_value.into())
         .await
@@ -325,7 +327,7 @@ local_test!(task_attach_relay_over_tcp_sessions, {
         .next()
         .expect("uuid prefix")
         .to_string();
-    let mut request = requester.node.task_client.attach_request();
+    let mut request = requester.node.clients.cluster.task.attach_request();
     {
         let mut builder = request.get().init_request();
         builder.set_selector(&selector);

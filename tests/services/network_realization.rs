@@ -24,7 +24,7 @@ fn public_web_ingress_pool() -> IngressPoolSpecValue {
 
 /// Creates one on-demand logical VXLAN network through the public network RPC surface.
 async fn create_restart_recovery_network(node: &HeadlessNode, name: &str) -> Uuid {
-    let mut request = node.networks_client.create_request();
+    let mut request = node.clients.cluster.networks.create_request();
     {
         let mut spec = request.get().init_spec();
         spec.set_name(name);
@@ -56,7 +56,8 @@ async fn create_restart_recovery_network(node: &HeadlessNode, name: &str) -> Uui
             Duration::from_secs(10),
             Duration::from_millis(50),
             || async {
-                node.network_registry
+                node.registries
+                    .networks
                     .get_spec(network_id)
                     .expect("load restart recovery network spec")
                     .is_some_and(|spec| {
@@ -79,7 +80,8 @@ async fn wait_for_local_network_ready(
     timeout: Duration,
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {
-        node.network_registry
+        node.registries
+            .networks
             .get_peer_state(network_id, node.id)
             .expect("load local network peer state")
             .is_some_and(|state| state.is_ready())
@@ -95,7 +97,7 @@ async fn wait_for_network_peer_nodes_headless(
     timeout: Duration,
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {
-        let Ok(peers) = node.network_registry.list_peer_states(Some(network_id)) else {
+        let Ok(peers) = node.registries.networks.list_peer_states(Some(network_id)) else {
             return false;
         };
         let peer_ids: HashSet<Uuid> = peers.into_iter().map(|peer| peer.peer_id).collect();
@@ -110,7 +112,8 @@ async fn network_release_diagnostics(cluster: &[TestNode], network_id: Uuid) -> 
     for node in cluster {
         let peers = node
             .node
-            .network_registry
+            .registries
+            .networks
             .list_peer_states(Some(network_id))
             .map(|rows| {
                 rows.into_iter()
@@ -121,7 +124,8 @@ async fn network_release_diagnostics(cluster: &[TestNode], network_id: Uuid) -> 
             .unwrap_or_else(|err| format!("peer-error={err:#}"));
         let attachment_rows = node
             .node
-            .network_registry
+            .registries
+            .networks
             .list_attachments(Some(network_id))
             .unwrap_or_default();
         let attachments = attachment_rows
@@ -136,7 +140,8 @@ async fn network_release_diagnostics(cluster: &[TestNode], network_id: Uuid) -> 
             .join(",");
         let all_tasks = node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .list_workloads(&TaskStateFilter::all())
             .await
             .unwrap_or_default();
@@ -173,7 +178,7 @@ async fn network_peer_nodes_stay_headless(
 ) -> bool {
     let deadline = Instant::now() + window;
     while Instant::now() < deadline {
-        let Ok(peers) = node.network_registry.list_peer_states(Some(network_id)) else {
+        let Ok(peers) = node.registries.networks.list_peer_states(Some(network_id)) else {
             return false;
         };
         let peer_ids: HashSet<Uuid> = peers.into_iter().map(|peer| peer.peer_id).collect();
@@ -199,7 +204,7 @@ async fn list_ingress_endpoints_for_service(
     node: &TestNode,
     service_name: &str,
 ) -> Vec<IngressEndpointTestRow> {
-    let mut request = node.node.ingress_client.endpoints_request();
+    let mut request = node.node.clients.cluster.ingress.endpoints_request();
     {
         let mut filter = request.get().init_filter();
         filter.set_service(service_name);
@@ -301,7 +306,8 @@ local_test!(
         let service_name = format!("on-demand-network-{}", Uuid::new_v4());
         let service_id = anchor
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 &service_name,
@@ -335,7 +341,8 @@ local_test!(
             "service task placement should converge before checking network realization"
         );
 
-        let tasks = list_active_service_tasks(&anchor.node.workload_manager, &service_name).await;
+        let tasks =
+            list_active_service_tasks(&anchor.node.controllers.workloads, &service_name).await;
         let realized_nodes: HashSet<Uuid> = tasks.iter().map(|task| task.node_id).collect();
         assert_eq!(
             realized_nodes.len(),
@@ -363,7 +370,7 @@ local_test!(
             "on_demand network should not retain extra non-ready peer rows"
         );
 
-        remove_service_via_rpc(&anchor.node.services_client, service_id).await;
+        remove_service_via_rpc(&anchor.node.clients.cluster.services, service_id).await;
         assert!(
             wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
                 .await,
@@ -421,7 +428,8 @@ local_test!(
 
         let service_name = format!("on-demand-restart-{}", Uuid::new_v4());
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 &service_name,
@@ -434,8 +442,12 @@ local_test!(
             .expect("submit restart recovery on-demand deployment");
 
         assert!(
-            wait_for_service_status(&node.service_controller, service_id, ServiceStatus::Running)
-                .await,
+            wait_for_service_status(
+                &node.controllers.services,
+                service_id,
+                ServiceStatus::Running
+            )
+            .await,
             "on-demand restart recovery service should reach running before restart"
         );
         assert!(
@@ -456,15 +468,18 @@ local_test!(
 
         if !wait_for_local_network_ready(&restarted, network_id, Duration::from_secs(30)).await {
             let spec = restarted
-                .network_registry
+                .registries
+                .networks
                 .get_spec(network_id)
                 .expect("load restart recovery network spec after restart");
             let peer = restarted
-                .network_registry
+                .registries
+                .networks
                 .get_peer_state(network_id, restarted.id)
                 .expect("load restart recovery peer state after restart");
             let service = restarted
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("load restart recovery service after restart");
@@ -474,7 +489,7 @@ local_test!(
         }
         assert!(
             wait_for_service_status(
-                &restarted.service_controller,
+                &restarted.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -482,10 +497,10 @@ local_test!(
             "restart should preserve the running service that demands the network"
         );
 
-        remove_service_via_rpc(&restarted.services_client, service_id).await;
+        remove_service_via_rpc(&restarted.clients.cluster.services, service_id).await;
         assert!(
             wait_for_service_status(
-                &restarted.service_controller,
+                &restarted.controllers.services,
                 service_id,
                 ServiceStatus::Stopped
             )
@@ -578,7 +593,8 @@ local_test!(
 
         let service_id = observer_node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
             .await
             .expect("submit task_nodes on-demand deployment");
@@ -617,7 +633,8 @@ local_test!(
         );
 
         let tasks =
-            list_active_service_tasks(&observer_node.node.workload_manager, &service_name).await;
+            list_active_service_tasks(&observer_node.node.controllers.workloads, &service_name)
+                .await;
         assert_eq!(
             tasks.first().map(|task| task.node_id),
             Some(backend_node.id()),
@@ -650,7 +667,7 @@ local_test!(
             );
         }
 
-        remove_service_via_rpc(&observer_node.node.services_client, service_id).await;
+        remove_service_via_rpc(&observer_node.node.clients.cluster.services, service_id).await;
         assert!(
             wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
                 .await,
@@ -769,7 +786,8 @@ local_test!(
 
         let service_id = ingress_node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
             .await
             .expect("submit ingress-pool on-demand deployment");
@@ -797,7 +815,8 @@ local_test!(
         );
 
         let tasks =
-            list_active_service_tasks(&ingress_node.node.workload_manager, &service_name).await;
+            list_active_service_tasks(&ingress_node.node.controllers.workloads, &service_name)
+                .await;
         assert_eq!(
             tasks.first().map(|task| task.node_id),
             Some(backend_node.id()),
@@ -831,7 +850,7 @@ local_test!(
             );
         }
 
-        remove_service_via_rpc(&ingress_node.node.services_client, service_id).await;
+        remove_service_via_rpc(&ingress_node.node.clients.cluster.services, service_id).await;
         assert!(
             wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
                 .await,
@@ -967,7 +986,8 @@ local_test!(
 
         let service_id = first_ingress_node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
             .await
             .expect("submit ingress-pool reselection deployment");
@@ -1105,7 +1125,11 @@ local_test!(
             );
         }
 
-        remove_service_via_rpc(&first_ingress_node.node.services_client, service_id).await;
+        remove_service_via_rpc(
+            &first_ingress_node.node.clients.cluster.services,
+            service_id,
+        )
+        .await;
         assert!(
             wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
                 .await,
@@ -1233,7 +1257,8 @@ local_test!(
 
         let service_id = ingress_node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
             .await
             .expect("submit late ingress-pool on-demand deployment");
@@ -1276,7 +1301,7 @@ local_test!(
             "late ingress-pool creation should wake network realization on the selected ingress node"
         );
 
-        remove_service_via_rpc(&ingress_node.node.services_client, service_id).await;
+        remove_service_via_rpc(&ingress_node.node.clients.cluster.services, service_id).await;
         assert!(
             wait_for_service_task_count_all(&cluster, &service_name, 0, Duration::from_secs(20))
                 .await,

@@ -177,7 +177,8 @@ async fn seed_rest_ingress_endpoint_fixture(harness: &RestTestHarness) -> (Uuid,
     harness
         .node()
         .node
-        .ingress_pool_registry
+        .registries
+        .ingress_pools
         .upsert(pool)
         .await
         .expect("seed ingress pool");
@@ -187,7 +188,8 @@ async fn seed_rest_ingress_endpoint_fixture(harness: &RestTestHarness) -> (Uuid,
     harness
         .node()
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .upsert(service)
         .await

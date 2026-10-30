@@ -32,7 +32,8 @@ local_test!(
         let task_templates = vec![demo_backend_task_template("backend", 8)];
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
             .await
             .expect("submit deployment");
@@ -235,7 +236,8 @@ local_test!(
         )];
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
             .await
             .expect("submit deployment");
@@ -447,12 +449,14 @@ local_test!(
         let (left, right) = tokio::join!(
             cluster[0]
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .upsert(older_generation.clone()),
             cluster[1]
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .upsert(newer_generation.clone())
         );
@@ -517,14 +521,16 @@ local_test!(
 
         cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .upsert(higher_phase.clone())
             .await
             .expect("upsert higher phase");
         cluster[1]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .upsert(lower_phase)
             .await
@@ -580,7 +586,8 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
     );
     anchor
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .upsert(baseline.clone())
         .await
@@ -682,12 +689,14 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
     let (left, right) = tokio::join!(
         anchor
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .upsert(deploying.clone()),
         joiner
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .upsert(rollback.clone())
     );
@@ -699,7 +708,13 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
             Duration::from_secs(5),
             Duration::from_millis(50),
             || async {
-                match anchor.node.service_controller.registry().get(deploying.id) {
+                match anchor
+                    .node
+                    .controllers
+                    .services
+                    .registry()
+                    .get(deploying.id)
+                {
                     Ok(Some(spec)) => spec == deploying,
                     _ => false,
                 }
@@ -713,7 +728,7 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
             Duration::from_secs(5),
             Duration::from_millis(50),
             || async {
-                match joiner.node.service_controller.registry().get(rollback.id) {
+                match joiner.node.controllers.services.registry().get(rollback.id) {
                     Ok(Some(spec)) => spec == rollback,
                     _ => false,
                 }
@@ -758,7 +773,8 @@ local_test!(services_crdt_split_merge_rollback_generation_converges, {
         .map(|node| {
             let spec = node
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(rollback.id)
                 .ok()
@@ -799,14 +815,15 @@ local_test!(services_sync_recovers_missing_entries, {
     ensure_demo_manifest_secrets(&cluster).await;
     let service_id = anchor
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(manifest_id, &manifest.name, &manifest.name, task_templates)
         .await
         .expect("submit deployment via anchor");
 
     assert!(
         wait_for_service_status(
-            &anchor.node.service_controller,
+            &anchor.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -815,7 +832,7 @@ local_test!(services_sync_recovers_missing_entries, {
     );
     assert!(
         wait_for_service_status(
-            &peer.node.service_controller,
+            &peer.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -825,7 +842,8 @@ local_test!(services_sync_recovers_missing_entries, {
 
     let expected_spec = anchor
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("lookup service spec")
@@ -834,12 +852,14 @@ local_test!(services_sync_recovers_missing_entries, {
     let expected_task_ids: Vec<Uuid> = expected_spec.assigned_replica_ids();
 
     peer.node
+        .stores
         .services
         .purge_local(&UuidKey::from(service_id))
         .await
         .expect("purge service from peer store");
     for task_id in &expected_task_ids {
         peer.node
+            .stores
             .workloads
             .purge_local(&UuidKey::from(*task_id))
             .await
@@ -848,21 +868,23 @@ local_test!(services_sync_recovers_missing_entries, {
 
     let services_after_remove = peer
         .node
-        .service_controller
+        .controllers
+        .services
         .list_services()
         .expect("list services after manual removal");
     assert!(services_after_remove.is_empty(), "peer registry emptied");
 
     let specs_after_remove = peer
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list tasks after removal");
     assert!(specs_after_remove.is_empty(), "peer tasks cleared");
 
     assert!(
-        wait_for_service_state(&peer.node.service_controller, service_id, true).await,
+        wait_for_service_state(&peer.node.controllers.services, service_id, true).await,
         "periodic sync should restore service spec"
     );
 
@@ -874,7 +896,8 @@ local_test!(services_sync_recovers_missing_entries, {
             || async {
                 let Ok(restored_specs) = peer
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .list_workloads(&TaskStateFilter::all())
                     .await
                 else {

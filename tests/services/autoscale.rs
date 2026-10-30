@@ -34,14 +34,15 @@ local_test!(services_autoscale_scales_memory_hot_template, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, vec![template])
         .await
         .expect("submit autoscaled service");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -55,7 +56,8 @@ local_test!(services_autoscale_scales_memory_hot_template, {
             Duration::from_millis(50),
             || async {
                 node.node
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .ok()
@@ -75,7 +77,7 @@ local_test!(services_autoscale_scales_memory_hot_template, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -126,14 +128,15 @@ local_test!(services_autoscale_scales_cpu_hot_template, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, vec![template])
         .await
         .expect("submit CPU-autoscaled service");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -162,7 +165,7 @@ local_test!(services_autoscale_scales_cpu_hot_template, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -224,7 +227,8 @@ local_test!(services_autoscale_scales_down_distributed_quiet_template, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             manifest_name,
@@ -275,7 +279,8 @@ local_test!(services_autoscale_scales_down_distributed_quiet_template, {
     });
     let update = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             manifest_name,
@@ -361,7 +366,8 @@ local_test!(services_autoscale_skips_decisions_while_deploying, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -373,7 +379,7 @@ local_test!(services_autoscale_skips_decisions_while_deploying, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -385,7 +391,8 @@ local_test!(services_autoscale_skips_decisions_while_deploying, {
     replacement.execution.command.push("v2".to_string());
     let redeploy = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -398,7 +405,7 @@ local_test!(services_autoscale_skips_decisions_while_deploying, {
     assert_eq!(redeploy.outcome, ServiceDeploymentOutcome::Accepted);
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Deploying
         )
@@ -412,7 +419,8 @@ local_test!(services_autoscale_skips_decisions_while_deploying, {
         Duration::from_millis(100),
         || async {
             node.node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .ok()
@@ -436,7 +444,7 @@ local_test!(services_autoscale_skips_decisions_while_deploying, {
     runtime.set_default_usage_sample(0, 0).await;
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -511,7 +519,8 @@ local_test!(services_autoscale_owner_failover_scales_on_new_owner, {
 
     let service_id_from_submission = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), &service_name, &service_name, vec![template])
         .await
         .expect("submit autoscaled service");
@@ -597,7 +606,8 @@ local_test!(services_autoscale_owner_failover_scales_on_new_owner, {
                 for node in &cluster {
                     let Some(spec) = node
                         .node
-                        .service_controller
+                        .controllers
+                        .services
                         .registry()
                         .get(service_id)
                         .ok()
@@ -677,7 +687,8 @@ async fn wait_for_template_replicas(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {
         node.node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .ok()
@@ -705,7 +716,8 @@ async fn wait_for_template_replicas_all(
         for node in cluster {
             let matches = node
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .ok()
@@ -736,7 +748,8 @@ async fn collect_autoscale_template_debug(
     for node in cluster {
         let row = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .ok()

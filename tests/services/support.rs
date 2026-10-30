@@ -268,7 +268,8 @@ pub(crate) async fn create_logical_test_network(cluster: &[TestNode], name: &str
 
     for node in cluster {
         node.node
-            .network_registry
+            .registries
+            .networks
             .upsert_spec(network.clone())
             .await
             .unwrap_or_else(|err| {
@@ -279,7 +280,8 @@ pub(crate) async fn create_logical_test_network(cluster: &[TestNode], name: &str
                 )
             });
         node.node
-            .network_controller
+            .controllers
+            .networks
             .schedule_spec_change(network.id)
             .await;
     }
@@ -300,7 +302,7 @@ pub(crate) async fn create_replicated_logical_test_network(
     realization: NetworkRealizationPolicy,
 ) -> Uuid {
     let node = cluster.first().expect("network test cluster is non-empty");
-    let mut request = node.node.networks_client.create_request();
+    let mut request = node.node.clients.cluster.networks.create_request();
     {
         let mut spec = request.get().init_spec();
         spec.set_name(name);
@@ -347,7 +349,8 @@ pub(crate) async fn create_replicated_logical_test_network(
 pub(crate) async fn upsert_ingress_pool_all(cluster: &[TestNode], pool: IngressPoolSpecValue) {
     for node in cluster {
         node.node
-            .ingress_pool_registry
+            .registries
+            .ingress_pools
             .upsert(pool.clone())
             .await
             .unwrap_or_else(|err| {
@@ -392,7 +395,8 @@ pub(crate) async fn wait_for_node_label_all(
     wait_until(timeout, Duration::from_millis(100), || async {
         cluster.iter().all(|node| {
             node.node
-                .registry
+                .registries
+                .peers
                 .peer_labels(node_id)
                 .and_then(|labels| labels.get(key).map(str::to_string))
                 .as_deref()
@@ -412,7 +416,8 @@ pub(crate) async fn wait_for_node_label_absent_all(
     wait_until(timeout, Duration::from_millis(100), || async {
         cluster.iter().all(|node| {
             node.node
-                .registry
+                .registries
+                .peers
                 .peer_labels(node_id)
                 .and_then(|labels| labels.get(key).map(str::to_string))
                 .is_none()
@@ -430,7 +435,7 @@ pub(crate) async fn wait_for_logical_network_spec_all(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {
         for node in cluster {
-            let Ok(Some(spec)) = node.node.network_registry.get_spec(network_id) else {
+            let Ok(Some(spec)) = node.node.registries.networks.get_spec(network_id) else {
                 return false;
             };
             if spec.status != NetworkStatus::Ready || spec.realization != realization {
@@ -454,7 +459,8 @@ pub(crate) async fn wait_for_network_ready_peer_nodes_all(
         for node in cluster {
             let Ok(peers) = node
                 .node
-                .network_registry
+                .registries
+                .networks
                 .list_peer_states(Some(network_id))
             else {
                 return false;
@@ -485,7 +491,8 @@ pub(crate) async fn wait_for_network_peer_nodes_all(
         for node in cluster {
             let Ok(peers) = node
                 .node
-                .network_registry
+                .registries
+                .networks
                 .list_peer_states(Some(network_id))
             else {
                 return false;
@@ -508,7 +515,8 @@ pub(crate) fn collect_network_peer_state_debug(cluster: &[TestNode], network_id:
         .map(|node| {
             let summary = node
                 .node
-                .network_registry
+                .registries
+                .networks
                 .list_peer_states(Some(network_id))
                 .map(|mut peers| {
                     peers.sort_by_key(|peer| peer.peer_id);
@@ -544,7 +552,8 @@ pub(crate) async fn network_peer_nodes_stay_all(
         for node in cluster {
             let Ok(peers) = node
                 .node
-                .network_registry
+                .registries
+                .networks
                 .list_peer_states(Some(network_id))
             else {
                 return false;
@@ -574,7 +583,7 @@ pub(crate) async fn wait_for_logical_network_ready_all(
     while Instant::now() < deadline {
         let mut healthy = true;
         for node in cluster {
-            let Ok(Some(spec)) = node.node.network_registry.get_spec(network_id) else {
+            let Ok(Some(spec)) = node.node.registries.networks.get_spec(network_id) else {
                 healthy = false;
                 break;
             };
@@ -585,7 +594,8 @@ pub(crate) async fn wait_for_logical_network_ready_all(
 
             let Ok(peers) = node
                 .node
-                .network_registry
+                .registries
+                .networks
                 .list_peer_states(Some(network_id))
             else {
                 healthy = false;
@@ -629,7 +639,14 @@ pub(crate) async fn wait_for_cached_cluster_sessions_all(
         let mut ready = true;
 
         for node in cluster {
-            if node.node.registry.connect_known_peers(true).await.is_err() {
+            if node
+                .node
+                .registries
+                .peers
+                .connect_known_peers(true)
+                .await
+                .is_err()
+            {
                 ready = false;
                 break;
             }
@@ -641,7 +658,8 @@ pub(crate) async fn wait_for_cached_cluster_sessions_all(
 
                 if node
                     .node
-                    .registry
+                    .registries
+                    .peers
                     .cached_session_for(peer.id())
                     .await
                     .is_none()
@@ -750,7 +768,7 @@ pub(crate) async fn collect_published_service_attachment_snapshot(
     network_id: Uuid,
     expected_task_count: usize,
 ) -> Option<Vec<(Uuid, Uuid)>> {
-    let mut tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+    let mut tasks = list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
     if tasks.len() != expected_task_count {
         return None;
     }
@@ -758,7 +776,8 @@ pub(crate) async fn collect_published_service_attachment_snapshot(
 
     let Ok(attachments) = node
         .node
-        .network_registry
+        .registries
+        .networks
         .list_attachments(Some(network_id))
     else {
         return None;
@@ -796,10 +815,11 @@ pub(crate) async fn count_visible_published_service_attachments(
     service_name: &str,
     network_id: Uuid,
 ) -> usize {
-    let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+    let tasks = list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
     let attachments = node
         .node
-        .network_registry
+        .registries
+        .networks
         .list_attachments(Some(network_id))
         .unwrap_or_default();
 
@@ -829,21 +849,23 @@ pub(crate) async fn collect_service_attachment_publication_debug(
 ) -> String {
     let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
-        let service_status =
-            node.node
-                .service_controller
-                .list_services()
-                .ok()
-                .and_then(|services| {
-                    services
-                        .into_iter()
-                        .find(|spec| spec.service_name == service_name)
-                        .map(|spec| spec.status())
-                });
+        let tasks = list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
+        let service_status = node
+            .node
+            .controllers
+            .services
+            .list_services()
+            .ok()
+            .and_then(|services| {
+                services
+                    .into_iter()
+                    .find(|spec| spec.service_name == service_name)
+                    .map(|spec| spec.status())
+            });
         let attachments = node
             .node
-            .network_registry
+            .registries
+            .networks
             .list_attachments(Some(network_id))
             .unwrap_or_default();
         out.push(debug_service_attachment_publication_state(
@@ -936,7 +958,8 @@ pub(crate) async fn surviving_nodes_observe_no_active_service_tasks_on_node(
             if node.id() == down_node_id {
                 continue;
             }
-            let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+            let tasks =
+                list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
             if tasks.iter().any(|task| task.node_id == down_node_id) {
                 return false;
             }
@@ -972,16 +995,20 @@ pub(crate) async fn template_attachments_published(
     network_id: Uuid,
     expected_task_count: usize,
 ) -> bool {
-    let tasks =
-        list_active_task_template_tasks(&node.node.workload_manager, service_name, template_name)
-            .await;
+    let tasks = list_active_task_template_tasks(
+        &node.node.controllers.workloads,
+        service_name,
+        template_name,
+    )
+    .await;
     if tasks.len() != expected_task_count {
         return false;
     }
 
     let Ok(attachments) = node
         .node
-        .network_registry
+        .registries
+        .networks
         .list_attachments(Some(network_id))
     else {
         return false;
@@ -1022,7 +1049,7 @@ pub(crate) async fn wait_for_template_launch_after_dependency_publication(
         )
         .await;
         let dependent_tasks = list_active_task_template_tasks(
-            &node.node.workload_manager,
+            &node.node.controllers.workloads,
             service_name,
             dependent_template,
         )
@@ -1062,7 +1089,7 @@ pub(crate) async fn wait_for_template_replacement_after_dependency_publication(
 
     while Instant::now() < deadline {
         let dependency_tasks = list_active_task_template_tasks(
-            &node.node.workload_manager,
+            &node.node.controllers.workloads,
             service_name,
             gate.dependency_template,
         )
@@ -1081,7 +1108,7 @@ pub(crate) async fn wait_for_template_replacement_after_dependency_publication(
             )
             .await;
         let dependent_tasks = list_active_task_template_tasks(
-            &node.node.workload_manager,
+            &node.node.controllers.workloads,
             service_name,
             gate.dependent_template,
         )
@@ -1124,7 +1151,7 @@ pub(crate) async fn all_nodes_have_service_task_count(
     expected: usize,
 ) -> bool {
     for node in cluster {
-        let count = list_active_service_tasks(&node.node.workload_manager, service_name)
+        let count = list_active_service_tasks(&node.node.controllers.workloads, service_name)
             .await
             .len();
         if count != expected {
@@ -1141,10 +1168,11 @@ pub(crate) async fn collect_service_task_count_debug(
 ) -> String {
     let mut rows = Vec::with_capacity(cluster.len());
     for node in cluster {
-        let mut tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+        let mut tasks =
+            list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
         let service_summary = node
             .node
-            .service_controller
+            .controllers.services
             .list_services()
             .map(|services| {
                 services
@@ -1222,7 +1250,7 @@ pub(crate) async fn wait_for_service_running_tasks_stable_all(
 
         for node in cluster {
             let mut tasks =
-                list_active_service_tasks(&node.node.workload_manager, service_name).await;
+                list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
             tasks.sort_by_key(|task| task.id);
             if tasks.len() != expected
                 || tasks
@@ -1278,7 +1306,7 @@ pub(crate) async fn wait_for_min_local_service_task_count_refs(
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
             let count = list_local_active_service_tasks(
-                &node.node.workload_manager,
+                &node.node.controllers.workloads,
                 service_name,
                 node.id(),
             )
@@ -1669,7 +1697,7 @@ pub(crate) async fn wait_for_min_local_service_task_count(
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
             let count = list_local_active_service_tasks(
-                &node.node.workload_manager,
+                &node.node.controllers.workloads,
                 service_name,
                 node.id(),
             )
@@ -1691,7 +1719,7 @@ pub(crate) async fn wait_for_reserved_slots(
     timeout: Duration,
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
-        if let Some(snapshot) = node.node.scheduler.snapshot().await {
+        if let Some(snapshot) = node.node.controllers.scheduler.snapshot().await {
             let reserved = snapshot
                 .slots
                 .iter()
@@ -1872,6 +1900,7 @@ pub(crate) async fn listed_node_state_via_topology(
 pub(crate) async fn reserve_all_scheduler_slots(node: &TestNode, owner: Uuid) {
     let snapshot = node
         .node
+        .controllers
         .scheduler
         .snapshot()
         .await
@@ -1891,6 +1920,7 @@ pub(crate) async fn reserve_all_scheduler_slots(node: &TestNode, owner: Uuid) {
     }
 
     node.node
+        .controllers
         .scheduler
         .reserve_resources(snapshot.version, intents, Vec::new())
         .await
@@ -1945,7 +1975,7 @@ pub(crate) async fn wait_for_service_status_all(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {
         for node in cluster {
-            match node.node.service_controller.registry().get(service_id) {
+            match node.node.controllers.services.registry().get(service_id) {
                 Ok(Some(spec)) if spec.status() == expected => {}
                 _ => return false,
             }
@@ -1986,7 +2016,7 @@ pub(crate) async fn wait_for_service_spec_all(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(50), || async {
         for node in cluster {
-            match node.node.service_controller.registry().get(service_id) {
+            match node.node.controllers.services.registry().get(service_id) {
                 Ok(Some(spec)) if service_spec_matches_expected(&spec, expected) => {}
                 _ => return false,
             }
@@ -2012,7 +2042,7 @@ pub(crate) async fn wait_for_service_replica_ids_converged_all(
         let mut all_match = true;
 
         for node in cluster {
-            let spec = match node.node.service_controller.registry().get(service_id) {
+            let spec = match node.node.controllers.services.registry().get(service_id) {
                 Ok(Some(spec)) if spec.status() == ServiceStatus::Running => spec,
                 _ => {
                     all_match = false;
@@ -2072,13 +2102,13 @@ pub(crate) async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
     ];
 
     for (name, plaintext) in secrets {
-        create_secret(&cluster[0].node.secrets_client, name, plaintext)
+        create_secret(&cluster[0].node.clients.cluster.secrets, name, plaintext)
             .await
             .unwrap_or_else(|err| panic!("create secret '{name}' failed: {err}"));
 
         assert!(
             wait_for_secret(
-                &cluster[0].node.secrets_client,
+                &cluster[0].node.clients.cluster.secrets,
                 name,
                 Duration::from_secs(10)
             )
@@ -2088,7 +2118,12 @@ pub(crate) async fn ensure_demo_manifest_secrets(cluster: &[TestNode]) {
 
         for peer in cluster.iter().skip(1) {
             assert!(
-                wait_for_secret(&peer.node.secrets_client, name, Duration::from_secs(10)).await,
+                wait_for_secret(
+                    &peer.node.clients.cluster.secrets,
+                    name,
+                    Duration::from_secs(10)
+                )
+                .await,
                 "node {} should replicate secret '{name}'",
                 peer.id()
             );

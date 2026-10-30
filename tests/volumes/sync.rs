@@ -10,7 +10,7 @@ local_test!(volumes_sync_converges_across_cluster, {
         .await
         .expect("initial roots equal");
 
-    let volume_id = create_managed_volume(&cluster[0].node.volumes_client, "pgdata").await;
+    let volume_id = create_managed_volume(&cluster[0].node.clients.cluster.volumes, "pgdata").await;
 
     assert!(
         wait_until(
@@ -19,7 +19,8 @@ local_test!(volumes_sync_converges_across_cluster, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_spec_by_name("pgdata")
                         .expect("volume lookup during sync")
                         .is_some()
@@ -37,7 +38,8 @@ local_test!(volumes_sync_converges_across_cluster, {
     for node in &cluster {
         let volume = node
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec_by_name("pgdata")
             .expect("volume lookup after sync")
             .expect("volume after sync");
@@ -76,7 +78,8 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
     request.plan_coordinator_node_id = Some(cluster[0].id());
     cluster[0]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .upsert_spec(request.clone())
         .await
         .expect("save replicated request");
@@ -98,7 +101,8 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
     );
     cluster[0]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .upsert_plan(plan.clone())
         .await
         .expect("save replicated plan");
@@ -112,7 +116,8 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
             || async {
                 cluster[1]
                     .node
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_plan(request.id)
                     .expect("read plan during sync")
                     == Some(plan.clone())
@@ -147,13 +152,15 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
     newer_status.leader_node_id = Some(cluster[1].id());
     cluster[0]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .upsert_group_status(older_status)
         .await
         .expect("save older group status");
     cluster[1]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .upsert_group_status(newer_status.clone())
         .await
         .expect("save newer group status");
@@ -175,7 +182,8 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
     );
     cluster[0]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .upsert_node_state(node_status.clone())
         .await
         .expect("save replica node status");
@@ -189,7 +197,8 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_group_status(request.id)
                         .expect("read group status during Sync")
                         == Some(newer_status.clone())
@@ -206,28 +215,32 @@ local_test!(replicated_volume_records_converge_through_peer_sync, {
     for node in &cluster {
         assert_eq!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_spec(request.id)
                 .expect("read replicated request"),
             Some(request.clone())
         );
         assert_eq!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_plan(request.id)
                 .expect("read replicated plan"),
             Some(plan.clone())
         );
         assert_eq!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(request.id)
                 .expect("read replicated group status"),
             Some(newer_status.clone())
         );
         assert_eq!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_node_state(request.id, cluster[0].id())
                 .expect("read replica node status"),
             Some(node_status.clone())

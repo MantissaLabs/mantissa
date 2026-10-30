@@ -12,7 +12,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
     let imported = tempdir().expect("create imported volume path");
     let volume_name = "svc-imported-data";
     let volume_id = import_local_volume_for_service(
-        &node.node.volumes_client,
+        &node.node.clients.cluster.volumes,
         volume_name,
         node.id(),
         imported.path(),
@@ -51,14 +51,15 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks)
         .await
         .expect("submit service deployment with imported volume");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -68,7 +69,8 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     let running = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read running service spec")
@@ -79,7 +81,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     assert!(
         wait_for_task_state(
-            &node.node.workload_manager,
+            &node.node.controllers.workloads,
             task_id,
             WorkloadPhase::Running,
             Duration::from_secs(10)
@@ -92,7 +94,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::VolumeUnavailable
         )
@@ -101,7 +103,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
     );
     assert!(
         wait_for_task_state(
-            &node.node.workload_manager,
+            &node.node.controllers.workloads,
             task_id,
             WorkloadPhase::VolumeUnavailable,
             Duration::from_secs(10)
@@ -114,7 +116,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
 
     assert!(
         wait_for_task_state(
-            &node.node.workload_manager,
+            &node.node.controllers.workloads,
             task_id,
             WorkloadPhase::Running,
             Duration::from_secs(15)
@@ -124,7 +126,7 @@ local_test!(services_volume_unavailable_enters_and_recovers, {
     );
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -146,7 +148,7 @@ local_test!(
         let imported = tempdir().expect("create imported volume path");
         let volume_name = "svc-rollout-data";
         let volume_id = import_local_volume_for_service(
-            &node.node.volumes_client,
+            &node.node.clients.cluster.volumes,
             volume_name,
             node.id(),
             imported.path(),
@@ -185,13 +187,14 @@ local_test!(
 
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
             .await
             .expect("submit baseline deployment");
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -201,7 +204,8 @@ local_test!(
 
         let baseline = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read baseline service")
@@ -212,7 +216,8 @@ local_test!(
 
         tasks[0].execution.cpu_millis = 200;
         node.node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_strategy(
                 Uuid::new_v4(),
                 manifest_name,
@@ -228,7 +233,8 @@ local_test!(
         while Instant::now() < deadline {
             let workloads = node
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .list_workloads(&TaskStateFilter::all())
                 .await
                 .expect("list rollout tasks");
@@ -241,7 +247,8 @@ local_test!(
             if new_task_exists {
                 let states = node
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .workload_phase_snapshot(&[old_task_id])
                     .await
                     .expect("read old task state");
@@ -263,7 +270,7 @@ local_test!(
         assert!(replacement_seen, "replacement task should become visible");
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )

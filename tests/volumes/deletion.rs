@@ -55,7 +55,7 @@ local_test!(replicated_volume_delete_removes_all_real_copies, {
         .expect("start replicated-volume deletion cluster");
     let result = async {
         let volume_id = create_replicated_volume_with_reclaim_result(
-            &cluster[0].node.volumes_client,
+            &cluster[0].node.clients.cluster.volumes,
             "real-replicated-delete",
             REAL_REPLICATED_VOLUME_BYTES,
             FilesystemOwnership::FsGroup { gid: 2_000 },
@@ -63,7 +63,7 @@ local_test!(replicated_volume_delete_removes_all_real_copies, {
         )
         .await?;
         let task_id = start_volume_task_via_public_api(
-            &cluster[0].node.task_client,
+            &cluster[0].node.clients.cluster.task,
             volume_id,
             "real-replicated-delete",
             "/var/lib/data",
@@ -86,7 +86,7 @@ local_test!(replicated_volume_delete_removes_all_real_copies, {
             .iter()
             .find(|node| node.id() == attached_node_id)
             .context("attached deletion-test node disappeared")?;
-        stop_task_via_public_api(&attached_node.node.task_client, task_id).await?;
+        stop_task_via_public_api(&attached_node.node.clients.cluster.task, task_id).await?;
         if !wait_until(
             Duration::from_secs(20),
             Duration::from_millis(100),
@@ -102,8 +102,11 @@ local_test!(replicated_volume_delete_removes_all_real_copies, {
         }
         wait_for_detached_volume(&cluster, volume_id, &mount_path, Duration::from_secs(20)).await?;
 
-        let started =
-            delete_volume(&attached_node.node.volumes_client, "real-replicated-delete").await;
+        let started = delete_volume(
+            &attached_node.node.clients.cluster.volumes,
+            "real-replicated-delete",
+        )
+        .await;
         if started.disposition != mantissa_protocol::volumes::VolumeDeleteDisposition::Deleted {
             anyhow::bail!("replicated delete did not accept terminal deletion");
         }
@@ -113,14 +116,16 @@ local_test!(replicated_volume_delete_removes_all_real_copies, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_spec_including_deleting(volume_id)
                         .ok()
                         .flatten()
                         .is_some_and(|spec| spec.is_deleted())
                         && node
                             .node
-                            .volume_registry
+                            .registries
+                            .volumes
                             .get_plan(volume_id)
                             .ok()
                             .flatten()
@@ -160,7 +165,7 @@ local_test!(new_volume_epoch_cleans_replica_that_missed_delete, {
         .expect("start replicated-volume supersession cluster");
     let result = async {
         let volume_id = create_replicated_volume_with_reclaim_result(
-            &cluster[0].node.volumes_client,
+            &cluster[0].node.clients.cluster.volumes,
             "missed-replicated-delete",
             REAL_REPLICATED_VOLUME_BYTES,
             FilesystemOwnership::Daemon,
@@ -168,7 +173,7 @@ local_test!(new_volume_epoch_cleans_replica_that_missed_delete, {
         )
         .await?;
         let task_id = start_volume_task_via_public_api(
-            &cluster[0].node.task_client,
+            &cluster[0].node.clients.cluster.task,
             volume_id,
             "missed-replicated-delete",
             "/var/lib/data",
@@ -180,12 +185,19 @@ local_test!(new_volume_epoch_cleans_replica_that_missed_delete, {
             .iter()
             .find(|node| node.id() == attached_node_id)
             .context("attached supersession-test node disappeared")?;
-        stop_task_via_public_api(&attached_node.node.task_client, task_id).await?;
+        stop_task_via_public_api(&attached_node.node.clients.cluster.task, task_id).await?;
         wait_for_detached_volume(&cluster, volume_id, &mount_path, Duration::from_secs(20)).await?;
 
         let plan = cluster
             .iter()
-            .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+            .find_map(|node| {
+                node.node
+                    .registries
+                    .volumes
+                    .get_plan(volume_id)
+                    .ok()
+                    .flatten()
+            })
             .context("supersession test has no replicated bootstrap plan")?;
         let target_id = plan.replica_node_ids[0];
         let (target_index, target) = cluster
@@ -199,7 +211,8 @@ local_test!(new_volume_epoch_cleans_replica_that_missed_delete, {
 
         let previous = target
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec(volume_id)?
             .context("supersession target has no old desired generation")?;
         let mut terminal = previous.clone();
@@ -216,7 +229,8 @@ local_test!(new_volume_epoch_cleans_replica_that_missed_delete, {
         // monotonically newer desired identity.
         target
             .node
-            .volume_registry
+            .registries
+            .volumes
             .upsert_spec(recreated.clone())
             .await?;
         if !wait_until(
@@ -233,7 +247,8 @@ local_test!(new_volume_epoch_cleans_replica_that_missed_delete, {
 
         for node in &cluster {
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .upsert_spec(recreated.clone())
                 .await?;
         }
@@ -246,8 +261,11 @@ local_test!(new_volume_epoch_cleans_replica_that_missed_delete, {
         {
             anyhow::bail!("one or more superseded replicas did not converge away");
         }
-        let deleted =
-            delete_volume(&cluster[0].node.volumes_client, "missed-replicated-delete").await;
+        let deleted = delete_volume(
+            &cluster[0].node.clients.cluster.volumes,
+            "missed-replicated-delete",
+        )
+        .await;
         if deleted.disposition != mantissa_protocol::volumes::VolumeDeleteDisposition::Deleted {
             anyhow::bail!("empty recreated generation did not accept deletion");
         }
@@ -270,7 +288,7 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
         .expect("start replicated-volume restore cluster");
     let result = async {
         let volume_id = create_replicated_volume_with_reclaim_result(
-            &cluster[0].node.volumes_client,
+            &cluster[0].node.clients.cluster.volumes,
             "real-replicated-retain",
             REAL_REPLICATED_VOLUME_BYTES,
             FilesystemOwnership::FsGroup { gid: 2_000 },
@@ -278,7 +296,7 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
         )
         .await?;
         let task_id = start_volume_task_via_public_api(
-            &cluster[0].node.task_client,
+            &cluster[0].node.clients.cluster.task,
             volume_id,
             "real-replicated-retain",
             "/var/lib/data",
@@ -315,7 +333,7 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             .iter()
             .find(|node| node.id() == attached_node_id)
             .context("attached retain-test node disappeared")?;
-        stop_task_via_public_api(&attached_node.node.task_client, task_id).await?;
+        stop_task_via_public_api(&attached_node.node.clients.cluster.task, task_id).await?;
         wait_for_detached_volume(&cluster, volume_id, &mount_path, Duration::from_secs(20)).await?;
 
         // The test runtime's derived idle boundary is four seconds. Keep this
@@ -324,8 +342,11 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
         // detach would miss that regression.
         tokio::time::sleep(Duration::from_secs(12)).await;
 
-        let retained =
-            delete_volume(&attached_node.node.volumes_client, "real-replicated-retain").await;
+        let retained = delete_volume(
+            &attached_node.node.clients.cluster.volumes,
+            "real-replicated-retain",
+        )
+        .await;
         if retained.disposition != mantissa_protocol::volumes::VolumeDeleteDisposition::Retained
             || retained.preserved_path.is_some()
         {
@@ -337,21 +358,24 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_spec(volume_id)
                         .ok()
                         .flatten()
                         .is_some_and(|spec| spec.is_retained())
                         && node
                             .node
-                            .volume_registry
+                            .registries
+                            .volumes
                             .get_plan(volume_id)
                             .ok()
                             .flatten()
                             .is_some()
                         && node
                             .node
-                            .volume_registry
+                            .registries
+                            .volumes
                             .get_group_status(volume_id)
                             .ok()
                             .flatten()
@@ -367,7 +391,7 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             );
         }
 
-        let mut inspect = attached_node.node.volumes_client.get_request();
+        let mut inspect = attached_node.node.clients.cluster.volumes.get_request();
         inspect.get().set_selector("real-replicated-retain");
         let inspected = inspect.send().promise.await?;
         let inspected = inspected.get()?.get_volume()?;
@@ -386,7 +410,9 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
         }
         let listed = attached_node
             .node
-            .volumes_client
+            .clients
+            .cluster
+            .volumes
             .list_request()
             .send()
             .promise
@@ -405,8 +431,11 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             anyhow::bail!("volume list did not include the retained volume");
         }
 
-        let restored_id =
-            restore_volume(&attached_node.node.volumes_client, "real-replicated-retain").await;
+        let restored_id = restore_volume(
+            &attached_node.node.clients.cluster.volumes,
+            "real-replicated-retain",
+        )
+        .await;
         if restored_id != volume_id {
             anyhow::bail!("restore returned a different volume ID");
         }
@@ -416,7 +445,8 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_group_status(volume_id)
                         .ok()
                         .flatten()
@@ -435,7 +465,7 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
         // recovery starts. Recovery may also finish before this response.
         // Both paths must converge without losing the synced retained probe.
         let restored_task = start_volume_task_via_public_api_with_state(
-            &cluster[0].node.task_client,
+            &cluster[0].node.clients.cluster.task,
             volume_id,
             "real-replicated-retain-restored",
             "/var/lib/data",
@@ -479,7 +509,8 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             .iter()
             .find(|node| node.id() == restored_node_id)
             .context("restored volume task node disappeared")?;
-        stop_task_via_public_api(&restored_node.node.task_client, restored_task.id).await?;
+        stop_task_via_public_api(&restored_node.node.clients.cluster.task, restored_task.id)
+            .await?;
         wait_for_detached_volume(
             &cluster,
             volume_id,
@@ -488,8 +519,11 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
         )
         .await?;
 
-        let retained_again =
-            delete_volume(&restored_node.node.volumes_client, "real-replicated-retain").await;
+        let retained_again = delete_volume(
+            &restored_node.node.clients.cluster.volumes,
+            "real-replicated-retain",
+        )
+        .await;
         if retained_again.disposition
             != mantissa_protocol::volumes::VolumeDeleteDisposition::Retained
             || retained_again.preserved_path.is_some()
@@ -502,14 +536,16 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_spec(volume_id)
                         .ok()
                         .flatten()
                         .is_some_and(|spec| spec.is_retained())
                         && node
                             .node
-                            .volume_registry
+                            .registries
+                            .volumes
                             .get_group_status(volume_id)
                             .ok()
                             .flatten()
@@ -523,7 +559,7 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
         }
 
         let deleted = delete_volume_with_data(
-            &restored_node.node.volumes_client,
+            &restored_node.node.clients.cluster.volumes,
             "real-replicated-retain",
             true,
         )
@@ -539,14 +575,16 @@ local_test!(replicated_volume_retain_restore_and_delete_data, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_spec_including_deleting(volume_id)
                         .ok()
                         .flatten()
                         .is_some_and(|spec| spec.is_deleted())
                         && node
                             .node
-                            .volume_registry
+                            .registries
+                            .volumes
                             .get_plan(volume_id)
                             .ok()
                             .flatten()
@@ -580,25 +618,27 @@ local_test!(volume_delete_retain_preserves_local_path, {
     let runtime = Arc::new(RecordingRuntimeBackend::default());
     let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
 
-    let volume_id = create_managed_volume(&node.volumes_client, "retain-data").await;
+    let volume_id = create_managed_volume(&node.clients.cluster.volumes, "retain-data").await;
     let task = start_standalone_volume_task(&node, volume_id, "retain-data", "/var/lib/data").await;
     wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
 
     let local_path = node
-        .volume_registry
+        .registries
+        .volumes
         .get_node_state(volume_id, node.id)
         .expect("load node state before retain delete")
         .expect("node state before retain delete")
         .local_path
         .expect("local path before retain delete");
 
-    node.workload_manager
+    node.controllers
+        .workloads
         .request_workload_stop(task.id)
         .await
         .expect("request task stop");
     wait_for_volume_published_tasks(&node, volume_id, &[]).await;
 
-    let deleted = delete_volume(&node.volumes_client, "retain-data").await;
+    let deleted = delete_volume(&node.clients.cluster.volumes, "retain-data").await;
     assert_eq!(
         deleted.disposition,
         mantissa_protocol::volumes::VolumeDeleteDisposition::Retained
@@ -611,7 +651,8 @@ local_test!(volume_delete_retain_preserves_local_path, {
         "retained local volume path should still exist"
     );
     assert!(
-        node.volume_registry
+        node.registries
+            .volumes
             .get_spec(volume_id)
             .expect("volume lookup after retain delete")
             .is_none(),
@@ -625,7 +666,7 @@ local_test!(volume_delete_delete_removes_managed_path, {
     let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
 
     let volume_id = create_managed_volume_with(
-        &node.volumes_client,
+        &node.clients.cluster.volumes,
         "delete-data",
         mantissa_protocol::volumes::VolumeBindingMode::WaitForFirstConsumer,
         mantissa_protocol::volumes::VolumeReclaimPolicy::Delete,
@@ -635,20 +676,22 @@ local_test!(volume_delete_delete_removes_managed_path, {
     wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
 
     let local_path = node
-        .volume_registry
+        .registries
+        .volumes
         .get_node_state(volume_id, node.id)
         .expect("load node state before delete reclaim")
         .expect("node state before delete reclaim")
         .local_path
         .expect("local path before delete reclaim");
 
-    node.workload_manager
+    node.controllers
+        .workloads
         .request_workload_stop(task.id)
         .await
         .expect("request task stop");
     wait_for_volume_published_tasks(&node, volume_id, &[]).await;
 
-    let deleted = delete_volume(&node.volumes_client, "delete-data").await;
+    let deleted = delete_volume(&node.clients.cluster.volumes, "delete-data").await;
     assert_eq!(
         deleted.disposition,
         mantissa_protocol::volumes::VolumeDeleteDisposition::Deleted
@@ -662,7 +705,8 @@ local_test!(volume_delete_delete_removes_managed_path, {
         "managed local volume path should be removed after delete reclaim"
     );
     assert!(
-        node.volume_registry
+        node.registries
+            .volumes
             .get_spec(volume_id)
             .expect("volume lookup after delete reclaim")
             .is_none(),
@@ -681,7 +725,7 @@ local_test!(volume_delete_delete_requires_owning_node, {
     wait_for_pairwise_sessions(&cluster).await;
 
     let volume_id = create_immediate_managed_volume_on_node(
-        &cluster[0].node.volumes_client,
+        &cluster[0].node.clients.cluster.volumes,
         "remote-delete",
         cluster[1].id(),
         mantissa_protocol::volumes::VolumeReclaimPolicy::Delete,
@@ -695,7 +739,8 @@ local_test!(volume_delete_delete_requires_owning_node, {
             || async {
                 match cluster[1]
                     .node
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_node_state(volume_id, cluster[1].id())
                 {
                     Ok(Some(state)) => state.local_path.is_some(),
@@ -709,12 +754,13 @@ local_test!(volume_delete_delete_requires_owning_node, {
 
     let mut stale_controller_spec = cluster[1]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .get_spec(volume_id)
         .expect("load live volume before delete")
         .expect("live volume should exist before delete");
 
-    let mut request = cluster[0].node.volumes_client.delete_request();
+    let mut request = cluster[0].node.clients.cluster.volumes.delete_request();
     request.get().set_selector("remote-delete");
     let err = match request.send().promise.await {
         Ok(_) => panic!("remote destructive delete should be rejected"),
@@ -728,14 +774,15 @@ local_test!(volume_delete_delete_requires_owning_node, {
     assert!(
         cluster[0]
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec(volume_id)
             .expect("volume lookup after rejected delete")
             .is_some(),
         "rejected remote delete should leave the volume object intact"
     );
 
-    let deleted = delete_volume(&cluster[1].node.volumes_client, "remote-delete").await;
+    let deleted = delete_volume(&cluster[1].node.clients.cluster.volumes, "remote-delete").await;
     assert_eq!(
         deleted.disposition,
         mantissa_protocol::volumes::VolumeDeleteDisposition::Deleted
@@ -748,7 +795,8 @@ local_test!(volume_delete_delete_requires_owning_node, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_spec(volume_id)
                         .expect("volume lookup after owning-node delete")
                         .is_none()
@@ -762,7 +810,8 @@ local_test!(volume_delete_delete_requires_owning_node, {
     for node in &cluster {
         let marker = node
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec_including_deleting(volume_id)
             .expect("load retained volume deletion marker")
             .expect("volume deletion marker should converge");
@@ -772,13 +821,15 @@ local_test!(volume_delete_delete_requires_owning_node, {
     stale_controller_spec.updated_at = "9999-12-31T23:59:59Z".to_string();
     for node in &cluster {
         node.node
-            .volume_registry
+            .registries
+            .volumes
             .upsert_spec(stale_controller_spec.clone())
             .await
             .expect("attempt stale post-delete controller write");
         assert!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_spec(volume_id)
                 .expect("lookup after stale controller write")
                 .is_none(),
@@ -787,7 +838,7 @@ local_test!(volume_delete_delete_requires_owning_node, {
     }
 
     let recreated_id = create_immediate_managed_volume_on_node(
-        &cluster[0].node.volumes_client,
+        &cluster[0].node.clients.cluster.volumes,
         "remote-delete",
         cluster[1].id(),
         mantissa_protocol::volumes::VolumeReclaimPolicy::Delete,
@@ -801,7 +852,8 @@ local_test!(volume_delete_delete_requires_owning_node, {
             || async {
                 cluster.iter().all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_spec(volume_id)
                         .expect("lookup recreated volume")
                         .is_some_and(|spec| spec.volume_epoch == 1)

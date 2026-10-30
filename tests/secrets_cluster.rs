@@ -81,7 +81,7 @@ async fn wait_for_plaintext_all(
     wait_until(timeout, Duration::from_millis(50), || async {
         for node in cluster {
             if !matches!(
-                fetch_secret_plaintext(&node.node.secrets_client, name).await,
+                fetch_secret_plaintext(&node.node.clients.cluster.secrets, name).await,
                 Ok(plaintext) if plaintext == expected
             ) {
                 return false;
@@ -102,7 +102,7 @@ async fn wait_for_plaintext_on_nodes(
     wait_until(timeout, Duration::from_millis(50), || async {
         for node in nodes {
             if !matches!(
-                fetch_secret_plaintext(&node.node.secrets_client, name).await,
+                fetch_secret_plaintext(&node.node.clients.cluster.secrets, name).await,
                 Ok(plaintext) if plaintext == expected
             ) {
                 return false;
@@ -437,7 +437,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// Reads the SecretMasterKeys root for the node's active cluster view.
 async fn secret_master_key_root_hex(node: &TestNode) -> String {
     let cluster_view = current_cluster_view(&node.topology()).await;
-    let mut roots_req = node.node.sync_client.get_roots_for_view_request();
+    let mut roots_req = node.node.clients.cluster.sync.get_roots_for_view_request();
     {
         let mut req = roots_req.get().init_req();
         cluster_view.write_capnp(req.reborrow().init_view());
@@ -558,6 +558,7 @@ struct MasterKeyRowShape {
 fn master_key_row_shape(node: &TestNode) -> MasterKeyRowShape {
     let (rows, tombs) = node
         .node
+        .stores
         .secret_master_keys
         .load_all()
         .expect("load replicated master-key rows");
@@ -610,6 +611,7 @@ fn master_key_rows_pruned_to_active(node: &TestNode) -> bool {
 fn master_key_row_debug(node: &TestNode) -> String {
     let (rows, tombs) = node
         .node
+        .stores
         .secret_master_keys
         .load_all()
         .expect("load replicated master-key rows");
@@ -687,10 +689,11 @@ fn disabled_store_gc_config() -> RuntimeStoreGcConfig {
 
 /// Returns true once a merged node has adopted the replicated destination current.
 fn local_current_matches_scope(node: &TestNode, scope_view: ClusterViewId) -> bool {
-    let Ok(current) = node.node.secret_master_store.current() else {
+    let Ok(current) = node.node.stores.secret_master_store.current() else {
         return false;
     };
-    let Ok(Some(replicated)) = current_for_scope(&node.node.secret_master_keys, scope_view) else {
+    let Ok(Some(replicated)) = current_for_scope(&node.node.stores.secret_master_keys, scope_view)
+    else {
         return false;
     };
     current.descriptor.scope_view == scope_view && current.key_id() == replicated.key_id
@@ -727,7 +730,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     let anchor = TestNode::new_with_tick_ms(100).await;
     let first_secret = b"created-before-joins";
     create_secret(
-        &anchor.node.secrets_client,
+        &anchor.node.clients.cluster.secrets,
         "pre-join-cluster-secret",
         first_secret,
     )
@@ -737,6 +740,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     let second = TestNode::new_with_tick_ms(100).await;
     let anchor_master_key_id = anchor
         .node
+        .stores
         .secret_master_store
         .current()
         .expect("anchor current master key before join")
@@ -745,6 +749,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     assert_eq!(
         second
             .node
+            .stores
             .secret_master_store
             .current()
             .expect("second current master key after join")
@@ -761,7 +766,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
 
     assert!(
         wait_for_plaintext(
-            &second.node.secrets_client,
+            &second.node.clients.cluster.secrets,
             "pre-join-cluster-secret",
             first_secret,
             Duration::from_secs(10),
@@ -773,6 +778,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     let third = TestNode::new_with_tick_ms(100).await;
     let joined_master_key_id = second
         .node
+        .stores
         .secret_master_store
         .current()
         .expect("second current master key before chained join")
@@ -784,6 +790,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     assert_eq!(
         third
             .node
+            .stores
             .secret_master_store
             .current()
             .expect("third current master key after chained join")
@@ -797,7 +804,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     for node in &cluster {
         assert!(
             wait_for_plaintext(
-                &node.node.secrets_client,
+                &node.node.clients.cluster.secrets,
                 "pre-join-cluster-secret",
                 first_secret,
                 Duration::from_secs(10),
@@ -810,7 +817,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
 
     let third_secret = b"created-after-third-join";
     create_secret(
-        &cluster[2].node.secrets_client,
+        &cluster[2].node.clients.cluster.secrets,
         "post-join-cluster-secret",
         third_secret,
     )
@@ -820,7 +827,7 @@ local_test!(master_key_exchange_supports_three_node_secret_decryption, {
     for node in &cluster {
         assert!(
             wait_for_plaintext(
-                &node.node.secrets_client,
+                &node.node.clients.cluster.secrets,
                 "post-join-cluster-secret",
                 third_secret,
                 Duration::from_secs(10),
@@ -1068,7 +1075,7 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
 
     let pre_split_secret = b"secret-before-split";
     create_secret(
-        &anchor.node.secrets_client,
+        &anchor.node.clients.cluster.secrets,
         "secret-before-split",
         pre_split_secret,
     )
@@ -1076,7 +1083,7 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
     .expect("create pre-split secret");
     assert!(
         wait_for_plaintext(
-            &joiner.node.secrets_client,
+            &joiner.node.clients.cluster.secrets,
             "secret-before-split",
             pre_split_secret,
             Duration::from_secs(10),
@@ -1089,6 +1096,7 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
 
     let anchor_current = anchor
         .node
+        .stores
         .secret_master_store
         .current()
         .expect("anchor current master key");
@@ -1098,7 +1106,7 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
         Some(split_id)
     );
     assert_eq!(
-        current_for_scope(&anchor.node.secret_master_keys, left_view)
+        current_for_scope(&anchor.node.stores.secret_master_keys, left_view)
             .expect("anchor split current row")
             .expect("anchor split current exists")
             .key_id,
@@ -1107,6 +1115,7 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
 
     let joiner_current = joiner
         .node
+        .stores
         .secret_master_store
         .current()
         .expect("joiner current master key");
@@ -1116,7 +1125,7 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
         Some(split_id)
     );
     assert_eq!(
-        current_for_scope(&joiner.node.secret_master_keys, right_view)
+        current_for_scope(&joiner.node.stores.secret_master_keys, right_view)
             .expect("joiner split current row")
             .expect("joiner split current exists")
             .key_id,
@@ -1124,41 +1133,41 @@ local_test!(split_scopes_secret_master_key_current_to_target_view, {
     );
 
     assert_eq!(
-        fetch_secret_plaintext(&anchor.node.secrets_client, "secret-before-split")
+        fetch_secret_plaintext(&anchor.node.clients.cluster.secrets, "secret-before-split")
             .await
             .expect("anchor reads pre-split secret"),
         pre_split_secret
     );
     assert_eq!(
-        fetch_secret_plaintext(&joiner.node.secrets_client, "secret-before-split")
+        fetch_secret_plaintext(&joiner.node.clients.cluster.secrets, "secret-before-split")
             .await
             .expect("joiner reads pre-split secret"),
         pre_split_secret
     );
 
     create_secret(
-        &anchor.node.secrets_client,
+        &anchor.node.clients.cluster.secrets,
         "left-after-split",
         b"left after split",
     )
     .await
     .expect("create left secret after split");
     assert_eq!(
-        fetch_secret_plaintext(&anchor.node.secrets_client, "left-after-split")
+        fetch_secret_plaintext(&anchor.node.clients.cluster.secrets, "left-after-split")
             .await
             .expect("anchor reads left secret"),
         b"left after split"
     );
 
     create_secret(
-        &joiner.node.secrets_client,
+        &joiner.node.clients.cluster.secrets,
         "right-after-split",
         b"right after split",
     )
     .await
     .expect("create right secret after split");
     assert_eq!(
-        fetch_secret_plaintext(&joiner.node.secrets_client, "right-after-split")
+        fetch_secret_plaintext(&joiner.node.clients.cluster.secrets, "right-after-split")
             .await
             .expect("joiner reads right secret"),
         b"right after split"
@@ -1180,7 +1189,7 @@ local_test!(split_merge_after_peer_leave_preserves_secret_decryption, {
 
     let pre_split = b"peer-leave-secret-created-before-split";
     create_secret(
-        &cluster[0].node.secrets_client,
+        &cluster[0].node.clients.cluster.secrets,
         "peer-leave-secret-before-partition",
         pre_split,
     )
@@ -1223,12 +1232,12 @@ local_test!(split_merge_after_peer_leave_preserves_secret_decryption, {
         "source partition should observe the remote split peer leave before merge"
     );
 
-    rotate_master_key(&left_a.node.secrets_client)
+    rotate_master_key(&left_a.node.clients.cluster.secrets)
         .await
         .expect("rotate left partition master key after peer leave");
     let left_secret = b"peer-leave-left-secret-after-rotation";
     create_secret(
-        &left_b.node.secrets_client,
+        &left_b.node.clients.cluster.secrets,
         "peer-leave-left-partition-secret",
         left_secret,
     )
@@ -1245,12 +1254,12 @@ local_test!(split_merge_after_peer_leave_preserves_secret_decryption, {
         "left partition should decrypt its rotated secret"
     );
 
-    rotate_master_key(&right_a.node.secrets_client)
+    rotate_master_key(&right_a.node.clients.cluster.secrets)
         .await
         .expect("rotate surviving right partition master key");
     let right_secret = b"peer-leave-right-secret-after-rotation";
     create_secret(
-        &right_a.node.secrets_client,
+        &right_a.node.clients.cluster.secrets,
         "peer-leave-right-partition-secret",
         right_secret,
     )
@@ -1258,7 +1267,7 @@ local_test!(split_merge_after_peer_leave_preserves_secret_decryption, {
     .expect("create right partition peer-leave secret");
     assert!(
         wait_for_plaintext(
-            &right_a.node.secrets_client,
+            &right_a.node.clients.cluster.secrets,
             "peer-leave-right-partition-secret",
             right_secret,
             Duration::from_secs(15),
@@ -1300,7 +1309,7 @@ local_test!(split_merge_after_peer_leave_preserves_secret_decryption, {
         );
     }
 
-    rotate_master_key(&left_a.node.secrets_client)
+    rotate_master_key(&left_a.node.clients.cluster.secrets)
         .await
         .expect("rotate merged cluster master key after peer leave");
     for (name, plaintext) in [
@@ -1330,7 +1339,7 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
 
     let pre_split = b"secret-created-before-split";
     create_secret(
-        &cluster[0].node.secrets_client,
+        &cluster[0].node.clients.cluster.secrets,
         "secret-before-partition",
         pre_split,
     )
@@ -1353,12 +1362,12 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
     let right_a = &cluster[2];
     let right_b = &cluster[3];
 
-    rotate_master_key(&left_a.node.secrets_client)
+    rotate_master_key(&left_a.node.clients.cluster.secrets)
         .await
         .expect("rotate left partition master key");
     let left_secret = b"left-partition-secret-after-rotation";
     create_secret(
-        &left_b.node.secrets_client,
+        &left_b.node.clients.cluster.secrets,
         "left-partition-secret",
         left_secret,
     )
@@ -1366,7 +1375,7 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
     .expect("create left partition secret");
     assert!(
         wait_for_plaintext(
-            &left_a.node.secrets_client,
+            &left_a.node.clients.cluster.secrets,
             "left-partition-secret",
             left_secret,
             Duration::from_secs(15),
@@ -1375,12 +1384,12 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
         "left partition peer should decrypt the left secret"
     );
 
-    rotate_master_key(&right_a.node.secrets_client)
+    rotate_master_key(&right_a.node.clients.cluster.secrets)
         .await
         .expect("rotate right partition master key");
     let right_secret = b"right-partition-secret-after-rotation";
     create_secret(
-        &right_b.node.secrets_client,
+        &right_b.node.clients.cluster.secrets,
         "right-partition-secret",
         right_secret,
     )
@@ -1388,7 +1397,7 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
     .expect("create right partition secret");
     assert!(
         wait_for_plaintext(
-            &right_a.node.secrets_client,
+            &right_a.node.clients.cluster.secrets,
             "right-partition-secret",
             right_secret,
             Duration::from_secs(15),
@@ -1414,7 +1423,7 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
         );
     }
 
-    rotate_master_key(&cluster[0].node.secrets_client)
+    rotate_master_key(&cluster[0].node.clients.cluster.secrets)
         .await
         .expect("rotate merged cluster master key");
     for (name, plaintext) in [
@@ -1430,7 +1439,7 @@ local_test!(split_merge_grants_partition_keys_for_secret_decryption, {
 
     let post_merge = b"secret-created-after-merge";
     create_secret(
-        &cluster[3].node.secrets_client,
+        &cluster[3].node.clients.cluster.secrets,
         "post-merge-secret",
         post_merge,
     )
@@ -1462,12 +1471,12 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
     TestNode::assert_cluster_size_all(&cluster, 4, "four-node cluster before split").await;
 
     let (_split_id, left_view, right_view) = split_four_node_cluster(&cluster).await;
-    rotate_master_key(&cluster[2].node.secrets_client)
+    rotate_master_key(&cluster[2].node.clients.cluster.secrets)
         .await
         .expect("rotate destination partition key");
     let destination_secret = b"destination secret before holder outage";
     create_secret(
-        &cluster[2].node.secrets_client,
+        &cluster[2].node.clients.cluster.secrets,
         "destination-secret-before-holder-outage",
         destination_secret,
     )
@@ -1475,7 +1484,7 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
     .expect("create destination secret");
     assert!(
         wait_for_plaintext(
-            &cluster[3].node.secrets_client,
+            &cluster[3].node.clients.cluster.secrets,
             "destination-secret-before-holder-outage",
             destination_secret,
             Duration::from_secs(15),
@@ -1484,12 +1493,12 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
         "both destination nodes should hold the rotated key before the outage"
     );
 
-    rotate_master_key(&cluster[2].node.secrets_client)
+    rotate_master_key(&cluster[2].node.clients.cluster.secrets)
         .await
         .expect("rotate destination partition key again");
     let current_destination_secret = b"current destination secret before holder outage";
     create_secret(
-        &cluster[2].node.secrets_client,
+        &cluster[2].node.clients.cluster.secrets,
         "current-destination-secret-before-holder-outage",
         current_destination_secret,
     )
@@ -1497,7 +1506,7 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
     .expect("create current destination secret");
     assert!(
         wait_for_plaintext(
-            &cluster[3].node.secrets_client,
+            &cluster[3].node.clients.cluster.secrets,
             "current-destination-secret-before-holder-outage",
             current_destination_secret,
             Duration::from_secs(15),
@@ -1512,7 +1521,8 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
     let selected_holder_id = cluster[selected_holder_index].id();
     let survivor_health = cluster[surviving_holder_index]
         .node
-        .registry
+        .registries
+        .peers
         .health_monitor();
     for _ in 0..3 {
         let _ = survivor_health.record_probe_failure(
@@ -1560,7 +1570,7 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
         ] {
             assert!(
                 wait_for_plaintext(
-                    &cluster[node_index].node.secrets_client,
+                    &cluster[node_index].node.clients.cluster.secrets,
                     name,
                     plaintext,
                     Duration::from_secs(30),
@@ -1605,7 +1615,7 @@ local_test!(merge_key_grants_survive_an_offline_selected_holder, {
     ] {
         assert!(
             wait_for_plaintext(
-                &cluster[selected_holder_index].node.secrets_client,
+                &cluster[selected_holder_index].node.clients.cluster.secrets,
                 name,
                 plaintext,
                 Duration::from_secs(15),
@@ -1639,7 +1649,7 @@ local_test!(
 
         let left_secret = b"left-secret-under-split-current";
         create_secret(
-            &left_a.node.secrets_client,
+            &left_a.node.clients.cluster.secrets,
             "left-split-current-secret",
             left_secret,
         )
@@ -1647,7 +1657,7 @@ local_test!(
         .expect("create left split-current secret");
         assert!(
             wait_for_plaintext(
-                &left_b.node.secrets_client,
+                &left_b.node.clients.cluster.secrets,
                 "left-split-current-secret",
                 left_secret,
                 Duration::from_secs(15),
@@ -1658,7 +1668,7 @@ local_test!(
 
         let right_secret = b"right-secret-under-split-current";
         create_secret(
-            &right_a.node.secrets_client,
+            &right_a.node.clients.cluster.secrets,
             "right-split-current-secret",
             right_secret,
         )
@@ -1666,7 +1676,7 @@ local_test!(
         .expect("create right split-current secret");
         assert!(
             wait_for_plaintext(
-                &right_b.node.secrets_client,
+                &right_b.node.clients.cluster.secrets,
                 "right-split-current-secret",
                 right_secret,
                 Duration::from_secs(15),
@@ -1703,12 +1713,16 @@ local_test!(master_key_rotation_replicates_through_sync_domain, {
     TestNode::assert_cluster_size_all(&cluster, 2, "two-node cluster before rotation").await;
 
     let secret = b"rotate-through-sync";
-    create_secret(&cluster[0].node.secrets_client, "rotated-secret", secret)
-        .await
-        .expect("create secret before rotation");
+    create_secret(
+        &cluster[0].node.clients.cluster.secrets,
+        "rotated-secret",
+        secret,
+    )
+    .await
+    .expect("create secret before rotation");
     assert!(
         wait_for_plaintext(
-            &cluster[1].node.secrets_client,
+            &cluster[1].node.clients.cluster.secrets,
             "rotated-secret",
             secret,
             Duration::from_secs(10),
@@ -1717,14 +1731,14 @@ local_test!(master_key_rotation_replicates_through_sync_domain, {
         "second node should decrypt the pre-rotation secret"
     );
 
-    rotate_master_key(&cluster[0].node.secrets_client)
+    rotate_master_key(&cluster[0].node.clients.cluster.secrets)
         .await
         .expect("rotate master key on anchor");
 
     for node in &cluster {
         assert!(
             wait_for_plaintext(
-                &node.node.secrets_client,
+                &node.node.clients.cluster.secrets,
                 "rotated-secret",
                 secret,
                 Duration::from_secs(10),

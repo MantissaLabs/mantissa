@@ -66,7 +66,7 @@ async fn wait_for_service_status_all(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
-            match node.node.service_controller.registry().get(service_id) {
+            match node.node.controllers.services.registry().get(service_id) {
                 Ok(Some(spec)) if spec.status() == expected => {}
                 _ => return false,
             }
@@ -85,7 +85,7 @@ async fn wait_for_service_manifest_running_all(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
-            match node.node.service_controller.registry().get(service_id) {
+            match node.node.controllers.services.registry().get(service_id) {
                 Ok(Some(spec))
                     if spec.manifest_id == manifest_id
                         && spec.status() == ServiceStatus::Running => {}
@@ -116,7 +116,7 @@ async fn wait_for_sharded_service_running_all(
 
 /// Counts how many target nodes currently own at least one active task for a service.
 async fn active_target_node_count(node: &TestNode, service_name: &str) -> usize {
-    list_active_service_tasks(&node.node.workload_manager, service_name)
+    list_active_service_tasks(&node.node.controllers.workloads, service_name)
         .await
         .into_iter()
         .map(|task| task.node_id)
@@ -139,7 +139,7 @@ fn static_tcp_host_port(host_port: u16) -> WorkloadPortBinding {
 async fn wait_for_any_reserved_slot(cluster: &[TestNode], timeout: Duration) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
-            let Some(snapshot) = node.node.scheduler.snapshot().await else {
+            let Some(snapshot) = node.node.controllers.scheduler.snapshot().await else {
                 continue;
             };
             if snapshot
@@ -164,7 +164,8 @@ async fn wait_for_service_active_task_ids_all(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
-            let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+            let tasks =
+                list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
             let task_ids = tasks.iter().map(|task| task.id).collect::<BTreeSet<_>>();
             if &task_ids != expected_ids
                 || tasks
@@ -190,13 +191,13 @@ async fn wait_for_dependency_templates_running_all(
     wait_until(timeout, Duration::from_millis(100), || async {
         for node in cluster {
             let backend = list_active_task_template_tasks(
-                &node.node.workload_manager,
+                &node.node.controllers.workloads,
                 service_name,
                 "backend",
             )
             .await;
             let frontend = list_active_task_template_tasks(
-                &node.node.workload_manager,
+                &node.node.controllers.workloads,
                 service_name,
                 "frontend",
             )
@@ -231,12 +232,18 @@ async fn wait_for_frontend_after_backend_running(
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        let backend =
-            list_active_task_template_tasks(&node.node.workload_manager, service_name, "backend")
-                .await;
-        let frontend =
-            list_active_task_template_tasks(&node.node.workload_manager, service_name, "frontend")
-                .await;
+        let backend = list_active_task_template_tasks(
+            &node.node.controllers.workloads,
+            service_name,
+            "backend",
+        )
+        .await;
+        let frontend = list_active_task_template_tasks(
+            &node.node.controllers.workloads,
+            service_name,
+            "frontend",
+        )
+        .await;
         let backend_ready = backend.len() == backend_count
             && backend
                 .iter()
@@ -267,7 +274,8 @@ local_test!(services_sharded_deployment_converges_and_stops, {
     let service_name = "sharded-converges";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -302,7 +310,8 @@ local_test!(services_sharded_deployment_converges_and_stops, {
 
     cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_stop(service_id)
         .await
         .expect("submit stop for sharded deployment");
@@ -349,7 +358,8 @@ local_test!(
         let service_name = "sharded-stop-during-deploy";
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -368,7 +378,8 @@ local_test!(
 
         cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_stop(service_id)
             .await
             .expect("submit stop while sharded deployment is still in flight");
@@ -415,7 +426,8 @@ local_test!(
         let initial_template = demo_backend_task_template("backend", 8);
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 initial_manifest_id,
                 service_name,
@@ -452,7 +464,8 @@ local_test!(
 
         let initial_spec = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load initial service spec")
@@ -474,7 +487,8 @@ local_test!(
         let replacement_manifest_id = Uuid::new_v4();
         let redeploy_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 replacement_manifest_id,
                 service_name,
@@ -512,7 +526,8 @@ local_test!(
 
         let replacement_spec = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load replacement service spec")
@@ -571,14 +586,15 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
             .await
             .expect("submit sharding-enabled unsatisfiable placement deployment");
 
         assert!(
             wait_for_service_status_detail_any(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 &["exclude every eligible node"]
             )
@@ -626,7 +642,8 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, vec![template])
             .await
             .expect("submit sharded host-port-conflicting deployment");
@@ -637,7 +654,8 @@ local_test!(
             || async {
                 cluster[0]
                     .node
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .ok()
@@ -649,7 +667,8 @@ local_test!(
         .await;
         let spec = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load conflicted service spec")
@@ -722,7 +741,8 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 &service_name,
@@ -740,7 +760,8 @@ local_test!(
             || async {
                 cluster[0]
                     .node
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .ok()
@@ -757,7 +778,8 @@ local_test!(
         .await;
         let interrupted_spec = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load interrupted service spec")
@@ -832,7 +854,8 @@ local_test!(services_sharded_hard_failure_drains_successful_shards, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -850,7 +873,8 @@ local_test!(services_sharded_hard_failure_drains_successful_shards, {
         || async {
             cluster[0]
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .ok()
@@ -867,7 +891,8 @@ local_test!(services_sharded_hard_failure_drains_successful_shards, {
     .await;
     let spec = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load partial-failure service spec")
@@ -907,7 +932,8 @@ local_test!(services_sharded_task_splitting_converges, {
     let service_name = "sharded-task-splitting";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -955,7 +981,8 @@ local_test!(services_sharded_dependency_ordered_templates_converge, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,

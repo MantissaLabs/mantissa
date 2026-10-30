@@ -227,7 +227,8 @@ local_test!(
         let mut spec = harness
             .node()
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec(volume_id)
             .expect("read volume")
             .expect("saved volume");
@@ -236,7 +237,8 @@ local_test!(
         harness
             .node()
             .node
-            .volume_registry
+            .registries
+            .volumes
             .upsert_spec(spec.clone())
             .await
             .expect("save ready volume");
@@ -257,7 +259,8 @@ local_test!(
         harness
             .node()
             .node
-            .volume_registry
+            .registries
+            .volumes
             .upsert_plan(plan.clone())
             .await
             .expect("save plan");
@@ -287,7 +290,8 @@ local_test!(
         harness
             .node()
             .node
-            .volume_registry
+            .registries
+            .volumes
             .upsert_group_status(group)
             .await
             .expect("save group status");
@@ -308,12 +312,13 @@ local_test!(
             harness
                 .node()
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .upsert_node_state(state)
                 .await
                 .expect("save replica node status");
         }
-        let health = harness.node().node.registry.health_monitor();
+        let health = harness.node().node.registries.peers.health_monitor();
         for node_id in replica_node_ids {
             health.record_join(node_id, 1);
         }

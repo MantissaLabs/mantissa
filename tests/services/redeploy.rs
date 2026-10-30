@@ -32,14 +32,15 @@ local_test!(services_redeploy_scales_replicas, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit initial deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -47,13 +48,14 @@ local_test!(services_redeploy_scales_replicas, {
         "service should reach running state before redeploy"
     );
     assert!(
-        wait_for_task_count(&node.node.workload_manager, 1, Duration::from_secs(5)).await,
+        wait_for_task_count(&node.node.controllers.workloads, 1, Duration::from_secs(5)).await,
         "initial deployment should launch a single replica"
     );
 
     let initial_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read initial spec")
@@ -69,7 +71,8 @@ local_test!(services_redeploy_scales_replicas, {
 
     let redeploy_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit redeployment");
@@ -79,7 +82,7 @@ local_test!(services_redeploy_scales_replicas, {
     );
 
     let scaled_running = wait_for_service_status(
-        &node.node.service_controller,
+        &node.node.controllers.services,
         service_id,
         ServiceStatus::Running,
     )
@@ -87,7 +90,8 @@ local_test!(services_redeploy_scales_replicas, {
     if !scaled_running {
         let current = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read scaled service spec")
@@ -102,13 +106,14 @@ local_test!(services_redeploy_scales_replicas, {
         );
     }
     assert!(
-        wait_for_task_count(&node.node.workload_manager, 3, Duration::from_secs(8)).await,
+        wait_for_task_count(&node.node.controllers.workloads, 3, Duration::from_secs(8)).await,
         "scaled service should eventually report three replicas"
     );
 
     let updated_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read updated spec")
@@ -156,14 +161,15 @@ local_test!(services_redeploy_updates_resources, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit initial deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -171,13 +177,14 @@ local_test!(services_redeploy_updates_resources, {
         "service should reach running state before resource update"
     );
     assert!(
-        wait_for_task_count(&node.node.workload_manager, 1, Duration::from_secs(5)).await,
+        wait_for_task_count(&node.node.controllers.workloads, 1, Duration::from_secs(5)).await,
         "baseline deployment should launch a single replica"
     );
 
     let initial_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read baseline spec")
@@ -191,7 +198,8 @@ local_test!(services_redeploy_updates_resources, {
 
     let redeploy_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit redeployment with new resources");
@@ -201,7 +209,7 @@ local_test!(services_redeploy_updates_resources, {
     );
 
     let refreshed_running = wait_for_service_status(
-        &node.node.service_controller,
+        &node.node.controllers.services,
         service_id,
         ServiceStatus::Running,
     )
@@ -209,7 +217,8 @@ local_test!(services_redeploy_updates_resources, {
     if !refreshed_running {
         let current = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read refreshed service spec")
@@ -225,7 +234,8 @@ local_test!(services_redeploy_updates_resources, {
     }
     let updated_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read updated spec")
@@ -245,7 +255,8 @@ local_test!(services_redeploy_updates_resources, {
 
     let replacement_spec = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(replacement_id)
         .await
         .expect("inspect updated task");
@@ -290,14 +301,15 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit initial deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -307,7 +319,8 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 
     let baseline = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read baseline spec")
@@ -315,7 +328,8 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 
     let submission = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_strategy_outcome(
             Uuid::new_v4(),
             manifest_name,
@@ -339,7 +353,8 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
     while Instant::now() < deadline {
         let current = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read service during no-op rejection")
@@ -354,7 +369,8 @@ local_test!(services_redeploy_rejects_unchanged_running_spec, {
 
     let after = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read final spec after no-op rejection")
@@ -410,14 +426,15 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit baseline deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -427,7 +444,8 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
 
     let baseline_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read baseline spec")
@@ -440,14 +458,15 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
     failing_tasks[0].execution.memory_bytes = 8 * 1024 * 1024 * 1024;
 
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, failing_tasks)
         .await
         .expect("submit failing redeployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -457,7 +476,8 @@ local_test!(services_redeploy_rolls_back_on_failed_replacement, {
 
     let rolled_back = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read rolled back spec")
@@ -504,14 +524,15 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit baseline deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -521,7 +542,8 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 
     let baseline_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read baseline spec")
@@ -544,7 +566,8 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
     };
 
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_strategy(
             Uuid::new_v4(),
             manifest_name,
@@ -557,7 +580,7 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -567,7 +590,8 @@ local_test!(services_redeploy_enforces_max_failures_budget, {
 
     let rolled_back = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read rolled back spec")
@@ -629,14 +653,15 @@ local_test!(
 
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
             .await
             .expect("submit baseline deployment");
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -646,7 +671,8 @@ local_test!(
 
         let baseline_spec = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read baseline spec")
@@ -659,7 +685,8 @@ local_test!(
         let strategy = rollout_strategy(1, ServiceRolloutOrder::StopFirst, 1, true);
 
         node.node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_strategy(
                 Uuid::new_v4(),
                 manifest_name,
@@ -675,7 +702,8 @@ local_test!(
         while Instant::now() < deadline {
             let tasks = node
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .list_workloads(&TaskStateFilter::all())
                 .await
                 .expect("list tasks during stop-first rollout");
@@ -690,7 +718,8 @@ local_test!(
             if replacement_visible {
                 let states = node
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .workload_phase_snapshot(&[old_task_id])
                     .await
                     .expect("snapshot old task state");
@@ -715,7 +744,8 @@ local_test!(
                 Duration::from_secs(30),
                 Duration::from_millis(100),
                 || async {
-                    if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id)
+                    if let Ok(Some(spec)) =
+                        node.node.controllers.services.registry().get(service_id)
                     {
                         return matches!(
                             spec.status(),
@@ -760,14 +790,15 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit baseline deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -778,7 +809,8 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
     tasks[0].execution.image = "alpine:3.19".into();
     let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, true);
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_strategy(
             Uuid::new_v4(),
             manifest_name,
@@ -795,7 +827,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
     let mut deploying_seen = false;
     let mut terminal_seen = false;
     while Instant::now() < deadline {
-        if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id) {
+        if let Ok(Some(spec)) = node.node.controllers.services.registry().get(service_id) {
             match spec.status() {
                 ServiceStatus::Deploying => deploying_seen = true,
                 ServiceStatus::Running
@@ -809,7 +841,7 @@ local_test!(services_redeploy_parallelism_two_allows_batched_surge, {
             }
         }
 
-        let count = list_active_service_tasks(&node.node.workload_manager, service_name)
+        let count = list_active_service_tasks(&node.node.controllers.workloads, service_name)
             .await
             .len();
         max_seen = max_seen.max(count);
@@ -865,14 +897,15 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit baseline deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -887,7 +920,8 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
     let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, false);
 
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_strategy(
             failing_manifest_id,
             manifest_name,
@@ -900,7 +934,7 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Failed
         )
@@ -910,7 +944,8 @@ local_test!(services_redeploy_auto_rollback_disabled_marks_failed, {
 
     let failed = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read failed spec")
@@ -958,14 +993,15 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), manifest_name, service_name, tasks.clone())
         .await
         .expect("submit baseline deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -980,7 +1016,8 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
     manager.enable_create_failures();
 
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_strategy(
             failing_manifest_id,
             manifest_name,
@@ -993,7 +1030,7 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Failed
         )
@@ -1003,7 +1040,8 @@ local_test!(services_redeploy_rollback_failure_marks_failed, {
 
     let failed = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read failed spec")

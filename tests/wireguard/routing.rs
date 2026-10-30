@@ -315,7 +315,8 @@ local_test!(
             let route_before = endpoint_route(&handle, endpoint.ip()).await;
             assert_endpoint_connects(listener).await;
 
-            node.peers
+            node.stores
+                .peers
                 .upsert(
                     &UuidKey::from(remote_peer_id),
                     test_peer_value(
@@ -329,10 +330,14 @@ local_test!(
                 )
                 .await
                 .expect("publish peer's physical endpoint");
-            let state =
-                ensure_wireguard_underlay(&node.registry, node.id, &desired_peers, previous)
-                    .await
-                    .expect("configure WireGuard with existing endpoint routing");
+            let state = ensure_wireguard_underlay(
+                &node.registries.peers,
+                node.id,
+                &desired_peers,
+                previous,
+            )
+            .await
+            .expect("configure WireGuard with existing endpoint routing");
             assert_endpoint_connects(listener).await;
             assert_eq!(endpoint_route(&handle, endpoint.ip()).await, route_before);
             let index = link_index(&handle, MANTISSA_WIREGUARD_IFNAME)
@@ -385,9 +390,10 @@ local_test!(
                 .await
                 .expect("seed stale and unrelated interface routes");
         }
-        let state = ensure_wireguard_underlay(&node.registry, node.id, &desired_peers, previous)
-            .await
-            .expect("repair and prune only Mantissa tunnel routes");
+        let state =
+            ensure_wireguard_underlay(&node.registries.peers, node.id, &desired_peers, previous)
+                .await
+                .expect("repair and prune only Mantissa tunnel routes");
         assert!(has_interface_route(&handle, remote_tunnel, index).await);
         assert!(
             host_routes(&handle, stale_tunnel.into())
@@ -397,9 +403,14 @@ local_test!(
         );
         assert!(has_interface_route(&handle, foreign_route, index).await);
 
-        ensure_wireguard_underlay(&node.registry, node.id, &HashSet::new(), Some(state))
-            .await
-            .expect("remove routes for peers outside the desired scope");
+        ensure_wireguard_underlay(
+            &node.registries.peers,
+            node.id,
+            &HashSet::new(),
+            Some(state),
+        )
+        .await
+        .expect("remove routes for peers outside the desired scope");
         assert!(
             host_routes(&handle, remote_tunnel.into())
                 .await

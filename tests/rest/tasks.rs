@@ -311,6 +311,7 @@ async fn seed_stream_task(
     harness
         .node()
         .node
+        .stores
         .workloads
         .upsert(&UuidKey::from(task_id), value.into())
         .await
@@ -423,6 +424,7 @@ local_test!(rest_tasks_inspect_retained_task_by_id_name_and_prefix, {
     harness
         .node()
         .node
+        .stores
         .workloads
         .upsert(&UuidKey::from(task_id), task.into())
         .await
@@ -615,6 +617,7 @@ local_test!(rest_tasks_inspect_preserves_runtime_configuration, {
     harness
         .node()
         .node
+        .stores
         .workloads
         .upsert(&UuidKey::from(task_id), task.into())
         .await

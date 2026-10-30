@@ -18,7 +18,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
     let service_name = "drain-singleton";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -30,7 +31,7 @@ local_test!(services_node_drain_migrates_singleton_service, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -40,7 +41,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
 
     let service = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load singleton service")
@@ -50,7 +52,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(task_id)
         .await
         .expect("inspect singleton task");
@@ -75,7 +78,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
         || async {
             let Some(service) = cluster[0]
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("load singleton service during drain")
@@ -90,12 +94,13 @@ local_test!(services_node_drain_migrates_singleton_service, {
             }
             let task = cluster[0]
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .inspect_workload(replacement_task_id)
                 .await
                 .ok();
             let local_drained = list_local_active_service_tasks(
-                &drained_node.node.workload_manager,
+                &drained_node.node.controllers.workloads,
                 service_name,
                 drained_node_id,
             )
@@ -113,7 +118,7 @@ local_test!(services_node_drain_migrates_singleton_service, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -123,7 +128,8 @@ local_test!(services_node_drain_migrates_singleton_service, {
 
     let migrated_service = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load migrated singleton service")
@@ -154,7 +160,8 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
     let service_name = "drain-multi";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -166,7 +173,7 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -176,7 +183,7 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
     for node in &cluster {
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -205,7 +212,7 @@ local_test!(services_node_drain_migrates_multi_replica_service, {
         Duration::from_millis(100),
         || async {
             let local_empty = list_local_active_service_tasks(
-                &drained_node.node.workload_manager,
+                &drained_node.node.controllers.workloads,
                 service_name,
                 drained_node.id(),
             )
@@ -240,7 +247,8 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
     let service_name = "node-down-reschedule";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -252,7 +260,7 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -268,7 +276,8 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
     let down_node_id = cluster[2].id();
     let baseline_spec = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load service before node failure")
@@ -297,7 +306,8 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
         || async {
             let Some(current) = cluster[0]
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("load rescheduled service")
@@ -312,7 +322,8 @@ local_test!(services_node_down_reschedules_multi_replica_service, {
             for task_id in current.assigned_replica_ids() {
                 let Ok(task) = cluster[0]
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .inspect_workload(task_id)
                     .await
                 else {
@@ -363,7 +374,8 @@ local_test!(services_node_leave_reschedules_singleton_service, {
     let service_name = "leave-singleton";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -375,7 +387,7 @@ local_test!(services_node_leave_reschedules_singleton_service, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -385,7 +397,8 @@ local_test!(services_node_leave_reschedules_singleton_service, {
 
     let service = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load singleton service")
@@ -395,7 +408,8 @@ local_test!(services_node_leave_reschedules_singleton_service, {
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(initial_task_id)
         .await
         .expect("inspect singleton task before leave");
@@ -426,7 +440,8 @@ local_test!(services_node_leave_reschedules_singleton_service, {
         || async {
             let Some(current) = survivor
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("load singleton service after leave")
@@ -445,7 +460,8 @@ local_test!(services_node_leave_reschedules_singleton_service, {
             }
             let Ok(replacement) = survivor
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .inspect_workload(replacement_task_id)
                 .await
             else {
@@ -490,7 +506,8 @@ local_test!(services_node_leave_reschedules_multi_template_service, {
     let service_name = "leave-multi-template";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -506,7 +523,7 @@ local_test!(services_node_leave_reschedules_multi_template_service, {
     for node in &cluster {
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -524,7 +541,7 @@ local_test!(services_node_leave_reschedules_multi_template_service, {
     let leaving_node = &cluster[2];
     let leaving_node_id = leaving_node.id();
     let leaving_task_ids: BTreeSet<Uuid> = list_local_active_service_tasks(
-        &leaving_node.node.workload_manager,
+        &leaving_node.node.controllers.workloads,
         service_name,
         leaving_node_id,
     )
@@ -539,7 +556,8 @@ local_test!(services_node_leave_reschedules_multi_template_service, {
 
     let baseline_spec = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load multi-template service before leave")
@@ -568,7 +586,8 @@ local_test!(services_node_leave_reschedules_multi_template_service, {
         || async {
             let Some(current) = survivor
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("load multi-template service after leave")
@@ -592,7 +611,8 @@ local_test!(services_node_leave_reschedules_multi_template_service, {
             for task_id in current_ids {
                 let Ok(task) = survivor
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .inspect_workload(task_id)
                     .await
                 else {
@@ -629,7 +649,8 @@ local_test!(services_node_drain_blocks_on_standalone_task, {
     let node = TestNode::new().await;
 
     node.node
-        .workload_manager
+        .controllers
+        .workloads
         .start_workload(
             "standalone",
             "ghcr.io/mantissa/demo:web",
@@ -676,7 +697,8 @@ local_test!(
         let service_name = "drain-deploying";
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 service_name,
@@ -691,7 +713,8 @@ local_test!(
         while Instant::now() < deploying_deadline {
             if let Some(spec) = cluster[0]
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("load slow service")
@@ -699,7 +722,8 @@ local_test!(
                 && let Some(task_id) = spec.assigned_replica_id(0)
                 && let Ok(task) = cluster[0]
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .inspect_workload(task_id)
                     .await
             {
@@ -751,7 +775,8 @@ local_test!(
             || async {
                 let Some(service) = cluster[0]
                     .node
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .expect("load deploying service during drain")
@@ -766,12 +791,13 @@ local_test!(
                 }
                 let task = cluster[0]
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .inspect_workload(replacement_task_id)
                     .await
                     .ok();
                 let local_drained = list_local_active_service_tasks(
-                    &drained_node.node.workload_manager,
+                    &drained_node.node.controllers.workloads,
                     service_name,
                     drained_node_id,
                 )
@@ -789,7 +815,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -818,7 +844,8 @@ local_test!(services_node_drain_reports_capacity_blocker, {
     let service_name = "drain-capacity";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -830,7 +857,7 @@ local_test!(services_node_drain_reports_capacity_blocker, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -840,7 +867,8 @@ local_test!(services_node_drain_reports_capacity_blocker, {
 
     let service = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load capacity-blocked service")
@@ -850,7 +878,8 @@ local_test!(services_node_drain_reports_capacity_blocker, {
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(task_id)
         .await
         .expect("inspect singleton task");
@@ -920,7 +949,8 @@ local_test!(services_node_drain_timeout_keeps_node_unschedulable, {
     let service_name = "drain-timeout";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -932,7 +962,7 @@ local_test!(services_node_drain_timeout_keeps_node_unschedulable, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -1024,7 +1054,8 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
     let service_name = "drain-list-state";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -1036,7 +1067,7 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -1046,7 +1077,8 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
 
     let service = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load singleton service")
@@ -1056,7 +1088,8 @@ local_test!(services_node_list_reports_drained_node_after_evacuation, {
         .expect("singleton service should have one task id");
     let initial_task = cluster[0]
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(task_id)
         .await
         .expect("inspect singleton task");

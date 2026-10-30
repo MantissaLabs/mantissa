@@ -18,9 +18,10 @@ local_test!(volumes_create_persists_across_restart, {
     .await
     .expect("start node");
 
-    let volume_id = create_managed_volume(&node.volumes_client, "pgdata").await;
+    let volume_id = create_managed_volume(&node.clients.cluster.volumes, "pgdata").await;
     let before_restart = node
-        .volume_registry
+        .registries
+        .volumes
         .get_spec_by_name("pgdata")
         .expect("volume lookup before restart")
         .expect("persisted volume before restart");
@@ -51,7 +52,8 @@ local_test!(volumes_create_persists_across_restart, {
             Duration::from_millis(25),
             || async {
                 restarted
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_spec_by_name("pgdata")
                     .expect("volume lookup after restart")
                     .is_some()
@@ -62,7 +64,8 @@ local_test!(volumes_create_persists_across_restart, {
     );
 
     let after_restart = restarted
-        .volume_registry
+        .registries
+        .volumes
         .get_spec_by_name("pgdata")
         .expect("volume lookup after restart")
         .expect("persisted volume after restart");
@@ -75,11 +78,12 @@ local_test!(
     {
         let node = TestNode::new().await;
         let volume_id =
-            create_replicated_volume(&node.node.volumes_client, "replicated-public").await;
+            create_replicated_volume(&node.node.clients.cluster.volumes, "replicated-public").await;
 
         let saved = node
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec(volume_id)
             .expect("read replicated volume")
             .expect("saved replicated volume");
@@ -92,27 +96,30 @@ local_test!(
         assert_eq!(saved.plan_coordinator_node_id, Some(node.id()));
         assert_eq!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_plan(volume_id)
                 .expect("read plan"),
             None
         );
         assert_eq!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .expect("read group status"),
             None
         );
         assert!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .list_node_states_for_volume(volume_id)
                 .expect("read node status")
                 .is_empty()
         );
 
-        let mut request = node.node.volumes_client.get_request();
+        let mut request = node.node.clients.cluster.volumes.get_request();
         request.get().set_selector("replicated-public");
         let response = request
             .send()
@@ -133,25 +140,26 @@ local_test!(
                 .is_empty()
         );
 
-        let deleted = delete_volume(&node.node.volumes_client, "replicated-public").await;
+        let deleted = delete_volume(&node.node.clients.cluster.volumes, "replicated-public").await;
         assert_eq!(
             deleted.disposition,
             mantissa_protocol::volumes::VolumeDeleteDisposition::Deleted
         );
         assert!(
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_spec_including_deleting(volume_id)
                 .expect("read unbound deletion marker")
                 .is_some_and(|spec| spec.is_deleted())
         );
-        let repeated = delete_volume(&node.node.volumes_client, "replicated-public").await;
+        let repeated = delete_volume(&node.node.clients.cluster.volumes, "replicated-public").await;
         assert_eq!(
             repeated.disposition,
             mantissa_protocol::volumes::VolumeDeleteDisposition::Deleted
         );
         assert!(repeated.preserved_path.is_none());
-        let mut deleted_status_request = node.node.volumes_client.get_status_request();
+        let mut deleted_status_request = node.node.clients.cluster.volumes.get_status_request();
         deleted_status_request
             .get()
             .set_selector("replicated-public");
@@ -173,11 +181,12 @@ local_test!(
         );
 
         let recreated =
-            create_replicated_volume(&node.node.volumes_client, "replicated-public").await;
+            create_replicated_volume(&node.node.clients.cluster.volumes, "replicated-public").await;
         assert_eq!(recreated, volume_id, "volume names retain their stable ID");
         let recreated_spec = node
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec(recreated)
             .expect("read recreated replicated volume")
             .expect("recreated replicated volume exists");

@@ -36,7 +36,7 @@ local_test!(
         let node = TestNode::new().await;
 
         let session_id = submit_agent_session(
-            &node.node.agents_client,
+            &node.node.clients.cluster.agents,
             "demo-agent",
             Some("solve the task"),
             Some("oci-default"),
@@ -44,11 +44,13 @@ local_test!(
         .await
         .expect("submit agent session");
 
-        let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+        let (run_id, workload_id) =
+            wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
 
         let task = node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .inspect_workload(workload_id)
             .await
             .expect("inspect agent workload");
@@ -60,6 +62,7 @@ local_test!(
         exited_task.state = WorkloadPhase::Exited(0);
         exited_task.updated_at = Utc::now().to_rfc3339();
         node.node
+            .stores
             .workloads
             .upsert(
                 &UuidKey::from(workload_id),
@@ -70,7 +73,7 @@ local_test!(
 
         assert!(
             wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-                let client = node.node.agents_client.clone();
+                let client = node.node.clients.cluster.agents.clone();
                 async move {
                     let sessions = list_sessions(&client).await.expect("list agent sessions");
                     let runs = list_runs(&client, Some(session_id))
@@ -100,7 +103,7 @@ local_test!(agents_gang_admission_records_grouped_run_workload, {
     let node = TestNode::new().await;
 
     let session_id = submit_agent_session_with_options(
-        &node.node.agents_client,
+        &node.node.clients.cluster.agents,
         "gang-agent",
         AgentSessionSubmitOptions {
             initial_input: Some("solve the task"),
@@ -111,10 +114,12 @@ local_test!(agents_gang_admission_records_grouped_run_workload, {
     .await
     .expect("submit gang-admitted agent session");
 
-    let (_run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    let (_run_id, workload_id) =
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
     let workload = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(workload_id)
         .await
         .expect("inspect gang agent workload");
@@ -136,7 +141,7 @@ local_test!(
         let node = TestNode::new().await;
 
         let session_id = submit_agent_session_with_options(
-            &node.node.agents_client,
+            &node.node.clients.cluster.agents,
             "gang-agent-overcommit",
             AgentSessionSubmitOptions {
                 initial_input: Some("solve the task"),
@@ -151,7 +156,7 @@ local_test!(
 
         assert!(
             wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-                let client = node.node.agents_client.clone();
+                let client = node.node.clients.cluster.agents.clone();
                 async move {
                     let runs = list_runs(&client, Some(session_id))
                         .await
@@ -172,7 +177,8 @@ local_test!(
 
         let workloads = node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .list_workloads(&TaskStateFilter::all())
             .await
             .expect("list workloads after failed gang agent admission");
@@ -191,7 +197,7 @@ local_test!(agents_inspect_returns_session_and_run_history, {
     let node = TestNode::new().await;
 
     let session_id = submit_agent_session(
-        &node.node.agents_client,
+        &node.node.clients.cluster.agents,
         "inspect-agent",
         Some("summarize the repo"),
         Some("oci-default"),
@@ -199,9 +205,10 @@ local_test!(agents_inspect_returns_session_and_run_history, {
     .await
     .expect("submit agent session");
 
-    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    let (run_id, workload_id) =
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
 
-    let mut request = node.node.agents_client.inspect_request();
+    let mut request = node.node.clients.cluster.agents.inspect_request();
     request.get().set_session_id(session_id.as_bytes());
     let response = request.send().promise.await.expect("inspect agent session");
     let reader = response.get().expect("inspect agent response");
@@ -234,13 +241,14 @@ local_test!(agents_submit_input_reuses_session_and_starts_new_run, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
-    let session_id = submit_agent_session(&node.node.agents_client, "idle-agent", None, None)
-        .await
-        .expect("submit idle agent session");
+    let session_id =
+        submit_agent_session(&node.node.clients.cluster.agents, "idle-agent", None, None)
+            .await
+            .expect("submit idle agent session");
 
     assert!(
         wait_until(Duration::from_secs(5), Duration::from_millis(100), || {
-            let client = node.node.agents_client.clone();
+            let client = node.node.clients.cluster.agents.clone();
             async move {
                 list_sessions(&client)
                     .await
@@ -257,17 +265,17 @@ local_test!(agents_submit_input_reuses_session_and_starts_new_run, {
         "new agent session without input should remain idle"
     );
 
-    submit_agent_input(&node.node.agents_client, session_id, "first turn")
+    submit_agent_input(&node.node.clients.cluster.agents, session_id, "first turn")
         .await
         .expect("submit first input");
 
     let (first_run_id, first_workload_id) =
-        wait_for_active_run(&node.node.agents_client, session_id).await;
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
     mark_workload_exited(&node, first_workload_id, 0).await;
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.agents_client.clone();
+            let client = node.node.clients.cluster.agents.clone();
             async move {
                 list_sessions(&client)
                     .await
@@ -285,12 +293,12 @@ local_test!(agents_submit_input_reuses_session_and_starts_new_run, {
         "agent session should become idle again after the first run succeeds"
     );
 
-    submit_agent_input(&node.node.agents_client, session_id, "second turn")
+    submit_agent_input(&node.node.clients.cluster.agents, session_id, "second turn")
         .await
         .expect("submit second input");
 
     let (second_run_id, second_workload_id) =
-        wait_for_active_run(&node.node.agents_client, session_id).await;
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
     assert_ne!(second_run_id, first_run_id);
     assert_ne!(second_workload_id, first_workload_id);
 });
@@ -301,7 +309,7 @@ local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
     let node = TestNode::new().await;
 
     let session_id = submit_agent_session_with_options(
-        &node.node.agents_client,
+        &node.node.clients.cluster.agents,
         "nono-agent",
         AgentSessionSubmitOptions {
             initial_input: Some("inspect the workspace"),
@@ -318,7 +326,8 @@ local_test!(agents_submit_nono_run_projects_runtime_sandbox_policy, {
     .await
     .expect("submit nono agent session");
 
-    let (_run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    let (_run_id, workload_id) =
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
     let create_request = wait_for_runtime_create_request(runtime_backend.as_ref()).await;
 
     assert_eq!(create_request.execution_platform, ExecutionPlatform::Oci);
@@ -362,7 +371,7 @@ local_test!(
         let node = TestNode::new().await;
 
         let session_id = submit_agent_session_with_options(
-            &node.node.agents_client,
+            &node.node.clients.cluster.agents,
             "agent-progress-deadline",
             AgentSessionSubmitOptions {
                 initial_input: Some("start"),
@@ -381,7 +390,7 @@ local_test!(
 
         assert!(
             wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-                let client = node.node.agents_client.clone();
+                let client = node.node.clients.cluster.agents.clone();
                 async move {
                     let sessions = list_sessions(&client).await.expect("list agent sessions");
                     let runs = list_runs(&client, Some(session_id))
@@ -412,7 +421,7 @@ local_test!(agents_healthy_deadline_fails_bootstrapping_workload, {
     let node = TestNode::new().await;
 
     let session_id = submit_agent_session_with_options(
-        &node.node.agents_client,
+        &node.node.clients.cluster.agents,
         "agent-healthy-deadline",
         AgentSessionSubmitOptions {
             initial_input: Some("start"),
@@ -426,7 +435,8 @@ local_test!(agents_healthy_deadline_fails_bootstrapping_workload, {
     )
     .await
     .expect("submit agent session with short healthy deadline");
-    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
+    let (run_id, workload_id) =
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
 
     mark_workload_phase_with_created_at(
         &node,
@@ -438,7 +448,7 @@ local_test!(agents_healthy_deadline_fails_bootstrapping_workload, {
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.agents_client.clone();
+            let client = node.node.clients.cluster.agents.clone();
             async move {
                 let sessions = list_sessions(&client).await.expect("list agent sessions");
                 let runs = list_runs(&client, Some(session_id))
@@ -471,7 +481,7 @@ local_test!(agents_cancel_active_run_returns_session_to_waiting_input, {
     let node = TestNode::new().await;
 
     let session_id = submit_agent_session(
-        &node.node.agents_client,
+        &node.node.clients.cluster.agents,
         "cancel-agent",
         Some("cancel this run"),
         None,
@@ -479,15 +489,16 @@ local_test!(agents_cancel_active_run_returns_session_to_waiting_input, {
     .await
     .expect("submit cancellable agent session");
 
-    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
-    cancel_agent_session(&node.node.agents_client, session_id)
+    let (run_id, workload_id) =
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
+    cancel_agent_session(&node.node.clients.cluster.agents, session_id)
         .await
         .expect("cancel active agent session");
     mark_workload_phase(&node, workload_id, WorkloadPhase::Stopped).await;
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.agents_client.clone();
+            let client = node.node.clients.cluster.agents.clone();
             async move {
                 let sessions = list_sessions(&client).await.expect("list agent sessions");
                 let runs = list_runs(&client, Some(session_id))
@@ -515,7 +526,7 @@ local_test!(agents_close_active_run_transitions_to_closed, {
     let node = TestNode::new().await;
 
     let session_id = submit_agent_session(
-        &node.node.agents_client,
+        &node.node.clients.cluster.agents,
         "close-agent",
         Some("close this session"),
         None,
@@ -523,14 +534,15 @@ local_test!(agents_close_active_run_transitions_to_closed, {
     .await
     .expect("submit closable agent session");
 
-    let (run_id, workload_id) = wait_for_active_run(&node.node.agents_client, session_id).await;
-    close_agent_session(&node.node.agents_client, session_id)
+    let (run_id, workload_id) =
+        wait_for_active_run(&node.node.clients.cluster.agents, session_id).await;
+    close_agent_session(&node.node.clients.cluster.agents, session_id)
         .await
         .expect("close active agent session");
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.agents_client.clone();
+            let client = node.node.clients.cluster.agents.clone();
             async move {
                 list_sessions(&client)
                     .await
@@ -551,7 +563,7 @@ local_test!(agents_close_active_run_transitions_to_closed, {
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.agents_client.clone();
+            let client = node.node.clients.cluster.agents.clone();
             async move {
                 let sessions = list_sessions(&client).await.expect("list agent sessions");
                 let runs = list_runs(&client, Some(session_id))
@@ -578,20 +590,25 @@ local_test!(agents_delete_closed_session_removes_session_and_runs, {
     let _guard = RuntimeBackendOverrideGuard::install_default();
     let node = TestNode::new().await;
 
-    let session_id = submit_agent_session(&node.node.agents_client, "delete-agent", None, None)
-        .await
-        .expect("submit deletable agent session");
+    let session_id = submit_agent_session(
+        &node.node.clients.cluster.agents,
+        "delete-agent",
+        None,
+        None,
+    )
+    .await
+    .expect("submit deletable agent session");
 
-    close_agent_session(&node.node.agents_client, session_id)
+    close_agent_session(&node.node.clients.cluster.agents, session_id)
         .await
         .expect("close idle agent session");
-    delete_agent_session(&node.node.agents_client, session_id)
+    delete_agent_session(&node.node.clients.cluster.agents, session_id)
         .await
         .expect("delete closed agent session");
 
     assert!(
         wait_until(Duration::from_secs(10), Duration::from_millis(100), || {
-            let client = node.node.agents_client.clone();
+            let client = node.node.clients.cluster.agents.clone();
             async move {
                 let sessions = list_sessions(&client).await.expect("list agent sessions");
                 let runs = list_runs(&client, Some(session_id))
@@ -1065,7 +1082,8 @@ async fn mark_workload_phase_with_created_at(
 ) {
     let mut task = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(workload_id)
         .await
         .expect("inspect agent workload");
@@ -1073,6 +1091,7 @@ async fn mark_workload_phase_with_created_at(
     task.created_at = created_at.to_rfc3339();
     task.updated_at = Utc::now().to_rfc3339();
     node.node
+        .stores
         .workloads
         .upsert(
             &UuidKey::from(workload_id),

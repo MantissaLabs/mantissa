@@ -20,7 +20,8 @@ local_test!(services_placement_startup_avoids_over_replication, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit deployment");
@@ -33,7 +34,7 @@ local_test!(services_placement_startup_avoids_over_replication, {
 
     while Instant::now() < deadline {
         for node in &cluster {
-            let count = list_active_service_tasks(&node.node.workload_manager, service_name)
+            let count = list_active_service_tasks(&node.node.controllers.workloads, service_name)
                 .await
                 .len();
             max_seen = max_seen.max(count);
@@ -41,7 +42,8 @@ local_test!(services_placement_startup_avoids_over_replication, {
 
         if let Ok(Some(spec)) = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             && spec.status() == ServiceStatus::Running
@@ -98,14 +100,15 @@ local_test!(
         let task_templates = vec![demo_backend_task_template("backend", 3)];
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
             .await
             .expect("submit deployment");
 
         assert!(
             wait_for_service_status(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -120,7 +123,8 @@ local_test!(
 
         let service_spec = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load service spec")
@@ -137,7 +141,8 @@ local_test!(
         for task_id in service_spec.assigned_replica_ids() {
             let task = cluster[0]
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .inspect_workload(task_id)
                 .await
                 .expect("inspect service task");
@@ -174,6 +179,7 @@ local_test!(
             for node in &cluster {
                 let snapshot = node
                     .node
+                    .controllers
                     .scheduler
                     .snapshot()
                     .await
@@ -240,14 +246,15 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, tasks.clone())
         .await
         .expect("submit initial deployment");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -262,7 +269,8 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
     tasks[0].replicas = 6;
     let redeploy_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, tasks)
         .await
         .expect("submit scale-out redeployment");
@@ -276,7 +284,7 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 
     while Instant::now() < deadline {
         for node in &cluster {
-            let count = list_active_service_tasks(&node.node.workload_manager, service_name)
+            let count = list_active_service_tasks(&node.node.controllers.workloads, service_name)
                 .await
                 .len();
             max_seen = max_seen.max(count);
@@ -284,7 +292,8 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 
         if let Ok(Some(spec)) = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             && spec.status() == ServiceStatus::Running
@@ -321,7 +330,8 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
 
     let final_spec = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load final service spec")
@@ -336,7 +346,8 @@ local_test!(services_scale_out_balances_without_excess_replicas, {
     for task_id in final_spec.assigned_replica_ids() {
         let task = cluster[0]
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .inspect_workload(task_id)
             .await
             .expect("inspect scaled task");
@@ -379,7 +390,8 @@ local_test!(services_large_deployment_converges_within_bound, {
 
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit large deployment");
@@ -390,7 +402,8 @@ local_test!(services_large_deployment_converges_within_bound, {
     while Instant::now() < deadline {
         if let Ok(Some(spec)) = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             && spec.status() == ServiceStatus::Running
@@ -422,7 +435,7 @@ local_test!(services_large_deployment_converges_within_bound, {
     );
 
     for node in &cluster {
-        let tasks = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+        let tasks = list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
         assert_eq!(
             tasks.len(),
             expected_replicas,

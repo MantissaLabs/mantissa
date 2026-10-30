@@ -130,6 +130,7 @@ async fn seed_bootstrap_workloads(anchor: &TestNode, count: u64) {
         .collect::<Vec<_>>();
     anchor
         .node
+        .stores
         .workloads
         .upsert_many(rows)
         .await
@@ -140,7 +141,8 @@ async fn seed_bootstrap_workloads(anchor: &TestNode, count: u64) {
 async fn force_peer_readiness(observer: &TestNode, target: Uuid, readiness: NodeReadiness) {
     let mut value = observer
         .node
-        .registry
+        .registries
+        .peers
         .peer_value_unscoped(target)
         .expect("peer value exists before forcing readiness");
     value.readiness = readiness;
@@ -148,12 +150,14 @@ async fn force_peer_readiness(observer: &TestNode, target: Uuid, readiness: Node
     let key = UuidKey::from(target);
     observer
         .node
+        .stores
         .peers
         .purge_local(&key)
         .await
         .expect("purge peer row before forcing readiness");
     observer
         .node
+        .stores
         .peers
         .upsert(&key, value)
         .await
@@ -248,7 +252,7 @@ local_test!(register_node_reports_syncing_during_bootstrap, {
         "anchor should report the newly joined peer as syncing before bootstrap catch-up completes"
     );
     assert!(
-        !anchor.node.registry.peer_schedulable(joiner.id()),
+        !anchor.node.registries.peers.peer_schedulable(joiner.id()),
         "syncing peers must be fenced from new placements"
     );
 
@@ -263,7 +267,7 @@ local_test!(register_node_reports_syncing_during_bootstrap, {
         "anchor should observe the joiner becoming ready after bootstrap sync"
     );
     assert!(
-        anchor.node.registry.peer_schedulable(joiner.id()),
+        anchor.node.registries.peers.peer_schedulable(joiner.id()),
         "ready peers should become placement eligible again"
     );
 
@@ -552,7 +556,8 @@ local_test!(node_leave_quiesces_cached_peer_contact_paths_inproc, {
     assert!(
         survivor_a
             .node
-            .registry
+            .registries
+            .peers
             .fetch_sync_capability_unscoped(leaving_id)
             .await
             .expect("survivor prewarms sync capability to leaving peer")
@@ -562,7 +567,8 @@ local_test!(node_leave_quiesces_cached_peer_contact_paths_inproc, {
     assert!(
         leaving
             .node
-            .registry
+            .registries
+            .peers
             .fetch_sync_capability_unscoped(survivor_a.id())
             .await
             .expect("leaving node prewarms sync capability to survivor")
@@ -584,7 +590,8 @@ local_test!(node_leave_quiesces_cached_peer_contact_paths_inproc, {
     assert!(
         survivor_a
             .node
-            .registry
+            .registries
+            .peers
             .fetch_sync_capability_unscoped(leaving_id)
             .await
             .expect("survivor should refuse cached sync capability to left peer")
@@ -594,7 +601,8 @@ local_test!(node_leave_quiesces_cached_peer_contact_paths_inproc, {
     assert!(
         leaving
             .node
-            .registry
+            .registries
+            .peers
             .fetch_sync_capability_unscoped(survivor_a.id())
             .await
             .expect("left node should refuse cached sync capability to survivor")
@@ -603,14 +611,16 @@ local_test!(node_leave_quiesces_cached_peer_contact_paths_inproc, {
     );
     leaving
         .node
-        .registry
+        .registries
+        .peers
         .connect_known_peers(true)
         .await
         .expect("left-node reconnect path should quietly no-op");
     assert!(
         leaving
             .node
-            .registry
+            .registries
+            .peers
             .cached_session_for(survivor_a.id())
             .await
             .is_none(),
@@ -689,7 +699,8 @@ local_test!(node_evict_revokes_existing_peer_session_inproc, {
 
     let stale_session_to_anchor = stale
         .node
-        .registry
+        .registries
+        .peers
         .session_for_peer(anchor.id())
         .await
         .expect("stale should have a session to anchor");
@@ -728,7 +739,8 @@ local_test!(peer_session_cannot_access_rest_admin_inproc, {
 
     let peer_session_to_anchor = peer
         .node
-        .registry
+        .registries
+        .peers
         .session_for_peer(anchor.id())
         .await
         .expect("peer should have a session to anchor");
@@ -799,6 +811,7 @@ local_test!(node_leave_clears_local_peer_auth_tcp, {
     assert!(
         !joiner
             .node
+            .stores
             .local_sessions
             .list_records()
             .expect("list local sessions before leave")
@@ -808,6 +821,7 @@ local_test!(node_leave_clears_local_peer_auth_tcp, {
     assert!(
         joiner
             .node
+            .stores
             .local_creds
             .get(anchor.id())
             .expect("load local credential before leave")
@@ -820,6 +834,7 @@ local_test!(node_leave_clears_local_peer_auth_tcp, {
     assert!(
         joiner
             .node
+            .stores
             .local_sessions
             .list_records()
             .expect("list local sessions after leave")
@@ -829,6 +844,7 @@ local_test!(node_leave_clears_local_peer_auth_tcp, {
     assert!(
         joiner
             .node
+            .stores
             .local_creds
             .get(anchor.id())
             .expect("load local credential after leave")

@@ -12,7 +12,8 @@ local_test!(
 
         let error = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "invalid-depends-on",
@@ -47,7 +48,8 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "depends-on-publication",
@@ -59,7 +61,7 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
 
     assert!(
         wait_for_service_status_detail_any(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             &[
                 "waiting for dependency template 'backend'",
@@ -94,7 +96,7 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -103,7 +105,7 @@ local_test!(services_depends_on_waits_for_dependency_publication, {
     );
 
     let frontend_tasks = list_active_task_template_tasks(
-        &node.node.workload_manager,
+        &node.node.controllers.workloads,
         "depends-on-publication",
         "frontend",
     )
@@ -206,7 +208,8 @@ local_test!(
 
         let service_id = backend_node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 &service_name,
@@ -227,12 +230,13 @@ local_test!(
             async move {
                 let dependency_ready = frontend_node
                     .node
-                    .network_controller
+                    .controllers
+                    .networks
                     .service_dependencies_ready(std::slice::from_ref(&dependency_requirement))
                     .await
                     .unwrap_or(false);
                 let frontend_tasks = list_active_task_template_tasks(
-                    &frontend_node.node.workload_manager,
+                    &frontend_node.node.controllers.workloads,
                     &service_name,
                     "frontend",
                 )
@@ -301,7 +305,8 @@ local_test!(
         let service_name = "depends-on-rollout";
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 service_name,
@@ -313,7 +318,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -321,18 +326,24 @@ local_test!(
             "baseline dependency deployment should reach running"
         );
 
-        let old_backend_task_ids: HashSet<Uuid> =
-            list_active_task_template_tasks(&node.node.workload_manager, service_name, "backend")
-                .await
-                .into_iter()
-                .map(|task| task.id)
-                .collect();
-        let old_frontend_task_ids: HashSet<Uuid> =
-            list_active_task_template_tasks(&node.node.workload_manager, service_name, "frontend")
-                .await
-                .into_iter()
-                .map(|task| task.id)
-                .collect();
+        let old_backend_task_ids: HashSet<Uuid> = list_active_task_template_tasks(
+            &node.node.controllers.workloads,
+            service_name,
+            "backend",
+        )
+        .await
+        .into_iter()
+        .map(|task| task.id)
+        .collect();
+        let old_frontend_task_ids: HashSet<Uuid> = list_active_task_template_tasks(
+            &node.node.controllers.workloads,
+            service_name,
+            "frontend",
+        )
+        .await
+        .into_iter()
+        .map(|task| task.id)
+        .collect();
 
         let mut redeploy_backend = backend;
         redeploy_backend.execution.command = vec![
@@ -350,7 +361,8 @@ local_test!(
         ];
 
         node.node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_strategy(
                 Uuid::new_v4(),
                 service_name,
@@ -386,7 +398,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )

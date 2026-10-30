@@ -356,11 +356,12 @@ async fn stale_network_normalization_preserves_concurrent_changes() {
                 let name = if deleted { "deleted" } else { "updated" };
                 let mut spec = test_network_spec(name, NetworkRealizationPolicy::AllNodes);
                 spec.set_status(NetworkStatus::Ready);
-                node.network_registry
+                node.registries
+                    .networks
                     .upsert_spec(spec.clone())
                     .await
                     .unwrap();
-                let observed = node.network_registry.get_spec(spec.id).unwrap().unwrap();
+                let observed = node.registries.networks.get_spec(spec.id).unwrap().unwrap();
 
                 let mut current = observed.clone();
                 if deleted {
@@ -371,15 +372,19 @@ async fn stale_network_normalization_preserves_concurrent_changes() {
                     current.description = "newer user settings".to_string();
                     current.sealed = true;
                 }
-                node.network_registry.upsert_spec(current).await.unwrap();
-                let expected = node.network_registry.get_spec(spec.id).unwrap();
+                node.registries.networks.upsert_spec(current).await.unwrap();
+                let expected = node.registries.networks.get_spec(spec.id).unwrap();
 
-                let result = node.network_controller.reconcile_network(observed).await;
+                let result = node.controllers.networks.reconcile_network(observed).await;
 
-                assert_eq!(node.network_registry.get_spec(spec.id).unwrap(), expected);
+                assert_eq!(
+                    node.registries.networks.get_spec(spec.id).unwrap(),
+                    expected
+                );
                 assert!(result.is_ok(), "outdated reconciliation should be skipped");
                 assert_eq!(
-                    node.network_registry
+                    node.registries
+                        .networks
                         .list_specs()
                         .unwrap()
                         .into_iter()
@@ -388,14 +393,16 @@ async fn stale_network_normalization_preserves_concurrent_changes() {
                 );
 
                 assert!(
-                    node.network_registry
+                    node.registries
+                        .networks
                         .list_peer_states(Some(spec.id))
                         .unwrap()
                         .is_empty()
                 );
                 assert!(
                     !node
-                        .network_controller
+                        .controllers
+                        .networks
                         .inner
                         .active_networks
                         .lock()
@@ -403,7 +410,8 @@ async fn stale_network_normalization_preserves_concurrent_changes() {
                         .contains(&spec.id)
                 );
                 assert!(
-                    node.network_controller
+                    node.controllers
+                        .networks
                         .inner
                         .pending_specs
                         .lock()
@@ -425,11 +433,12 @@ async fn stale_ready_promotion_preserves_concurrent_changes() {
             for deleted in [true, false] {
                 let name = if deleted { "deleted" } else { "updated" };
                 let spec = test_network_spec(name, NetworkRealizationPolicy::AllNodes);
-                node.network_registry
+                node.registries
+                    .networks
                     .upsert_spec(spec.clone())
                     .await
                     .unwrap();
-                let observed = node.network_registry.get_spec(spec.id).unwrap().unwrap();
+                let observed = node.registries.networks.get_spec(spec.id).unwrap().unwrap();
 
                 let mut current = observed.clone();
                 if deleted {
@@ -438,17 +447,22 @@ async fn stale_ready_promotion_preserves_concurrent_changes() {
                     current.mtu = 1300;
                     current.description = "newer pending user settings".to_string();
                 }
-                node.network_registry.upsert_spec(current).await.unwrap();
-                let expected = node.network_registry.get_spec(spec.id).unwrap();
+                node.registries.networks.upsert_spec(current).await.unwrap();
+                let expected = node.registries.networks.get_spec(spec.id).unwrap();
 
-                node.network_controller
+                node.controllers
+                    .networks
                     .mark_spec_ready_after_reconcile(observed)
                     .await
                     .unwrap();
 
-                assert_eq!(node.network_registry.get_spec(spec.id).unwrap(), expected);
+                assert_eq!(
+                    node.registries.networks.get_spec(spec.id).unwrap(),
+                    expected
+                );
                 assert!(
-                    node.network_controller
+                    node.controllers
+                        .networks
                         .inner
                         .pending_specs
                         .lock()

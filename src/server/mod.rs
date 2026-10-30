@@ -13,13 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::error;
 use uuid::Uuid;
 
-use mantissa_protocol::{
-    agents::AgentsClient, gossip::GossipClient, jobs::JobsClient, network::NetworksClient,
-    node::NodeClient, rest::RestAdminClient, scheduling::scheduler::Client as SchedulerClient,
-    secrets::secrets::Client as SecretsClient, services::ServicesClient, sync::SyncClient,
-    task::TaskClient, topology::TopologyClient, volumes::VolumesClient, workload::WorkloadClient,
-};
-
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
@@ -363,54 +356,5 @@ impl Server {
     pub async fn start_local_admin_socket_at(&self, path: PathBuf) -> std::io::Result<PathBuf> {
         let local_session = self.sessions.new_local_client();
         mantissa_net::unix_socket::start_unix_socket_server_at(local_session, path).await
-    }
-}
-
-/// Builds the cluster session capability bundle from bootstrap outputs.
-///
-/// Bootstrap keeps using this type name so the server constructor is explicit
-/// about the capabilities that will later be served through cluster sessions.
-#[derive(Clone)]
-pub struct ServerClients {
-    pub topology_client: TopologyClient,
-    pub gossip_client: GossipClient,
-    pub sync_client: SyncClient,
-    pub node_client: NodeClient,
-    pub task_client: TaskClient,
-    pub workload_client: WorkloadClient,
-    pub jobs_client: JobsClient,
-    pub agents_client: AgentsClient,
-    pub scheduler_client: SchedulerClient,
-    pub services_client: ServicesClient,
-    pub secrets_client: SecretsClient,
-    pub networks_client: NetworksClient,
-    pub ingress_client: mantissa_protocol::ingress::ingress::Client,
-    pub volumes_client: VolumesClient,
-    pub rest_admin_client: RestAdminClient,
-}
-
-impl From<ServerClients> for ClusterSessionServices {
-    /// Converts the bootstrap capability bundle into the shared session bundle.
-    ///
-    /// This keeps bootstrap wiring explicit while letting the server/session
-    /// layer work with one shared capability type internally.
-    fn from(clients: ServerClients) -> Self {
-        Self {
-            topology: clients.topology_client,
-            sync: clients.sync_client,
-            gossip: clients.gossip_client,
-            node: clients.node_client,
-            task: clients.task_client,
-            workload: clients.workload_client,
-            jobs: clients.jobs_client,
-            agents: clients.agents_client,
-            scheduler: clients.scheduler_client,
-            services: clients.services_client,
-            secrets: clients.secrets_client,
-            networks: clients.networks_client,
-            ingress: clients.ingress_client,
-            volumes: clients.volumes_client,
-            rest_admin: clients.rest_admin_client,
-        }
     }
 }

@@ -191,7 +191,8 @@ local_test!(health_cached_capability_respects_stop_inproc, {
     let cluster_view = current_cluster_view(&anchor.topology()).await;
     let health_cap = anchor
         .node
-        .registry
+        .registries
+        .peers
         .fetch_health_capability(joiner.id(), cluster_view)
         .await
         .expect("health capability fetch should not fail")

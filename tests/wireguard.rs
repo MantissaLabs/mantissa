@@ -75,7 +75,8 @@ async fn upsert_remote_wireguard_peer(
     peer_id: Uuid,
     enabled: bool,
 ) {
-    node.peers
+    node.stores
+        .peers
         .upsert(
             &UuidKey::from(peer_id),
             test_peer_value(
@@ -89,7 +90,8 @@ async fn upsert_remote_wireguard_peer(
         )
         .await
         .expect("upsert synthetic remote WireGuard peer");
-    node.network_controller
+    node.controllers
+        .networks
         .schedule_spec_change(network_id)
         .await;
 }
@@ -193,9 +195,9 @@ async fn wait_for_local_wireguard_publication(
 ) -> bool {
     wait_until(timeout, Duration::from_millis(100), || async {
         matches!(
-            node.network_registry.get_spec(network_id),
+            node.registries.networks.get_spec(network_id),
             Ok(Some(spec)) if spec.status == NetworkStatus::Ready
-        ) && node.registry.peer_wireguard(node.id).is_some()
+        ) && node.registries.peers.peer_wireguard(node.id).is_some()
             && link_exists(MANTISSA_WIREGUARD_IFNAME)
     })
     .await
@@ -226,7 +228,8 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
         1450,
         Vec::new(),
     );
-    node.network_registry
+    node.registries
+        .networks
         .upsert_spec(network.clone())
         .await
         .expect("upsert privileged WireGuard test network");
@@ -239,11 +242,11 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
         Duration::from_millis(100),
         || async {
             matches!(
-                node.network_registry.get_peer_state(network.id, node.id),
+                node.registries.networks.get_peer_state(network.id, node.id),
                 Ok(Some(state))
                     if state.state == NetworkPeerState::Configuring && state.error.is_none()
             ) && matches!(
-                node.network_registry.get_spec(network.id),
+                node.registries.networks.get_spec(network.id),
                 Ok(Some(spec)) if spec.status == NetworkStatus::Pending
             )
         },
@@ -251,15 +254,18 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
     .await;
     if !blocked {
         let spec = node
-            .network_registry
+            .registries
+            .networks
             .get_spec(network.id)
             .expect("load wireguard network after blocked wait");
         let peer_state = node
-            .network_registry
+            .registries
+            .networks
             .get_peer_state(network.id, node.id)
             .expect("load local peer state after blocked wait");
         let visible_peers = node
-            .registry
+            .registries
+            .peers
             .peer_values_snapshot()
             .expect("load visible peers after blocked wait");
         panic!(
@@ -268,7 +274,8 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
     }
 
     let blocked_spec = node
-        .network_registry
+        .registries
+        .networks
         .get_spec(network.id)
         .expect("load blocked network spec")
         .expect("blocked network spec should remain present");
@@ -286,10 +293,10 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
             Duration::from_millis(100),
             || async {
                 matches!(
-                    node.network_registry.get_spec(network.id),
+                    node.registries.networks.get_spec(network.id),
                     Ok(Some(spec)) if spec.status == NetworkStatus::Ready
                 ) && matches!(
-                    node.network_registry.get_peer_state(network.id, node.id),
+                    node.registries.networks.get_peer_state(network.id, node.id),
                     Ok(Some(state)) if state.state == NetworkPeerState::Ready
                 )
             }
@@ -299,7 +306,8 @@ local_test!(wireguard_scoped_peer_gate_blocks_until_peer_enabled, {
     );
 
     let local_wireguard = node
-        .registry
+        .registries
+        .peers
         .peer_wireguard(node.id)
         .expect("local peer should publish its WireGuard state");
     assert!(
@@ -398,7 +406,7 @@ local_test!(wireguard_disabled_keeps_plaintext_overlay_path, {
         "wireguard disabled should keep mnwg0 absent on the host"
     );
     assert!(
-        node.registry.peer_wireguard(node.id).is_none(),
+        node.registries.peers.peer_wireguard(node.id).is_none(),
         "wireguard disabled should not publish a local WireGuard advertisement"
     );
     assert!(
@@ -455,11 +463,13 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     .await
     .expect("start persisted WireGuard node");
 
-    node.network_registry
+    node.registries
+        .networks
         .upsert_spec(network.clone())
         .await
         .expect("upsert persisted WireGuard network");
-    node.network_controller
+    node.controllers
+        .networks
         .schedule_spec_change(network.id)
         .await;
 
@@ -467,14 +477,16 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
         wait_for_local_wireguard_publication(&node, network.id, Duration::from_secs(60)).await;
     if !published_first {
         let spec = node
-            .network_registry
+            .registries
+            .networks
             .get_spec(network.id)
             .expect("load persisted wireguard network after first publication wait");
         let peer_state = node
-            .network_registry
+            .registries
+            .networks
             .get_peer_state(network.id, node.id)
             .expect("load persisted wireguard peer state after first publication wait");
-        let published_self = node.registry.peer_wireguard(node.id);
+        let published_self = node.registries.peers.peer_wireguard(node.id);
         panic!(
             "first start should publish the local WireGuard identity and create mnwg0; spec={spec:?}; peer_state={peer_state:?}; published_self={published_self:?}; mnwg0_exists={}",
             link_exists(MANTISSA_WIREGUARD_IFNAME)
@@ -482,7 +494,8 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     }
 
     let published_before = node
-        .registry
+        .registries
+        .peers
         .peer_wireguard(node.id)
         .expect("first start should publish local WireGuard metadata");
     let key_path = mantissa_net::wireguard::resolve_wireguard_key_path()
@@ -511,14 +524,16 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
         wait_for_local_wireguard_publication(&restarted, network.id, Duration::from_secs(60)).await;
     if !published_restarted {
         let spec = restarted
-            .network_registry
+            .registries
+            .networks
             .get_spec(network.id)
             .expect("load persisted wireguard network after restart publication wait");
         let peer_state = restarted
-            .network_registry
+            .registries
+            .networks
             .get_peer_state(network.id, restarted.id)
             .expect("load persisted wireguard peer state after restart publication wait");
-        let published_self = restarted.registry.peer_wireguard(restarted.id);
+        let published_self = restarted.registries.peers.peer_wireguard(restarted.id);
         panic!(
             "restart should reuse the persisted WireGuard identity and recreate mnwg0; spec={spec:?}; peer_state={peer_state:?}; published_self={published_self:?}; mnwg0_exists={}",
             link_exists(MANTISSA_WIREGUARD_IFNAME)
@@ -526,7 +541,8 @@ local_test!(wireguard_restart_reuses_persisted_identity, {
     }
 
     let published_after = restarted
-        .registry
+        .registries
+        .peers
         .peer_wireguard(restarted.id)
         .expect("restart should republish local WireGuard metadata");
     let key_bytes_after =
@@ -602,7 +618,8 @@ local_test!(wireguard_manage_firewall_installs_vxlan_rules, {
         1450,
         Vec::new(),
     );
-    node.network_registry
+    node.registries
+        .networks
         .upsert_spec(network.clone())
         .await
         .expect("upsert privileged WireGuard firewall network");
@@ -616,9 +633,9 @@ local_test!(wireguard_manage_firewall_installs_vxlan_rules, {
             Duration::from_millis(100),
             || async {
                 matches!(
-                    node.network_registry.get_spec(network.id),
+                    node.registries.networks.get_spec(network.id),
                     Ok(Some(spec)) if spec.status == NetworkStatus::Ready
-                ) && node.registry.peer_wireguard(node.id).is_some()
+                ) && node.registries.peers.peer_wireguard(node.id).is_some()
                     && link_exists(MANTISSA_WIREGUARD_IFNAME)
                     && ip6tables_rule_exists("INPUT", &input_rule)
                     && ip6tables_rule_exists("OUTPUT", &output_rule)

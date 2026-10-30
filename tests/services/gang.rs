@@ -51,6 +51,7 @@ fn constrain_template_to_node(template: &mut TaskTemplateSpecValue, node_id: Uui
 async fn reserve_free_scheduler_slots(node: &TestNode, owner: Uuid) -> usize {
     let snapshot = node
         .node
+        .controllers
         .scheduler
         .snapshot()
         .await
@@ -69,6 +70,7 @@ async fn reserve_free_scheduler_slots(node: &TestNode, owner: Uuid) -> usize {
     let reserved = intents.len();
     if reserved > 0 {
         node.node
+            .controllers
             .scheduler
             .reserve_resources(snapshot.version, intents, Vec::new())
             .await
@@ -80,7 +82,8 @@ async fn reserve_free_scheduler_slots(node: &TestNode, owner: Uuid) -> usize {
 /// Lists every workload row owned by one service, including non-active rows.
 async fn list_service_workloads(node: &TestNode, service_name: &str) -> Vec<WorkloadSpec> {
     node.node
-        .workload_manager
+        .controllers
+        .workloads
         .list_workloads(&TaskStateFilter::all())
         .await
         .expect("list service workloads")
@@ -100,7 +103,8 @@ async fn wait_for_active_service_workloads(
 ) -> Vec<WorkloadSpec> {
     let deadline = Instant::now() + SERVICE_WORKLOAD_WAIT_TIMEOUT;
     loop {
-        let workloads = list_active_service_tasks(&node.node.workload_manager, service_name).await;
+        let workloads =
+            list_active_service_tasks(&node.node.controllers.workloads, service_name).await;
         if workloads.len() == expected_count {
             return workloads;
         }
@@ -123,7 +127,7 @@ async fn wait_for_service_manifest_status(
         Duration::from_secs(30),
         Duration::from_millis(50),
         || async {
-            match node.node.service_controller.registry().get(service_id) {
+            match node.node.controllers.services.registry().get(service_id) {
                 Ok(Some(spec)) => spec.manifest_id == manifest_id && spec.status() == expected,
                 Ok(None) | Err(_) => false,
             }
@@ -162,7 +166,8 @@ async fn wait_for_service_detail_containing(
     loop {
         let observed = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load service while waiting for detail");
@@ -192,7 +197,7 @@ async fn wait_for_service_detail_containing(
 async fn group_slot_reservations(cluster: &[TestNode]) -> Vec<(Uuid, u64, Uuid)> {
     let mut reservations = Vec::new();
     for node in cluster {
-        let Some(snapshot) = node.node.scheduler.snapshot().await else {
+        let Some(snapshot) = node.node.controllers.scheduler.snapshot().await else {
             continue;
         };
         for slot in &snapshot.slots {
@@ -236,7 +241,7 @@ async fn wait_for_gang_reservations_on_assigned_nodes(
         let mut reservations_match = true;
         let mut observed = Vec::new();
         for node in cluster {
-            let Some(snapshot) = node.node.scheduler.snapshot().await else {
+            let Some(snapshot) = node.node.controllers.scheduler.snapshot().await else {
                 reservations_match = false;
                 observed.push(format!("node {} snapshot unavailable", node.id()));
                 break;
@@ -347,6 +352,7 @@ fn observed_admission_record(
     group_id: Uuid,
 ) -> Option<WorkloadAdmissionGroupRecord> {
     node.node
+        .stores
         .workloads
         .get_snapshot(&UuidKey::from(group_id))
         .expect("load admission group snapshot")
@@ -421,6 +427,7 @@ async fn upsert_admission_record_without_gossip(
     record: WorkloadAdmissionGroupRecord,
 ) {
     node.node
+        .stores
         .workloads
         .upsert(&UuidKey::from(record.id), WorkloadStoreValue::from(record))
         .await
@@ -430,6 +437,7 @@ async fn upsert_admission_record_without_gossip(
 /// Persists a workload row directly, bypassing workload gossip.
 async fn upsert_workload_without_gossip(node: &TestNode, value: WorkloadValue) {
     node.node
+        .stores
         .workloads
         .upsert(&UuidKey::from(value.id), WorkloadStoreValue::from(value))
         .await
@@ -531,6 +539,7 @@ async fn prepare_crash_scenario_group_member(
 ) -> (Uuid, Vec<u64>) {
     let prepared = target
         .node
+        .controllers
         .scheduler
         .prepare_task_lease_group(
             coordinator_node_id,
@@ -554,6 +563,7 @@ async fn prepare_crash_scenario_group_member(
     if commit {
         target
             .node
+            .controllers
             .scheduler
             .commit_task_lease_group(group_id, coordinator_node_id, &prepared.leases)
             .await
@@ -570,7 +580,7 @@ async fn prepare_crash_scenario_group_member(
 
 /// Returns true once no scheduler slot on the node references the admission group.
 async fn scheduler_group_released(node: &TestNode, group_id: Uuid) -> bool {
-    let Some(snapshot) = node.node.scheduler.snapshot().await else {
+    let Some(snapshot) = node.node.controllers.scheduler.snapshot().await else {
         return false;
     };
 
@@ -583,7 +593,7 @@ async fn scheduler_group_released(node: &TestNode, group_id: Uuid) -> bool {
 
 /// Returns true once one scheduler slot carries the expected committed group reservation.
 async fn scheduler_group_reserved_for_task(node: &TestNode, group_id: Uuid, task_id: Uuid) -> bool {
-    let Some(snapshot) = node.node.scheduler.snapshot().await else {
+    let Some(snapshot) = node.node.controllers.scheduler.snapshot().await else {
         return false;
     };
 
@@ -681,7 +691,13 @@ local_test!(
                 DISTRIBUTED_GANG_WAIT_TIMEOUT,
                 SERVICE_WORKLOAD_POLL_INTERVAL,
                 || async {
-                    match target.node.workload_manager.inspect_workload(task_id).await {
+                    match target
+                        .node
+                        .controllers
+                        .workloads
+                        .inspect_workload(task_id)
+                        .await
+                    {
                         Ok(spec) => {
                             spec.admission_state == WorkloadAdmissionState::GroupCommitted
                                 && spec.lease_id.is_none()
@@ -783,7 +799,8 @@ local_test!(
                 || async {
                     cluster[0]
                         .node
-                        .workload_manager
+                        .controllers
+                        .workloads
                         .inspect_workload(task_id)
                         .await
                         .is_err()
@@ -812,7 +829,8 @@ local_test!(
         let service_name = "gang-empty";
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -826,7 +844,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -836,7 +854,8 @@ local_test!(
 
         let spec = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load empty gang service")
@@ -861,7 +880,8 @@ local_test!(
         let service_name = "gang-flat";
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -878,7 +898,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -900,7 +920,8 @@ local_test!(
 
         let spec = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load gang service")
@@ -920,7 +941,8 @@ local_test!(
 
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -977,7 +999,8 @@ local_test!(
         let service_name = "gang-remote-flat";
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -991,7 +1014,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &cluster[0].node.service_controller,
+                &cluster[0].node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -1073,7 +1096,8 @@ local_test!(services_gang_flat_deployment_commits_over_tcp_cluster, {
     let service_name = "gang-tcp-flat";
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -1087,7 +1111,7 @@ local_test!(services_gang_flat_deployment_commits_over_tcp_cluster, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running,
         )
@@ -1144,7 +1168,8 @@ local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
 
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -1158,7 +1183,7 @@ local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -1170,7 +1195,8 @@ local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
     let rollout_manifest_id = Uuid::new_v4();
     let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, true);
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             rollout_manifest_id,
             service_name,
@@ -1185,12 +1211,12 @@ local_test!(services_gang_rollout_commits_parallel_replacement_chunk, {
     let mut max_active = 0usize;
     let mut reached_rollout_manifest = false;
     while Instant::now() < deadline {
-        let active = list_active_service_tasks(&node.node.workload_manager, service_name)
+        let active = list_active_service_tasks(&node.node.controllers.workloads, service_name)
             .await
             .len();
         max_active = max_active.max(active);
 
-        if let Ok(Some(spec)) = node.node.service_controller.registry().get(service_id) {
+        if let Ok(Some(spec)) = node.node.controllers.services.registry().get(service_id) {
             reached_rollout_manifest |= spec.manifest_id == rollout_manifest_id;
             if spec.manifest_id == rollout_manifest_id && spec.status() == ServiceStatus::Running {
                 break;
@@ -1272,7 +1298,8 @@ local_test!(services_gang_rollout_commits_remote_replacement_groups, {
     let mut tasks = vec![demo_backend_task_template("api", 3)];
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             Uuid::new_v4(),
             service_name,
@@ -1286,7 +1313,7 @@ local_test!(services_gang_rollout_commits_remote_replacement_groups, {
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running,
         )
@@ -1304,7 +1331,8 @@ local_test!(services_gang_rollout_commits_remote_replacement_groups, {
     let strategy = rollout_strategy(2, ServiceRolloutOrder::StartFirst, 1, true);
     cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment_with_options_outcome(
             rollout_manifest_id,
             service_name,
@@ -1400,7 +1428,8 @@ local_test!(
         let baseline_manifest_id = Uuid::new_v4();
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 baseline_manifest_id,
                 service_name,
@@ -1412,7 +1441,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -1421,7 +1450,8 @@ local_test!(
         );
         let baseline_spec = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load baseline service")
@@ -1442,7 +1472,8 @@ local_test!(
         let rollout_manifest_id = Uuid::new_v4();
         let strategy = rollout_strategy(1, ServiceRolloutOrder::StartFirst, 1, true);
         node.node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 rollout_manifest_id,
                 service_name,
@@ -1458,7 +1489,7 @@ local_test!(
                 Duration::from_secs(30),
                 Duration::from_millis(50),
                 || async {
-                    match node.node.service_controller.registry().get(service_id) {
+                    match node.node.controllers.services.registry().get(service_id) {
                         Ok(Some(spec)) => {
                             spec.manifest_id == baseline_manifest_id
                                 && spec.status() == ServiceStatus::Running
@@ -1519,6 +1550,7 @@ local_test!(
 
         let remote_slot_count = cluster[1]
             .node
+            .controllers
             .scheduler
             .snapshot()
             .await
@@ -1540,7 +1572,8 @@ local_test!(
 
         let service_id = cluster[0]
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -1575,6 +1608,7 @@ local_test!(
 
         let remote_snapshot = cluster[1]
             .node
+            .controllers
             .scheduler
             .snapshot()
             .await
@@ -1604,7 +1638,8 @@ local_test!(
 
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -1618,7 +1653,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -1673,7 +1708,8 @@ local_test!(
 
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,
@@ -1700,7 +1736,7 @@ local_test!(
         );
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Failed
             )
@@ -1732,7 +1768,8 @@ local_test!(
 
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment_with_options_outcome(
                 Uuid::new_v4(),
                 service_name,

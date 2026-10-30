@@ -73,7 +73,8 @@ async fn seed_network_attachment(harness: &RestTestHarness, network_id: &str) {
     harness
         .node()
         .node
-        .network_registry
+        .registries
+        .networks
         .upsert_attachment(attachment)
         .await
         .expect("seed network attachment");

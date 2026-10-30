@@ -366,7 +366,7 @@ async fn cluster_view_rows(
 
 /// Renders one peer register's membership values for failure diagnostics.
 fn peer_membership_debug(node: &TestNode, peer_id: Uuid) -> String {
-    let reg = match node.node.peers.get_reg(&UuidKey::from(peer_id)) {
+    let reg = match node.node.stores.peers.get_reg(&UuidKey::from(peer_id)) {
         Ok(Some(reg)) => reg,
         Ok(None) => return "missing".to_string(),
         Err(err) => return format!("load_error={err}"),
@@ -420,7 +420,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
     let epoch = view.get_epoch();
     assert_eq!(epoch, 0, "legacy default epoch should be 0");
 
-    let mut roots_req = node.node.sync_client.get_roots_for_view_request();
+    let mut roots_req = node.node.clients.cluster.sync.get_roots_for_view_request();
     {
         let mut req = roots_req.get().init_req();
         let mut req_view = req.reborrow().init_view();
@@ -443,7 +443,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
         "view-scoped roots should expose all domains"
     );
 
-    let mut mismatched_roots_req = node.node.sync_client.get_roots_for_view_request();
+    let mut mismatched_roots_req = node.node.clients.cluster.sync.get_roots_for_view_request();
     {
         let mut req = mismatched_roots_req.get().init_req();
         let mut req_view = req.reborrow().init_view();
@@ -464,7 +464,7 @@ local_test!(cluster_view_protocol_strict_inproc, {
         mismatched_roots_msg
     );
 
-    let mut ranges_req = node.node.sync_client.get_ranges_for_view_request();
+    let mut ranges_req = node.node.clients.cluster.sync.get_ranges_for_view_request();
     {
         let mut req = ranges_req.get().init_req();
         let mut req_view = req.reborrow().init_view();
@@ -794,7 +794,7 @@ local_test!(cluster_view_split_commits_inproc, {
         let stage = cluster_operation_stage(&node.topology(), split_uuid).await;
         if stage != ClusterOperationStage::Proposed {
             assert!(
-                current_for_scope(&node.node.secret_master_keys, expected_view)
+                current_for_scope(&node.node.stores.secret_master_keys, expected_view)
                     .expect("load split target current")
                     .is_some(),
                 "split must not cross Prepared before its target current row is durable"
@@ -1384,7 +1384,7 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
     .expect("start replay node");
 
     wait_for_operation_stage(
-        &node.topology_client,
+        &node.clients.cluster.topology,
         operation.id.as_bytes(),
         ClusterOperationStage::Finalized,
         Duration::from_secs(5),
@@ -1392,7 +1392,9 @@ local_test!(cluster_view_replays_pending_operation_on_startup, {
     .await;
 
     let view_resp = node
-        .topology_client
+        .clients
+        .cluster
+        .topology
         .get_cluster_view_request()
         .send()
         .promise
@@ -1520,7 +1522,9 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
     .expect("start scope restore node");
 
     let list_resp = node
-        .topology_client
+        .clients
+        .cluster
+        .topology
         .list_request()
         .send()
         .promise
@@ -1553,7 +1557,9 @@ local_test!(cluster_view_startup_restores_split_peer_scope, {
     );
 
     let views_resp = node
-        .topology_client
+        .clients
+        .cluster
+        .topology
         .list_cluster_views_request()
         .send()
         .promise
@@ -1643,7 +1649,9 @@ local_test!(cluster_view_startup_preserves_persisted_self_drain_fence, {
         timeout(Duration::from_secs(5), async {
             loop {
                 let list_resp = node
-                    .topology_client
+                    .clients
+                    .cluster
+                    .topology
                     .list_request()
                     .send()
                     .promise
@@ -1760,7 +1768,11 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
 
     sleep(Duration::from_millis(200)).await;
 
-    let mut lookup_req = node.topology_client.get_cluster_operation_request();
+    let mut lookup_req = node
+        .clients
+        .cluster
+        .topology
+        .get_cluster_operation_request();
     lookup_req.get().set_id(operation.id.as_bytes());
     let lookup_resp = lookup_req
         .send()
@@ -1779,7 +1791,9 @@ local_test!(cluster_view_startup_replay_skips_dry_run_operation, {
     );
 
     let view_resp = node
-        .topology_client
+        .clients
+        .cluster
+        .topology
         .get_cluster_view_request()
         .send()
         .promise
@@ -1847,7 +1861,9 @@ local_test!(cluster_view_startup_restores_persisted_active_view, {
     .expect("start restore node");
 
     let view_resp = node
-        .topology_client
+        .clients
+        .cluster
+        .topology
         .get_cluster_view_request()
         .send()
         .promise
@@ -1934,7 +1950,9 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
     .expect("start split restore node");
 
     let view_resp = node
-        .topology_client
+        .clients
+        .cluster
+        .topology
         .get_cluster_view_request()
         .send()
         .promise
@@ -1951,12 +1969,12 @@ local_test!(cluster_view_startup_finishes_persisted_split_transition, {
         "startup must restore persisted split target view"
     );
     assert_eq!(
-        node.registry.out_of_view_node_ids(),
+        node.registries.peers.out_of_view_node_ids(),
         std::collections::HashSet::from([sibling_node_id]),
         "startup must restore the peer fence saved with the active view"
     );
     wait_for_operation_stage(
-        &node.topology_client,
+        &node.clients.cluster.topology,
         operation.id.as_bytes(),
         ClusterOperationStage::Finalized,
         Duration::from_secs(5),
@@ -2035,12 +2053,12 @@ local_test!(cluster_view_startup_rejects_unrelated_split_target, {
     .expect("start split recovery node");
 
     assert_eq!(
-        current_cluster_view(&node.topology_client).await,
+        current_cluster_view(&node.clients.cluster.topology).await,
         target_view,
         "startup must restore the independently installed active view"
     );
     assert_eq!(
-        cluster_operation_stage(&node.topology_client, operation.id).await,
+        cluster_operation_stage(&node.clients.cluster.topology, operation.id).await,
         ClusterOperationStage::Prepared,
         "an unrelated view installation must not advance the split"
     );
@@ -2101,7 +2119,7 @@ local_test!(
         .expect("start split replay node");
 
         wait_for_cluster_view(
-            &node.topology_client,
+            &node.clients.cluster.topology,
             split_target_b,
             Duration::from_secs(5),
         )
@@ -2183,22 +2201,31 @@ local_test!(
         .expect("start stale-precondition node");
 
         wait_for_operation_stage(
-            &node.topology_client,
+            &node.clients.cluster.topology,
             first_operation.id.as_bytes(),
             ClusterOperationStage::Finalized,
             Duration::from_secs(5),
         )
         .await;
         wait_for_operation_stage(
-            &node.topology_client,
+            &node.clients.cluster.topology,
             second_operation.id.as_bytes(),
             ClusterOperationStage::Aborted,
             Duration::from_secs(5),
         )
         .await;
-        wait_for_cluster_view(&node.topology_client, first_target, Duration::from_secs(5)).await;
+        wait_for_cluster_view(
+            &node.clients.cluster.topology,
+            first_target,
+            Duration::from_secs(5),
+        )
+        .await;
 
-        let mut get_second = node.topology_client.get_cluster_operation_request();
+        let mut get_second = node
+            .clients
+            .cluster
+            .topology
+            .get_cluster_operation_request();
         get_second.get().set_id(second_operation.id.as_bytes());
         let second_resp = get_second
             .send()
@@ -3157,6 +3184,7 @@ local_test!(cluster_view_split_scopes_listings_to_active_view, {
     // Split commits keep peer and authentication rows for cluster-wide transition repair.
     let (active_peers, _) = anchor
         .node
+        .stores
         .peers
         .load_all()
         .expect("load anchor peers after split");
@@ -3349,7 +3377,8 @@ local_test!(cluster_session_reports_live_view_after_transition, {
 
     let cached_anchor_session = joiner
         .node
-        .registry
+        .registries
+        .peers
         .session_for_peer_unscoped(anchor.id())
         .await
         .expect("cached anchor session");
@@ -3560,6 +3589,7 @@ local_test!(
 
         let joiner_current = joiner
             .node
+            .stores
             .secret_master_store
             .current()
             .expect("offline split participant current key");

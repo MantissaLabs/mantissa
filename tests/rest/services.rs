@@ -21,7 +21,8 @@ async fn seed_retained_service(harness: &RestTestHarness, name: &str) -> Uuid {
     harness
         .node()
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .upsert(service)
         .await
@@ -175,6 +176,7 @@ local_test!(
             harness
                 .node()
                 .node
+                .stores
                 .workloads
                 .upsert(&UuidKey::from(id), task.into())
                 .await
@@ -198,6 +200,7 @@ local_test!(
             harness
                 .node()
                 .node
+                .stores
                 .workloads
                 .upsert(&UuidKey::from(id), task.into())
                 .await
@@ -351,6 +354,7 @@ local_test!(rest_service_logs_report_task_failures_with_source, {
     harness
         .node()
         .node
+        .stores
         .workloads
         .upsert(&UuidKey::from(task_id), task.into())
         .await

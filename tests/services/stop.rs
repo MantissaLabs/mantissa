@@ -9,14 +9,15 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     let task_templates = vec![demo_backend_task_template("backend", 1)];
     let service_id = node
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit deployment");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -36,7 +37,8 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
 
     let running_spec = node
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load running service")
@@ -46,20 +48,22 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
         .expect("running service should expose one task id");
     let original_task = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(task_id)
         .await
         .expect("inspect running task");
 
     node.node
-        .service_controller
+        .controllers
+        .services
         .submit_stop(service_id)
         .await
         .expect("submit stop");
 
     assert!(
         wait_for_service_status(
-            &node.node.service_controller,
+            &node.node.controllers.services,
             service_id,
             ServiceStatus::Stopped
         )
@@ -86,6 +90,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     stale.updated_at = Utc::now().to_rfc3339();
 
     node.node
+        .stores
         .workloads
         .upsert(&UuidKey::from(stale.id), task_spec_to_value(&stale).into())
         .await
@@ -93,6 +98,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
 
     let snapshot = node
         .node
+        .controllers
         .scheduler
         .snapshot()
         .await
@@ -110,6 +116,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
             .collect();
         let _ = node
             .node
+            .controllers
             .scheduler
             .reserve_resources(snapshot.version, intents, Vec::new())
             .await;
@@ -139,6 +146,7 @@ local_test!(services_stop_drains_stale_tasks_and_slots, {
     stale_stopping.updated_at = Utc::now().to_rfc3339();
 
     node.node
+        .stores
         .workloads
         .upsert(
             &UuidKey::from(stale_stopping.id),
@@ -170,7 +178,8 @@ local_test!(
         let task_templates = vec![demo_backend_task_template("backend", 2)];
         let service_id = node
             .node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 manifest_name,
@@ -182,7 +191,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -192,7 +201,8 @@ local_test!(
 
         let baseline = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load running service")
@@ -204,14 +214,15 @@ local_test!(
         );
 
         node.node
-            .service_controller
+            .controllers
+            .services
             .submit_stop(service_id)
             .await
             .expect("submit stop");
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Stopped
             )
@@ -223,7 +234,8 @@ local_test!(
         let mut redeploy_templates = task_templates;
         redeploy_templates[0].execution.image = "hashicorp/http-echo:0.2.3".to_string();
         node.node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 redeploy_manifest_id,
                 manifest_name,
@@ -235,7 +247,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Running
             )
@@ -245,7 +257,8 @@ local_test!(
 
         let redeployed = node
             .node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("load redeployed service")
@@ -280,14 +293,15 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
     let task_templates = vec![demo_backend_task_template("backend", 3)];
     let service_id = cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(Uuid::new_v4(), service_name, service_name, task_templates)
         .await
         .expect("submit deployment");
 
     assert!(
         wait_for_service_status(
-            &cluster[0].node.service_controller,
+            &cluster[0].node.controllers.services,
             service_id,
             ServiceStatus::Running
         )
@@ -302,7 +316,7 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
         let mut all_have_local_replica = true;
         for node in &cluster {
             let local_count = list_local_active_service_tasks(
-                &node.node.workload_manager,
+                &node.node.controllers.workloads,
                 service_name,
                 node.id(),
             )
@@ -328,7 +342,8 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
 
     cluster[0]
         .node
-        .service_controller
+        .controllers
+        .services
         .submit_stop(service_id)
         .await
         .expect("submit stop");
@@ -336,7 +351,7 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
     for node in &cluster {
         assert!(
             wait_for_service_status(
-                &node.node.service_controller,
+                &node.node.controllers.services,
                 service_id,
                 ServiceStatus::Stopped
             )
@@ -351,7 +366,7 @@ local_test!(services_stop_propagates_and_drains_three_nodes, {
         let mut local_drained = false;
         while Instant::now() < local_drain_deadline {
             let local_count = list_local_active_service_tasks(
-                &node.node.workload_manager,
+                &node.node.controllers.workloads,
                 service_name,
                 node.id(),
             )

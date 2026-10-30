@@ -43,7 +43,8 @@ async fn seed_service(harness: &RestTestHarness, templates: &[&str]) -> Uuid {
     harness
         .node()
         .node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .upsert(service)
         .await
@@ -63,6 +64,7 @@ async fn seed_replica(harness: &RestTestHarness, replica: u16, generation: u64) 
     harness
         .node()
         .node
+        .stores
         .workloads
         .upsert(&UuidKey::from(id), task.into())
         .await

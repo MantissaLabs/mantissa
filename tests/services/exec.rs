@@ -24,7 +24,8 @@ async fn seed_service(node: &TestNode, name: &str, templates: &[&str]) -> Uuid {
     let id = service.id;
 
     node.node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .upsert(service)
         .await
@@ -127,6 +128,7 @@ local_test!(
             tied_attempt,
         ] {
             node.node
+                .stores
                 .workloads
                 .upsert(&UuidKey::from(task.id), task.into())
                 .await
@@ -160,6 +162,7 @@ local_test!(
         seed_service(&node, "empty", &[]).await;
         let task = backend_task(10, 1, 1, WorkloadPhase::Running);
         node.node
+            .stores
             .workloads
             .upsert(&UuidKey::from(task.id), task.into())
             .await
@@ -260,6 +263,7 @@ local_test!(service_exec_rejects_selections_without_running_tasks, {
         backend_task(23, 2, 4, WorkloadPhase::Creating),
     ] {
         node.node
+            .stores
             .workloads
             .upsert(&UuidKey::from(task.id), task.into())
             .await

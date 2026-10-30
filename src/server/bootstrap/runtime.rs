@@ -1,87 +1,37 @@
+use super::components::{BuiltRuntime, build_runtime_components};
+use super::replicated_volumes::{
+    ReplicatedVolumeStartup, prepare_replicated_volumes, shutdown_replicated_volumes,
+};
+use super::tasks::{RuntimeTaskHandles, spawn_runtime_tasks};
 use super::{BootstrapContext, BootstrapResult, stores::BootstrapStores};
-use crate::agents::{AgentController, AgentControllerConfig, AgentRegistry, AgentsRpc};
+use crate::agents::AgentController;
 use crate::cluster::{ClusterViewState, RootSchemaState};
-use crate::gossip::{DEFAULT_FANOUT, DedupeStateHandle, Message};
+use crate::config;
+use crate::gossip::DEFAULT_FANOUT;
 use crate::ingress::registry::IngressPoolRegistry;
-use crate::ingress::service::IngressRpc;
-use crate::jobs::{JobController, JobControllerConfig, JobRegistry, JobsRpc};
+use crate::jobs::JobController;
 use crate::network::controller::NetworkController;
-use crate::network::gossip::NetworkGossiper;
 use crate::network::registry::NetworkRegistry;
-use crate::network::service::NetworksRpc;
-use crate::observability::metrics::{self as runtime_metrics, MetricsSamplerInputs};
 use crate::registry::Registry;
-use crate::runtime::oci::DockerRuntimeBackend;
 use crate::runtime::set::RuntimeSet;
-use crate::runtime::testing::{
-    IN_MEMORY_RUNTIME_BACKEND_KIND, new_in_memory_runtime_backend,
-    use_in_memory_runtime_backend_from_env,
-};
 use crate::scheduler::Scheduler;
-use crate::scheduler::digest::{
-    SchedulerDigestPublisher, SchedulerDigestRegistry, SchedulerDigestReplicator,
-};
-use crate::scheduler::service::SchedulerService;
 use crate::secrets::master_key::envelope::{PassphraseKdfParams, SecretPassphrase};
-use crate::secrets::master_key::reconciler::SecretMasterKeyReconciler;
-use crate::secrets::master_key::replication::{
-    SecretMasterKeyPublisher, SecretMasterKeyReplicator,
-};
 use crate::server::config::Config;
-use crate::server::{Server, ServerClients, ServerDependencies};
-use crate::services::{
-    ServiceController, ServiceControllerConfig, ServiceControllerTiming, ServiceReconcileTrigger,
-    ServicesRPC,
-};
-use crate::store::path::default_db_path;
-use crate::store::replicated::gc::{StoreGcRunner, StoreGcRunnerInputs};
-use crate::store::replicated::registry::{ReplicatedStoreHandles, replicated_store_registry};
-use crate::sync::{SyncGcProgress, SyncRunner, SyncService, SyncStores};
-use crate::task::service::TaskService;
-use crate::topology::{Keys, Topology, TopologyConfig, TopologyDependencies, TopologyStorage};
-use crate::volumes::replicated::{
-    ReplicatedVolumeController, ReplicatedVolumePlanner, ReplicatedVolumeRuntime,
-    ReplicatedVolumeSplitValidator, ReplicatedVolumeSupport, VolumeMembershipChangeBlocker,
-    desired_replica_generations,
-};
-use crate::volumes::{VolumeController, VolumeRegistry, VolumeReplicator, VolumesRpc};
-use crate::workload::WorkloadRegistry;
-use crate::workload::manager::{WorkloadManager, WorkloadManagerConfig, WorkloadRuntimeConfig};
-use crate::workload::network_prerequisites::WorkloadNetworkPrerequisites;
-use crate::workload::service::WorkloadService;
-use crate::{config, gossip, services};
-use async_channel::{Receiver, Sender};
-use mantissa_protocol::agents::agents::Client as AgentsClient;
-use mantissa_protocol::gossip::gossip::Client as GossipClient;
-use mantissa_protocol::jobs::jobs::Client as JobsClient;
-use mantissa_protocol::network::networks::Client as NetworksClient;
-use mantissa_protocol::scheduling::scheduler::Client as SchedulerClient;
-use mantissa_protocol::secrets::secrets::Client as SecretsClient;
+use crate::server::session::ClusterSessionServices;
+use crate::server::{Server, ServerDependencies};
+use crate::services::{ServiceController, ServiceControllerTiming, ServiceRegistry};
+use crate::sync::{SyncGcProgress, SyncStores};
+use crate::topology::Topology;
+use crate::volumes::VolumeRegistry;
+use crate::volumes::replicated::ReplicatedVolumeRuntime;
+use crate::workload::manager::{WorkloadManager, WorkloadRuntimeConfig};
 use mantissa_protocol::server::server::Client as ServerClient;
-use mantissa_protocol::services::services::Client as ServicesClient;
-use mantissa_protocol::topology::topology::Client as TopologyClient;
-use mantissa_protocol::volumes::volumes::Client as VolumesClient;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc};
-use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
-
-/// How one daemon chooses whether to start replicated-volume storage.
-#[derive(Clone)]
-pub enum ReplicatedVolumeStartup {
-    /// Do not start storage. Headless tests use this unless they opt in.
-    Disabled,
-
-    /// Use built-in settings when this host passes every local check.
-    Automatic,
-
-    /// Use the complete settings supplied by the operator.
-    Configured(Box<config::ReplicatedVolumeConfig>),
-}
+use tracing::{error, info};
 
 /// Overrides applied to the shared bootstrap pipeline.
 ///
@@ -112,12 +62,13 @@ pub struct BootstrapOptions {
     pub replicated_volumes: ReplicatedVolumeStartup,
     /// KDF cost for passphrase-backed master-key envelopes.
     ///
-    /// Production uses the hardened default; headless tests lower only this
+    /// Production uses the hardened default. Headless tests lower only this
     /// cost while preserving the same envelope and transfer behavior.
     pub master_key_kdf_params: PassphraseKdfParams,
 }
 
 impl Default for BootstrapOptions {
+    /// Uses production health settings while leaving runtime and storage overrides to the caller.
     fn default() -> Self {
         Self {
             task_runtime: None,
@@ -146,39 +97,40 @@ impl Default for BootstrapOptions {
     }
 }
 
-/// Runtime components that need to remain accessible after bootstrap.
-///
-/// Headless tests inspect these handles directly while the daemon path mostly
-/// uses them indirectly through the exported `Server` capability.
-pub struct RuntimeComponents {
-    gossip_client: GossipClient,
+/// Controllers retained by the daemon and headless nodes to run and stop local work.
+pub struct RuntimeControllers {
     pub topology: Topology,
-    pub topology_client: TopologyClient,
-    pub sync_client: mantissa_protocol::sync::sync::Client,
-    pub workload_manager: WorkloadManager,
-    pub task_client: mantissa_protocol::task::task::Client,
-    workload_client: mantissa_protocol::workload::workload::Client,
-    pub job_controller: JobController,
-    pub jobs_client: JobsClient,
-    pub agent_controller: AgentController,
-    pub agents_client: AgentsClient,
-    pub service_controller: ServiceController,
     pub scheduler: Rc<Scheduler>,
-    scheduler_client: SchedulerClient,
-    pub registry: Registry,
-    pub services_client: ServicesClient,
-    pub secrets_client: SecretsClient,
-    pub networks_client: NetworksClient,
-    pub ingress_client: mantissa_protocol::ingress::ingress::Client,
-    pub volumes_client: VolumesClient,
-    pub network_registry: NetworkRegistry,
-    pub ingress_pool_registry: IngressPoolRegistry,
-    pub volume_registry: VolumeRegistry,
-    pub network_controller: NetworkController,
-    pub sync_stores: SyncStores,
-    pub sync_gc_progress: SyncGcProgress,
+    pub workloads: WorkloadManager,
+    pub jobs: JobController,
+    pub agents: AgentController,
+    pub services: ServiceController,
+    pub networks: NetworkController,
+}
+
+/// Peer connections and desired service, network, ingress, and volume state shared by controllers.
+pub struct RuntimeRegistries {
+    pub peers: Registry,
+    pub services: ServiceRegistry,
+    pub networks: NetworkRegistry,
+    pub ingress_pools: IngressPoolRegistry,
+    pub volumes: VolumeRegistry,
+}
+
+/// Replicated stores and view metadata shared by sync, garbage collection, and metrics.
+pub(crate) struct RuntimeReplication {
+    pub stores: SyncStores,
+    pub gc_progress: SyncGcProgress,
     pub cluster_view: ClusterViewState,
     pub root_schema: RootSchemaState,
+}
+
+/// Completed subsystems retained after bootstrap for sessions and runtime shutdown.
+pub(crate) struct RuntimeComponents {
+    pub clients: ClusterSessionServices,
+    pub controllers: RuntimeControllers,
+    pub registries: RuntimeRegistries,
+    pub replication: RuntimeReplication,
     pub replicated_volumes: Option<Arc<ReplicatedVolumeRuntime>>,
 }
 
@@ -186,312 +138,46 @@ pub struct RuntimeComponents {
 ///
 /// This is the single result of the boot pipeline: stores are open, runtime
 /// actors are spawned, and the `Server` capability is fully wired.
-pub struct BootedRuntime {
+pub(crate) struct BootedRuntime {
     pub stores: BootstrapStores,
     pub components: RuntimeComponents,
     pub server: Server,
     pub runtime_tasks: RuntimeTaskHandles,
 }
 
-/// Join handles for the background actors spawned during bootstrap.
-///
-/// Headless tests keep these handles so they can shut down long-running
-/// controllers before restarting the same node identity from durable state.
-pub struct RuntimeTaskHandles {
-    tasks: Vec<JoinHandle<()>>,
-    gossip_control: async_channel::Sender<gossip::OutboundControl>,
-}
-
-impl RuntimeTaskHandles {
-    /// Waits for the outbound worker to attempt every workload update queued before shutdown.
-    pub async fn flush_gossip(&self, timeout: Duration) -> Result<(), anyhow::Error> {
-        let (sent, received) = tokio::sync::oneshot::channel();
-        self.gossip_control
-            .send(gossip::OutboundControl::Flush(sent))
-            .await
-            .map_err(|_| anyhow::anyhow!("outbound gossip worker is unavailable"))?;
-        tokio::time::timeout(timeout, received)
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out while attempting final gossip updates"))?
-            .map_err(|_| anyhow::anyhow!("outbound gossip worker stopped before final updates"))
-    }
-
-    /// Abort every runtime actor that bootstrap spawned.
-    ///
-    /// Headless restart tests use this after graceful subsystem cleanup so
-    /// lingering controllers do not keep sockets, timers, or store watchers
-    /// alive across the simulated daemon restart.
-    pub fn abort(self) {
-        for task in self.tasks {
-            task.abort();
-        }
-    }
-
-    /// Abort every runtime actor and wait until each task has fully stopped.
-    ///
-    /// Restart tests reuse the same durable state immediately after shutdown.
-    /// Waiting for the cancelled tasks closes the window where a previous
-    /// controller can still be unwinding while the replacement runtime starts
-    /// reconciling the same local networking resources.
-    pub async fn abort_and_wait(self) {
-        for task in self.tasks {
-            task.abort();
-            let _ = task.await;
-        }
-    }
-}
-
-/// Actors that only exist to run background loops once bootstrap completes.
-///
-/// These are separated from the externally useful component handles so the boot
-/// result stays focused on objects other modules actually inspect.
-struct RuntimeActors {
-    runtime_health: config::RuntimeHealthConfig,
-    secret_replicator: crate::secrets::gossip::SecretReplicator,
-    secret_master_key_replicator: SecretMasterKeyReplicator,
-    secret_master_key_reconciler: SecretMasterKeyReconciler,
-    secret_master_key_replication_notify: Arc<Notify>,
-    volume_replicator: VolumeReplicator,
-    scheduler_digest_replicator: SchedulerDigestReplicator,
-    volume_controller: VolumeController,
-    replicated_volume_planner: ReplicatedVolumePlanner,
-    replicated_volume_controller: Option<ReplicatedVolumeController>,
-    network_gossiper: NetworkGossiper,
-}
-
-/// Channel bundle used while wiring gossip-driven subsystems together.
-///
-/// Keeping these receivers grouped avoids a long sequence of near-identical
-/// local bindings inside the runtime assembly code.
-struct RuntimeChannels {
-    gossip_tx: Sender<Message>,
-    gossip_rx: Receiver<Message>,
-    topology_tx: Sender<Message>,
-    topology_rx: Receiver<Message>,
-    task_tx: Sender<Message>,
-    task_rx: Receiver<Message>,
-    job_tx: Sender<Message>,
-    job_rx: Receiver<Message>,
-    agent_tx: Sender<Message>,
-    agent_rx: Receiver<Message>,
-    service_tx: Sender<Message>,
-    service_rx: Receiver<Message>,
-    network_tx: Sender<Message>,
-    network_rx: Receiver<Message>,
-    secret_tx: Sender<Message>,
-    secret_rx: Receiver<Message>,
-    secret_master_key_tx: Sender<Message>,
-    secret_master_key_rx: Receiver<Message>,
-    volume_tx: Sender<Message>,
-    volume_rx: Receiver<Message>,
-    scheduler_digest_tx: Sender<Message>,
-    scheduler_digest_rx: Receiver<Message>,
-}
-
-/// Cloned gossip routes fed into the gossip service.
-///
-/// This groups the sender side of the runtime channels so helper functions can
-/// depend on one argument instead of a long list of near-identical senders.
-struct GossipRoutes {
-    topology: Sender<Message>,
-    task: Sender<Message>,
-    job: Sender<Message>,
-    agent: Sender<Message>,
-    service: Sender<Message>,
-    network: Sender<Message>,
-    secret: Sender<Message>,
-    secret_master_key: Sender<Message>,
-    volume: Sender<Message>,
-    scheduler_digest: Sender<Message>,
-    outbound: Sender<Message>,
-}
-
-impl RuntimeChannels {
-    /// Allocates the gossip channels shared by startup actors.
-    ///
-    /// Every replicated domain gets its own bounded queue while the bootstrap
-    /// phase keeps the capacity decision in one place.
-    fn new(channel_capacity: usize) -> Self {
-        let capacity = channel_capacity.max(1);
-        let (gossip_tx, gossip_rx) = async_channel::bounded(capacity);
-        let (topology_tx, topology_rx) = async_channel::bounded(capacity);
-        let (task_tx, task_rx) = async_channel::bounded(capacity);
-        let (job_tx, job_rx) = async_channel::bounded(capacity);
-        let (agent_tx, agent_rx) = async_channel::bounded(capacity);
-        let (service_tx, service_rx) = async_channel::bounded(capacity);
-        let (network_tx, network_rx) = async_channel::bounded(capacity);
-        let (secret_tx, secret_rx) = async_channel::bounded(capacity);
-        let (secret_master_key_tx, secret_master_key_rx) = async_channel::bounded(capacity);
-        let (volume_tx, volume_rx) = async_channel::bounded(capacity);
-        let (scheduler_digest_tx, scheduler_digest_rx) = async_channel::bounded(capacity);
-
-        Self {
-            gossip_tx,
-            gossip_rx,
-            topology_tx,
-            topology_rx,
-            task_tx,
-            task_rx,
-            job_tx,
-            job_rx,
-            agent_tx,
-            agent_rx,
-            service_tx,
-            service_rx,
-            network_tx,
-            network_rx,
-            secret_tx,
-            secret_rx,
-            secret_master_key_tx,
-            secret_master_key_rx,
-            volume_tx,
-            volume_rx,
-            scheduler_digest_tx,
-            scheduler_digest_rx,
-        }
-    }
-
-    /// Clones the sender routes consumed by the gossip service.
-    ///
-    /// Runtime assembly keeps ownership of the original channels while helpers
-    /// receive a smaller grouped view of the routes they need.
-    fn routes(&self) -> GossipRoutes {
-        GossipRoutes {
-            topology: self.topology_tx.clone(),
-            task: self.task_tx.clone(),
-            job: self.job_tx.clone(),
-            agent: self.agent_tx.clone(),
-            service: self.service_tx.clone(),
-            network: self.network_tx.clone(),
-            secret: self.secret_tx.clone(),
-            secret_master_key: self.secret_master_key_tx.clone(),
-            volume: self.volume_tx.clone(),
-            scheduler_digest: self.scheduler_digest_tx.clone(),
-            outbound: self.gossip_tx.clone(),
-        }
-    }
-}
-
-/// Inputs required to construct the topology actor.
-///
-/// Grouping these runtime dependencies keeps the topology factory readable and
-/// avoids an ever-growing positional argument list.
-struct TopologyBuildInputs<'a> {
-    ctx: &'a BootstrapContext,
-    cluster_view: ClusterViewState,
-    root_schema: RootSchemaState,
-    topology_rx: Receiver<Message>,
-    gossip_tx: Sender<Message>,
-    topology_stores: TopologyStorage,
-    deps: TopologyDependencies,
-    runtime_support: crate::runtime::types::RuntimeSupportProfile,
-    replicated_volume_support: ReplicatedVolumeSupport,
-}
-
-/// Options consumed only while spawning long-running runtime tasks.
-struct RuntimeTaskOptions {
-    signing_key: ed25519_dalek::SigningKey,
-    local_node_id: uuid::Uuid,
-    gossip_fanout: usize,
-    store_gc_config: Option<config::RuntimeStoreGcConfig>,
-}
-
-/// Replicated-volume and cluster-view state prepared before subsystem wiring.
-struct ReplicatedVolumeBootstrapInputs {
-    runtime: Option<Arc<ReplicatedVolumeRuntime>>,
-    cluster_view: ClusterViewState,
-    volume_registry: VolumeRegistry,
-    membership_change_blocker: VolumeMembershipChangeBlocker,
-    split_validator: ReplicatedVolumeSplitValidator,
-}
-
-/// Replicated-volume settings and any socket already bound by a test node.
-struct ReplicatedVolumeStartupInputs {
-    mode: ReplicatedVolumeStartup,
-    prebound_listener: Option<TcpListener>,
-}
-
-/// Boots the full server runtime from an initialized bootstrap context.
-///
-/// This is the shared startup pipeline used by both the daemon and headless
-/// nodes so assembly order only lives in one place.
-pub async fn boot(
+/// Boots the shared runtime before the daemon or a headless node opens its transport.
+pub(crate) async fn boot(
     ctx: BootstrapContext,
     options: BootstrapOptions,
 ) -> BootstrapResult<BootedRuntime> {
     boot_with_replicated_volume_listener(ctx, options, None).await
 }
 
-/// Boots a test node without releasing its reserved storage socket first.
+/// Boots a headless node while retaining its reserved replicated-storage socket.
 pub(crate) async fn boot_with_replicated_volume_listener(
     ctx: BootstrapContext,
     options: BootstrapOptions,
     replicated_volume_listener: Option<TcpListener>,
 ) -> BootstrapResult<BootedRuntime> {
     let stores = BootstrapStores::open(&ctx, &options).await?;
-    let cluster_view = stores.restore_cluster_view_state()?;
-    let volume_registry = VolumeRegistry::new(
-        stores.volumes.clone(),
-        stores.volume_nodes.clone(),
-        stores.volume_plans.clone(),
-        stores.volume_group_statuses.clone(),
-        stores.volume_capacity_requests.clone(),
-    );
-    let membership_change_blocker =
-        VolumeMembershipChangeBlocker::new(stores.cluster_operations.clone(), cluster_view.clone());
-    let replicated_volumes = open_replicated_volumes(
-        &ctx,
-        &stores,
-        ReplicatedVolumeStartupInputs {
-            mode: options.replicated_volumes.clone(),
-            prebound_listener: replicated_volume_listener,
-        },
-        options.advertise_override.as_deref(),
-        cluster_view.clone(),
-        membership_change_blocker.clone(),
-        volume_registry.clone(),
-    )
-    .await?;
-    let split_validator =
-        ReplicatedVolumeSplitValidator::new(volume_registry.clone(), replicated_volumes.clone());
-    // This async assembly path carries a large future state machine during
-    // headless startup. Boxing it keeps current-thread test stacks bounded.
-    let built = Box::pin(build_runtime_components(
-        &ctx,
-        &stores,
-        &options,
-        ReplicatedVolumeBootstrapInputs {
-            runtime: replicated_volumes.clone(),
-            cluster_view,
-            volume_registry,
-            membership_change_blocker,
-            split_validator,
-        },
-    ))
-    .await;
-    let (components, actors, gossip_rx, gossip_dedupe) = match built {
+    let volumes =
+        prepare_replicated_volumes(&ctx, &stores, &options, replicated_volume_listener).await?;
+    let replicated_volumes = volumes.runtime.clone();
+
+    // The construction future holds many component values across recovery awaits.
+    // Boxing it keeps headless startup within the current-thread test stack.
+    let built = Box::pin(build_runtime_components(&ctx, &stores, &options, volumes)).await;
+    let BuiltRuntime { components, actors } = match built {
         Ok(built) => built,
         Err(error) => {
             shutdown_replicated_volumes(replicated_volumes.as_ref()).await;
             return Err(error);
         }
     };
-    apply_runtime_overrides(&components, &options);
+
+    apply_runtime_overrides(&components.controllers.topology, &options);
     let server = build_server(&ctx, &stores, &components);
-    let runtime_tasks = spawn_runtime_tasks(
-        &components,
-        &stores,
-        actors,
-        gossip_rx,
-        gossip_dedupe,
-        RuntimeTaskOptions {
-            signing_key: ctx.signing_key.clone(),
-            local_node_id: ctx.self_id,
-            gossip_fanout: options.gossip_fanout,
-            store_gc_config: options.store_gc_config.clone(),
-        },
-    )
-    .await;
+    let runtime_tasks = spawn_runtime_tasks(&components, actors).await;
     if let Err(error) = finish_boot(&server, &components).await {
         runtime_tasks.abort_and_wait().await;
         shutdown_replicated_volumes(replicated_volumes.as_ref()).await;
@@ -506,915 +192,44 @@ pub(crate) async fn boot_with_replicated_volume_listener(
     })
 }
 
-/// Checks, recovers, and starts replicated storage before the daemon is ready.
-async fn open_replicated_volumes(
-    ctx: &BootstrapContext,
-    stores: &BootstrapStores,
-    startup: ReplicatedVolumeStartupInputs,
-    advertise_override: Option<&str>,
-    cluster_view: ClusterViewState,
-    membership_change_blocker: VolumeMembershipChangeBlocker,
-    desired_registry: VolumeRegistry,
-) -> BootstrapResult<Option<Arc<ReplicatedVolumeRuntime>>> {
-    let (config, automatic) = match startup.mode {
-        ReplicatedVolumeStartup::Disabled => return Ok(None),
-        ReplicatedVolumeStartup::Automatic => {
-            let config = match config::ReplicatedVolumeConfig::automatic(advertise_override) {
-                Ok(config) => config,
-                Err(error) => {
-                    warn!(
-                        target: "server",
-                        "replicated volumes are unavailable on this node: {error:#}"
-                    );
-                    return Ok(None);
-                }
-            };
-            (config, true)
-        }
-        ReplicatedVolumeStartup::Configured(config) => (*config, false),
-    };
-
-    let startup_timeout = Duration::from_millis(config.startup_timeout_ms);
-    let startup_started = tokio::time::Instant::now();
-    let prepared = if automatic {
-        match tokio::time::timeout(
-            startup_timeout,
-            ReplicatedVolumeRuntime::prepare_host(&config, ctx.self_id),
-        )
-        .await
-        {
-            Ok(Ok(prepared)) => Some(prepared),
-            Ok(Err(error)) => {
-                warn!(
-                    target: "server",
-                    "replicated volumes are unavailable on this node: {error:#}"
-                );
-                return Ok(None);
-            }
-            Err(_) => {
-                warn!(
-                    target: "server",
-                    "replicated volumes are unavailable because local checks exceeded {startup_timeout:?}"
-                );
-                return Ok(None);
-            }
-        }
-    } else {
-        None
-    };
-
-    let Some(open_timeout) = startup_timeout.checked_sub(startup_started.elapsed()) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("replicated-volume startup exceeded {startup_timeout:?}"),
-        )
-        .into());
-    };
-    let open = open_replicated_volume_runtime(
-        config,
-        prepared,
-        ctx.self_id,
-        Arc::clone(&ctx.noise_keys),
-        stores.peers.clone(),
-        cluster_view,
-        membership_change_blocker,
-    );
-    let storage = tokio::time::timeout(open_timeout, open)
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("replicated-volume storage did not open within {startup_timeout:?}"),
-            )
-        })??;
-
-    let desired_specs = desired_registry.list_reconcilable_specs_including_deleting()?;
-    storage.replace_desired_generations(desired_replica_generations(&desired_specs));
-
-    let listen_result = match startup.prebound_listener {
-        Some(listener) => storage.start_listening_on(listener),
-        None => storage.start_listening(),
-    };
-    if let Err(error) = listen_result {
-        shutdown_replicated_volumes(Some(&storage)).await;
-        if automatic {
-            warn!(
-                target: "server",
-                "replicated volumes are unavailable because the storage address could not be opened: {error:#}"
-            );
-            return Ok(None);
-        }
-        return Err(error.into());
-    }
-
-    let Some(recovery_timeout) = startup_timeout.checked_sub(startup_started.elapsed()) else {
-        shutdown_replicated_volumes(Some(&storage)).await;
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("replicated-volume startup exceeded {startup_timeout:?}"),
-        )
-        .into());
-    };
-    match tokio::time::timeout(recovery_timeout, storage.recover()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            shutdown_replicated_volumes(Some(&storage)).await;
-            return Err(error.into());
-        }
-        Err(_) => {
-            shutdown_replicated_volumes(Some(&storage)).await;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("replicated-volume recovery did not finish within {startup_timeout:?}"),
-            )
-            .into());
-        }
-    };
-    Ok(Some(storage))
-}
-
-/// Opens storage with either new checks or checks completed by automatic setup.
-async fn open_replicated_volume_runtime(
-    config: config::ReplicatedVolumeConfig,
-    prepared: Option<crate::volumes::replicated::PreparedReplicatedVolumeHost>,
-    node_id: uuid::Uuid,
-    noise_keys: Arc<mantissa_net::noise::NoiseKeys>,
-    peers: crate::store::replicated::peers::PeersStore,
-    cluster_view: ClusterViewState,
-    membership_change_blocker: VolumeMembershipChangeBlocker,
-) -> anyhow::Result<Arc<ReplicatedVolumeRuntime>> {
-    match prepared {
-        Some(prepared) => {
-            ReplicatedVolumeRuntime::open_prepared(
-                prepared,
-                node_id,
-                noise_keys,
-                peers,
-                cluster_view,
-                membership_change_blocker,
-            )
-            .await
-        }
-        None => {
-            ReplicatedVolumeRuntime::open(
-                config,
-                node_id,
-                noise_keys,
-                peers,
-                cluster_view,
-                membership_change_blocker,
-            )
-            .await
-        }
-    }
-}
-
-/// Stops recovered storage while preserving the startup error being reported.
-async fn shutdown_replicated_volumes(storage: Option<&Arc<ReplicatedVolumeRuntime>>) {
-    if let Some(storage) = storage
-        && let Err(error) = storage.shutdown().await
-    {
-        error!(target: "server", "failed to stop replicated storage: {error}");
-    }
-}
-
-/// Applies timing and advertise overrides after runtime components exist.
-///
-/// These knobs are shared by the daemon and headless callers but they only
-/// affect the topology actor once it has been constructed.
-fn apply_runtime_overrides(components: &RuntimeComponents, options: &BootstrapOptions) {
+/// Applies caller timing and address overrides before topology background loops start.
+fn apply_runtime_overrides(topology: &Topology, options: &BootstrapOptions) {
     if let Some(sync_tick) = options.sync_tick {
-        components.topology.set_sync_interval(sync_tick);
+        topology.set_sync_interval(sync_tick);
     }
     if let Some(sync_fanout) = options.sync_fanout {
-        components.topology.set_sync_fanout(sync_fanout);
+        topology.set_sync_fanout(sync_fanout);
     }
     if let Some(workload_repair_fanout) = options.workload_repair_fanout {
-        components
-            .topology
-            .set_workload_repair_fanout(workload_repair_fanout);
+        topology.set_workload_repair_fanout(workload_repair_fanout);
     }
     if let Some(sync_tick) = options.global_metadata_sync_tick.or(options.sync_tick) {
-        components
-            .topology
-            .set_global_metadata_sync_interval(sync_tick);
+        topology.set_global_metadata_sync_interval(sync_tick);
     }
     if let Some(sync_fanout) = options.global_metadata_sync_fanout.or(options.sync_fanout) {
-        components
-            .topology
-            .set_global_metadata_sync_fanout(sync_fanout);
+        topology.set_global_metadata_sync_fanout(sync_fanout);
     }
     if let Some(gossip_tick) = options.gossip_tick {
-        components.topology.set_gossip_interval(gossip_tick);
+        topology.set_gossip_interval(gossip_tick);
     }
     if let Some(advertise_override) = &options.advertise_override {
-        components
-            .topology
-            .set_advertise_override(Some(advertise_override.clone()));
+        topology.set_advertise_override(Some(advertise_override.clone()));
     }
 }
 
-/// Builds the runtime actors and exported capabilities.
-///
-/// This phase wires topology, sync, gossip, task, service, network, volume,
-/// scheduler, and secret subsystems together without yet starting listeners.
-async fn build_runtime_components(
-    ctx: &BootstrapContext,
-    stores: &BootstrapStores,
-    options: &BootstrapOptions,
-    replicated_volume_inputs: ReplicatedVolumeBootstrapInputs,
-) -> BootstrapResult<(
-    RuntimeComponents,
-    RuntimeActors,
-    Receiver<Message>,
-    DedupeStateHandle,
-)> {
-    let ReplicatedVolumeBootstrapInputs {
-        runtime: replicated_volumes,
-        cluster_view,
-        volume_registry,
-        membership_change_blocker,
-        split_validator,
-    } = replicated_volume_inputs;
-    let channels = RuntimeChannels::new(options.gossip_channel_capacity);
-    let gossip_routes = channels.routes();
-    let RuntimeChannels {
-        gossip_tx,
-        gossip_rx,
-        topology_rx,
-        task_rx,
-        job_rx,
-        agent_rx,
-        service_rx,
-        network_rx,
-        secret_rx,
-        secret_master_key_rx,
-        volume_rx,
-        scheduler_digest_rx,
-        ..
-    } = channels;
-
-    let root_schema = stores.restore_root_schema_state(&ctx.db, options.root_schema_override)?;
-    let replicated_volume_support = match replicated_volumes.as_ref() {
-        Some(storage) => storage.support(root_schema.publication_generation())?,
-        None => ReplicatedVolumeSupport::stopped(
-            root_schema.publication_generation(),
-            root_schema.info().updated_at_unix_ms,
-        ),
-    };
-    let (gossip_client, gossip_dedupe) = build_gossip_client(&cluster_view, &gossip_routes);
-
-    let runtime_health = options.runtime_health;
-    let health_monitor = mantissa_health::HealthMonitor::new(ctx.self_id);
-    let secret_master_key_replication_notify = Arc::new(Notify::new());
-    let secret_master_key_publisher = SecretMasterKeyPublisher::new(
-        stores.secret_master_keys.clone(),
-        gossip_tx.clone(),
-        secret_master_key_replication_notify.clone(),
-        ctx.self_id,
-        ctx.noise_keys.clone(),
-    );
-    let topology_stores = build_topology_stores(stores, secret_master_key_publisher.clone());
-    let sync_stores = build_sync_stores(stores);
-    sync_stores
-        .rebuild_msts_for_root_schema_version(root_schema.supported_version())
-        .await
-        .map_err(|error| std::io::Error::other(format!("rebuild sync MSTs: {error}")))?;
-    let attachment_sync_notify = Arc::new(Notify::new());
-    let network_demand_sync_notify = Arc::new(Notify::new());
-    let sync_runner = SyncRunner::new(
-        sync_stores.clone(),
-        root_schema,
-        Some(attachment_sync_notify.clone()),
-        Some(network_demand_sync_notify.clone()),
-        Some(secret_master_key_replication_notify.clone()),
-    );
-    let sync_gc_progress = sync_runner.gc_progress();
-    let network_registry = NetworkRegistry::new(
-        stores.networks.clone(),
-        stores.network_peers.clone(),
-        stores.network_attachments.clone(),
-    );
-    let workload_registry = WorkloadRegistry::new(stores.workloads.clone());
-    let service_registry = services::ServiceRegistry::new(stores.services.clone());
-    let service_reconcile_trigger = ServiceReconcileTrigger::new();
-    let ingress_pool_registry = IngressPoolRegistry::new(stores.ingress_pools.clone());
-    let registry = build_registry(ctx, stores, health_monitor.clone(), cluster_view.clone());
-    let scheduler = build_scheduler(ctx, stores, registry.clone()).await?;
-    let runtime_set = build_runtime_set(options).await?;
-    let runtime_support = runtime_set.advertised_support();
-    let topology = build_topology(TopologyBuildInputs {
-        ctx,
-        cluster_view: cluster_view.clone(),
-        root_schema,
-        topology_rx,
-        gossip_tx: gossip_tx.clone(),
-        topology_stores: topology_stores.clone(),
-        deps: TopologyDependencies {
-            registry: registry.clone(),
-            network_registry: network_registry.clone(),
-            workload_registry: workload_registry.clone(),
-            service_registry: service_registry.clone(),
-            service_reconcile_trigger: service_reconcile_trigger.clone(),
-            volume_registry: volume_registry.clone(),
-            replicated_volume_split_validator: split_validator,
-            scheduler: scheduler.clone(),
-            sync: sync_runner.clone(),
-            health_monitor: health_monitor.clone(),
-            runtime_health,
-        },
-        runtime_support,
-        replicated_volume_support,
-    })?;
-    restore_topology_derived_state(&topology).await?;
-    let topology_client = capnp_rpc::new_client(topology.clone());
-    let sync_client = build_sync_client(cluster_view.clone(), root_schema, sync_stores.clone());
-
-    let local_node_name = resolve_local_node_name(ctx);
-    let secret_registry = crate::secrets::registry::SecretRegistry::new(stores.secrets.clone());
-    let secret_replicator = crate::secrets::gossip::SecretReplicator::new(
-        secret_registry.clone(),
-        gossip_tx.clone(),
-        secret_rx,
-    );
-    let secret_master_key_replicator = SecretMasterKeyReplicator::new(
-        stores.secret_master_keys.clone(),
-        secret_master_key_rx,
-        secret_master_key_replication_notify.clone(),
-    );
-    let secret_master_key_reconciler = SecretMasterKeyReconciler::new(
-        ctx.self_id,
-        ctx.noise_keys.clone(),
-        registry.clone(),
-        stores.secret_master_keys.clone(),
-        stores.secret_master_store.clone(),
-        stores.secret_keyring.clone(),
-        cluster_view.clone(),
-    );
-    if let Err(error) = secret_master_key_reconciler.reconcile_active_view().await {
-        tracing::warn!(
-            target: "secrets",
-            "failed to reconcile replicated secret master keys during startup: {error:#}"
-        );
-    }
-
-    let volume_replicator =
-        VolumeReplicator::new(volume_registry.clone(), gossip_tx.clone(), volume_rx);
-    let local_volume_root = resolve_local_volume_root(options)?;
-    let volume_controller = VolumeController::new(
-        volume_registry.clone(),
-        gossip_tx.clone(),
-        ctx.self_id,
-        local_node_name.clone(),
-        local_volume_root.clone(),
-        config::local_volume_enforce_capacity(),
-    );
-    let replicated_volume_planner = ReplicatedVolumePlanner::new(
-        volume_registry.clone(),
-        registry.clone(),
-        membership_change_blocker.clone(),
-        registry.health_monitor(),
-        gossip_tx.clone(),
-        ctx.self_id,
-    );
-    let replicated_volume_controller = replicated_volumes.as_ref().map(|runtime| {
-        ReplicatedVolumeController::new(
-            volume_registry.clone(),
-            registry.clone(),
-            membership_change_blocker,
-            registry.health_monitor(),
-            gossip_tx.clone(),
-            Arc::clone(runtime),
-        )
-    });
-
-    let job_registry = JobRegistry::new(stores.jobs.clone());
-    let agent_registry = AgentRegistry::new(stores.agents.clone());
-    let (forwarding_tx, forwarding_rx) = mpsc::unbounded_channel();
-    let network_controller =
-        NetworkController::new(crate::network::controller::NetworkControllerInit {
-            registry: network_registry.clone(),
-            cluster_registry: registry.clone(),
-            ingress_pools: ingress_pool_registry.clone(),
-            workload_store: stores.workloads.clone(),
-            service_registry: service_registry.clone(),
-            node_id: ctx.self_id,
-            node_name: local_node_name.clone(),
-            gossip_tx: gossip_tx.clone(),
-            forwarding_events: Some(forwarding_rx),
-            attachment_sync_notify: Some(attachment_sync_notify),
-            network_demand_sync_notify: Some(network_demand_sync_notify),
-            reconcile_drift_interval: options.network_reconcile_tick,
-            attachment_refresh_interval: options.network_attachment_refresh_tick,
-        })
-        .map_err(|error| -> Box<dyn std::error::Error> {
-            Box::new(std::io::Error::other(error.to_string()))
-        })?;
-    ctx.node
-        .set_nodeport_manager(network_controller.nodeport_manager());
-    ctx.node.set_network_controller(network_controller.clone());
-    let network_gossiper = NetworkGossiper::new(
-        network_registry.clone(),
-        network_controller.clone(),
-        gossip_tx.clone(),
-        network_rx,
-    );
-
-    let scheduler_digest_registry = SchedulerDigestRegistry::new(stores.scheduler_digests.clone());
-    let scheduler_digest_publisher = SchedulerDigestPublisher::new(
-        scheduler_digest_registry.clone(),
-        gossip_tx.clone(),
-        ctx.self_id,
-    );
-    let scheduler_digest_replicator =
-        SchedulerDigestReplicator::new(scheduler_digest_registry.clone(), scheduler_digest_rx);
-    scheduler.set_digest_publisher(scheduler_digest_publisher);
-    scheduler.set_digest_registry(scheduler_digest_registry);
-    scheduler.publish_current_digest().await;
-
-    let workload_manager = WorkloadManager::new(WorkloadManagerConfig {
-        store: stores.workloads.clone(),
-        tx: gossip_tx.clone(),
-        rx: task_rx,
-        local_node_id: ctx.self_id,
-        local_node_name: local_node_name.clone(),
-        scheduler: scheduler.clone(),
-        runtime_set,
-        registry: registry.clone(),
-        service_registry: service_registry.clone(),
-        network_registry: network_registry.clone(),
-        network_controller: Some(network_controller.clone()),
-        volume_registry: volume_registry.clone(),
-        replicated_volume_runtime: replicated_volumes.clone(),
-        secret_registry: secret_registry.clone(),
-        secret_keyring: stores.secret_keyring.clone(),
-        forwarding_events: Some(forwarding_tx),
-        attachment_override: None,
-        runtime_config: options.task_runtime,
-        local_volume_root,
-        enforce_local_volume_capacity: config::local_volume_enforce_capacity(),
-    });
-    let task_service =
-        TaskService::new(workload_manager.clone(), topology.clone(), registry.clone());
-    let task_client = capnp_rpc::new_client(task_service);
-    let workload_service = WorkloadService::new(workload_manager.clone());
-    let workload_client = capnp_rpc::new_client(workload_service);
-    let network_prerequisites = WorkloadNetworkPrerequisites::new(
-        network_registry.clone(),
-        network_controller.clone(),
-        registry.clone(),
-        gossip_tx.clone(),
-    );
-
-    let job_controller = JobController::new(JobControllerConfig {
-        registry: job_registry,
-        workload_manager: workload_manager.clone(),
-        network_prerequisites: network_prerequisites.clone(),
-        cluster_registry: registry.clone(),
-        gossip_tx: gossip_tx.clone(),
-        gossip_rx: job_rx,
-        local_node_id: ctx.self_id,
-        health_monitor: health_monitor.clone(),
-    });
-    let jobs_service = JobsRpc::new(job_controller.clone(), topology.clone());
-    let jobs_client = capnp_rpc::new_client(jobs_service);
-
-    let agent_controller = AgentController::new(AgentControllerConfig {
-        registry: agent_registry,
-        workload_manager: workload_manager.clone(),
-        network_prerequisites: network_prerequisites.clone(),
-        cluster_registry: registry.clone(),
-        gossip_tx: gossip_tx.clone(),
-        gossip_rx: agent_rx,
-        local_node_id: ctx.self_id,
-        health_monitor: health_monitor.clone(),
-    });
-    let agents_service = AgentsRpc::new(agent_controller.clone(), topology.clone());
-    let agents_client = capnp_rpc::new_client(agents_service);
-
-    let service_controller = ServiceController::new(ServiceControllerConfig {
-        registry: service_registry.clone(),
-        workload_manager: workload_manager.clone(),
-        cluster_registry: registry.clone(),
-        network_registry: network_registry.clone(),
-        network_controller: Some(network_controller.clone()),
-        network_prerequisites,
-        volume_registry: volume_registry.clone(),
-        gossip_tx: gossip_tx.clone(),
-        gossip_rx: service_rx,
-        local_node_id: ctx.self_id,
-        health_monitor: health_monitor.clone(),
-        reconcile_trigger: service_reconcile_trigger,
-        timing: options.service_timing,
-    });
-    let services_service = ServicesRPC::new(service_controller.clone(), topology.clone());
-    let services_client = capnp_rpc::new_client(services_service);
-
-    let networks_service = NetworksRpc::new(
-        network_registry.clone(),
-        network_gossiper.clone(),
-        network_controller.clone(),
-        topology.clone(),
-    );
-    let networks_client = capnp_rpc::new_client(networks_service);
-
-    let ingress_service = IngressRpc::new(
-        ingress_pool_registry.clone(),
-        service_registry.clone(),
-        network_registry.clone(),
-        registry.clone(),
-        network_controller.clone(),
-        topology.clone(),
-    );
-    let ingress_client = capnp_rpc::new_client(ingress_service);
-
-    let secrets_service = crate::secrets::service::SecretsService::new(
-        crate::secrets::service::SecretsServiceConfig {
-            registry: secret_registry,
-            keyring: stores.secret_keyring.clone(),
-            master_store: stores.secret_master_store.clone(),
-            master_key_publisher: secret_master_key_publisher,
-            topology: Some(topology.clone()),
-            replicator: secret_replicator.clone(),
-            local_node_id: ctx.self_id,
-            noise_keys: ctx.noise_keys.clone(),
-        },
-    );
-    let secrets_client = capnp_rpc::new_client(secrets_service);
-
-    let volumes_service = VolumesRpc::new(
-        volume_registry.clone(),
-        registry.clone(),
-        topology.clone(),
-        volume_replicator.clone(),
-        replicated_volumes.clone(),
-    );
-    let volumes_client = capnp_rpc::new_client(volumes_service);
-
-    let scheduler_service = SchedulerService::new(
-        scheduler.clone(),
-        ctx.self_id,
-        local_node_name.clone(),
-        Some(network_controller.clone()),
-    );
-    let scheduler_client = capnp_rpc::new_client(scheduler_service);
-
-    Ok((
-        RuntimeComponents {
-            gossip_client,
-            topology,
-            topology_client,
-            sync_client,
-            workload_manager,
-            task_client,
-            workload_client,
-            job_controller,
-            jobs_client,
-            agent_controller,
-            agents_client,
-            service_controller,
-            scheduler,
-            scheduler_client,
-            registry,
-            services_client,
-            secrets_client,
-            networks_client,
-            ingress_client,
-            volumes_client,
-            network_registry,
-            ingress_pool_registry,
-            volume_registry,
-            network_controller,
-            sync_stores,
-            sync_gc_progress,
-            cluster_view,
-            root_schema,
-            replicated_volumes,
-        },
-        RuntimeActors {
-            runtime_health,
-            secret_replicator,
-            secret_master_key_replicator,
-            secret_master_key_reconciler,
-            secret_master_key_replication_notify,
-            volume_replicator,
-            scheduler_digest_replicator,
-            volume_controller,
-            replicated_volume_planner,
-            replicated_volume_controller,
-            network_gossiper,
-        },
-        gossip_rx,
-        gossip_dedupe,
-    ))
-}
-
-/// Builds the topology store bundle expected by the topology subsystem.
-///
-/// This keeps the conversion from bootstrap stores to topology stores local to
-/// the runtime assembly instead of repeating the field mapping elsewhere.
-fn build_topology_stores(
-    stores: &BootstrapStores,
-    secret_master_key_publisher: SecretMasterKeyPublisher,
-) -> TopologyStorage {
-    TopologyStorage {
-        local_credential_store: stores.local_creds.clone(),
-        local_sessions: stores.local_sessions.clone(),
-        session_auth: stores.session_auth.clone(),
-        peers: stores.peers.clone(),
-        cluster_operations: stores.cluster_operations.clone(),
-        cluster_view_store: stores.cluster_view.clone(),
-        token_store: stores.token_store.clone(),
-        secret_master_store: stores.secret_master_store.clone(),
-        secret_keyring: stores.secret_keyring.clone(),
-        secrets: stores.secrets.clone(),
-        secret_master_keys: stores.secret_master_keys.clone(),
-        secret_master_key_publisher,
-    }
-}
-
-/// Builds the replicated store bundle owned by the sync subsystem.
-///
-/// Sync serves and reconciles every replicated domain, so bootstrap assembles
-/// that store set once and hands it to the sync server and client-side runner.
-fn build_sync_stores(stores: &BootstrapStores) -> SyncStores {
-    replicated_store_registry(ReplicatedStoreHandles {
-        peers: stores.peers.clone(),
-        workloads: stores.workloads.clone(),
-        services: stores.services.clone(),
-        jobs: stores.jobs.clone(),
-        agents: stores.agents.clone(),
-        secrets: stores.secrets.clone(),
-        secret_master_keys: stores.secret_master_keys.clone(),
-        networks: stores.networks.clone(),
-        network_peers: stores.network_peers.clone(),
-        network_attachments: stores.network_attachments.clone(),
-        cluster_views: stores.cluster_view.cluster_view_domain_store(),
-        cluster_operations: stores.cluster_operations.domain_store(),
-        volumes: stores.volumes.clone(),
-        volume_nodes: stores.volume_nodes.clone(),
-        volume_plans: stores.volume_plans.clone(),
-        volume_group_statuses: stores.volume_group_statuses.clone(),
-        volume_capacity_requests: stores.volume_capacity_requests.clone(),
-        scheduler_digests: stores.scheduler_digests.clone(),
-        ingress_pools: stores.ingress_pools.clone(),
-    })
-}
-
-/// Builds the gossip capability and dedupe handle.
-///
-/// The gossip service is the central fanout point for replicated domains, so
-/// bootstrap wires it first and hands its channels to the rest of the stack.
-fn build_gossip_client(
-    cluster_view: &ClusterViewState,
-    routes: &GossipRoutes,
-) -> (GossipClient, DedupeStateHandle) {
-    let gossip = gossip::Gossip::new(
-        gossip::Channels {
-            topology_events: routes.topology.clone(),
-            workload_events: routes.task.clone(),
-            job_events: routes.job.clone(),
-            agent_events: routes.agent.clone(),
-            service_events: routes.service.clone(),
-            network_events: routes.network.clone(),
-            secret_events: routes.secret.clone(),
-            secret_master_key_events: routes.secret_master_key.clone(),
-            volume_events: routes.volume.clone(),
-            scheduler_digest_events: routes.scheduler_digest.clone(),
-            outbound_events: routes.outbound.clone(),
-        },
-        cluster_view.clone(),
-    );
-    let gossip_dedupe = gossip.dedupe_state_handle();
-    (capnp_rpc::new_client(gossip), gossip_dedupe)
-}
-
-/// Builds the registry used for peer handle and session management.
-///
-/// Topology, scheduling, and service code all depend on the same peer registry,
-/// so bootstrap constructs it once and shares it across the runtime.
-fn build_registry(
-    ctx: &BootstrapContext,
-    stores: &BootstrapStores,
-    health_monitor: Arc<mantissa_health::HealthMonitor>,
-    cluster_view: ClusterViewState,
-) -> Registry {
-    Registry::new(
-        stores.peers.clone(),
-        stores.local_sessions.clone(),
-        ctx.signing_key.clone(),
-        ctx.noise_keys.clone(),
-        ctx.self_id,
-        health_monitor,
-        cluster_view,
-    )
-}
-
-/// Builds and initializes the scheduler for the local node.
-///
-/// Scheduler initialization depends on the registry and node information, so
-/// bootstrap performs it before tasks and services are allowed to run.
-async fn build_scheduler(
-    ctx: &BootstrapContext,
-    stores: &BootstrapStores,
-    registry: Registry,
-) -> BootstrapResult<Rc<Scheduler>> {
-    let runtime_config = config::scheduler_runtime_config();
-    let scheduler = Rc::new(
-        Scheduler::new(stores.scheduler_store.clone(), registry, ctx.self_id)
-            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?,
-    );
-    scheduler
-        .initialize_with_node(&ctx.node, runtime_config)
-        .await
-        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
-    Ok(scheduler)
-}
-
-/// Builds the topology actor for the local node.
-///
-/// Topology is the central coordination component, so the rest of the runtime
-/// hangs off the stores, registry, and scheduler wired here.
-fn build_topology(inputs: TopologyBuildInputs<'_>) -> BootstrapResult<Topology> {
-    let keys = Keys {
-        noise_public_key: inputs.ctx.noise_keys.public,
-        signing_key: inputs.ctx.signing_key.clone(),
-    };
-    Topology::new(TopologyConfig {
-        addr: inputs.ctx.listen_addr.clone(),
-        gossip_receiver: inputs.topology_rx,
-        gossip_sender: inputs.gossip_tx,
-        node: inputs.ctx.node.clone(),
-        cluster_view: inputs.cluster_view,
-        root_schema: inputs.root_schema,
-        stores: inputs.topology_stores,
-        crypto: keys,
-        deps: inputs.deps,
-        runtime_support: inputs.runtime_support,
-        replicated_volume_support: inputs.replicated_volume_support,
-    })
-    .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })
-}
-
-/// Restores topology-derived state before the node begins serving traffic.
-///
-/// This keeps durable topology recovery explicit instead of burying it in the
-/// main runtime construction flow.
-async fn restore_topology_derived_state(topology: &Topology) -> BootstrapResult<()> {
-    let completed_retirements = topology.publish_pending_view_retirements().await?;
-    if completed_retirements > 0 {
-        info!(
-            target: "cluster_view",
-            completed_retirements,
-            "completed pending source cluster view retirements during startup"
-        );
-    }
-
-    match topology.restore_cluster_names_from_operations().await {
-        Ok(restored) if restored > 0 => {
-            info!(
-                target: "cluster_view",
-                restored,
-                "restored cluster lineage names from durable operation history"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(
-                target: "cluster_view",
-                "failed to restore cluster lineage names from operation history: {error}"
-            );
-        }
-    }
-
-    let replayed = topology.replay_cluster_operations_on_startup().await?;
-    if replayed > 0 {
-        info!(
-            target: "cluster_view",
-            replayed,
-            "replayed pending cluster operations during startup"
-        );
-    }
-
-    topology
-        .reconcile_finalized_cluster_transitions_for_active_view(
-            "startup finalized-row reconciliation",
-        )
-        .await?;
-
-    if let Err(error) = topology.publish_local_cluster_node_count().await {
-        tracing::warn!(
-            target: "cluster_view",
-            "failed to publish local cluster node count during startup recovery: {error}"
-        );
-    }
-
-    Ok(())
-}
-
-/// Builds the sync capability over the replicated stores.
-///
-/// Sync is view-scoped but otherwise read-only at bootstrap time, so it can be
-/// assembled once the stores and active cluster view are known.
-fn build_sync_client(
-    cluster_view: ClusterViewState,
-    root_schema: RootSchemaState,
-    stores: SyncStores,
-) -> mantissa_protocol::sync::sync::Client {
-    let sync_service = SyncService::new(cluster_view, root_schema, stores);
-    capnp_rpc::new_client(sync_service)
-}
-
-/// Resolves a stable local node label for scheduler and network services.
-///
-/// The runtime prefers the detected hostname but falls back to the listen
-/// address so local-only test nodes still get a readable identifier.
-fn resolve_local_node_name(ctx: &BootstrapContext) -> String {
-    ctx.node
-        .system_info
-        .info
-        .hostname
-        .clone()
-        .unwrap_or_else(|| ctx.listen_addr.clone())
-}
-
-/// Resolves the local volume root used by the volume and task subsystems.
-///
-/// Headless tests can override this while the daemon path falls back to the
-/// regular process configuration.
-fn resolve_local_volume_root(options: &BootstrapOptions) -> BootstrapResult<PathBuf> {
-    match &options.local_volume_root {
-        Some(path) => Ok(path.clone()),
-        None => config::local_volume_root().map_err(|error| -> Box<dyn std::error::Error> {
-            Box::new(std::io::Error::other(error.to_string()))
-        }),
-    }
-}
-
-/// Resolves the container manager used by the task subsystem.
-///
-/// Tests can inject an in-memory runtime while production continues to default
-/// to Docker unless an environment override asks for the in-memory manager.
-async fn build_runtime_set(options: &BootstrapOptions) -> BootstrapResult<RuntimeSet> {
-    if let Some(runtime_set) = &options.runtime_set {
-        return Ok(runtime_set.clone());
-    }
-
-    if use_in_memory_runtime_backend_from_env() {
-        info!(
-            target: "task",
-            "using in-memory container runtime from env override"
-        );
-        return Ok(RuntimeSet::singleton(
-            IN_MEMORY_RUNTIME_BACKEND_KIND,
-            new_in_memory_runtime_backend(),
-        ));
-    }
-
-    let docker = DockerRuntimeBackend::new()
-        .await
-        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
-    Ok(RuntimeSet::singleton("docker", Arc::new(docker)))
-}
-
-/// Builds the exported `Server` capability with all dependencies injected.
-///
-/// This is the last pure construction step before post-boot wiring and
-/// transport startup begin.
+/// Gives the server the same capabilities retained for headless clients.
 fn build_server(
     ctx: &BootstrapContext,
     stores: &BootstrapStores,
     components: &RuntimeComponents,
 ) -> Server {
-    let config = Config::new(ctx.listen_addr.clone());
-
-    let clients = ServerClients {
-        topology_client: components.topology_client.clone(),
-        gossip_client: components.gossip_client.clone(),
-        sync_client: components.sync_client.clone(),
-        node_client: ctx.node_client.clone(),
-        task_client: components.task_client.clone(),
-        workload_client: components.workload_client.clone(),
-        jobs_client: components.jobs_client.clone(),
-        agents_client: components.agents_client.clone(),
-        scheduler_client: components.scheduler_client.clone(),
-        services_client: components.services_client.clone(),
-        secrets_client: components.secrets_client.clone(),
-        networks_client: components.networks_client.clone(),
-        ingress_client: components.ingress_client.clone(),
-        volumes_client: components.volumes_client.clone(),
-        rest_admin_client: capnp_rpc::new_client(crate::rest::RestAdmin::new(
-            stores.rest_token_store.clone(),
-        )),
-    };
-
     Server::new(
         ctx.self_id,
         ctx.signing_key.clone(),
-        config,
+        Config::new(ctx.listen_addr.clone()),
         ServerDependencies {
-            topology: components.topology.clone(),
-            session_services: clients.into(),
+            topology: components.controllers.topology.clone(),
+            session_services: components.clients.clone(),
             token_store: stores.token_store.clone(),
             session_store: stores.session_auth.clone(),
             noise_keys: ctx.noise_keys.clone(),
@@ -1423,18 +238,20 @@ fn build_server(
     )
 }
 
-/// Completes post-construction wiring before listeners are started.
-///
-/// This is where topology receives the server capability and one-shot startup
-/// tasks, such as the network controller, are started.
+/// Attaches the completed server to topology before external transports open.
 async fn finish_boot(server: &Server, components: &RuntimeComponents) -> BootstrapResult<()> {
     let server_client: ServerClient = capnp_rpc::new_client(server.clone());
-    if let Err(handle) = components.topology.set_server_handle(server_client).await {
+    if let Err(handle) = components
+        .controllers
+        .topology
+        .set_server_handle(server_client)
+        .await
+    {
         error!(target: "server", "failed to set server handle");
         drop(handle);
     }
 
-    match components.scheduler.snapshot().await {
+    match components.controllers.scheduler.snapshot().await {
         Some(snapshot) => {
             info!(
                 target: "scheduler",
@@ -1448,187 +265,4 @@ async fn finish_boot(server: &Server, components: &RuntimeComponents) -> Bootstr
         }
     }
     Ok(())
-}
-
-/// Spawns the long-running background tasks once bootstrap is complete.
-///
-/// Startup keeps these loops centralized so the daemon and headless paths do
-/// not drift in which actors are actually running.
-async fn spawn_runtime_tasks(
-    components: &RuntimeComponents,
-    stores: &BootstrapStores,
-    actors: RuntimeActors,
-    gossip_rx: Receiver<Message>,
-    gossip_dedupe: DedupeStateHandle,
-    options: RuntimeTaskOptions,
-) -> RuntimeTaskHandles {
-    let RuntimeTaskOptions {
-        signing_key,
-        local_node_id,
-        gossip_fanout,
-        store_gc_config,
-    } = options;
-    let RuntimeActors {
-        runtime_health: _runtime_health,
-        secret_replicator,
-        secret_master_key_replicator,
-        secret_master_key_reconciler,
-        secret_master_key_replication_notify,
-        volume_replicator,
-        scheduler_digest_replicator,
-        volume_controller,
-        replicated_volume_planner,
-        replicated_volume_controller,
-        network_gossiper,
-    } = actors;
-
-    let topology_runner = components.topology.clone();
-    let topology_lifecycle = components.topology.clone();
-    let topology_for_gossip = components.topology.clone();
-    let gossip_tick = topology_for_gossip.gossip_interval();
-    let (gossip_control, gossip_controls) = async_channel::bounded(1);
-    let mut tasks = Vec::new();
-
-    match config::metrics_runtime_config() {
-        Ok(metrics_config) => {
-            let state_db_path = match default_db_path() {
-                Ok(path) => path,
-                Err(error) => {
-                    error!(target: "metrics", "failed to resolve state database path: {error}");
-                    std::path::PathBuf::from("state.redb")
-                }
-            };
-            if let Some(task) = runtime_metrics::spawn_metrics(
-                metrics_config,
-                MetricsSamplerInputs {
-                    scheduler: components.scheduler.clone(),
-                    registry: components.registry.clone(),
-                    nodeport: components.network_controller.nodeport_manager(),
-                    stores: components.sync_stores.clone(),
-                    progress: components.sync_gc_progress.clone(),
-                    cluster_view: components.cluster_view.clone(),
-                    root_schema: components.root_schema,
-                    state_db_path,
-                },
-            ) {
-                tasks.push(task);
-            }
-        }
-        Err(error) => {
-            error!(target: "metrics", "invalid metrics configuration: {error}");
-        }
-    }
-
-    let mut workload_runner = components.workload_manager.clone();
-    tasks.push(tokio::task::spawn_local(async move {
-        workload_runner.run().await;
-    }));
-
-    let mut job_runner = components.job_controller.clone();
-    tasks.push(tokio::task::spawn_local(async move {
-        job_runner.run().await;
-    }));
-
-    let mut agent_runner = components.agent_controller.clone();
-    tasks.push(tokio::task::spawn_local(async move {
-        agent_runner.run().await;
-    }));
-
-    let mut service_runner = components.service_controller.clone();
-    tasks.push(tokio::task::spawn_local(async move {
-        service_runner.run().await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        secret_replicator.run().await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        secret_master_key_replicator.run().await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        secret_master_key_reconciler
-            .run_on_notify(secret_master_key_replication_notify)
-            .await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        volume_replicator.run().await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        scheduler_digest_replicator.run().await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        volume_controller.run().await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        replicated_volume_planner.run().await;
-    }));
-
-    if let Some(controller) = replicated_volume_controller {
-        tasks.push(tokio::task::spawn_local(async move {
-            controller.run().await;
-        }));
-    }
-
-    tasks.push(tokio::task::spawn_local(async move {
-        network_gossiper.run().await;
-    }));
-
-    let store_gc_runner = StoreGcRunner::new(StoreGcRunnerInputs {
-        stores: components.sync_stores.clone(),
-        registry: components.registry.clone(),
-        progress: components.sync_gc_progress.clone(),
-        cluster_view: components.cluster_view.clone(),
-        root_schema: components.root_schema,
-        local_node_id,
-        cluster_view_store: stores.cluster_view.clone(),
-        secrets: stores.secrets.clone(),
-        secret_master_keys: stores.secret_master_keys.clone(),
-        config: store_gc_config.unwrap_or_else(config::store_gc_runtime_config),
-    });
-    if let Some(task) = store_gc_runner.spawn() {
-        tasks.push(task);
-    }
-
-    tasks.push(tokio::task::spawn_local(async move {
-        gossip::start(
-            gossip_rx,
-            gossip_controls,
-            topology_for_gossip,
-            gossip_dedupe,
-            Some(gossip_fanout),
-            gossip_tick,
-        )
-        .await;
-    }));
-
-    tasks.push(tokio::task::spawn_local(async move {
-        topology_runner.run().await;
-    }));
-
-    if topology_lifecycle.already_joined().await.unwrap_or(false) {
-        topology_lifecycle.ensure_cluster_background_tasks();
-
-        let topology_for_boot = components.topology.clone();
-        tasks.push(tokio::task::spawn_local(async move {
-            if let Err(error) = topology_for_boot
-                .connect_known_peers(Some(&signing_key))
-                .await
-            {
-                error!(target: "server", "Startup connect failed: {error}");
-            }
-        }));
-    }
-
-    tasks.extend(components.network_controller.spawn());
-
-    RuntimeTaskHandles {
-        tasks,
-        gossip_control,
-    }
 }

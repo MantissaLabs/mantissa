@@ -508,7 +508,10 @@ async fn wait_scheduler_digest_roots_equal_all(
     loop {
         let mut roots = Vec::with_capacity(cluster.len());
         for node in cluster {
-            roots.push((node.id(), node.node.scheduler_digests.root_hex().await));
+            roots.push((
+                node.id(),
+                node.node.stores.scheduler_digests.root_hex().await,
+            ));
         }
 
         let all_non_empty = roots.iter().all(|(_, root)| !root.is_empty());
@@ -554,7 +557,7 @@ async fn wait_workload_roots_equal_all(
     loop {
         let mut roots = Vec::with_capacity(cluster.len());
         for node in cluster {
-            roots.push((node.id(), node.node.workloads.root_hex().await));
+            roots.push((node.id(), node.node.stores.workloads.root_hex().await));
         }
 
         let all_non_empty = roots.iter().all(|(_, root)| !root.is_empty());
@@ -1172,6 +1175,7 @@ local_test!(
         let rows = workload_batch(2_000, 7, cluster[0].id());
         cluster[0]
             .node
+            .stores
             .workloads
             .upsert_many(rows.clone())
             .await
@@ -1183,6 +1187,7 @@ local_test!(
         for (key, _) in &rows {
             cluster[0]
                 .node
+                .stores
                 .workloads
                 .remove(key)
                 .await
@@ -1198,10 +1203,11 @@ local_test!(
                 Duration::from_millis(50),
                 || async {
                     cluster.iter().all(|node| {
-                        workload_tombstone_count(&node.node.workloads) == 0
+                        workload_tombstone_count(&node.node.stores.workloads) == 0
                             && rows.iter().all(|(key, _)| {
                                 !node
                                     .node
+                                    .stores
                                     .workloads
                                     .exists(key)
                                     .expect("check workload row during GC wait")
@@ -1221,6 +1227,7 @@ local_test!(
                 assert!(
                     !node
                         .node
+                        .stores
                         .workloads
                         .exists(key)
                         .expect("check workload row after GC"),
@@ -1250,6 +1257,7 @@ local_test!(
         let rows = workload_batch(3_000, 4, cluster[0].id());
         cluster[0]
             .node
+            .stores
             .workloads
             .upsert_many(rows.clone())
             .await
@@ -1261,6 +1269,7 @@ local_test!(
         for (key, _) in &rows {
             cluster[0]
                 .node
+                .stores
                 .workloads
                 .remove(key)
                 .await
@@ -1273,7 +1282,7 @@ local_test!(
         sleep(Duration::from_millis(500)).await;
         for node in &cluster[..2] {
             assert_eq!(
-                workload_tombstone_count(&node.node.workloads),
+                workload_tombstone_count(&node.node.stores.workloads),
                 rows.len(),
                 "offline active peer should block tombstone pruning"
             );
@@ -1298,10 +1307,11 @@ local_test!(
                 }
 
                 cluster.iter().all(|node| {
-                    workload_tombstone_count(&node.node.workloads) == 0
+                    workload_tombstone_count(&node.node.stores.workloads) == 0
                         && rows.iter().all(|(key, _)| {
                             !node
                                 .node
+                                .stores
                                 .workloads
                                 .exists(key)
                                 .expect("check workload row after active peer rejoin")
@@ -1317,6 +1327,7 @@ local_test!(
                     .iter()
                     .filter(|(key, _)| {
                         node.node
+                            .stores
                             .workloads
                             .exists(key)
                             .expect("check workload row for active peer diagnostics")
@@ -1325,8 +1336,8 @@ local_test!(
                 states.push(format!(
                     "{} root={} tombstones={} live_rows={}",
                     &node.id().to_string()[..8],
-                    node.node.workloads.root_hex().await,
-                    workload_tombstone_count(&node.node.workloads),
+                    node.node.stores.workloads.root_hex().await,
+                    workload_tombstone_count(&node.node.stores.workloads),
                     live_rows
                 ));
             }
@@ -1357,6 +1368,7 @@ local_test!(store_gc_clean_leave_unblocks_tombstone_pruning, {
     let rows = workload_batch(4_000, 4, cluster[0].id());
     cluster[0]
         .node
+        .stores
         .workloads
         .upsert_many(rows.clone())
         .await
@@ -1368,6 +1380,7 @@ local_test!(store_gc_clean_leave_unblocks_tombstone_pruning, {
     for (key, _) in &rows {
         cluster[0]
             .node
+            .stores
             .workloads
             .remove(key)
             .await
@@ -1384,7 +1397,7 @@ local_test!(store_gc_clean_leave_unblocks_tombstone_pruning, {
             || async {
                 cluster[..2]
                     .iter()
-                    .all(|node| workload_tombstone_count(&node.node.workloads) == 0)
+                    .all(|node| workload_tombstone_count(&node.node.stores.workloads) == 0)
             }
         )
         .await,
@@ -1411,6 +1424,7 @@ local_test!(
             let register =
                 scheduler_digest_concurrent_register(node.id(), node_id, index as u64 + 1);
             node.node
+                .stores
                 .scheduler_digests
                 .merge_register(&key, &register)
                 .await
@@ -1422,18 +1436,20 @@ local_test!(
 
         for node in &cluster {
             assert_eq!(
-                scheduler_digest_versions(&node.node.scheduler_digests, &key),
+                scheduler_digest_versions(&node.node.stores.scheduler_digests, &key),
                 vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
             );
         }
 
         let (stale_registers, _) = cluster[9]
             .node
+            .stores
             .scheduler_digests
             .load_all_regs()
             .expect("capture stale pre-compaction scheduler digest registers");
         let report = cluster[0]
             .node
+            .stores
             .scheduler_digests
             .compact_registers(&StoreGcPolicy {
                 tombstone_min_retention_ms: 0,
@@ -1448,7 +1464,7 @@ local_test!(
             "the target scheduler digest row should be part of the compaction pass"
         );
         assert_eq!(
-            scheduler_digest_versions(&cluster[0].node.scheduler_digests, &key),
+            scheduler_digest_versions(&cluster[0].node.stores.scheduler_digests, &key),
             vec![8, 9, 10]
         );
 
@@ -1457,19 +1473,20 @@ local_test!(
             .expect("compacted scheduler digest row should propagate to all nodes");
         for node in &cluster {
             assert_eq!(
-                scheduler_digest_versions(&node.node.scheduler_digests, &key),
+                scheduler_digest_versions(&node.node.stores.scheduler_digests, &key),
                 vec![8, 9, 10]
             );
         }
 
         cluster[5]
             .node
+            .stores
             .scheduler_digests
             .apply_delta_chunk_update_mst(stale_registers, Vec::new())
             .await
             .expect("apply stale pre-compaction scheduler digest register");
         assert_eq!(
-            scheduler_digest_versions(&cluster[5].node.scheduler_digests, &key),
+            scheduler_digest_versions(&cluster[5].node.stores.scheduler_digests, &key),
             vec![8, 9, 10],
             "stale pre-compaction rows must not reintroduce dropped MVReg values"
         );

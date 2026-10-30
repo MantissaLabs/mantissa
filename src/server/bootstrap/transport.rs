@@ -1,4 +1,4 @@
-use super::runtime::{BootstrapOptions, ReplicatedVolumeStartup};
+use super::{replicated_volumes::ReplicatedVolumeStartup, runtime::BootstrapOptions};
 use crate::config;
 use crate::secrets::master_key::envelope::{PassphraseKdfParams, SecretPassphrase};
 

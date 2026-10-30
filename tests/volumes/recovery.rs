@@ -118,7 +118,7 @@ async fn run_missing_bootstrap_replica_flow(
         BootstrapReplicaFailure::FilePreparation => "incomplete-bootstrap-replica",
     };
     let volume_id = create_replicated_volume_result(
-        &cluster[0].node.volumes_client,
+        &cluster[0].node.clients.cluster.volumes,
         volume_name,
         REAL_REPLICATED_VOLUME_BYTES,
     )
@@ -177,7 +177,7 @@ async fn run_missing_bootstrap_replica_flow(
             fs::write(&blocks, b"prevent bootstrap file preparation")?;
         }
     }
-    let client = cluster[0].node.task_client.clone();
+    let client = cluster[0].node.clients.cluster.task.clone();
     let mut consumer = tokio::task::spawn_local(async move {
         start_volume_task_via_public_api(&client, volume_id, volume_name, "/var/lib/data").await
     });
@@ -213,7 +213,7 @@ async fn run_missing_bootstrap_replica_flow(
             poll.tick().await;
             let mut rebuilt_everywhere = true;
             for node in cluster {
-                let Some(group) = node.node.volume_registry.get_group_status(volume_id)? else {
+                let Some(group) = node.node.registries.volumes.get_group_status(volume_id)? else {
                     rebuilt_everywhere = false;
                     continue;
                 };
@@ -229,7 +229,8 @@ async fn run_missing_bootstrap_replica_flow(
                 );
                 let state = node
                     .node
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_node_state(volume_id, missing_node_id)?;
                 rebuilt_everywhere &= group.copy_node_ids.len() == 3
                     && group.copy_node_ids.contains(&missing_node_id)
@@ -360,13 +361,15 @@ async fn run_recovery_benchmark(
             .first()
             .context("replicated-volume recovery benchmark cluster is empty")?
             .node
-            .volumes_client,
+            .clients
+            .cluster
+            .volumes,
         &volume_name,
         REAL_REPLICATED_VOLUME_BYTES,
     )
     .await?;
     let task_id = start_volume_task_via_public_api(
-        &cluster[0].node.task_client,
+        &cluster[0].node.clients.cluster.task,
         volume_id,
         &volume_name,
         "/var/lib/data",
@@ -381,7 +384,8 @@ async fn run_recovery_benchmark(
     .await?;
     let plan = cluster[0]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .get_group_status(volume_id)
         .context("read recovery benchmark group observation")?
         .context("recovery benchmark has no group observation")?;
@@ -488,12 +492,12 @@ async fn run_recovery_benchmark(
         .position(|node| node.id() == attached_node_id)
         .context("attached recovery benchmark node stopped unexpectedly")?;
     let stop_started = Instant::now();
-    stop_task_via_public_api(&cluster[attached_index].node.task_client, task_id).await?;
+    stop_task_via_public_api(&cluster[attached_index].node.clients.cluster.task, task_id).await?;
     if !wait_until(
         Duration::from_secs(20),
         Duration::from_millis(100),
         || async {
-            public_task_is_gone(&cluster[attached_index].node.task_client, task_id)
+            public_task_is_gone(&cluster[attached_index].node.clients.cluster.task, task_id)
                 .await
                 .unwrap_or(false)
         },

@@ -52,11 +52,14 @@ async fn run_six_node_split_flow(
     let requester = cluster.first().context("six-node cluster is empty")?;
     let source_view = current_cluster_view(&requester.topology()).await;
     let volume_name = "split-safe-replicated";
-    let volume_id =
-        create_replicated_volume_result(&requester.node.volumes_client, volume_name, 64 << 20)
-            .await?;
+    let volume_id = create_replicated_volume_result(
+        &requester.node.clients.cluster.volumes,
+        volume_name,
+        64 << 20,
+    )
+    .await?;
     let task_id = start_volume_task_via_public_api(
-        &requester.node.task_client,
+        &requester.node.clients.cluster.task,
         volume_id,
         volume_name,
         "/var/lib/data",
@@ -71,7 +74,7 @@ async fn run_six_node_split_flow(
         .find(|node_id| *node_id != writer_node_id)
         .context("replicated volume has no follower to replace")?;
     drain_node_via_topology(
-        &requester.node.topology_client,
+        &requester.node.clients.cluster.topology,
         replaced_node_id,
         "replicated-volume split membership test",
     )
@@ -175,7 +178,7 @@ async fn run_six_node_split_flow(
 
     let owner_api = node_by_id(cluster, complete_targets[0][0])?;
     let restarted_task_id = start_volume_task_via_public_api(
-        &owner_api.node.task_client,
+        &owner_api.node.clients.cluster.task,
         volume_id,
         volume_name,
         "/var/lib/data",
@@ -200,7 +203,7 @@ async fn run_six_node_split_flow(
         .find(|node_id| *node_id != restarted_writer)
         .context("restarted split child has no follower to replace")?;
     drain_node_via_topology(
-        &owner_api.node.topology_client,
+        &owner_api.node.clients.cluster.topology,
         drained_follower,
         "post-split replicated-volume repair test",
     )
@@ -375,7 +378,7 @@ async fn merge_split_children(
         || async {
             for node in cluster {
                 if current_cluster_view(&node.topology()).await != split_views[0]
-                    || !node.node.registry.out_of_view_node_ids().is_empty()
+                    || !node.node.registries.peers.out_of_view_node_ids().is_empty()
                 {
                     return false;
                 }
@@ -390,7 +393,7 @@ async fn merge_split_children(
             view_boundaries.push((
                 node.id(),
                 current_cluster_view(&node.topology()).await,
-                node.node.registry.out_of_view_node_ids(),
+                node.node.registries.peers.out_of_view_node_ids(),
             ));
         }
         anyhow::bail!("merged cluster did not clear its split boundaries: {view_boundaries:?}");
@@ -422,7 +425,8 @@ async fn wait_for_stable_group_on_nodes(
                 .filter(|node| observer_node_ids.contains(&node.id()))
                 .all(|node| {
                     node.node
-                        .volume_registry
+                        .registries
+                        .volumes
                         .get_group_status(volume_id)
                         .ok()
                         .flatten()
@@ -456,7 +460,8 @@ async fn wait_for_converged_splittable_group_on_nodes(
             let node = node_by_id(cluster, *node_id)?;
             let copies = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)?
                 .and_then(stable_group_copy_set);
             let Some(copies) = copies else {
@@ -465,7 +470,8 @@ async fn wait_for_converged_splittable_group_on_nodes(
             };
             let public_rows_are_current = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .list_node_states_for_volume(volume_id)?
                 .into_iter()
                 .all(|row| copies.contains(&row.node_id) || row.state == VolumeNodeState::Pending);
@@ -540,17 +546,22 @@ async fn stop_task_and_wait_for_owner_detach(
     volume_id: Uuid,
     mount_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let client = &node_by_id(cluster, owner_node_ids[0])?.node.task_client;
+    let client = &node_by_id(cluster, owner_node_ids[0])?
+        .node
+        .clients
+        .cluster
+        .task;
     stop_task_via_public_api(client, task_id).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let mut detached = true;
         for node_id in owner_node_ids {
             let node = node_by_id(cluster, *node_id)?;
-            detached &= public_task_is_gone(&node.node.task_client, task_id).await?;
+            detached &= public_task_is_gone(&node.node.clients.cluster.task, task_id).await?;
             detached &= node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)?
                 .is_some_and(|status| {
                     status.attached_node_id.is_none() && status.status != VolumeStatus::InUse
@@ -577,7 +588,8 @@ fn observed_active_replicas_on_nodes(
         .filter(|node| observer_node_ids.contains(&node.id()))
         .find_map(|node| {
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .ok()
                 .flatten()
@@ -605,7 +617,8 @@ async fn wait_for_node_drain_on_nodes(
             .filter(|node| observer_node_ids.contains(&node.id()))
             .all(|node| {
                 node.node
-                    .registry
+                    .registries
+                    .peers
                     .peer_value_unscoped(drained_node_id)
                     .is_some_and(|peer| {
                         peer.scheduling.drain_requested && !peer.scheduling.schedulable
@@ -635,7 +648,8 @@ async fn wait_for_replacement_on_nodes(
             let node = node_by_id(cluster, *node_id)?;
             let copies = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)?
                 .and_then(stable_group_copy_set)
                 .filter(|copies| !copies.contains(&old_node_id));
@@ -684,7 +698,8 @@ async fn wait_for_writer_mount_after_replica_replacement(
     let writer = node_by_id(cluster, writer_node_id)?;
     let descriptor = writer
         .node
-        .volume_registry
+        .registries
+        .volumes
         .get_plan(volume_id)?
         .context("post-split writer has no replicated-volume plan")?
         .descriptor
@@ -697,7 +712,8 @@ async fn wait_for_writer_mount_after_replica_replacement(
             .replicated_volume_replacement_is_applied_for_test(key, replaced_node_id)?;
         let published_mount = writer
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_node_state(volume_id, writer_node_id)?
             .filter(|state| {
                 state.state == VolumeNodeState::Published
@@ -891,7 +907,7 @@ async fn assert_split_view_boundaries(
                 Duration::from_secs(45),
             )
             .await;
-            let out_of_view_node_ids = node.node.registry.out_of_view_node_ids();
+            let out_of_view_node_ids = node.node.registries.peers.out_of_view_node_ids();
             if out_of_view_node_ids != expected_out_of_view {
                 anyhow::bail!(
                     "node {node_id} has out-of-view nodes {out_of_view_node_ids:?} after split, expected {expected_out_of_view:?}"
@@ -910,7 +926,14 @@ async fn open_future_cross_child_storage_connection(
 ) -> anyhow::Result<()> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("pre-split transport check has no volume plan")?
         .descriptor
         .to_storage()?;
@@ -930,7 +953,14 @@ async fn assert_storage_transport_is_split(
 ) -> anyhow::Result<()> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("split transport check has no volume plan")?
         .descriptor
         .to_storage()?;
@@ -970,7 +1000,14 @@ async fn assert_storage_transport_is_merged(
 ) -> anyhow::Result<()> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("merged transport check has no volume plan")?
         .descriptor
         .to_storage()?;

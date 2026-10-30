@@ -925,14 +925,22 @@ pub(crate) async fn start_replicated_volume_test_cluster_with_node_count(
 /// Returns true when every running storage node has a cached session to every other one.
 pub(crate) async fn replicated_volume_test_nodes_have_sessions(cluster: &[TestNode]) -> bool {
     for node in cluster {
-        if node.node.registry.connect_known_peers(true).await.is_err() {
+        if node
+            .node
+            .registries
+            .peers
+            .connect_known_peers(true)
+            .await
+            .is_err()
+        {
             return false;
         }
         for peer in cluster {
             if node.id() != peer.id()
                 && node
                     .node
-                    .registry
+                    .registries
+                    .peers
                     .cached_session_for(peer.id())
                     .await
                     .is_none()
@@ -986,7 +994,8 @@ fn replicated_volume_test_nodes_have_current_storage_addresses(
                 expected.iter().all(|(peer_id, address)| {
                     observer
                         .node
-                        .registry
+                        .registries
+                        .peers
                         .peer_value_unscoped(*peer_id)
                         .is_some_and(|peer| {
                             peer.replicated_volumes.is_running()
@@ -1015,7 +1024,8 @@ fn replicated_volume_test_storage_address_diagnostics(
                     let observer = cluster.iter().find(|node| node.id() == *observer_id)?;
                     let address = observer
                         .node
-                        .registry
+                        .registries
+                        .peers
                         .peer_value_unscoped(*node_id)
                         .map(|peer| peer.replicated_volumes.address);
                     Some((*observer_id, address))
@@ -1076,7 +1086,7 @@ pub(crate) async fn shutdown_replicated_volume_test_node(
     // exit drops those objects with the process, so mirror that boundary before reopening the
     // same local volume database in this process.
     for peer in cluster {
-        peer.node.registry.remove_peer(node_id).await;
+        peer.node.registries.peers.remove_peer(node_id).await;
     }
     Ok(())
 }
@@ -1158,7 +1168,13 @@ pub(crate) async fn restart_replicated_volume_test_view(
             };
             if crate::common::convergence::current_cluster_view(&node.topology()).await
                 != expected_view
-                || node.node.registry.connect_known_peers(true).await.is_err()
+                || node
+                    .node
+                    .registries
+                    .peers
+                    .connect_known_peers(true)
+                    .await
+                    .is_err()
             {
                 ready = false;
                 continue;
@@ -1167,7 +1183,8 @@ pub(crate) async fn restart_replicated_volume_test_view(
                 if peer_id != node_id
                     && node
                         .node
-                        .registry
+                        .registries
+                        .peers
                         .cached_session_for(*peer_id)
                         .await
                         .is_none()
@@ -1375,7 +1392,7 @@ pub(crate) async fn wait_for_public_task_running(
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     loop {
         poll.tick().await;
-        let request = owner.node.task_client.list_request();
+        let request = owner.node.clients.cluster.task.list_request();
         let response = tokio::time::timeout(PUBLIC_API_TIMEOUT, request.send().promise).await;
         let observation = match response {
             Ok(Ok(response)) => response
@@ -1410,17 +1427,22 @@ pub(crate) async fn wait_for_public_task_running(
 pub(crate) fn replicated_volume_start_diagnostics(cluster: &[TestNode], volume_id: Uuid) -> String {
     let mut reports = Vec::with_capacity(cluster.len());
     for node in cluster {
-        let plan = node.node.volume_registry.get_plan(volume_id).map(|plan| {
-            plan.map(|plan| {
-                format!(
-                    "bootstrap={}, replicas={:?}",
-                    plan.bootstrap_id, plan.replica_node_ids
-                )
-            })
-        });
+        let plan = node
+            .node
+            .registries
+            .volumes
+            .get_plan(volume_id)
+            .map(|plan| {
+                plan.map(|plan| {
+                    format!(
+                        "bootstrap={}, replicas={:?}",
+                        plan.bootstrap_id, plan.replica_node_ids
+                    )
+                })
+            });
         let group = node
             .node
-            .volume_registry
+            .registries.volumes
             .get_group_status(volume_id)
             .map(|status| {
                 status.map(|status| {
@@ -1441,7 +1463,8 @@ pub(crate) fn replicated_volume_start_diagnostics(cluster: &[TestNode], volume_i
             });
         let states = node
             .node
-            .volume_registry
+            .registries
+            .volumes
             .list_node_states_for_volume(volume_id)
             .map(|states| {
                 states
@@ -1454,7 +1477,7 @@ pub(crate) fn replicated_volume_start_diagnostics(cluster: &[TestNode], volume_i
                     })
                     .collect::<Vec<_>>()
             });
-        let health = node.node.registry.health_monitor().snapshot();
+        let health = node.node.registries.peers.health_monitor().snapshot();
         reports.push(format!(
             "observer={}: plan={plan:?}, group={group:?}, nodes={states:?}, health={health:?}",
             node.id()
@@ -1470,7 +1493,14 @@ pub(crate) async fn replicated_volume_local_diagnostics(
 ) -> anyhow::Result<String> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("local diagnostics have no volume plan")?
         .descriptor
         .to_storage()?;
@@ -1529,7 +1559,7 @@ pub(crate) async fn public_task_is_gone_from_cluster(
     task_id: Uuid,
 ) -> anyhow::Result<bool> {
     for node in cluster {
-        if !public_task_is_gone(&node.node.task_client, task_id).await? {
+        if !public_task_is_gone(&node.node.clients.cluster.task, task_id).await? {
             return Ok(false);
         }
     }
@@ -1540,9 +1570,10 @@ pub(crate) async fn public_task_is_gone_from_cluster(
 pub(crate) async fn public_task_cluster_diagnostics(cluster: &[TestNode], task_id: Uuid) -> String {
     let mut reports = Vec::with_capacity(cluster.len());
     for node in cluster {
-        let root = node.node.workloads.root_digest().await;
+        let root = node.node.stores.workloads.root_digest().await;
         let stored = match node
             .node
+            .stores
             .workloads
             .get_snapshot(&mantissa_store::uuid_key::UuidKey::from(task_id))
         {
@@ -1571,7 +1602,8 @@ pub(crate) async fn public_task_cluster_diagnostics(cluster: &[TestNode], task_i
         };
         let report = match node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .list_workloads(&WorkloadStateFilter::all())
             .await
         {
@@ -1606,7 +1638,13 @@ pub(crate) async fn check_volume_control_apis(
     {
         let response = tokio::time::timeout(
             PUBLIC_API_TIMEOUT,
-            node.node.volumes_client.list_request().send().promise,
+            node.node
+                .clients
+                .cluster
+                .volumes
+                .list_request()
+                .send()
+                .promise,
         )
         .await
         .context("volume list timed out while the volume was busy")??;
@@ -1634,7 +1672,7 @@ pub(crate) async fn check_volume_control_apis(
     }
 
     {
-        let mut request = node.node.volumes_client.get_status_request();
+        let mut request = node.node.clients.cluster.volumes.get_status_request();
         request.get().set_selector(volume_name);
         let response = tokio::time::timeout(PUBLIC_API_TIMEOUT, request.send().promise)
             .await
@@ -1649,7 +1687,13 @@ pub(crate) async fn check_volume_control_apis(
     {
         let response = tokio::time::timeout(
             PUBLIC_API_TIMEOUT,
-            node.node.topology_client.list_request().send().promise,
+            node.node
+                .clients
+                .cluster
+                .topology
+                .list_request()
+                .send()
+                .promise,
         )
         .await
         .context("node list timed out while the volume was busy")??;
@@ -1680,7 +1724,7 @@ pub(crate) async fn check_attached_node_apis(
 ) -> anyhow::Result<()> {
     check_volume_control_apis(node, volume_name, expected_node_count).await?;
 
-    let mut inspect = node.node.volumes_client.get_status_request();
+    let mut inspect = node.node.clients.cluster.volumes.get_status_request();
     inspect.get().set_selector(volume_name);
     let response = tokio::time::timeout(PUBLIC_API_TIMEOUT, inspect.send().promise)
         .await
@@ -1700,7 +1744,7 @@ pub(crate) async fn check_attached_node_apis(
 
     let response = tokio::time::timeout(
         PUBLIC_API_TIMEOUT,
-        node.node.task_client.list_request().send().promise,
+        node.node.clients.cluster.task.list_request().send().promise,
     )
     .await
     .context("task list timed out while the volume was busy")??;
@@ -1901,7 +1945,14 @@ pub(crate) async fn wait_for_attached_volume(
 ) -> anyhow::Result<(Uuid, PathBuf)> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("attached volume has no bootstrap plan")?
         .descriptor
         .to_storage()?;
@@ -1913,7 +1964,8 @@ pub(crate) async fn wait_for_attached_volume(
         for node in cluster {
             let attached_node_id = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .ok()
                 .flatten()
@@ -1925,7 +1977,8 @@ pub(crate) async fn wait_for_attached_volume(
             let path = cluster.iter().find_map(|observer| {
                 observer
                     .node
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_node_state(volume_id, attached_node_id)
                     .ok()
                     .flatten()
@@ -1955,7 +2008,14 @@ async fn wait_for_recovered_attachment(
 ) -> anyhow::Result<PathBuf> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("recovered attachment has no bootstrap plan")?
         .descriptor
         .to_storage()?;
@@ -1967,7 +2027,8 @@ async fn wait_for_recovered_attachment(
         if let Some(node) = cluster.iter().find(|node| node.id() == attached_node_id) {
             let recovered = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_node_state(volume_id, attached_node_id)?
                 .filter(|state| {
                     state.updated_at != previous_update
@@ -2010,7 +2071,8 @@ async fn wait_for_surviving_copies_to_observe_down(
                     .find(|node| node.id() == *observer_id)
                     .and_then(|node| {
                         node.node
-                            .registry
+                            .registries
+                            .peers
                             .health_monitor()
                             .snapshot()
                             .get(&failed_node_id)
@@ -2076,7 +2138,14 @@ async fn wait_for_failed_copy_recovery_status(
 ) -> anyhow::Result<()> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("two-copy recovery diagnostics have no volume plan")?
         .descriptor
         .to_storage()?;
@@ -2088,7 +2157,8 @@ async fn wait_for_failed_copy_recovery_status(
         poll.tick().await;
         if cluster.iter().any(|node| {
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .ok()
                 .flatten()
@@ -2209,7 +2279,14 @@ pub(crate) async fn wait_for_failed_attachment_republish(
 ) -> anyhow::Result<()> {
     let descriptor = cluster
         .iter()
-        .find_map(|node| node.node.volume_registry.get_plan(volume_id).ok().flatten())
+        .find_map(|node| {
+            node.node
+                .registries
+                .volumes
+                .get_plan(volume_id)
+                .ok()
+                .flatten()
+        })
         .context("degraded attachment has no bootstrap plan")?
         .descriptor
         .to_storage()?;
@@ -2221,7 +2298,8 @@ pub(crate) async fn wait_for_failed_attachment_republish(
         if let Some(node) = cluster.iter().find(|node| node.id() == attached_node_id) {
             let state = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_node_state(volume_id, attached_node_id)?;
             let runtime_mounted = node.node.replicated_volume_is_mounted(key).await?;
             let mount_present = path_is_mounted(mount_path)?;
@@ -2243,7 +2321,8 @@ pub(crate) async fn wait_for_failed_attachment_republish(
                     format!(
                         "node_state={:?}, runtime_mounted={:?}, mount_table={:?}",
                         node.node
-                            .volume_registry
+                            .registries
+                            .volumes
                             .get_node_state(volume_id, attached_node_id),
                         node.node.replicated_volume_is_mounted(key).await,
                         path_is_mounted(mount_path),
@@ -2276,7 +2355,8 @@ pub(crate) async fn wait_for_detached_volume(
         for node in cluster {
             if let Some(status) = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .context("read volume state while waiting for detach")?
             {
@@ -2286,7 +2366,8 @@ pub(crate) async fn wait_for_detached_volume(
             }
             all_task_publications_cleared &= node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .list_node_states_for_volume(volume_id)
                 .context("read task publications while waiting for detach")?
                 .iter()
@@ -2439,7 +2520,8 @@ pub(crate) fn observed_active_replicas(
         .iter()
         .find_map(|node| {
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .ok()
                 .flatten()
@@ -2468,7 +2550,8 @@ pub(crate) async fn wait_for_replica_replacement(
         .first()
         .context("replica replacement has no running node")?
         .node
-        .volume_registry
+        .registries
+        .volumes
         .get_plan(volume_id)?
         .context("replica replacement has no volume plan")?
         .descriptor
@@ -2484,7 +2567,8 @@ pub(crate) async fn wait_for_replica_replacement(
         for node in cluster {
             if let Some(group) = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .context("read control state while waiting for replica replacement")?
                 && matches!(group.status, VolumeStatus::Ready | VolumeStatus::InUse)
@@ -2546,14 +2630,19 @@ pub(crate) async fn wait_for_replica_replacement(
                 .map(|node| {
                     (
                         node.id(),
-                        node.node.volume_registry.get_group_status(volume_id),
+                        node.node.registries.volumes.get_group_status(volume_id),
                     )
                 })
                 .collect::<Vec<_>>();
             let local = replicated_volume_local_diagnostics(cluster, volume_id).await;
             let health = cluster
                 .iter()
-                .map(|node| (node.id(), node.node.registry.health_monitor().snapshot()))
+                .map(|node| {
+                    (
+                        node.id(),
+                        node.node.registries.peers.health_monitor().snapshot(),
+                    )
+                })
                 .collect::<Vec<_>>();
             anyhow::bail!(
                 "{timeout_reason}; running nodes: {:?}; \
@@ -2580,7 +2669,8 @@ pub(crate) async fn wait_for_new_volume_binding(
         for node in cluster {
             let bound_node_id = node
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_spec(volume_id)
                 .context("read volume while waiting for its new writer")?
                 .and_then(|spec| spec.bound_node_id);
@@ -2676,7 +2766,8 @@ pub(crate) async fn wait_for_running_service_task(
         for node in cluster {
             if let Some(service) = node
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .context("read service while waiting for startup")?
@@ -2697,7 +2788,7 @@ pub(crate) async fn service_start_diagnostics(cluster: &[TestNode], service_id: 
     let mut reports = Vec::with_capacity(cluster.len());
     for node in cluster {
         let mut observed_service_name = None;
-        let service = node.node.service_controller.registry().get(service_id);
+        let service = node.node.controllers.services.registry().get(service_id);
         let service = match service {
             Ok(Some(service)) => {
                 observed_service_name = Some(service.service_name.clone());
@@ -2714,7 +2805,8 @@ pub(crate) async fn service_start_diagnostics(cluster: &[TestNode], service_id: 
         };
         let tasks = match node
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .list_workloads(&WorkloadStateFilter::all())
             .await
         {
@@ -2760,7 +2852,8 @@ pub(crate) async fn wait_for_stopped_service(
         for node in cluster {
             if node
                 .node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .context("read service while waiting for stop")?
@@ -2970,14 +3063,16 @@ async fn wait_for_online_expansion(
         let converged = cluster.iter().all(|observer| {
             let request_matches = observer
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_capacity_request(volume_id)
                 .ok()
                 .flatten()
                 .is_some_and(|request| request.target_capacity_bytes == target_capacity_bytes);
             let group_matches = observer
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .ok()
                 .flatten()
@@ -2990,7 +3085,8 @@ async fn wait_for_online_expansion(
                                 .find(|node| node.id() == *copy)
                                 .and_then(|node| {
                                     node.node
-                                        .volume_registry
+                                        .registries
+                                        .volumes
                                         .get_node_state(volume_id, *copy)
                                         .ok()
                                         .flatten()
@@ -3015,7 +3111,8 @@ async fn wait_for_online_expansion(
             .find(|node| node.id() == attached_node_id)
             .and_then(|node| {
                 node.node
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_node_state(volume_id, attached_node_id)
                     .ok()
                     .flatten()
@@ -3035,10 +3132,11 @@ async fn wait_for_online_expansion(
                 .map(|node| {
                     (
                         node.id(),
-                        node.node.volume_registry.get_capacity_request(volume_id),
-                        node.node.volume_registry.get_group_status(volume_id),
+                        node.node.registries.volumes.get_capacity_request(volume_id),
+                        node.node.registries.volumes.get_group_status(volume_id),
                         node.node
-                            .volume_registry
+                            .registries
+                            .volumes
                             .list_node_states_for_volume(volume_id),
                     )
                 })
@@ -3069,10 +3167,16 @@ async fn wait_for_expansion_request_while_copy_is_missing(
         for observer in cluster {
             let request_matches = observer
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_capacity_request(volume_id)?
                 .is_some_and(|request| request.target_capacity_bytes == target_capacity_bytes);
-            let Some(group) = observer.node.volume_registry.get_group_status(volume_id)? else {
+            let Some(group) = observer
+                .node
+                .registries
+                .volumes
+                .get_group_status(volume_id)?
+            else {
                 ready = false;
                 continue;
             };
@@ -3118,7 +3222,9 @@ async fn expand_after_missing_copy_restarts(
         .first()
         .context("online expansion has no public API node")?
         .node
-        .volumes_client
+        .clients
+        .cluster
+        .volumes
         .clone();
     request_replicated_volume_expansion(
         &client,
@@ -3186,7 +3292,9 @@ async fn expand_attached_volume_during_io(
             .first()
             .context("online expansion has no public API node")?
             .node
-            .volumes_client;
+            .clients
+            .cluster
+            .volumes;
         request_replicated_volume_expansion(client, "real-replicated", target_capacity_bytes, true)
             .await?;
         wait_for_online_expansion(
@@ -3219,7 +3327,8 @@ async fn expand_attached_volume_during_io(
         .find(|node| node.id() == attached_node_id)
         .context("expanded volume writer is not running")?
         .node
-        .volume_registry
+        .registries
+        .volumes
         .get_node_state(volume_id, attached_node_id)?
         .context("expanded volume has no writer status")?;
     if !writer_state.published_task_ids.contains(&task_id) {
@@ -3235,13 +3344,13 @@ pub(crate) async fn run_replicated_volume_public_flow(
 ) -> anyhow::Result<()> {
     let expected_node_count = states.len();
     let volume_id = create_replicated_volume_result(
-        &cluster[0].node.volumes_client,
+        &cluster[0].node.clients.cluster.volumes,
         "real-replicated",
         REAL_REPLICATED_VOLUME_BYTES,
     )
     .await?;
     let task_id = start_volume_task_via_public_api(
-        &cluster[0].node.task_client,
+        &cluster[0].node.clients.cluster.task,
         volume_id,
         "real-replicated",
         "/var/lib/data",
@@ -3276,7 +3385,12 @@ pub(crate) async fn run_replicated_volume_public_flow(
         )
         .await?;
 
-        let mut status_request = attached_node.node.volumes_client.get_status_request();
+        let mut status_request = attached_node
+            .node
+            .clients
+            .cluster
+            .volumes
+            .get_status_request();
         status_request.get().set_selector("real-replicated");
         let status_response = status_request
             .send()
@@ -3355,7 +3469,8 @@ pub(crate) async fn run_replicated_volume_public_flow(
         .find(|node| node.id() == attached_node_id)
         .context("attached node disappeared before writer restart")?
         .node
-        .volume_registry
+        .registries
+        .volumes
         .get_node_state(volume_id, attached_node_id)
         .context("read attachment state before writer restart")?
         .context("writer restart has no saved attachment state")?
@@ -3451,7 +3566,8 @@ pub(crate) async fn run_replicated_volume_public_flow(
                 .context("attached node disappeared after follower restart")?;
             let descriptor = attached
                 .node
-                .volume_registry
+                .registries
+                .volumes
                 .get_plan(volume_id)?
                 .context("follower restart diagnostics have no volume plan")?
                 .descriptor
@@ -3570,7 +3686,7 @@ pub(crate) async fn run_replicated_volume_public_flow(
         .iter()
         .position(|node| node.id() == attached_node_id)
         .context("attached node disappeared before clean task stop")?;
-    stop_task_via_public_api(&cluster[attached_index].node.task_client, task_id).await?;
+    stop_task_via_public_api(&cluster[attached_index].node.clients.cluster.task, task_id).await?;
     if !wait_until(
         Duration::from_secs(20),
         Duration::from_millis(100),
@@ -3597,7 +3713,9 @@ pub(crate) async fn run_replicated_volume_public_flow(
         .first()
         .context("test cluster is empty before writer drain")?
         .node
-        .topology_client
+        .clients
+        .cluster
+        .topology
         .clone();
     drain_node_via_topology(&drain_client, attached_node_id, "volume writer move test")
         .await
@@ -3621,7 +3739,9 @@ pub(crate) async fn run_replicated_volume_public_flow(
         .find(|node| node.id() != attached_node_id)
         .context("no non-draining node can accept the replacement workload")?
         .node
-        .services_client
+        .clients
+        .cluster
+        .services
         .clone();
     let service_id =
         deploy_volume_service_via_public_api(&service_client, volume_id, "real-replicated").await?;
@@ -3712,7 +3832,11 @@ pub(crate) async fn run_replicated_volume_public_flow(
         .iter()
         .position(|node| node.id() == attached_node_id)
         .context("attached node disappeared before lost-quorum service stop")?;
-    stop_service_via_public_api(&cluster[attached_index].node.services_client, service_id).await?;
+    stop_service_via_public_api(
+        &cluster[attached_index].node.clients.cluster.services,
+        service_id,
+    )
+    .await?;
     wait_for_stopped_service(cluster, service_id, Duration::from_secs(20)).await?;
     if !wait_until(
         Duration::from_secs(20),
@@ -3745,13 +3869,13 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
     cluster: &[TestNode],
 ) -> anyhow::Result<()> {
     let volume_id = create_replicated_volume_result(
-        &cluster[0].node.volumes_client,
+        &cluster[0].node.clients.cluster.volumes,
         "insufficient-space-expand",
         REAL_REPLICATED_VOLUME_BYTES,
     )
     .await?;
     let _task_id = start_volume_task_via_public_api(
-        &cluster[0].node.task_client,
+        &cluster[0].node.clients.cluster.task,
         volume_id,
         "insufficient-space-expand",
         "/var/lib/data",
@@ -3773,7 +3897,8 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
         status_poll.tick().await;
         let state = attached
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_node_state(volume_id, attached_node_id)?;
         if state.as_ref().is_some_and(|state| {
             state.served_capacity_bytes == Some(REAL_REPLICATED_VOLUME_BYTES)
@@ -3805,7 +3930,7 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
 
     let check = async {
         request_replicated_volume_expansion(
-            &cluster[0].node.volumes_client,
+            &cluster[0].node.clients.cluster.volumes,
             "insufficient-space-expand",
             REAL_REPLICATED_VOLUME_UNAVAILABLE_EXPANSION_BYTES,
             true,
@@ -3817,7 +3942,7 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
             poll.tick().await;
             let request_seen_everywhere = cluster.iter().all(|node| {
                 node.node
-                    .volume_registry
+                    .registries.volumes
                     .get_capacity_request(volume_id)
                     .ok()
                     .flatten()
@@ -3827,7 +3952,7 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
                     })
             });
             for node in cluster {
-                if let Some(group) = node.node.volume_registry.get_group_status(volume_id)?
+                if let Some(group) = node.node.registries.volumes.get_group_status(volume_id)?
                     && group.replicated_capacity_bytes != REAL_REPLICATED_VOLUME_BYTES
                 {
                     anyhow::bail!(
@@ -3838,7 +3963,7 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
             }
             let writer_state = attached
                 .node
-                .volume_registry
+                .registries.volumes
                 .get_node_state(volume_id, attached_node_id)?
                 .context("insufficient-space writer has no local status")?;
             let filesystem_capacity = mounted_filesystem_capacity(&host_mount)?;
@@ -3864,7 +3989,7 @@ pub(crate) async fn run_insufficient_space_expansion_flow(
             anyhow::bail!("insufficient-space desired capacity did not converge");
         }
 
-        let mut request = attached.node.volumes_client.get_status_request();
+        let mut request = attached.node.clients.cluster.volumes.get_status_request();
         request.get().set_selector("insufficient-space-expand");
         let response = request.send().promise.await?;
         let status = response.get()?.get_volume()?;
@@ -4168,7 +4293,14 @@ pub(crate) async fn wait_for_pairwise_sessions(cluster: &[TestNode]) {
             Duration::from_millis(50),
             || async {
                 for node in cluster {
-                    if node.node.registry.connect_known_peers(true).await.is_err() {
+                    if node
+                        .node
+                        .registries
+                        .peers
+                        .connect_known_peers(true)
+                        .await
+                        .is_err()
+                    {
                         return false;
                     }
                 }
@@ -4189,7 +4321,8 @@ pub(crate) async fn wait_for_node_drain(
     if wait_until(timeout, Duration::from_millis(100), || async {
         cluster.iter().all(|node| {
             node.node
-                .registry
+                .registries
+                .peers
                 .peer_value_unscoped(node_id)
                 .is_some_and(|peer| peer.scheduling.drain_requested && !peer.scheduling.schedulable)
         })
@@ -4230,7 +4363,8 @@ pub(crate) async fn wait_for_stable_replicas_after_restart(
         let mut agreed_replicas = None;
         let all_match = cluster.iter().all(|node| {
             node.node
-                .volume_registry
+                .registries
+                .volumes
                 .get_group_status(volume_id)
                 .ok()
                 .flatten()
@@ -4325,7 +4459,8 @@ pub(crate) async fn start_standalone_volume_task(
     target: &str,
 ) -> mantissa::workload::model::WorkloadSpec {
     let mut started = node
-        .workload_manager
+        .controllers
+        .workloads
         .start_workloads_batch(vec![standalone_volume_task_request(
             volume_id,
             volume_name,
@@ -4396,7 +4531,7 @@ pub(crate) async fn wait_for_volume_published_tasks(
             Duration::from_secs(10),
             Duration::from_millis(25),
             || async {
-                match node.volume_registry.get_node_state(volume_id, node.id) {
+                match node.registries.volumes.get_node_state(volume_id, node.id) {
                     Ok(Some(state)) => state.published_task_ids == expected,
                     _ => false,
                 }

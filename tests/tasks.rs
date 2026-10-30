@@ -73,7 +73,15 @@ fn read_uuid(data: capnp::data::Reader<'_>) -> Result<Uuid, capnp::Error> {
 
 /// Lists task identifiers exposed by the public task capability.
 async fn list_task_ids(node: &TestNode) -> Result<Vec<Uuid>, capnp::Error> {
-    let response = node.node.task_client.list_request().send().promise.await?;
+    let response = node
+        .node
+        .clients
+        .cluster
+        .task
+        .list_request()
+        .send()
+        .promise
+        .await?;
     let tasks = response.get()?.get_tasks()?;
     let mut ids = Vec::with_capacity(tasks.len() as usize);
     for task in tasks.iter() {
@@ -109,6 +117,7 @@ local_test!(task_list_includes_service_owned_workloads, {
     let service_task = replicated_service_task_value(task_id, node.id(), "node-a");
 
     node.node
+        .stores
         .workloads
         .upsert(&UuidKey::from(task_id), service_task.into())
         .await
@@ -187,6 +196,7 @@ local_test!(
             async move {
                 let observed = anchor
                     .node
+                    .controllers
                     .scheduler
                     .observed_scheduler_digests()
                     .expect("load observed scheduler digests")
@@ -226,7 +236,8 @@ local_test!(
             async move {
                 let tasks = anchor
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .list_workloads(&TaskStateFilter::active_only())
                     .await
                     .expect("list active workloads");
@@ -248,7 +259,8 @@ local_test!(
         if !balanced {
             let tasks = cluster[0]
                 .node
-                .workload_manager
+                .controllers
+                .workloads
                 .list_workloads(&TaskStateFilter::active_only())
                 .await
                 .expect("list active workloads after spread timeout");
@@ -313,7 +325,8 @@ local_test!(task_client_sends_registry_auth_secret_reference, {
     let id = Uuid::parse_str(&task.id).expect("task UUID");
     let spec = node
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(id)
         .await
         .expect("inspect private-image task");

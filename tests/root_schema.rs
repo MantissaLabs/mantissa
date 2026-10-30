@@ -139,6 +139,7 @@ fn default_test_runtime_set() -> RuntimeSet {
 fn stored_peer_root_schema(node: &TestNode, peer_id: Uuid) -> (u32, u32) {
     let reg = node
         .node
+        .stores
         .peers
         .get_reg(&UuidKey::from(peer_id))
         .expect("read peer register")
@@ -152,14 +153,24 @@ fn stored_peer_root_schema(node: &TestNode, peer_id: Uuid) -> (u32, u32) {
 
 /// Reads the converged scheduling state for one peer row from the local peer store.
 fn stored_peer_scheduling(node: &TestNode, peer_id: Uuid) -> Option<PeerSchedulingState> {
-    let reg = node.node.peers.get_reg(&UuidKey::from(peer_id)).ok()??;
+    let reg = node
+        .node
+        .stores
+        .peers
+        .get_reg(&UuidKey::from(peer_id))
+        .ok()??;
     let value = PeerValue::select_reg(&reg)?;
     Some(value.scheduling)
 }
 
 /// Reads the converged runtime support profile for one peer row from the local peer store.
 fn stored_peer_runtime_support(node: &TestNode, peer_id: Uuid) -> Option<RuntimeSupportProfile> {
-    let reg = node.node.peers.get_reg(&UuidKey::from(peer_id)).ok()??;
+    let reg = node
+        .node
+        .stores
+        .peers
+        .get_reg(&UuidKey::from(peer_id))
+        .ok()??;
     let value = PeerValue::select_reg(&reg)?;
     Some(value.runtime_support)
 }
@@ -173,6 +184,7 @@ async fn update_peer_runtime_support(
     let key = UuidKey::from(target);
     let reg = node
         .node
+        .stores
         .peers
         .get_reg(&key)
         .expect("read peer register")
@@ -180,6 +192,7 @@ async fn update_peer_runtime_support(
     let mut value = PeerValue::select_reg(&reg).expect("resolved peer value");
     value.runtime_support = runtime_support;
     node.node
+        .stores
         .peers
         .upsert(&key, value)
         .await
@@ -193,7 +206,7 @@ async fn peers_root_hex_at_version(
 ) -> Result<String, capnp::Error> {
     let cluster_view = active_cluster_view(node).await?;
 
-    let mut request = node.node.sync_client.get_roots_for_view_request();
+    let mut request = node.node.clients.cluster.sync.get_roots_for_view_request();
     {
         let mut req = request.get().init_req();
         cluster_view.write_capnp(req.reborrow().init_view());
@@ -234,7 +247,7 @@ async fn request_peers_ranges_at_version(
 ) -> Result<(), capnp::Error> {
     let cluster_view = active_cluster_view(node).await?;
 
-    let mut request = node.node.sync_client.get_ranges_for_view_request();
+    let mut request = node.node.clients.cluster.sync.get_ranges_for_view_request();
     {
         let mut req = request.get().init_req();
         cluster_view.write_capnp(req.reborrow().init_view());
@@ -254,7 +267,7 @@ async fn open_empty_delta_at_version(
 ) -> Result<(), capnp::Error> {
     let cluster_view = active_cluster_view(node).await?;
 
-    let mut request = node.node.sync_client.open_delta_for_view_request();
+    let mut request = node.node.clients.cluster.sync.open_delta_for_view_request();
     {
         let mut req = request.get().init_req();
         cluster_view.write_capnp(req.reborrow().init_view());
@@ -275,7 +288,7 @@ async fn open_delta_with_mismatched_want_version(
 ) -> Result<(), capnp::Error> {
     let cluster_view = active_cluster_view(node).await?;
 
-    let mut request = node.node.sync_client.open_delta_for_view_request();
+    let mut request = node.node.clients.cluster.sync.open_delta_for_view_request();
     {
         let mut req = request.get().init_req();
         cluster_view.write_capnp(req.reborrow().init_view());

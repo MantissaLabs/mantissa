@@ -367,11 +367,13 @@ pub async fn create_privileged_network(
     expected_status: NetworkStatus,
 ) -> NetworkSpecValue {
     register_privileged_network_cleanup(network.id);
-    node.network_registry
+    node.registries
+        .networks
         .upsert_spec(network.clone())
         .await
         .expect("upsert privileged test network");
-    node.network_controller
+    node.controllers
+        .networks
         .schedule_spec_change(network.id)
         .await;
 
@@ -380,7 +382,7 @@ pub async fn create_privileged_network(
         Duration::from_millis(100),
         || async {
             matches!(
-                node.network_registry.get_spec(network.id),
+                node.registries.networks.get_spec(network.id),
                 Ok(Some(spec)) if spec.status == expected_status
             )
         },
@@ -388,13 +390,15 @@ pub async fn create_privileged_network(
     .await;
     if !reached_status {
         let observed_status = node
-            .network_registry
+            .registries
+            .networks
             .get_spec(network.id)
             .ok()
             .flatten()
             .map(|spec| spec.status);
         let peer_errors: Vec<String> = node
-            .network_registry
+            .registries
+            .networks
             .list_peer_states(Some(network.id))
             .map(|states| {
                 states
@@ -883,7 +887,8 @@ fn privileged_network_bpf_pin_dir(network_id: Uuid) -> PathBuf {
 /// the teardown sequence.
 pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
     let Some(mut spec) = node
-        .network_registry
+        .registries
+        .networks
         .get_spec(network_id)
         .expect("load privileged test network before delete")
     else {
@@ -891,11 +896,13 @@ pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
     };
 
     spec.mark_deleted();
-    node.network_registry
+    node.registries
+        .networks
         .upsert_spec(spec)
         .await
         .expect("mark privileged test network deleted");
-    node.network_controller
+    node.controllers
+        .networks
         .schedule_spec_change(network_id)
         .await;
 
@@ -907,12 +914,14 @@ pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
             let pin_dir = pin_dir.clone();
             async move {
                 let peer_states_gone = node
-                    .network_registry
+                    .registries
+                    .networks
                     .list_peer_states(Some(network_id))
                     .map(|states| states.is_empty())
                     .unwrap_or(false);
                 let attachments_gone = node
-                    .network_registry
+                    .registries
+                    .networks
                     .list_attachments(Some(network_id))
                     .map(|attachments| attachments.is_empty())
                     .unwrap_or(false);
@@ -928,11 +937,13 @@ pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
     let _ = std::fs::remove_dir_all(&pin_dir);
     if !cleaned_by_controller {
         let _ = node
-            .network_registry
+            .registries
+            .networks
             .remove_peer_states_for_network(network_id)
             .await;
         let _ = node
-            .network_registry
+            .registries
+            .networks
             .remove_attachments_for_network(network_id)
             .await;
     }
@@ -943,12 +954,14 @@ pub async fn delete_privileged_network(node: &HeadlessNode, network_id: Uuid) {
             let pin_dir = pin_dir.clone();
             async move {
                 let peer_states_gone = node
-                    .network_registry
+                    .registries
+                    .networks
                     .list_peer_states(Some(network_id))
                     .map(|states| states.is_empty())
                     .unwrap_or(false);
                 let attachments_gone = node
-                    .network_registry
+                    .registries
+                    .networks
                     .list_attachments(Some(network_id))
                     .map(|attachments| attachments.is_empty())
                     .unwrap_or(false);

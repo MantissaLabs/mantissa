@@ -1585,7 +1585,7 @@ async fn check_remote_registry_auth_readiness(
         .await
         .expect("wait for registry test cluster readiness");
     let config = registry_auth_config("private-registry-password");
-    let mut create = cluster[0].node.secrets_client.create_request();
+    let mut create = cluster[0].node.clients.cluster.secrets.create_request();
     {
         let mut request = create.get().init_request();
         request.set_name("application-registry");
@@ -1612,7 +1612,7 @@ async fn check_remote_registry_auth_readiness(
     let (first_check_tx, first_check_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let secrets = capnp_new_client(DelayedSecretAvailability {
-        inner: target.node.secrets_client.clone(),
+        inner: target.node.clients.cluster.secrets.clone(),
         first_check: RefCell::new(Some(first_check_tx)),
         release: RefCell::new(Some(release_rx)),
     });
@@ -1627,6 +1627,7 @@ async fn check_remote_registry_auth_readiness(
             || async {
                 owner
                     .node
+                    .controllers
                     .scheduler
                     .observed_scheduler_digests()
                     .expect("read owner scheduler digests")
@@ -1640,16 +1641,18 @@ async fn check_remote_registry_auth_readiness(
 
     let inner = owner
         .node
-        .registry
+        .registries
+        .peers
         .session_for_peer(target.id())
         .await
         .expect("obtain real target session");
     owner
         .node
-        .registry
+        .registries
+        .peers
         .attach_handle_and_session(
             target.id(),
-            target.node.server_client.clone(),
+            target.node.clients.server.clone(),
             capnp_new_client(SecretAvailabilitySession { inner, secrets }),
         )
         .await;
@@ -1659,7 +1662,8 @@ async fn check_remote_registry_auth_readiness(
     assert!(
         owner
             .node
-            .registry
+            .registries
+            .peers
             .fetch_sync_capability_unscoped(target.id())
             .await
             .expect("resolve sync through the delayed readiness session")
@@ -1672,7 +1676,7 @@ async fn check_remote_registry_auth_readiness(
     request.id = Some(id);
     request.target_node = Some(target.id());
     let reference = request.registry_auth.clone();
-    let manager = owner.node.workload_manager.clone();
+    let manager = owner.node.controllers.workloads.clone();
     let mut launch = spawn_local(async move {
         match admission_mode {
             WorkloadAdmissionMode::Gang => {
@@ -1705,7 +1709,8 @@ async fn check_remote_registry_auth_readiness(
     assert!(
         owner
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .inspect_workload(id)
             .await
             .is_err()
@@ -1713,13 +1718,15 @@ async fn check_remote_registry_auth_readiness(
     assert!(
         target
             .node
-            .workload_manager
+            .controllers
+            .workloads
             .inspect_workload(id)
             .await
             .is_err()
     );
     let snapshot = target
         .node
+        .controllers
         .scheduler
         .snapshot()
         .await
@@ -1747,7 +1754,8 @@ async fn check_remote_registry_auth_readiness(
             || async {
                 target
                     .node
-                    .workload_manager
+                    .controllers
+                    .workloads
                     .inspect_workload(id)
                     .await
                     .is_ok_and(|spec| {
@@ -1764,7 +1772,8 @@ async fn check_remote_registry_auth_readiness(
 
     let remote = target
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .inspect_workload(specs[0].id)
         .await
         .expect("inspect private-image workload on target node");

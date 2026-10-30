@@ -207,7 +207,8 @@ fn privileged_network_state_absent(node: &HeadlessNode, network_id: Uuid) -> boo
     let interfaces = privileged_network_interfaces(network_id);
     let pin_dir = pinned_lb_map_dir(network_id);
     let peer_rows_absent = node
-        .network_registry
+        .registries
+        .networks
         .list_peer_states(Some(network_id))
         .map(|states| states.is_empty())
         .unwrap_or(false);
@@ -219,7 +220,8 @@ async fn privileged_network_state_debug(node: &HeadlessNode, network_id: Uuid) -
     let interfaces = privileged_network_interfaces(network_id);
     let pin_dir = pinned_lb_map_dir(network_id);
     let peer_rows = node
-        .network_registry
+        .registries
+        .networks
         .list_peer_states(Some(network_id))
         .map(|states| {
             states
@@ -452,7 +454,8 @@ async fn wait_for_local_service_task(
     let deadline = Instant::now() + timeout;
     loop {
         let tasks = node
-            .workload_manager
+            .controllers
+            .workloads
             .list_workloads(&WorkloadStateFilter::all())
             .await
             .expect("list workloads for privileged service task lookup");
@@ -491,14 +494,15 @@ fn exec_task_container(task_id: Uuid, command: &str) -> Output {
 /// Remove one service through the real RPC surface so cleanup follows production controller paths.
 async fn remove_service_via_rpc(node: &HeadlessNode, service_id: Uuid) {
     let service_name = node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("load service before privileged cleanup")
         .unwrap_or_else(|| panic!("service {service_id} should exist before cleanup"))
         .service_name;
 
-    let mut delete = node.services_client.delete_request();
+    let mut delete = node.clients.cluster.services.delete_request();
     {
         let mut ids = delete.get().init_ids(1);
         ids.set(0, service_id.as_bytes());
@@ -511,7 +515,7 @@ async fn remove_service_via_rpc(node: &HeadlessNode, service_id: Uuid) {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Stopped,
             Duration::from_secs(180),
@@ -745,7 +749,8 @@ async fn wait_for_backend_ips(
     loop {
         let mut backend_ips = BTreeSet::new();
         for attachment in node
-            .network_registry
+            .registries
+            .networks
             .list_attachments(Some(network_id))
             .expect("list network attachments for eBPF test")
         {
@@ -782,7 +787,8 @@ async fn wait_for_backend_ips_v6(
     loop {
         let mut backend_ips = BTreeSet::new();
         for attachment in node
-            .network_registry
+            .registries
+            .networks
             .list_attachments(Some(network_id))
             .expect("list network attachments for IPv6 eBPF test")
         {
@@ -909,7 +915,8 @@ async fn upsert_privileged_remote_peer(
     address: &str,
     hostname: &str,
 ) {
-    node.peers
+    node.stores
+        .peers
         .upsert(
             &UuidKey::from(peer_id),
             privileged_remote_peer_value(peer_id, address, hostname),
@@ -946,7 +953,7 @@ fn privileged_remote_attachment(
 
 /// Evict one peer through the topology RPC so the test uses the same leave cleanup hook as gossip.
 async fn evict_privileged_remote_peer(node: &HeadlessNode, peer_id: Uuid) {
-    let mut request = node.topology_client.evict_request();
+    let mut request = node.clients.cluster.topology.evict_request();
     request.get().init_node_id().set_bytes(peer_id.as_bytes());
     request
         .send()
@@ -992,7 +999,8 @@ async fn privileged_leave_dataplane_debug(
         Err(err) => format!("provisioner_error={err:#}"),
     };
     let peer_rows = node
-        .network_registry
+        .registries
+        .networks
         .list_peer_states(Some(network_id))
         .map(|states| {
             states
@@ -1008,7 +1016,8 @@ async fn privileged_leave_dataplane_debug(
         })
         .unwrap_or_else(|err| format!("peer_state_error={err:#}"));
     let attachments = node
-        .network_registry
+        .registries
+        .networks
         .list_attachments(Some(network_id))
         .map(|attachments| {
             attachments
@@ -1069,16 +1078,19 @@ impl PrivilegedLeaveState {
     fn load(node: &HeadlessNode, scenario: &PrivilegedLeaveScenario) -> Self {
         Self {
             peer_counts: node
-                .network_registry
+                .registries
+                .networks
                 .peer_counts()
                 .ok()
                 .and_then(|counts| counts.get(&scenario.network_id).copied()),
             peer_rows: node
-                .network_registry
+                .registries
+                .networks
                 .list_peer_states(Some(scenario.network_id))
                 .unwrap_or_default(),
             attachments: node
-                .network_registry
+                .registries
+                .networks
                 .list_attachments(Some(scenario.network_id))
                 .unwrap_or_default(),
             fdb: vxlan_fdb_dump(&scenario.vxlan_ifname),
@@ -1256,7 +1268,8 @@ async fn install_privileged_remote_leave_state(
             peer.hostname,
         )
         .await;
-        node.network_registry
+        node.registries
+            .networks
             .upsert_peer_state(NetworkPeerStateValue::new(
                 scenario.network_id,
                 peer.id,
@@ -1266,7 +1279,8 @@ async fn install_privileged_remote_leave_state(
             ))
             .await
             .expect("upsert synthetic peer network state");
-        node.network_registry
+        node.registries
+            .networks
             .upsert_attachment(privileged_remote_attachment(
                 scenario.network_id,
                 peer.id,
@@ -1277,7 +1291,8 @@ async fn install_privileged_remote_leave_state(
             .expect("upsert synthetic remote attachment");
     }
 
-    node.network_controller
+    node.controllers
+        .networks
         .schedule_spec_change(scenario.network_id)
         .await;
 }
@@ -1323,7 +1338,8 @@ async fn wait_for_privileged_left_peer_retired(
 /// Assert that topology left an inactive tombstone for the evicted peer identity.
 fn assert_privileged_peer_tombstoned(node: &HeadlessNode, peer_id: Uuid) {
     let peer_row = node
-        .registry
+        .registries
+        .peers
         .peer_value_unscoped(peer_id)
         .expect("left peer tombstone should remain visible");
     assert!(
@@ -1484,7 +1500,8 @@ local_test!(
 
         let service_name = format!("ebpf-on-demand-cold-{}", Uuid::new_v4());
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 &service_name,
@@ -1496,7 +1513,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -1510,7 +1527,8 @@ local_test!(
             Duration::from_millis(100),
             || async {
                 let peer_ready = node
-                    .network_registry
+                    .registries
+                    .networks
                     .get_peer_state(network_id, node.id)
                     .map(|state| state.is_some_and(|state| state.is_ready()))
                     .unwrap_or(false);
@@ -1622,7 +1640,8 @@ local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
     );
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "ebpf-mtu-service",
@@ -1634,7 +1653,7 @@ local_test!(ebpf_overlay_programs_runtime_mss_for_small_mtu, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -1807,7 +1826,8 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
     let network_id = network.id;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "ebpf-vip-service",
@@ -1819,7 +1839,7 @@ local_test!(ebpf_overlay_host_vip_reaches_service_from_host_access, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -1910,7 +1930,8 @@ local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
     let network_id = network.id;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "ebpf-status-service",
@@ -1922,7 +1943,7 @@ local_test!(ebpf_overlay_status_reports_programmed_vip_traffic, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2044,7 +2065,8 @@ local_test!(
         let network_id = network.id;
 
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "ebpf-vip-v6-service",
@@ -2056,7 +2078,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -2150,7 +2172,8 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
     let service_name = "ebpf-vip-v4-task-service";
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -2165,7 +2188,7 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2179,7 +2202,8 @@ local_test!(ebpf_overlay_task_dns_reaches_service_vip, {
     let deadline = Instant::now() + Duration::from_secs(60);
     let backend_ips = loop {
         let backend_ips: BTreeSet<Ipv4Addr> = node
-            .network_registry
+            .registries
+            .networks
             .list_attachments(Some(network_id))
             .expect("list IPv4 attachments for task-facing eBPF test")
             .into_iter()
@@ -2321,7 +2345,8 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
     let service_name = "ebpf-vip-v6-task-service";
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             service_name,
@@ -2336,7 +2361,7 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2350,7 +2375,8 @@ local_test!(ebpf_overlay_ipv6_task_dns_reaches_service_vip, {
     let deadline = Instant::now() + Duration::from_secs(60);
     let backend_ips = loop {
         let backend_ips: BTreeSet<Ipv6Addr> = node
-            .network_registry
+            .registries
+            .networks
             .list_attachments(Some(network_id))
             .expect("list IPv6 attachments for task-facing eBPF test")
             .into_iter()
@@ -2491,7 +2517,8 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
     let network_id = network.id;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "ebpf-vip-lb-service",
@@ -2503,7 +2530,7 @@ local_test!(ebpf_overlay_vip_load_balances_across_local_replicas, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2571,7 +2598,8 @@ local_test!(
         let network_id = network.id;
 
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "ebpf-vip-lb-v6-service",
@@ -2583,7 +2611,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -2651,7 +2679,8 @@ local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
     let network_id = network.id;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "ebpf-return-vip-service",
@@ -2663,7 +2692,7 @@ local_test!(ebpf_overlay_return_path_preserves_vip_identity, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2741,7 +2770,8 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
     let network_id = network.id;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "ebpf-udp-vip-service",
@@ -2753,7 +2783,7 @@ local_test!(ebpf_overlay_udp_service_reaches_host_access_vip, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2842,7 +2872,8 @@ local_test!(
         let pin_dir = pinned_lb_map_dir(network_id);
 
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "ebpf-delete-service",
@@ -2854,7 +2885,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -2985,7 +3016,8 @@ local_test!(
         let pin_dir = pinned_lb_map_dir(network_id);
 
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "ebpf-delete-service",
@@ -2997,7 +3029,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -3094,7 +3126,8 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
     let network_id = network.id;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "ebpf-heal-service",
@@ -3106,7 +3139,7 @@ local_test!(ebpf_overlay_heals_after_lb_map_removal, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),

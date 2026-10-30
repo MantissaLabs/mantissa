@@ -1,6 +1,10 @@
+mod channels;
+mod components;
 mod context;
+mod replicated_volumes;
 mod runtime;
 mod stores;
+mod tasks;
 mod transport;
 
 use crate::secrets::master_key::envelope::SecretPassphrase;
@@ -8,10 +12,13 @@ use crate::server;
 use tracing::{info, warn};
 
 pub(crate) use context::BootstrapContext;
+pub(crate) use replicated_volumes::ReplicatedVolumeStartup;
 pub(crate) use runtime::{
-    BootedRuntime, BootstrapOptions, ReplicatedVolumeStartup, RuntimeTaskHandles, boot,
-    boot_with_replicated_volume_listener,
+    BootedRuntime, BootstrapOptions, boot, boot_with_replicated_volume_listener,
 };
+pub use runtime::{RuntimeControllers, RuntimeRegistries};
+pub use stores::BootstrapStores;
+pub(crate) use tasks::RuntimeTaskHandles;
 
 pub(crate) type BootstrapResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -60,13 +67,13 @@ pub async fn start(
                 tokio::time::timeout_at(deadline, async {
                     runtime
                         .components
-                        .workload_manager
+                        .controllers.workloads
                         .begin_shutdown()
                         .await;
                     loop {
                         match runtime
                             .components
-                            .workload_manager
+                            .controllers.workloads
                             .quiesce_replicated_volume_tasks_for_shutdown()
                             .await
                         {
@@ -119,7 +126,8 @@ pub async fn start(
             };
             if let Err(error) = runtime
                 .components
-                .workload_manager
+                .controllers
+                .workloads
                 .flush_workload_updates_for_shutdown()
                 .await
             {
@@ -139,7 +147,7 @@ pub async fn start(
             }
             handles.abort();
             runtime.server.release_replicated_volumes();
-            let network_shutdown = runtime.components.network_controller.shutdown().await;
+            let network_shutdown = runtime.components.controllers.networks.shutdown().await;
             runtime.runtime_tasks.abort_and_wait().await;
             let storage_shutdown = match (
                 runtime.components.replicated_volumes.as_ref(),

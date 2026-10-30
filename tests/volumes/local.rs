@@ -12,7 +12,7 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
     fs::create_dir_all(&imported_path).expect("create imported path");
 
     let volume_id = import_local_volume(
-        &cluster[1].node.volumes_client,
+        &cluster[1].node.clients.cluster.volumes,
         "pgdata-import",
         cluster[1].id(),
         imported_path.to_str().expect("imported path utf8"),
@@ -26,7 +26,8 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
             || async {
                 cluster[1]
                     .node
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_spec_by_name("pgdata-import")
                     .expect("imported volume lookup")
                     .is_some()
@@ -38,7 +39,8 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
 
     let spec = cluster[1]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .get_spec_by_name("pgdata-import")
         .expect("imported volume lookup")
         .expect("imported volume spec");
@@ -51,7 +53,8 @@ local_test!(volumes_import_binds_immediately_to_selected_node, {
 
     let node_states = cluster[1]
         .node
-        .volume_registry
+        .registries
+        .volumes
         .list_node_states_for_volume(volume_id)
         .expect("volume node states");
     assert_eq!(node_states.len(), 1);
@@ -78,7 +81,7 @@ local_test!(volumes_import_requires_request_on_target_node, {
     let imported_path = temp_dir.path().join("remote-import-data");
     fs::create_dir_all(&imported_path).expect("create imported path");
 
-    let mut request = cluster[0].node.volumes_client.import_request();
+    let mut request = cluster[0].node.clients.cluster.volumes.import_request();
     {
         let mut inner = request.get().init_request();
         inner.set_name("remote-import");
@@ -100,7 +103,8 @@ local_test!(volumes_import_requires_request_on_target_node, {
     assert!(
         cluster[0]
             .node
-            .volume_registry
+            .registries
+            .volumes
             .get_spec_by_name("remote-import")
             .expect("volume lookup after failed import")
             .is_none(),
@@ -114,18 +118,20 @@ local_test!(local_volume_wait_for_first_consumer_binds_on_first_start, {
     let node =
         create_recording_node(runtime.clone(), local_volume_root.path().join("volumes")).await;
 
-    let volume_id = create_managed_volume(&node.volumes_client, "pgdata").await;
+    let volume_id = create_managed_volume(&node.clients.cluster.volumes, "pgdata").await;
     let spec = start_standalone_volume_task(&node, volume_id, "pgdata", "/var/lib/data").await;
 
     let bound = node
-        .volume_registry
+        .registries
+        .volumes
         .get_spec(volume_id)
         .expect("load bound volume")
         .expect("volume spec");
     assert_eq!(bound.bound_node_id, Some(node.id));
 
     let node_state = node
-        .volume_registry
+        .registries
+        .volumes
         .get_node_state(volume_id, node.id)
         .expect("load local node state")
         .expect("local node state");
@@ -150,7 +156,7 @@ local_test!(task_restart_preserves_local_volume_mount, {
     let node =
         create_recording_node(runtime.clone(), local_volume_root.path().join("volumes")).await;
 
-    let volume_id = create_managed_volume(&node.volumes_client, "restart-data").await;
+    let volume_id = create_managed_volume(&node.clients.cluster.volumes, "restart-data").await;
     let spec = start_standalone_volume_task(&node, volume_id, "restart-data", "/srv/data").await;
 
     let initial_mounts = runtime.volume_mounts().await;
@@ -161,7 +167,7 @@ local_test!(task_restart_preserves_local_volume_mount, {
     );
 
     runtime.forget_runtime().await;
-    let mut runtime_manager = node.workload_manager.clone();
+    let mut runtime_manager = node.controllers.workloads.clone();
     let runtime_handle = tokio::task::spawn_local(async move {
         runtime_manager.run().await;
     });
@@ -189,7 +195,8 @@ local_test!(task_restart_preserves_local_volume_mount, {
     );
 
     let node_state = node
-        .volume_registry
+        .registries
+        .volumes
         .get_node_state(volume_id, node.id)
         .expect("load node state after restart")
         .expect("node state after restart");
@@ -224,17 +231,20 @@ local_test!(multi_volume_bound_node_conflict_rejected, {
         bound_node_id: Some(other_node),
         bound_node_name: Some("remote".to_string()),
     });
-    node.volume_registry
+    node.registries
+        .volumes
         .upsert_spec(left.clone())
         .await
         .expect("upsert left volume");
-    node.volume_registry
+    node.registries
+        .volumes
         .upsert_spec(right.clone())
         .await
         .expect("upsert right volume");
 
     let err = node
-        .workload_manager
+        .controllers
+        .workloads
         .start_workloads_batch(vec![WorkloadStartRequest {
             name: "conflict".into(),
             execution: ResolvedExecutionSpec {
@@ -305,7 +315,7 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
     fs::create_dir_all(&imported_path).expect("create imported path");
 
     let volume_id = import_local_volume(
-        &cluster[1].node.volumes_client,
+        &cluster[1].node.clients.cluster.volumes,
         "remote-volume",
         cluster[1].id(),
         imported_path.to_str().expect("imported path utf8"),
@@ -317,7 +327,7 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
             Duration::from_secs(10),
             Duration::from_millis(25),
             || async {
-                match cluster[0].node.volume_registry.get_spec(volume_id) {
+                match cluster[0].node.registries.volumes.get_spec(volume_id) {
                     Ok(Some(spec)) => spec.bound_node_id == Some(cluster[1].id()),
                     _ => false,
                 }
@@ -329,7 +339,8 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
 
     let mut started = cluster[0]
         .node
-        .workload_manager
+        .controllers
+        .workloads
         .start_workloads_batch(vec![standalone_volume_task_request(
             volume_id,
             "remote-volume",
@@ -352,7 +363,8 @@ local_test!(bound_local_volume_forces_scheduler_locality, {
             || async {
                 match cluster[1]
                     .node
-                    .volume_registry
+                    .registries
+                    .volumes
                     .get_node_state(volume_id, cluster[1].id())
                 {
                     Ok(Some(state)) => {
@@ -374,11 +386,11 @@ local_test!(nodes_drain_blocks_on_local_volume_task, {
     let runtime = Arc::new(RecordingRuntimeBackend::default());
     let node = create_recording_node(runtime, local_volume_root.path().join("volumes")).await;
 
-    let volume_id = create_managed_volume(&node.volumes_client, "drain-data").await;
+    let volume_id = create_managed_volume(&node.clients.cluster.volumes, "drain-data").await;
     let task = start_standalone_volume_task(&node, volume_id, "drain-data", "/var/lib/data").await;
     wait_for_volume_published_tasks(&node, volume_id, &[task.id]).await;
 
-    let err = drain_node_via_topology(&node.topology_client, node.id, "maintenance")
+    let err = drain_node_via_topology(&node.clients.cluster.topology, node.id, "maintenance")
         .await
         .expect_err("local-volume task should block drain");
     let rendered = err.to_string();

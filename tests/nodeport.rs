@@ -628,7 +628,8 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     let network_id = network.id;
 
     let service_id = node
-        .service_controller
+        .controllers
+        .services
         .submit_deployment(
             Uuid::new_v4(),
             "nodeport-privileged",
@@ -646,7 +647,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -659,7 +660,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         Duration::from_secs(60),
         Duration::from_millis(100),
         || async {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             status.state == NodePortRuntimeState::Ready
                 && status.source_mode == NodePortSourceMode::SnatHostAccess
                 && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
@@ -672,9 +673,10 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     )
     .await;
     if !nodeport_ready {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read privileged NodePort service after readiness failure")
@@ -686,7 +688,8 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     }
 
     let service = node
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read privileged NodePort service")
@@ -709,9 +712,10 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
     )
     .await;
     if !http_ok {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read privileged NodePort service after http failure")
@@ -756,7 +760,7 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
             Duration::from_secs(15),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 match (status.ingress_stats, status.egress_stats) {
                     (Some(ingress), Some(egress)) => {
                         ingress.packets > 0
@@ -772,14 +776,14 @@ local_test!(nodeport_public_service_reaches_backend_and_cleans_up, {
         "real traffic should move the pinned NodePort packet counters"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
 
     assert!(
         wait_until(
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 status.active_ports == 0
                     && status.active_host_networks == 0
                     && status.state == NodePortRuntimeState::Pending
@@ -853,7 +857,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     let network_id = network.id;
 
     let service_id = deploy_privileged_nodeport_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-restart",
         network_id,
         NODEPORT_RESPONSE,
@@ -865,7 +869,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -878,9 +882,10 @@ local_test!(nodeport_restart_restores_public_service_publication, {
         Duration::from_secs(60),
         Duration::from_millis(100),
         || async {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let public_endpoint_ready = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .ok()
@@ -898,9 +903,10 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     )
     .await;
     if !first_ready {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read persisted NodePort service after first readiness failure")
@@ -941,7 +947,7 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     .expect("restart persisted NodePort node");
 
     let running_after_restart = wait_for_service_status(
-        &restarted.service_controller,
+        &restarted.controllers.services,
         service_id,
         ServiceStatus::Running,
         Duration::from_secs(180),
@@ -949,20 +955,24 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     .await;
     if !running_after_restart {
         let status = restarted
-            .network_controller
+            .controllers
+            .networks
             .nodeport_manager()
             .status()
             .await;
         let network_spec = restarted
-            .network_registry
+            .registries
+            .networks
             .get_spec(network_id)
             .expect("load persisted network after restart running timeout");
         let peer_state = restarted
-            .network_registry
+            .registries
+            .networks
             .get_peer_state(network_id, restarted.id)
             .expect("load local peer state after restart running timeout");
         let service = restarted
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read persisted NodePort service after restart running timeout")
@@ -978,12 +988,14 @@ local_test!(nodeport_restart_restores_public_service_publication, {
         Duration::from_millis(100),
         || async {
             let status = restarted
-                .network_controller
+                .controllers
+                .networks
                 .nodeport_manager()
                 .status()
                 .await;
             let public_endpoint_ready = restarted
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .ok()
@@ -1002,20 +1014,24 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     .await;
     if !nodeport_ready_after_restart {
         let status = restarted
-            .network_controller
+            .controllers
+            .networks
             .nodeport_manager()
             .status()
             .await;
         let network_spec = restarted
-            .network_registry
+            .registries
+            .networks
             .get_spec(network_id)
             .expect("load persisted network after restart readiness failure");
         let peer_state = restarted
-            .network_registry
+            .registries
+            .networks
             .get_peer_state(network_id, restarted.id)
             .expect("load local peer state after restart readiness failure");
         let service = restarted
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read persisted NodePort service after restart readiness failure")
@@ -1031,7 +1047,8 @@ local_test!(nodeport_restart_restores_public_service_publication, {
         Duration::from_millis(100),
         || async {
             restarted
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("read persisted NodePort service while clearing restart detail")
@@ -1040,7 +1057,8 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     )
     .await;
     let service = restarted
-        .service_controller
+        .controllers
+        .services
         .registry()
         .get(service_id)
         .expect("read persisted NodePort service after restart detail wait")
@@ -1063,7 +1081,8 @@ local_test!(nodeport_restart_restores_public_service_publication, {
     .await;
     if !http_ok_after_restart {
         let status = restarted
-            .network_controller
+            .controllers
+            .networks
             .nodeport_manager()
             .status()
             .await;
@@ -1076,14 +1095,15 @@ local_test!(nodeport_restart_restores_public_service_publication, {
         );
     }
 
-    remove_service_via_rpc(&restarted.services_client, service_id).await;
+    remove_service_via_rpc(&restarted.clients.cluster.services, service_id).await;
     assert!(
         wait_until(
             Duration::from_secs(180),
             Duration::from_millis(100),
             || async {
                 match restarted
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .expect("read persisted NodePort service during restart teardown")
@@ -1136,7 +1156,7 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
     let network_id = network.id;
 
     let service_id = deploy_privileged_nodeport_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-mtu",
         network_id,
         NODEPORT_RESPONSE,
@@ -1148,7 +1168,7 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -1161,7 +1181,7 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
         Duration::from_secs(60),
         Duration::from_millis(100),
         || async {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             status.state == NodePortRuntimeState::Ready
                 && status.source_mode == NodePortSourceMode::SnatHostAccess
                 && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
@@ -1174,9 +1194,10 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
     )
     .await;
     if !nodeport_ready {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read small-MTU NodePort service after readiness failure")
@@ -1200,9 +1221,10 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
     )
     .await;
     if !http_ok {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read small-MTU NodePort service after HTTP failure")
@@ -1240,7 +1262,7 @@ local_test!(nodeport_tcp_syn_mss_clamps_to_host_access_mtu, {
         "NodePort ingress should clamp the forwarded TCP SYN MSS to the host-access MTU: {capture}"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -1280,7 +1302,8 @@ local_test!(
         let network_id = network.id;
 
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "nodeport-privileged-v6",
@@ -1298,7 +1321,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -1311,7 +1334,7 @@ local_test!(
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 status.state == NodePortRuntimeState::Ready
                     && status.identity_source == Some(NodePortIdentitySource::NodePortIp)
                     && status.active_ports == 1
@@ -1322,9 +1345,10 @@ local_test!(
         )
         .await;
         if !nodeport_ready {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let service = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("read privileged IPv6 NodePort service after readiness failure")
@@ -1350,9 +1374,10 @@ local_test!(
         )
         .await;
         if !http_ok {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let service = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("read privileged IPv6 NodePort service after http failure")
@@ -1368,13 +1393,14 @@ local_test!(
         }
 
         let delete_result = tokio::time::timeout(Duration::from_secs(30), async {
-            remove_service_via_rpc(&node.services_client, service_id).await;
+            remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
         })
         .await;
         if delete_result.is_err() {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let service = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("read privileged IPv6 NodePort service after delete timeout");
@@ -1425,7 +1451,8 @@ local_test!(
         let network_id = network.id;
 
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 "nodeport-remap",
@@ -1442,16 +1469,17 @@ local_test!(
             .expect("submit remapped NodePort deployment");
 
         let running = wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
         )
         .await;
         if !running {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let service = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("read remapped NodePort service after running timeout")
@@ -1467,9 +1495,10 @@ local_test!(
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 let service = node
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .expect("read remapped NodePort service while waiting for publication")
@@ -1485,9 +1514,10 @@ local_test!(
         )
         .await;
         if !nodeport_ready {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let service = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("read remapped NodePort service after readiness failure")
@@ -1511,9 +1541,10 @@ local_test!(
         )
         .await;
         if !http_ok {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let service = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(service_id)
                 .expect("read remapped NodePort service after http failure")
@@ -1528,7 +1559,7 @@ local_test!(
             );
         }
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
         delete_privileged_network(&node, network_id).await;
     }
 );
@@ -1565,7 +1596,7 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
     let network_id = network.id;
 
     let service_id = deploy_privileged_nodeport_udp_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-udp",
         network_id,
         NODEPORT_UDP_PORT,
@@ -1576,7 +1607,7 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -1589,7 +1620,7 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
         Duration::from_secs(60),
         Duration::from_millis(100),
         || async {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             status.state == NodePortRuntimeState::Ready
                 && status.active_ports == 1
                 && status.active_host_networks == 1
@@ -1600,9 +1631,10 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
     )
     .await;
     if !nodeport_ready {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read privileged NodePort UDP service after readiness failure")
@@ -1622,9 +1654,10 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
     )
     .await;
     if !udp_ok {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read privileged NodePort UDP service after udp failure")
@@ -1649,7 +1682,7 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
             Duration::from_secs(15),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 match (status.ingress_stats, status.egress_stats) {
                     (Some(ingress), Some(egress)) => {
                         ingress.packets > 0
@@ -1665,14 +1698,14 @@ local_test!(nodeport_udp_public_service_reaches_backend_and_cleans_up, {
         "real UDP traffic should move the pinned NodePort packet counters"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
 
     assert!(
         wait_until(
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 status.active_ports == 0
                     && status.active_host_networks == 0
                     && status.state == NodePortRuntimeState::Pending
@@ -1727,7 +1760,7 @@ local_test!(nodeport_udp_service_removal_clears_stale_flow_maps, {
     let network_id = network.id;
 
     let service_id = deploy_privileged_nodeport_udp_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-udp-flow-clear",
         network_id,
         NODEPORT_UDP_PORT,
@@ -1738,7 +1771,7 @@ local_test!(nodeport_udp_service_removal_clears_stale_flow_maps, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -1774,14 +1807,14 @@ local_test!(nodeport_udp_service_removal_clears_stale_flow_maps, {
         "udp cleanup test should leave cached NodePort flow entries after traffic"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
 
     assert!(
         wait_until(
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 status.active_ports == 0
                     && status.active_host_networks == 0
                     && status.state == NodePortRuntimeState::Pending
@@ -1844,7 +1877,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
 
     let service_name = "nodeport-udp-remap-flow-clear";
     let service_id = deploy_privileged_nodeport_udp_service(
-        &node.service_controller,
+        &node.controllers.services,
         service_name,
         network_id,
         NODEPORT_UDP_PORT,
@@ -1855,7 +1888,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -1893,7 +1926,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
     );
 
     let redeploy_id = deploy_privileged_nodeport_udp_service(
-        &node.service_controller,
+        &node.controllers.services,
         service_name,
         network_id,
         NODEPORT_UDP_REMAP_PORT,
@@ -1908,7 +1941,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -1921,7 +1954,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 status.state == NodePortRuntimeState::Ready && status.active_ports == 1
             },
         )
@@ -1967,7 +2000,7 @@ local_test!(nodeport_udp_public_port_remap_clears_stale_flow_maps, {
         "udp remap cleanup test should accept traffic on the new public port"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -2004,7 +2037,7 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
     let network_id = network.id;
 
     let service_id = deploy_privileged_nodeport_udp_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-small-flow-capacity",
         network_id,
         NODEPORT_UDP_PORT,
@@ -2015,7 +2048,7 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2067,7 +2100,7 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
             ) {
                 return false;
             }
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             matches!(
                 status.flow_diagnostics,
                 Some(diagnostics)
@@ -2081,7 +2114,7 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
     )
     .await;
     if !reported_eviction {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let forward_dump = dump_nodeport_map("NODEPORT_FWD");
         let reverse_dump = dump_nodeport_map("NODEPORT_REV");
         panic!(
@@ -2089,7 +2122,7 @@ local_test!(nodeport_small_flow_capacity_reports_estimated_evictions, {
         );
     }
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -2128,7 +2161,7 @@ local_test!(
         let network_id = network.id;
 
         let service_id = deploy_privileged_nodeport_udp_service(
-            &node.service_controller,
+            &node.controllers.services,
             "nodeport-fragment-drop",
             network_id,
             NODEPORT_UDP_PORT,
@@ -2139,7 +2172,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -2153,7 +2186,7 @@ local_test!(
                 Duration::from_secs(60),
                 Duration::from_millis(100),
                 || async {
-                    let status = node.network_controller.nodeport_manager().status().await;
+                    let status = node.controllers.networks.nodeport_manager().status().await;
                     status.state == NodePortRuntimeState::Ready && status.active_ports == 1
                 }
             )
@@ -2174,7 +2207,7 @@ local_test!(
                     b"mant",
                 )
                 .expect("inject fragmented IPv4 first fragment into NodePort");
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 matches!(
                     status.ingress_drop_reasons,
                     Some(reasons) if reasons.fragmented_ipv4_packets >= 1
@@ -2183,7 +2216,7 @@ local_test!(
         )
         .await;
         if !fragment_reported {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let forward_dump = dump_nodeport_map("NODEPORT_FWD");
             let reverse_dump = dump_nodeport_map("NODEPORT_REV");
             panic!(
@@ -2205,7 +2238,7 @@ local_test!(
             "fragmented IPv4 rejection should not break normal NodePort UDP traffic"
         );
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
         delete_privileged_network(&node, network_id).await;
     }
 );
@@ -2242,7 +2275,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
     let network_id = network.id;
 
     let owner_service_id = deploy_privileged_nodeport_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-owner",
         network_id,
         NODEPORT_CONFLICT_RESPONSE,
@@ -2254,7 +2287,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             owner_service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2267,9 +2300,10 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         Duration::from_secs(60),
         Duration::from_millis(100),
         || async {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             let service = node
-                .service_controller
+                .controllers
+                .services
                 .registry()
                 .get(owner_service_id)
                 .expect("read owner NodePort service while waiting for publication")
@@ -2283,9 +2317,10 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
     )
     .await;
     if !owner_published {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(owner_service_id)
             .expect("read owner NodePort service after publication timeout")
@@ -2309,9 +2344,10 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
     )
     .await;
     if !owner_http_ok {
-        let status = node.network_controller.nodeport_manager().status().await;
+        let status = node.controllers.networks.nodeport_manager().status().await;
         let service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(owner_service_id)
             .expect("read owner NodePort service after HTTP timeout")
@@ -2327,7 +2363,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
     }
 
     let conflict = deploy_privileged_nodeport_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-conflict",
         network_id,
         "this service should never own the public port",
@@ -2343,7 +2379,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         "conflicting deployment should expose a clear ownership error: {conflict_text}"
     );
 
-    let status = node.network_controller.nodeport_manager().status().await;
+    let status = node.controllers.networks.nodeport_manager().status().await;
     assert_eq!(
         status.active_ports, 1,
         "rejecting a conflicting deployment should keep the original NodePort owner intact"
@@ -2357,7 +2393,7 @@ local_test!(nodeport_conflicting_public_port_keeps_existing_owner, {
         "conflict rejection should not steal traffic away from the original service: {response}"
     );
 
-    remove_service_via_rpc(&node.services_client, owner_service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, owner_service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -2396,7 +2432,7 @@ local_test!(
         let network_id = network.id;
 
         let service_id = deploy_privileged_nodeport_service(
-            &node.service_controller,
+            &node.controllers.services,
             "nodeport-degraded",
             network_id,
             NODEPORT_DEGRADED_RESPONSE,
@@ -2408,7 +2444,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -2422,9 +2458,10 @@ local_test!(
                 Duration::from_secs(60),
                 Duration::from_millis(100),
                 || async {
-                    let status = node.network_controller.nodeport_manager().status().await;
+                    let status = node.controllers.networks.nodeport_manager().status().await;
                     let service = node
-                        .service_controller
+                        .controllers
+                        .services
                         .registry()
                         .get(service_id)
                         .expect("read degraded public service")
@@ -2443,9 +2480,10 @@ local_test!(
             "degraded NodePort state should propagate into the service public endpoint detail"
         );
 
-        let degraded_status = node.network_controller.nodeport_manager().status().await;
+        let degraded_status = node.controllers.networks.nodeport_manager().status().await;
         let degraded_service = node
-            .service_controller
+            .controllers
+            .services
             .registry()
             .get(service_id)
             .expect("read degraded NodePort service after status propagation")
@@ -2479,7 +2517,7 @@ local_test!(
             "degraded NodePort should not expose the public port on loopback"
         );
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
         delete_privileged_network(&node, network_id).await;
     }
 );
@@ -2516,7 +2554,7 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
     let network_id = network.id;
 
     let service_id = deploy_privileged_nodeport_service(
-        &node.service_controller,
+        &node.controllers.services,
         "nodeport-identity-autodetect",
         network_id,
         NODEPORT_RESPONSE,
@@ -2528,7 +2566,7 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
 
     assert!(
         wait_for_service_status(
-            &node.service_controller,
+            &node.controllers.services,
             service_id,
             ServiceStatus::Running,
             Duration::from_secs(180),
@@ -2542,9 +2580,10 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 let service = node
-                    .service_controller
+                    .controllers
+                    .services
                     .registry()
                     .get(service_id)
                     .expect("read autodetected NodePort service")
@@ -2562,7 +2601,7 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
         "missing explicit NodePort identity should fall back to autodetect and publish successfully"
     );
 
-    let status = node.network_controller.nodeport_manager().status().await;
+    let status = node.controllers.networks.nodeport_manager().status().await;
     let resolved_node_ip = status
         .resolved_node_ip
         .expect("autodetect should resolve one publication address");
@@ -2586,7 +2625,7 @@ local_test!(nodeport_runtime_autodetects_identity_by_default, {
         "autodetected NodePort identity should expose the public port"
     );
 
-    remove_service_via_rpc(&node.services_client, service_id).await;
+    remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
     delete_privileged_network(&node, network_id).await;
 });
 
@@ -2626,7 +2665,8 @@ local_test!(
         let network_id = network.id;
 
         let service_id = node
-            .service_controller
+            .controllers
+            .services
             .submit_deployment(
                 Uuid::new_v4(),
                 service_name,
@@ -2654,7 +2694,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -2667,7 +2707,7 @@ local_test!(
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async {
-                let status = node.network_controller.nodeport_manager().status().await;
+                let status = node.controllers.networks.nodeport_manager().status().await;
                 matches!(
                     status.flow_diagnostics,
                     Some(diagnostics)
@@ -2680,13 +2720,13 @@ local_test!(
         )
         .await;
         if !bypass_reported {
-            let status = node.network_controller.nodeport_manager().status().await;
+            let status = node.controllers.networks.nodeport_manager().status().await;
             panic!(
                 "internal DNS and host-access traffic should bypass reverse-miss accounting instead of inflating reverse_misses; status={status:?}"
             );
         }
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
         delete_privileged_network(&node, network_id).await;
     }
 );
@@ -2734,7 +2774,7 @@ local_test!(
         let network_id = network.id;
 
         let service_id = deploy_privileged_nodeport_service(
-            &node.service_controller,
+            &node.controllers.services,
             "nodeport-degraded-v6",
             network_id,
             NODEPORT_DEGRADED_RESPONSE,
@@ -2746,7 +2786,7 @@ local_test!(
 
         assert!(
             wait_for_service_status(
-                &node.service_controller,
+                &node.controllers.services,
                 service_id,
                 ServiceStatus::Running,
                 Duration::from_secs(180),
@@ -2760,9 +2800,10 @@ local_test!(
                 Duration::from_secs(60),
                 Duration::from_millis(100),
                 || async {
-                    let status = node.network_controller.nodeport_manager().status().await;
+                    let status = node.controllers.networks.nodeport_manager().status().await;
                     let service = node
-                        .service_controller
+                        .controllers
+                        .services
                         .registry()
                         .get(service_id)
                         .expect("read degraded IPv6 public service")
@@ -2784,7 +2825,7 @@ local_test!(
             "missing external IPv6 publication capacity should degrade NodePort with a precise operator-facing reason"
         );
 
-        remove_service_via_rpc(&node.services_client, service_id).await;
+        remove_service_via_rpc(&node.clients.cluster.services, service_id).await;
         delete_privileged_network(&node, network_id).await;
     }
 );

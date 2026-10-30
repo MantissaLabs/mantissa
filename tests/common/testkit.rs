@@ -535,7 +535,8 @@ impl TestNode {
     ) -> PeerControlPlaneOverride {
         let peer_id = peer.id();
         self.node
-            .registry
+            .registries
+            .peers
             .register_peer_handle(peer_id, UnavailablePeerServer::client(peer_id))
             .await;
 
@@ -559,8 +560,9 @@ impl TestNode {
         );
 
         self.node
-            .registry
-            .register_peer_handle(peer_id, peer.node.server_client.clone())
+            .registries
+            .peers
+            .register_peer_handle(peer_id, peer.node.clients.server.clone())
             .await;
     }
 
@@ -573,7 +575,7 @@ impl TestNode {
 
     /// Fetch the list of known node IDs via `Topology.list`.
     pub async fn list_ids(&self) -> Vec<Uuid> {
-        let req = self.node.topology_client.list_request();
+        let req = self.node.clients.cluster.topology.list_request();
         let resp = req.send().promise.await.expect("list send");
         let get_resp = resp.get().expect("list get");
         let nodes = get_resp.get_nodes().expect("list nodes result");
@@ -593,7 +595,7 @@ impl TestNode {
     pub async fn list_readiness_states(
         &self,
     ) -> Result<Vec<(Uuid, NodeReadinessState)>, capnp::Error> {
-        let req = self.node.topology_client.list_request();
+        let req = self.node.clients.cluster.topology.list_request();
         let resp = req.send().promise.await?;
         let get_resp = resp.get()?;
         let nodes = get_resp.get_nodes()?;
@@ -701,7 +703,7 @@ impl TestNode {
 
     /// Convenience accessor to the node's Topology client.
     pub fn topology(&self) -> topology::Client {
-        self.node.topology_client.clone()
+        self.node.clients.cluster.topology.clone()
     }
 
     /// Current node's own `peers` root (hex), via local Sync.
@@ -981,14 +983,14 @@ impl TestNode {
 
     /// Ask this node to leave the cluster via its local Topology capability.
     pub async fn leave(&self) -> Result<(), capnp::Error> {
-        let req = self.node.topology_client.leave_request();
+        let req = self.node.clients.cluster.topology.leave_request();
         let _ = req.send().promise.await?;
         Ok(())
     }
 
     /// Ask this node to evict `node_id` through its local Topology capability.
     pub async fn evict(&self, node_id: Uuid) -> Result<(), capnp::Error> {
-        let mut req = self.node.topology_client.evict_request();
+        let mut req = self.node.clients.cluster.topology.evict_request();
         req.get().init_node_id().set_bytes(node_id.as_bytes());
         let _ = req.send().promise.await?;
         Ok(())
